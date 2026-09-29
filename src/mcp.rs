@@ -413,7 +413,7 @@ impl LocalMachine {
     }
 }
 
-#[tool_router]
+#[tool_router(vis = "pub")]
 impl LocalMachine {
     #[tool(
         description = "Show this MCP server's workspace directory, filesystem boundary, and execution policy without modifying anything.",

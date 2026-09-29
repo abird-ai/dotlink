@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Simplify first-run setup into a compact beginner-friendly checklist.
+- Hide verbose tunnel INFO logs by default while keeping them available through `RUST_LOG`.
+- Add a complete Nix flake package, app, development shell, formatter, and `nix flake check` checks for tests, rustfmt, and Clippy.
+- Add `-v` / `--verbose` concise MCP request and tool-call logging.
+- Add `--list-tools`, generated directly from the live MCP tool router.
+- Add direct setup links for finding ChatGPT Workspace IDs and OpenAI Organization IDs.
+
+
 ## 0.2.0
 
 - Added `--cwd=<DIR>`.

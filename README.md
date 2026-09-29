@@ -56,21 +56,48 @@ abird-tunnel --cwd=/path/to/project
 
 `--cwd` is optional and defaults to the current working directory from which `abird-tunnel` was invoked.
 
-A normal startup looks like:
+A normal startup stays intentionally small:
 
 ```text
 abird-tunnel 0.2.0
 ────────────────────────────────────────────────────────
-Tunnel ID   tunnel_0123456789abcdef0123456789abcdef
-Workspace   /home/pvl/src/my-project
-Bash        enabled
-Status      connecting…
-────────────────────────────────────────────────────────
-Paste the Tunnel ID into the ChatGPT plugin's Tunnel connection.
-Keep this process running. Press Ctrl-C to stop.
+• Tunnel     tunnel_0123456789abcdef0123456789abcdef
+• Workspace  /home/pvl/src/my-project
+• Bash       enabled
+• Status     connecting…
 
-Connected    ready
+ChatGPT → Plugins → Tunnel → paste the Tunnel ID above.
+Ctrl-C to stop.
+
+✓ Connected — ready
 ```
+
+Detailed transport logs are hidden by default.
+
+For a concise live view of what ChatGPT asks the bridge to do:
+
+```bash
+abird-tunnel --verbose
+# or
+abird-tunnel -v
+```
+
+Example:
+
+```text
+→ initialize
+← initialize  200  1ms
+→ tools/list
+← tools/list  200  0ms
+→ tools/call fs_read_text  path="README.md"
+← fs_read_text  200  2ms
+→ tools/call shell_exec  cwd="." command="cargo test"
+← shell_exec  200  842ms
+```
+
+Verbose mode shows method/tool names and useful small arguments. Bulk
+`content` and `stdin` values are shown only as byte counts. For lower-level
+transport diagnostics, use `RUST_LOG=abird_tunnel=info`.
 
 ## Filesystem boundary
 
@@ -104,16 +131,39 @@ If you want a hard boundary for shell commands too, run `abird-tunnel` inside a 
 
 ## First-run OpenAI setup
 
-The first run performs interactive setup. It asks for a restricted tunnel runtime API key and either:
+Setup is designed to be a short one-time checklist:
 
-- an existing `tunnel_...` ID; or
-- a one-time Admin API key plus a ChatGPT workspace or Platform organization so it can create the tunnel.
+```text
+abird-tunnel setup
+────────────────────────────────────────────────────────
+1. Create a Runtime API key
+   • Permissions: Tunnels Read + Use
+   • https://platform.openai.com/settings/organization/api-keys
+   Paste key:
 
-The Admin key is used only for tunnel creation and is never persisted. The runtime key is saved separately from ordinary configuration with user-only file permissions on Unix.
+2. Choose a tunnel
+   • Paste an existing Tunnel ID, or press Enter to create one.
+   Tunnel ID [create new]:
+```
 
-The runtime key should have only **Tunnels Read + Use**. Tunnel creation requires tunnel-management permission and an Admin API key.
+If you create a new tunnel, setup adds only two more short steps:
 
-A freshly created tunnel can take a short period to become active; the client retries during activation.
+- create an **Admin API key** with **Tunnels Manage**;
+- choose a ChatGPT workspace ID, or use your OpenAI organization ID.
+
+ID locations:
+
+- **ChatGPT Workspace ID:** https://chatgpt.com/admin — select the workspace,
+  open its settings, and copy the Workspace ID/UUID.
+- **OpenAI Organization ID:** https://platform.openai.com/settings/organization/general
+  — copy the `org-...` identifier.
+
+The Admin key is used exactly once, is **never saved**, and can be deleted as
+soon as setup finishes. The restricted Runtime key is saved separately with
+user-only permissions on Unix and is reused on future launches.
+
+A fresh tunnel can take a short moment to activate; `abird-tunnel` handles
+that automatically.
 
 OpenAI documentation:
 
@@ -138,24 +188,35 @@ See [`docs/CHATGPT_PLUGIN.md`](docs/CHATGPT_PLUGIN.md) for the complete flow and
 
 ## Building
 
-Rust 1.98.1 is pinned by this source tree.
+### Nix — recommended
+
+The flake is a complete build/run/test interface:
 
 ```bash
-cargo build --release
-./target/release/abird-tunnel
+nix build                 # build ./result/bin/abird-tunnel
+nix run .                 # run abird-tunnel
+nix run . -- --setup      # pass CLI arguments
+nix flake check           # build + tests + rustfmt + clippy -D warnings
+nix develop               # Rust development shell
 ```
 
-For a user install:
+The checked-in `flake.lock` pins Nixpkgs so CI and local builds use the same
+toolchain. The package build itself runs `cargo test --all-features`.
+
+Inside `nix develop`, the equivalent direct Rust checks are:
 
 ```bash
-cargo install --path .
-abird-tunnel
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo build --release --all-features
 ```
 
-### Nix / NixOS
+### Cargo
+
+Rust 1.98.1 is pinned by `rust-toolchain.toml`:
 
 ```bash
-nix develop
 cargo build --release
 cargo install --path .
 abird-tunnel
@@ -212,6 +273,9 @@ abird-tunnel                     start everything; workspace = current directory
 abird-tunnel --cwd=<DIR>         use DIR as the filesystem workspace
 abird-tunnel --setup             redo first-run tunnel setup
 abird-tunnel --print-id          print the configured Tunnel ID and exit
+abird-tunnel --list-tools        list every exposed MCP tool and exit
+abird-tunnel -v                  show concise incoming requests/tool calls
+abird-tunnel --verbose           same as -v
 abird-tunnel --no-shell          disable shell_exec for this run
 ```
 
@@ -222,6 +286,12 @@ abird-tunnel --cwd=~/src/abird --no-shell
 ```
 
 ## MCP tools
+
+List the live tool set directly from the MCP router:
+
+```bash
+abird-tunnel --list-tools
+```
 
 | Tool | Purpose | Mutates? |
 |---|---|---:|

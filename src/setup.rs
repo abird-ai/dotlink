@@ -160,37 +160,41 @@ fn apply_nonsecret_env_overrides(config: &mut AppConfig) -> Result<()> {
 
 async fn interactive_setup() -> Result<SetupResult> {
     println!();
-    println!("abird-tunnel — first setup");
+    println!("abird-tunnel setup");
     println!("────────────────────────────────────────────────────────");
-    println!("You need a restricted Runtime API key with Tunnels Read + Use:");
-    println!("  https://platform.openai.com/settings/organization/api-keys");
-    println!();
-
-    let runtime_api_key = Zeroizing::new(prompt_secret("Runtime API key: ")?);
+    println!("1. Create a Runtime API key");
+    println!("   • Permissions: Tunnels Read + Use");
+    println!("   • https://platform.openai.com/settings/organization/api-keys");
+    let runtime_api_key = Zeroizing::new(prompt_secret("   Paste key: ")?);
     if runtime_api_key.trim().is_empty() {
         bail!("runtime API key cannot be empty");
     }
 
     println!();
-    println!("If you already created a tunnel, paste its ID.");
-    println!("Leave it blank and abird-tunnel will create one for you.");
-    let existing_id = prompt_line("Existing Tunnel ID [create new]: ")?;
+    println!("2. Choose a tunnel");
+    println!("   • Paste an existing Tunnel ID, or press Enter to create one.");
+    let existing_id = prompt_line("   Tunnel ID [create new]: ")?;
 
     let (tunnel_id, new_tunnel, runtime_organization_id) = if existing_id.trim().is_empty() {
         println!();
-        println!("Creating a tunnel requires a Platform Admin API key with Tunnels Manage.");
-        println!("The admin key is used only for this request and is NOT saved.");
-        println!("  https://platform.openai.com/settings/organization/admin-keys");
-        let admin_key = Zeroizing::new(prompt_secret("Admin API key: ")?);
+        println!("3. Create a one-time Admin key");
+        println!("   • Permission: Tunnels Manage");
+        println!("   • Used once and never saved; you can delete it after setup.");
+        println!("   • https://platform.openai.com/settings/organization/admin-keys");
+        let admin_key = Zeroizing::new(prompt_secret("   Paste key: ")?);
         if admin_key.trim().is_empty() {
             bail!("admin API key cannot be empty when creating a tunnel");
         }
 
         println!();
-        println!("For ChatGPT, a workspace-scoped tunnel is usually the right choice.");
-        let workspace_id = prompt_line("ChatGPT workspace ID [optional]: ")?;
+        println!("4. Choose tunnel scope");
+        println!("   • Workspace ID:    https://chatgpt.com/admin");
+        println!("     Select your ChatGPT workspace → Settings, then copy Workspace ID.");
+        println!("   • Organization ID: https://platform.openai.com/settings/organization/general");
+        println!("   • Paste a Workspace ID, or press Enter to use your Organization ID.");
+        let workspace_id = prompt_line("   ChatGPT workspace ID [optional]: ")?;
         let organization_id = if workspace_id.trim().is_empty() {
-            prompt_line("OpenAI organization ID: ")?
+            prompt_line("   OpenAI organization ID: ")?
         } else {
             String::new()
         };
@@ -198,6 +202,8 @@ async fn interactive_setup() -> Result<SetupResult> {
             bail!("a workspace ID or organization ID is required to create a tunnel");
         }
 
+        print!("   Creating tunnel… ");
+        io::stdout().flush()?;
         let tunnel_id = create_tunnel(
             DEFAULT_BASE_URL,
             &admin_key,
@@ -205,7 +211,8 @@ async fn interactive_setup() -> Result<SetupResult> {
             organization_id.trim(),
         )
         .await?;
-        println!("\nCreated tunnel: {tunnel_id}");
+        println!("done");
+        println!("   ✓ {tunnel_id}");
         (
             tunnel_id,
             true,
@@ -236,11 +243,13 @@ async fn interactive_setup() -> Result<SetupResult> {
     validate_config(&config)?;
     save_config(&config)?;
 
-    println!(
-        "Saved configuration to {} (runtime key protected by user-only file permissions where supported).",
-        config_path()?.display()
-    );
-    println!("Bash access is enabled while abird-tunnel is running.");
+    println!();
+    println!("✓ Setup complete");
+    println!("  • Runtime key saved securely for future runs.");
+    if new_tunnel {
+        println!("  • Admin key was not saved — you can delete it now.");
+    }
+    println!("  • Bash is enabled. Use --no-shell to disable it.");
 
     Ok(SetupResult {
         config,

@@ -37,20 +37,33 @@ struct Args {
     /// Print the saved tunnel id and exit.
     #[arg(long)]
     print_id: bool,
+
+    /// Show concise incoming MCP requests and tool calls.
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// List the MCP tools exposed by abird-tunnel and exit.
+    #[arg(long)]
+    list_tools: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.list_tools {
+        print_tools();
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("abird_tunnel=info")),
+                .unwrap_or_else(|_| EnvFilter::new("abird_tunnel=warn")),
         )
         .with_writer(std::io::stderr)
         .with_ansi(true)
         .init();
-
-    let args = Args::parse();
     // Capture the launch directory before any setup work so the default workspace is
     // exactly the directory from which the user invoked `abird-tunnel`.
     let launch_cwd = std::env::current_dir()?;
@@ -84,6 +97,7 @@ async fn main() -> Result<()> {
         setup.config.runtime_api_key.clone(),
         setup.config.organization_id.clone(),
         setup.new_tunnel,
+        args.verbose,
         cancellation.child_token(),
     )?;
 
@@ -92,6 +106,7 @@ async fn main() -> Result<()> {
         machine.workspace_root(),
         allow_shell,
         setup.new_tunnel,
+        args.verbose,
     );
 
     tokio::select! {
@@ -106,22 +121,54 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_banner(tunnel_id: &str, workspace_root: &std::path::Path, shell: bool, new_tunnel: bool) {
+fn print_banner(
+    tunnel_id: &str,
+    workspace_root: &std::path::Path,
+    shell: bool,
+    new_tunnel: bool,
+    verbose: bool,
+) {
     println!();
     println!("abird-tunnel {}", env!("CARGO_PKG_VERSION"));
     println!("────────────────────────────────────────────────────────");
-    println!("Tunnel ID   {tunnel_id}");
-    println!("Workspace   {}", workspace_root.display());
-    println!("Bash        {}", if shell { "enabled" } else { "disabled" });
-    if new_tunnel {
-        println!("Status      tunnel created; connecting…");
-    } else {
-        println!("Status      connecting…");
+    println!("• Tunnel     {tunnel_id}");
+    println!("• Workspace  {}", workspace_root.display());
+    println!(
+        "• Bash       {}",
+        if shell { "enabled" } else { "disabled" }
+    );
+    println!(
+        "• Status     {}",
+        if new_tunnel {
+            "new tunnel; connecting…"
+        } else {
+            "connecting…"
+        }
+    );
+    if verbose {
+        println!("• Verbose    enabled");
     }
-    println!("────────────────────────────────────────────────────────");
-    println!("Paste the Tunnel ID into the ChatGPT plugin's Tunnel connection.");
-    println!("Keep this process running. Press Ctrl-C to stop.");
     println!();
+    println!("ChatGPT → Plugins → Tunnel → paste the Tunnel ID above.");
+    println!("Ctrl-C to stop.");
+    println!();
+}
+
+fn print_tools() {
+    let mut tools = LocalMachine::tool_router().list_all();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+    println!("abird-tunnel tools");
+    println!("────────────────────────────────────────────────────────");
+    for tool in tools {
+        let title = tool
+            .title
+            .as_deref()
+            .or_else(|| tool.annotations.as_ref().and_then(|a| a.title.as_deref()))
+            .or(tool.description.as_deref())
+            .unwrap_or("");
+        println!("• {:<16} {}", tool.name, title);
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +185,37 @@ mod tests {
     fn cwd_is_optional() {
         let args = Args::try_parse_from(["abird-tunnel"]).unwrap();
         assert!(args.cwd.is_none());
+    }
+
+    #[test]
+    fn parses_verbose_and_list_tools() {
+        let verbose = Args::try_parse_from(["abird-tunnel", "-v"]).unwrap();
+        assert!(verbose.verbose);
+
+        let list = Args::try_parse_from(["abird-tunnel", "--list-tools"]).unwrap();
+        assert!(list.list_tools);
+    }
+
+    #[test]
+    fn tool_list_comes_from_actual_router() {
+        let mut names: Vec<_> = LocalMachine::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "fs_list",
+                "fs_mkdir",
+                "fs_read_text",
+                "fs_remove",
+                "fs_stat",
+                "fs_write_text",
+                "machine_info",
+                "shell_exec",
+            ]
+        );
     }
 }

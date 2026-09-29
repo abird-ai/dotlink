@@ -236,6 +236,7 @@ pub struct TunnelClient {
     organization_id: Option<Arc<str>>,
     instance_id: Arc<str>,
     activation_grace_until: Option<Instant>,
+    verbose: bool,
     cancellation: CancellationToken,
     concurrency: Arc<Semaphore>,
 }
@@ -293,6 +294,7 @@ impl TunnelClient {
         api_key: String,
         organization_id: Option<String>,
         newly_created: bool,
+        verbose: bool,
         cancellation: CancellationToken,
     ) -> Result<Self> {
         if tunnel_id.trim().is_empty() || api_key.trim().is_empty() {
@@ -311,6 +313,7 @@ impl TunnelClient {
             organization_id: organization_id.map(Arc::from),
             instance_id: Arc::from(Uuid::new_v4().to_string()),
             activation_grace_until: newly_created.then(|| Instant::now() + Duration::from_secs(45)),
+            verbose,
             cancellation,
             concurrency: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         })
@@ -337,7 +340,7 @@ impl TunnelClient {
                             failures = 0;
                             not_ready_failures = 0;
                             if !announced {
-                                println!("Connected    ready");
+                                println!("✓ Connected — ready");
                                 println!();
                                 info!(tunnel_id = %self.tunnel_id, "secure MCP tunnel connected");
                                 announced = true;
@@ -472,6 +475,10 @@ impl TunnelClient {
                     return Ok(());
                 };
                 let has_request_id = jsonrpc.get("id").is_some();
+                let started = Instant::now();
+                if self.verbose {
+                    eprintln!("{}", verbose_request_summary(jsonrpc));
+                }
                 let dispatch = mcp.dispatch(&command.headers, jsonrpc);
                 let local = match await_before_deadline(deadline, dispatch).await {
                     Ok(Some(result)) => match result {
@@ -511,6 +518,15 @@ impl TunnelClient {
                     Ok(None) => return Ok(()),
                     Err(error) => return Err(error),
                 };
+
+                if self.verbose {
+                    eprintln!(
+                        "← {}  {}  {}ms",
+                        verbose_request_label(jsonrpc),
+                        local.status,
+                        started.elapsed().as_millis()
+                    );
+                }
 
                 if !has_request_id {
                     let response = TunnelResponse {
@@ -761,6 +777,87 @@ fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
     Some(Duration::new(secs, nanos))
 }
 
+fn verbose_request_label(jsonrpc: &Value) -> String {
+    let method = jsonrpc
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("jsonrpc");
+    if method == "tools/call"
+        && let Some(name) = jsonrpc.pointer("/params/name").and_then(Value::as_str)
+    {
+        return name.to_owned();
+    }
+    method.to_owned()
+}
+
+fn verbose_request_summary(jsonrpc: &Value) -> String {
+    let method = jsonrpc
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("jsonrpc");
+    if method != "tools/call" {
+        return format!("→ {method}");
+    }
+
+    let name = jsonrpc
+        .pointer("/params/name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let arguments = jsonrpc.pointer("/params/arguments");
+    let args = arguments.map(summarize_tool_arguments).unwrap_or_default();
+    if args.is_empty() {
+        format!("→ tools/call {name}")
+    } else {
+        format!("→ tools/call {name}  {args}")
+    }
+}
+
+fn summarize_tool_arguments(arguments: &Value) -> String {
+    let Some(object) = arguments.as_object() else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+    for key in [
+        "path",
+        "cwd",
+        "command",
+        "mode",
+        "recursive",
+        "parents",
+        "create_parents",
+        "timeout_secs",
+        "max_entries",
+        "max_bytes",
+        "max_output_bytes",
+    ] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        parts.push(format!("{key}={}", summarize_value(value)));
+    }
+    for key in ["content", "stdin"] {
+        if let Some(Value::String(value)) = object.get(key) {
+            parts.push(format!("{key}=<{} bytes>", value.len()));
+        }
+    }
+    parts.join(" ")
+}
+
+fn summarize_value(value: &Value) -> String {
+    match value {
+        Value::String(value) => {
+            let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut preview: String = compact.chars().take(120).collect();
+            if compact.chars().count() > 120 {
+                preview.push('…');
+            }
+            format!("{preview:?}")
+        }
+        other => other.to_string(),
+    }
+}
+
 fn is_terminal_jsonrpc(value: &Value) -> bool {
     value.get("id").is_some() && (value.get("result").is_some() || value.get("error").is_some())
 }
@@ -854,5 +951,27 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(is_jsonrpc_notification(&messages[0]));
         assert!(is_terminal_jsonrpc(&messages[1]));
+    }
+
+    #[test]
+    fn verbose_tool_summary_is_short_and_redacts_bulk_content() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "fs_write_text",
+                "arguments": {
+                    "path": "src/main.rs",
+                    "content": "secret-ish payload",
+                    "create_parents": true
+                }
+            }
+        });
+        let summary = verbose_request_summary(&request);
+        assert!(summary.contains("tools/call fs_write_text"));
+        assert!(summary.contains("path=\"src/main.rs\""));
+        assert!(summary.contains("content=<18 bytes>"));
+        assert!(!summary.contains("secret-ish payload"));
     }
 }
