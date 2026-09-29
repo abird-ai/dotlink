@@ -1,1 +1,3 @@
+mod logging;
+
 fn main() {}
