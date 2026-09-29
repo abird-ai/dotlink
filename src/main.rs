@@ -46,6 +46,34 @@ struct Args {
     #[arg(long, requires = "http")]
     ngrok: bool,
 
+    /// Use fresh hard-to-guess URL paths for both local HTTP and ngrok.
+    #[arg(long, requires = "http")]
+    ephemeral_url: bool,
+
+    /// Override local HTTP ephemeral-path behavior. Bare flag means true.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        requires = "http",
+        alias = "http-emphemeral-url"
+    )]
+    http_ephemeral_url: Option<bool>,
+
+    /// Override ngrok ephemeral-path behavior. Bare flag means true.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        requires = "ngrok",
+        alias = "ngrok-emphemeral-url"
+    )]
+    ngrok_ephemeral_url: Option<bool>,
+
     /// Add a readable directory. May be repeated. The cwd is readable by default.
     #[arg(long, value_name = "DIR")]
     allow_read: Vec<PathBuf>,
@@ -290,12 +318,16 @@ async fn main() -> Result<()> {
         None
     };
 
+    let (http_ephemeral_url, ngrok_ephemeral_url) = ephemeral_url_policy(&args);
+
     let active_transports = ActiveTransports {
         openai,
         stdio: args.stdio,
         http: http_bind.map(|bind| transports::http::Config {
             bind,
             ngrok: args.ngrok,
+            http_ephemeral_url,
+            ngrok_ephemeral_url,
         }),
     };
 
@@ -345,6 +377,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn ephemeral_url_policy(args: &Args) -> (bool, bool) {
+    (
+        args.http_ephemeral_url.unwrap_or(args.ephemeral_url),
+        args.ngrok_ephemeral_url.unwrap_or(args.ephemeral_url),
+    )
+}
+
 fn print_banner(
     transports: &ActiveTransports,
     machine: &LocalMachine,
@@ -359,9 +398,17 @@ fn print_banner(
         eprintln!("• Tunnel     {}", openai.tunnel_id);
     }
     if let Some(http) = transports.http {
-        eprintln!("• HTTP       http://{}/mcp", http.bind);
+        if http.http_ephemeral_url {
+            eprintln!("• HTTP       ephemeral URL; exact path will be printed after bind");
+        } else {
+            eprintln!("• HTTP       http://{}/mcp", http.bind);
+        }
         if http.ngrok {
-            eprintln!("• ngrok      enabled; public URL will be printed after connection");
+            if http.ngrok_ephemeral_url {
+                eprintln!("• ngrok      enabled with independent ephemeral MCP path");
+            } else {
+                eprintln!("• ngrok      enabled; public URL will be printed after connection");
+            }
         }
     }
     eprintln!("• Cwd        {}", machine.cwd().display());
@@ -520,6 +567,72 @@ mod tests {
         let args = Args::try_parse_from(["abird-tunnel", "--http", "--ngrok"]).unwrap();
         assert!(args.http);
         assert!(args.ngrok);
+    }
+
+    #[test]
+    fn ephemeral_url_requires_http() {
+        assert!(Args::try_parse_from(["abird-tunnel", "--ephemeral-url"]).is_err());
+        let args = Args::try_parse_from(["abird-tunnel", "--http", "--ephemeral-url"]).unwrap();
+        assert!(args.http);
+        assert!(args.ephemeral_url);
+    }
+
+    #[test]
+    fn transport_ephemeral_overrides_parse_independently() {
+        let args = Args::try_parse_from([
+            "abird-tunnel",
+            "--http",
+            "--ngrok",
+            "--ephemeral-url",
+            "--http-ephemeral-url=false",
+            "--ngrok-ephemeral-url",
+        ])
+        .unwrap();
+        assert!(args.ephemeral_url);
+        assert_eq!(args.http_ephemeral_url, Some(false));
+        assert_eq!(args.ngrok_ephemeral_url, Some(true));
+    }
+
+    #[test]
+    fn global_ephemeral_url_can_be_overridden_per_transport() {
+        let args = Args::try_parse_from([
+            "abird-tunnel",
+            "--http",
+            "--ngrok",
+            "--ephemeral-url",
+            "--http-ephemeral-url=false",
+        ])
+        .unwrap();
+        assert_eq!(ephemeral_url_policy(&args), (false, true));
+
+        let args = Args::try_parse_from([
+            "abird-tunnel",
+            "--http",
+            "--ngrok",
+            "--ephemeral-url",
+            "--ngrok-ephemeral-url=false",
+        ])
+        .unwrap();
+        assert_eq!(ephemeral_url_policy(&args), (true, false));
+    }
+
+    #[test]
+    fn individual_ephemeral_flags_are_independent() {
+        let args =
+            Args::try_parse_from(["abird-tunnel", "--http", "--http-ephemeral-url"]).unwrap();
+        assert_eq!(ephemeral_url_policy(&args), (true, false));
+
+        let args =
+            Args::try_parse_from(["abird-tunnel", "--http", "--ngrok", "--ngrok-ephemeral-url"])
+                .unwrap();
+        assert_eq!(ephemeral_url_policy(&args), (false, true));
+    }
+
+    #[test]
+    fn ngrok_ephemeral_override_requires_ngrok() {
+        assert!(
+            Args::try_parse_from(["abird-tunnel", "--http", "--ngrok-ephemeral-url",]).is_err()
+        );
     }
 
     #[test]

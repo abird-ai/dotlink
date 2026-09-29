@@ -1,7 +1,4 @@
-use std::{
-    future::IntoFuture,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
@@ -12,9 +9,10 @@ use ngrok::{
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use uuid::Uuid;
 
 use crate::mcp::LocalMachine;
 
@@ -22,6 +20,8 @@ use crate::mcp::LocalMachine;
 pub struct Config {
     pub bind: SocketAddr,
     pub ngrok: bool,
+    pub http_ephemeral_url: bool,
+    pub ngrok_ephemeral_url: bool,
 }
 
 pub async fn run(
@@ -29,44 +29,31 @@ pub async fn run(
     config: Config,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let server_config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
-        .with_json_response(true)
-        .with_sse_keep_alive(None)
-        .with_sse_retry(None)
-        .with_cancellation_token(cancellation.child_token());
-
-    let service: StreamableHttpService<LocalMachine, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(machine.clone()),
-            LocalSessionManager::default().into(),
-            server_config,
-        );
-
-    let router = Router::new().nest_service("/mcp", service);
-    let listener = TcpListener::bind(config.bind)
+    let http_path = mcp_path(config.http_ephemeral_url);
+    let http_listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind HTTP MCP server to {}", config.bind))?;
-    let local_addr = listener
+    let http_addr = http_listener
         .local_addr()
         .context("failed to read HTTP listen address")?;
 
-    eprintln!("✓ HTTP MCP: http://{local_addr}/mcp");
-
-    let shutdown = cancellation.child_token();
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled_owned().await;
-        })
-        .into_future();
-    tokio::pin!(server);
+    eprintln!("✓ HTTP MCP: http://{http_addr}{http_path}");
 
     if !config.ngrok {
-        server.await.context("HTTP MCP server failed")?;
-        return Ok(());
+        return run_server(machine, http_listener, http_path, cancellation).await;
     }
 
-    let upstream = ngrok_upstream(local_addr)?;
+    // ngrok gets a separate loopback-only backend so its public route can be
+    // independently ephemeral (or stable) from the local HTTP route.
+    let ngrok_path = mcp_path(config.ngrok_ephemeral_url);
+    let ngrok_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .context("failed to bind ngrok MCP backend")?;
+    let ngrok_addr = ngrok_listener
+        .local_addr()
+        .context("failed to read ngrok backend address")?;
+
+    let upstream = ngrok_upstream(ngrok_addr)?;
     let session = ngrok::Session::builder()
         .authtoken_from_env()
         .connect()
@@ -80,25 +67,97 @@ pub async fn run(
         .await
         .context("failed to create ngrok HTTP endpoint")?;
 
-    let public_mcp = format!("{}/mcp", forwarder.url().trim_end_matches('/'));
+    let public_mcp = format!("{}{}", forwarder.url().trim_end_matches('/'), ngrok_path);
     eprintln!("✓ ngrok MCP: {public_mcp}");
     eprintln!("  Connect any Streamable HTTP MCP client directly to that URL.");
     eprintln!(
         "  Warning: the public endpoint exposes the MCP permissions granted to this process."
     );
 
-    tokio::select! {
-        result = &mut server => {
-            result.context("HTTP MCP server failed")?;
-        }
+    let http_ct = cancellation.child_token();
+    let ngrok_ct = cancellation.child_token();
+    let mut http_task = spawn_server(machine.clone(), http_listener, http_path, http_ct);
+    let mut ngrok_task = spawn_server(machine, ngrok_listener, ngrok_path, ngrok_ct);
+
+    let result = tokio::select! {
+        result = &mut http_task => join_server("HTTP MCP server", result),
+        result = &mut ngrok_task => join_server("ngrok MCP backend", result),
         result = forwarder.join() => {
             let result = result.context("ngrok forwarding task panicked")?;
-            result.map_err(|error| anyhow!("ngrok forwarding failed: {error}"))?;
+            result.map_err(|error| anyhow!("ngrok forwarding failed: {error}"))
         }
-        _ = cancellation.cancelled() => {}
+        _ = cancellation.cancelled() => Ok(()),
+    };
+
+    cancellation.cancel();
+
+    if !http_task.is_finished() {
+        let _ = http_task.await;
+    }
+    if !ngrok_task.is_finished() {
+        let _ = ngrok_task.await;
     }
 
-    Ok(())
+    result
+}
+
+async fn run_server(
+    machine: LocalMachine,
+    listener: TcpListener,
+    path: String,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let router = mcp_router(machine, &path, cancellation.child_token());
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            cancellation.cancelled_owned().await;
+        })
+        .await
+        .context("HTTP MCP server failed")
+}
+
+fn spawn_server(
+    machine: LocalMachine,
+    listener: TcpListener,
+    path: String,
+    cancellation: CancellationToken,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move { run_server(machine, listener, path, cancellation).await })
+}
+
+fn join_server(name: &str, result: Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    match result {
+        Ok(result) => result.with_context(|| format!("{name} failed")),
+        Err(error) => Err(anyhow!("{name} task panicked: {error}")),
+    }
+}
+
+fn mcp_router(machine: LocalMachine, path: &str, cancellation: CancellationToken) -> Router {
+    let server_config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_sse_retry(None)
+        .with_cancellation_token(cancellation);
+
+    let service: StreamableHttpService<LocalMachine, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(machine.clone()),
+            LocalSessionManager::default().into(),
+            server_config,
+        );
+
+    Router::new().nest_service(path, service)
+}
+
+fn mcp_path(ephemeral: bool) -> String {
+    if !ephemeral {
+        return "/mcp".to_owned();
+    }
+
+    // Two UUIDv4 values provide ~244 bits of randomness while staying URL-safe.
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    format!("/mcp/{token}")
 }
 
 fn ngrok_upstream(bind: SocketAddr) -> Result<Url> {
@@ -120,6 +179,21 @@ fn ngrok_upstream(bind: SocketAddr) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_mcp_path_is_stable() {
+        assert_eq!(mcp_path(false), "/mcp");
+    }
+
+    #[test]
+    fn ephemeral_mcp_path_is_long_url_safe_and_fresh() {
+        let first = mcp_path(true);
+        let second = mcp_path(true);
+        let token = first.strip_prefix("/mcp/").expect("ephemeral prefix");
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn unspecified_http_bind_forwards_ngrok_to_loopback() {

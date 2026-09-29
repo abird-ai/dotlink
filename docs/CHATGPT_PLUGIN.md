@@ -164,3 +164,13 @@ NGROK_AUTHTOKEN=... abird-tunnel --http --ngrok
 ~~~
 
 abird-tunnel prints the final public /mcp URL. A Streamable HTTP MCP client can connect directly to that URL.
+
+
+For hard-to-guess per-run HTTP paths:
+
+~~~text
+abird-tunnel --http --ephemeral-url
+abird-tunnel --http --ngrok --ngrok-ephemeral-url
+~~~
+
+The local HTTP and ngrok ephemeral settings are independent.

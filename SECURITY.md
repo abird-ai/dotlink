@@ -57,6 +57,16 @@ Changing --http-bind to a non-loopback address can expose the MCP server to othe
 
 The HTTP transport does not add application-layer authentication by itself.
 
+### Ephemeral URL paths
+
+--ephemeral-url gives both local HTTP and ngrok fresh high-entropy MCP paths for the current process.
+
+--http-ephemeral-url and --ngrok-ephemeral-url control the two transports independently and override the shorthand. Explicit =false is supported.
+
+When a transport uses an ephemeral path, its normal /mcp route is not exposed by that transport.
+
+The generated path is approximately 244 bits of randomness and is intended to make accidental discovery difficult. It is not a replacement for authentication or access control.
+
 ### ngrok
 
 --ngrok creates a public HTTPS endpoint for the configured HTTP MCP server.

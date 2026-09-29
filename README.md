@@ -118,6 +118,44 @@ abird-tunnel --http --http-bind=127.0.0.1:8080
 
 HTTP-capable MCP clients connect directly to /mcp.
 
+### Ephemeral HTTP paths
+
+HTTP and ngrok can each use a fresh hard-to-guess MCP path for one process run.
+
+Use the shorthand for both:
+
+~~~bash
+abird-tunnel --http --ngrok --ephemeral-url
+~~~
+
+This gives local HTTP and ngrok independent fresh paths such as:
+
+~~~text
+http://127.0.0.1:3000/mcp/<64-hex-token>
+https://example.ngrok.app/mcp/<different-64-hex-token>
+~~~
+
+Control them independently:
+
+~~~bash
+# local HTTP ephemeral, ngrok stable
+abird-tunnel --http --ngrok --http-ephemeral-url
+
+# local HTTP stable, ngrok ephemeral
+abird-tunnel --http --ngrok --ngrok-ephemeral-url
+~~~
+
+Per-transport flags override the shorthand, including explicit false:
+
+~~~bash
+abird-tunnel --http --ngrok --ephemeral-url --http-ephemeral-url=false
+abird-tunnel --http --ngrok --ephemeral-url --ngrok-ephemeral-url=false
+~~~
+
+Each ephemeral route is generated fresh at process start using two UUIDv4 values (~244 random bits). The ordinary /mcp path is not mounted for that transport when its ephemeral mode is enabled.
+
+A hard-to-guess path is an additional obscurity layer, not authentication.
+
 ### ngrok public MCP endpoint
 
 --ngrok enhances the HTTP transport; it is not another MCP transport.
@@ -339,6 +377,9 @@ abird-tunnel --setup           configure supported transports
 --http                         start configured HTTP MCP
 --http-bind=<ADDR>             override HTTP listen address
 --ngrok                        publish --http through ngrok
+--ephemeral-url                ephemeral local HTTP + ngrok paths
+--http-ephemeral-url[=BOOL]    override local HTTP path behavior
+--ngrok-ephemeral-url[=BOOL]   override ngrok path behavior
 
 --cwd=<DIR>                    default cwd
 

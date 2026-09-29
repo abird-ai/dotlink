@@ -102,6 +102,23 @@ Runtime override:
 
 HTTP uses LocalSessionManager for normal Streamable HTTP sessions.
 
+## Independent ephemeral HTTP routes
+
+The HTTP transport resolves two route policies:
+
+~~~text
+http_ephemeral_url
+ngrok_ephemeral_url
+~~~
+
+--ephemeral-url sets both to true by default.
+
+--http-ephemeral-url and --ngrok-ephemeral-url are per-transport overrides and accept explicit =false.
+
+Local HTTP and ngrok are genuinely isolated: ngrok uses a second loopback-only MCP backend listener. This lets one side expose /mcp while the other uses /mcp/<random-token> without accidentally mounting both routes on the same externally reachable listener.
+
+Each ephemeral path is generated independently on process start.
+
 ## ngrok
 
 When --http --ngrok is selected:

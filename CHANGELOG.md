@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add --ephemeral-url for fresh high-entropy HTTP/ngrok MCP paths.
+- Add independent --http-ephemeral-url and --ngrok-ephemeral-url overrides, including explicit =false.
+- Use a separate loopback-only ngrok backend so local and public MCP routes can differ without cross-exposure.
 - Add modular persisted transport support for OpenAI Secure MCP Tunnel, stdio MCP, and Streamable HTTP MCP.
 - Add --stdio for subprocess MCP clients such as Claude Desktop and Claude Code.
 - Add --http and --http-bind for local Streamable HTTP MCP at /mcp.
