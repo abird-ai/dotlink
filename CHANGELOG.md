@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add modular persisted transport support for OpenAI Secure MCP Tunnel, stdio MCP, and Streamable HTTP MCP.
+- Add --stdio for subprocess MCP clients such as Claude Desktop and Claude Code.
+- Add --http and --http-bind for local Streamable HTTP MCP at /mcp.
+- Add --ngrok using the ngrok Rust SDK to publish the HTTP MCP endpoint directly as a public HTTPS /mcp URL.
+- Skip all OpenAI credential/tunnel setup when OpenAI transport is disabled.
+- Move transport implementations into src/transports/openai.rs, stdio.rs, and http.rs around one shared LocalMachine policy.
+- Let clean termination of one transport leave concurrently active transports running.
+- Reserve stdout exclusively for MCP protocol traffic when stdio is active.
 - Replace the old fs_* API with a Pi-like tool surface: read, write, edit, ls, and platform shell.
 - Add read_binary, write_binary, and patch_binary with MCP/base64/hex support.
 - Make the default tool surface read-only.

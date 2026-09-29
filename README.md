@@ -1,320 +1,401 @@
 # abird-tunnel
 
-A single Rust binary that connects ChatGPT to local files and tools through OpenAI Secure MCP Tunnel.
+A small Rust MCP bridge for permission-scoped local files and optional local command execution.
 
-```text
-ChatGPT
-   │ Secure MCP Tunnel (outbound HTTPS)
-   ▼
-api.openai.com
-   ▲
-   │
+The same LocalMachine MCP server can be exposed through three independent transports:
+
+~~~text
+                         LocalMachine
+            read / write / edit / ls / binary / shell
+                              |
+               +--------------+--------------+
+               |              |              |
+             OpenAI          stdio      Streamable HTTP
+          Secure Tunnel   stdin/stdout       /mcp
+                                             |
+                                             +-- optional ngrok
+                                                 public HTTPS /mcp
+~~~
+
+The transports are modular: OpenAI, stdio, and HTTP can each be enabled or disabled in persisted setup.
+
+## Setup
+
+Run once:
+
+~~~bash
+abird-tunnel --setup
+~~~
+
+Setup begins with:
+
+~~~text
+1. Choose MCP transports
+   • openai — OpenAI Secure MCP Tunnel; starts automatically
+   • stdio  — local stdio MCP server; start with --stdio
+   • http   — local HTTP MCP server; start with --http
+   • Enter comma-separated names, or 'all'.
+   Enabled [openai]:
+~~~
+
+Examples:
+
+~~~text
+openai
+stdio
+http
+stdio,http
+openai,stdio,http
+all
+~~~
+
+If OpenAI is not selected, every OpenAI credential/tunnel question is skipped and no OpenAI runtime key is required.
+
+The selection is persisted in:
+
+~~~text
+~/.config/abird-tunnel/config.toml
+~~~
+
+## Transport activation
+
+Configured OpenAI Tunnel starts automatically:
+
+~~~bash
 abird-tunnel
-   ├── read / write / edit / ls
-   ├── read_binary / write_binary / patch_binary
-   └── bash (Unix) / powershell (Windows)
-```
+~~~
 
-There is no Go `tunnel-client`, local MCP listener, inbound firewall rule, or public endpoint. The Rust process speaks the OpenAI tunnel protocol directly and dispatches MCP in memory through `rmcp`.
+Configured stdio and HTTP start only when explicitly requested:
 
-## Quick start
+~~~bash
+abird-tunnel --stdio
+abird-tunnel --http
+abird-tunnel --stdio --http
+~~~
 
-```bash
-cd ~/src/my-project
-abird-tunnel
-```
+If OpenAI is also enabled, it runs alongside requested local transports.
 
-With no permission flags, only the effective cwd is readable and the exposed tools are:
+A transport disabled in setup cannot be started until it is enabled with abird-tunnel --setup.
 
-```text
-ls
-read
-read_binary
-```
+### stdio
 
-Choose another default cwd with:
+--stdio is the standard subprocess MCP transport for clients such as Claude Desktop, Claude Code, and other clients that launch an MCP server command.
 
-```bash
-abird-tunnel --cwd=/path/to/project
-```
+Typical client shape:
+
+~~~json
+{
+  "mcpServers": {
+    "abird": {
+      "command": "abird-tunnel",
+      "args": ["--stdio"]
+    }
+  }
+}
+~~~
+
+When stdio is active, stdout is reserved exclusively for MCP JSON-RPC. Human-readable status goes to stderr.
+
+### HTTP
+
+The default local Streamable HTTP endpoint is:
+
+~~~text
+http://127.0.0.1:3000/mcp
+~~~
+
+Start it with:
+
+~~~bash
+abird-tunnel --http
+~~~
+
+Override the bind address for one run:
+
+~~~bash
+abird-tunnel --http --http-bind=127.0.0.1:8080
+~~~
+
+HTTP-capable MCP clients connect directly to /mcp.
+
+### ngrok public MCP endpoint
+
+--ngrok enhances the HTTP transport; it is not another MCP transport.
+
+Set the ngrok SDK token:
+
+~~~bash
+export NGROK_AUTHTOKEN='...'
+~~~
+
+Then:
+
+~~~bash
+abird-tunnel --http --ngrok
+~~~
+
+abird-tunnel starts the local Streamable HTTP MCP server, opens a public ngrok endpoint using the ngrok Rust SDK, and prints a URL such as:
+
+~~~text
+✓ ngrok MCP: https://example.ngrok.app/mcp
+~~~
+
+Any Streamable HTTP MCP client can connect directly to that public /mcp URL.
+
+The public URL exposes whatever MCP permissions were granted to this abird-tunnel process. Treat it as sensitive or add appropriate ngrok access controls.
 
 ## Filesystem permissions
 
-Permissions are additive. `--deny` always takes precedence.
+Permissions are additive. --deny always wins.
 
-The default is equivalent to:
+Default:
 
-```text
+~~~text
 --allow-read=<cwd>
-```
+~~~
 
-Add repeatable grants:
+Additional grants:
 
-```bash
+~~~bash
 abird-tunnel --allow-read=/data/reference
 abird-tunnel --allow-write=/data/output
 abird-tunnel --allow-rw=/src/project
 abird-tunnel --deny=/src/project/secrets
-```
+~~~
 
-- `--allow-read=DIR`: read DIR.
-- `--allow-write=DIR`: write DIR without granting read.
-- `--allow-rw=DIR`: read + write DIR.
-- `--deny=DIR`: deny DIR even if a broader allow contains it.
+- --allow-read=DIR adds read permission.
+- --allow-write=DIR adds write permission without adding read permission.
+- --allow-rw=DIR adds both.
+- --deny=PATH overrides matching allow rules.
 
 Bare:
 
-```bash
+~~~bash
 abird-tunnel --allow-write
-```
+~~~
 
-is shorthand for:
+is shorthand for read+write on cwd.
 
-```text
---allow-rw=<cwd>
-```
+Relative MCP paths resolve from --cwd. Absolute paths work when granted. Existing paths and ancestors are canonicalized before Rust policy checks to prevent symlink escapes.
 
-while `--allow-write=/some/dir` is genuinely write-only.
-
-Relative tool paths resolve from `--cwd`. Absolute paths are accepted when allowed. Existing targets and ancestors are canonicalized, so symlink escapes cannot bypass the policy.
-
-`edit` and `patch_binary` require both read and write permission. `write` and `write_binary` require write permission only.
-
-## Linux shell sandbox
-
-Enable the shell explicitly:
-
-```bash
-abird-tunnel --allow-shell
-```
-
-On Linux, Bash runs inside **Bubblewrap** by default. The sandbox:
-
-- mounts readable grants read-only;
-- mounts paths with both read + write permission read-write;
-- leaves write-only grants out of the shell unless a read grant overlaps them;
-- masks `--deny` directories;
-- masks the saved tunnel runtime key;
-- uses an empty temporary home;
-- isolates PID, IPC, and UTS namespaces; and
-- **blocks network access by default**.
-
-Allow network inside the sandbox with:
-
-```bash
-abird-tunnel --allow-shell --allow-network
-```
-
-`--allow-network` is only valid for the Linux sandbox.
-
-Bubblewrap cannot safely expose an existing host directory as truly write-only. Use `--allow-rw=DIR` when the shell itself needs writable access to that directory.
-
-## Dangerous unsandboxed access
-
-`--no-sandbox` does not grant shell access by itself.
-
-An unsandboxed shell inherently has host filesystem and network capability, so both acknowledgements are required:
-
-```bash
-abird-tunnel \
-  --allow-shell \
-  --no-sandbox \
-  --allow-rw-all-dangerous \
-  --allow-network-dangereous
-```
-
-`--allow-rw-all-dangerous` also makes the Rust filesystem tools unrestricted. Explicit `--deny` still wins for Rust tools.
-
-An unsandboxed shell cannot enforce `--deny`, so that combination is rejected.
-
-The full shortcut is:
-
-```bash
-abird-tunnel --allow-all-dangerous
-```
-
-which means unrestricted filesystem + network + unsandboxed shell.
-
-On Windows the shell tool is `powershell`, preferring `pwsh.exe` and then `powershell.exe`. Bubblewrap is Linux-only, so Windows shell execution requires the dangerous unsandboxed acknowledgements.
-
-## Binary tools
-
-The text tools stay Pi-like and text-only:
-
-```text
-read
-write
-edit
-ls
-bash / powershell
-```
-
-Binary operations are separate:
-
-```text
-read_binary
-write_binary
-patch_binary
-```
-
-`read_binary` supports:
-
-```text
-format=mcp      typed MCP image/audio/blob content
-format=base64   base64 text
-format=hex      hexadecimal text
-```
-
-`format=mcp` is the default: images become MCP image content, audio becomes MCP audio content, and other binary types become MCP blob resources.
-
-`write_binary` accepts `encoding=base64|hex`.
-
-`patch_binary` replaces a byte range by offset and supports replacement, insertion (`length=0`), and deletion (empty payload + positive `length`).
+edit and patch_binary require read+write. write and write_binary require write only.
 
 ## Tool surface
 
 Default:
 
-```bash
-abird-tunnel --list-tools
-```
-
-```text
+~~~text
 ls
 read
 read_binary
-```
+~~~
 
-With any write grant:
+Any write grant adds:
 
-```text
-edit
-ls
-patch_binary
-read
-read_binary
+~~~text
 write
+edit
 write_binary
-```
+patch_binary
+~~~
 
-With shell enabled, `bash` on Unix or `powershell` on Windows is added.
+Shell adds one platform tool:
 
-Examples:
+~~~text
+bash         # Unix
+powershell   # Windows
+~~~
 
-```bash
+Inspect the visible tool surface without starting a transport:
+
+~~~bash
+abird-tunnel --list-tools
 abird-tunnel --allow-write --list-tools
 abird-tunnel --allow-shell --list-tools
-abird-tunnel --allow-rw=/src/project --allow-shell --list-tools
-```
+~~~
 
-## Verbose request logging
+## Text and binary tools
 
-```bash
-abird-tunnel -v
-# or
-abird-tunnel --verbose
-```
+The Pi-like text tools stay simple:
 
-Example:
+~~~text
+read
+write
+edit
+ls
+bash / powershell
+~~~
 
-```text
-→ tools/call read  path="README.md"
-← read  200  2ms
-→ tools/call bash  cwd="." command="cargo test"
-← bash  200  842ms
-```
+Binary work is separate:
 
-Bulk `content` and `stdin` are logged only as byte counts.
+~~~text
+read_binary
+write_binary
+patch_binary
+~~~
 
-## First-run OpenAI setup
+read_binary supports:
+
+~~~text
+format=mcp      typed MCP image/audio/blob content
+format=base64   base64 text
+format=hex      hexadecimal text
+~~~
+
+format=mcp is the default. Images become MCP image content, audio becomes MCP audio content, and other binary files become MCP blob resources.
+
+write_binary accepts encoding=base64|hex.
+
+patch_binary works by byte offset and can replace, insert with length=0, or delete with an empty payload plus positive length.
+
+## Linux shell sandbox
+
+Enable shell explicitly:
+
+~~~bash
+abird-tunnel --allow-shell
+~~~
+
+On Linux, Bash runs inside Bubblewrap by default.
+
+The sandbox:
+
+- mounts readable grants read-only;
+- mounts effective read+write grants read-write;
+- does not expose purely write-only host paths to Bash;
+- masks denied paths;
+- masks the saved OpenAI tunnel runtime key when present;
+- uses an empty temporary home;
+- isolates PID, IPC, and UTS namespaces;
+- blocks shell network access by default.
+
+Enable network inside the sandbox with:
+
+~~~bash
+abird-tunnel --allow-shell --allow-network
+~~~
+
+This shell-network policy does not affect the main abird-tunnel process. OpenAI Tunnel and ngrok use outbound networking from that main process.
+
+## Dangerous unsandboxed access
+
+Unsandboxed shell execution inherently has the OS user's filesystem and network authority.
+
+It therefore requires:
+
+~~~bash
+abird-tunnel \
+  --allow-shell \
+  --no-sandbox \
+  --allow-rw-all-dangerous \
+  --allow-network-dangereous
+~~~
+
+The corrected alias --allow-network-dangerous is also accepted.
+
+The full escape hatch is:
+
+~~~bash
+abird-tunnel --allow-all-dangerous
+~~~
+
+That means unrestricted filesystem + unsandboxed shell + network.
+
+--deny cannot constrain an unsandboxed shell, so that combination is rejected.
+
+## OpenAI Secure MCP Tunnel
+
+This setup is shown only when OpenAI transport is enabled.
 
 Setup asks for:
 
-1. a restricted Runtime API key with **Tunnels Read + Use**;
-2. an existing tunnel ID, or a one-time Admin key with **Tunnels Manage** to create one;
+1. a Runtime API key with Tunnels Read + Use;
+2. an existing Tunnel ID, or a one-time Admin API key with Tunnels Manage;
 3. a ChatGPT Workspace ID or OpenAI Organization ID when creating a tunnel.
 
-Useful links:
+The Admin key is never persisted.
+
+The Runtime key is stored separately at:
+
+~~~text
+~/.config/abird-tunnel/runtime.key
+~~~
+
+When OpenAI transport is disabled, that key is not required and setup removes a previously saved runtime key.
+
+Useful locations:
 
 - Runtime API keys: https://platform.openai.com/settings/organization/api-keys
-- Admin keys: https://platform.openai.com/settings/organization/admin-keys
+- Admin API keys: https://platform.openai.com/settings/organization/admin-keys
 - ChatGPT Workspace ID: https://chatgpt.com/admin
 - OpenAI Organization ID: https://platform.openai.com/settings/organization/general
 
-The Admin key is used once, never saved, and can be deleted after setup.
+## CLI summary
+
+~~~text
+abird-tunnel --setup           configure supported transports
+
+--stdio                        start configured stdio MCP
+--http                         start configured HTTP MCP
+--http-bind=<ADDR>             override HTTP listen address
+--ngrok                        publish --http through ngrok
+
+--cwd=<DIR>                    default cwd
+
+--allow-read=<DIR>             add read
+--allow-write=<DIR>            add write-only
+--allow-rw=<DIR>               add read+write
+--allow-write                  shorthand: rw cwd
+--deny=<PATH>                  deny; always wins
+
+--allow-shell                  add platform shell
+--allow-network                network inside Linux shell sandbox
+--no-sandbox                   disable Bubblewrap
+
+--allow-rw-all-dangerous       unrestricted Rust filesystem tools
+--allow-network-dangereous     acknowledge unsandboxed network
+--allow-all-dangerous          unrestricted rw + network + unsandboxed shell
+
+--list-tools                   show exposed tools
+-v, --verbose                  concise request/tool logs
+--print-id                     print configured OpenAI Tunnel ID
+~~~
 
 ## Build
 
-Nix is the recommended Linux path:
-
-```bash
+~~~bash
 nix build
 nix run .
 nix flake check
 nix develop
-```
+~~~
 
-The Linux Nix package includes Bubblewrap and Bash in the runtime wrapper.
+Inside nix develop:
 
-Inside `nix develop`:
-
-```bash
+~~~bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo build --release --all-features
-```
+~~~
 
-Cargo install also works; install `bubblewrap` separately on Linux if you want `--allow-shell`.
+The Linux Nix package includes Bubblewrap and Bash.
 
-## CLI summary
+## Project layout
 
-```text
-abird-tunnel
-    read-only cwd
+~~~text
+src/
+  main.rs
+  mcp.rs
+  setup.rs
+  transports/
+    mod.rs
+    openai.rs
+    stdio.rs
+    http.rs
+~~~
 
---allow-read=<DIR>          add read
---allow-write=<DIR>         add write-only
---allow-rw=<DIR>            add read+write
---allow-write               shorthand: rw cwd
---deny=<DIR>                deny; always wins
-
---allow-shell               add platform shell
---allow-network             network inside Linux sandbox
---no-sandbox                disable Bubblewrap only
-
---allow-rw-all-dangerous    unrestricted Rust filesystem tools
---allow-network-dangereous   acknowledge unsandboxed network
-                             corrected alias: --allow-network-dangerous
---allow-all-dangerous       unrestricted rw + network + unsandboxed shell
-
---cwd=<DIR>                 default cwd
---list-tools                show exposed tools
--v, --verbose               concise tool logs
---setup                     redo tunnel setup
---print-id                  print Tunnel ID
-```
-
-## Persistent state
-
-```text
-~/.config/abird-tunnel/config.toml
-~/.config/abird-tunnel/runtime.key
-```
-
-Filesystem grants are selected fresh on every launch. The runtime key is mode `0600` on Unix and its parent directory is `0700`. Rust filesystem tools reject that credential path, and the Linux sandbox masks it.
-
-## Connect to ChatGPT
-
-After `abird-tunnel` prints the `tunnel_...` ID:
-
-1. enable ChatGPT Developer mode;
-2. create a Plugin developer connection using **Tunnel**;
-3. paste the tunnel ID;
-4. copy the resulting `plugin_asdk_app...` connection ID;
-5. use `prompts/PLUGIN_CREATOR.md` to create the private plugin package.
-
-See `docs/CHATGPT_PLUGIN.md` for the companion flow.
+mcp.rs owns the permission-scoped tool implementation. Each transport is isolated in its own module.
 
 ## License
 

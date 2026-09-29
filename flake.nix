@@ -40,7 +40,7 @@
 
           abird-tunnel = pkgs.rustPlatform.buildRustPackage {
             pname = "abird-tunnel";
-            version = "0.3.0";
+            version = "0.4.0";
             inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;
@@ -111,7 +111,7 @@
 
           clippy = pkgs.rustPlatform.buildRustPackage {
             pname = "abird-tunnel-clippy";
-            version = "0.3.0";
+            version = "0.4.0";
             inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;

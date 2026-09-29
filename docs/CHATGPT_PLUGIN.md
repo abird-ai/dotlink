@@ -133,3 +133,34 @@ References:
 - https://developers.openai.com/api/docs/guides/secure-mcp-tunnels
 - https://developers.openai.com/plugins/deploy/connect-chatgpt
 - https://developers.openai.com/plugins/build/plugins
+
+
+## Other MCP clients
+
+The OpenAI plugin flow above uses the OpenAI transport. The same LocalMachine MCP server can also run without OpenAI.
+
+For subprocess MCP clients such as Claude Desktop or Claude Code, enable stdio during abird-tunnel --setup, then configure the client to launch:
+
+~~~text
+abird-tunnel --stdio
+~~~
+
+For Streamable HTTP clients, enable http during setup and run:
+
+~~~text
+abird-tunnel --http
+~~~
+
+The default endpoint is:
+
+~~~text
+http://127.0.0.1:3000/mcp
+~~~
+
+For a public HTTPS endpoint through the ngrok Rust SDK:
+
+~~~text
+NGROK_AUTHTOKEN=... abird-tunnel --http --ngrok
+~~~
+
+abird-tunnel prints the final public /mcp URL. A Streamable HTTP MCP client can connect directly to that URL.

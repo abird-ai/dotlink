@@ -809,6 +809,7 @@ impl LocalMachine {
             .env_remove("CONTROL_PLANE_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("OPENAI_ADMIN_KEY")
+            .env_remove("NGROK_AUTHTOKEN")
             .kill_on_drop(true);
 
         let mut child = match command.spawn() {

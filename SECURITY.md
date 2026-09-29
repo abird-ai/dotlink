@@ -1,172 +1,196 @@
 # Security model
 
-`abird-tunnel` is least-privilege by default.
+abird-tunnel is least-privilege by default.
 
-With no permission flags it exposes only:
+Without write or shell flags, the visible tools are:
 
-```text
+~~~text
 ls
 read
 read_binary
-```
+~~~
 
-and only the effective cwd is readable.
+and cwd is the only implicit readable directory.
 
 ## Filesystem grants
 
-Filesystem permissions are selected on every launch.
+Launch-time permissions:
 
-```text
+~~~text
 --allow-read=DIR
 --allow-write=DIR
 --allow-rw=DIR
---deny=DIR
-```
+--deny=PATH
+~~~
 
-Rules are additive. `--deny` always takes precedence.
+Allow rules are additive.
 
-The effective cwd is read-enabled by default. Bare `--allow-write` is shorthand for rw on cwd.
+deny always takes precedence.
 
-Rust filesystem tools canonicalize existing targets and ancestors before access checks. Symlink escapes therefore do not bypass the grant policy.
+Bare --allow-write means read+write cwd.
 
-Text and binary mutations use the same checks:
+Rust file tools canonicalize existing targets and ancestors before policy checks so symlink traversal cannot escape a grant.
 
-- `write` / `write_binary` require write permission;
-- `edit` / `patch_binary` require read + write permission;
-- `read` / `read_binary` / `ls` require read permission.
+Tool requirements:
 
-The saved tunnel runtime credential is separately protected even if a broad read grant would otherwise contain it.
+- read, read_binary, ls require read;
+- write, write_binary require write;
+- edit, patch_binary require read+write.
+
+## Transport security
+
+### stdio
+
+stdio is local subprocess IPC over stdin/stdout.
+
+When --stdio is active, stdout is protocol-only. Status and diagnostics are written to stderr.
+
+### local HTTP
+
+HTTP defaults to loopback:
+
+~~~text
+127.0.0.1:3000
+~~~
+
+Changing --http-bind to a non-loopback address can expose the MCP server to other machines on the network.
+
+The HTTP transport does not add application-layer authentication by itself.
+
+### ngrok
+
+--ngrok creates a public HTTPS endpoint for the configured HTTP MCP server.
+
+That endpoint exposes the same MCP tools and filesystem/shell permissions as the local server.
+
+Anyone who can reach an unprotected public endpoint may be able to exercise those permissions.
+
+Use ngrok access controls when appropriate and grant only the minimum abird filesystem/shell permissions required.
+
+The ngrok SDK credential is read from NGROK_AUTHTOKEN. It authenticates abird-tunnel to ngrok; it is not, by itself, authentication for MCP callers.
+
+## OpenAI credentials
+
+OpenAI credentials exist only when the OpenAI transport is enabled.
+
+The Runtime key is stored at:
+
+~~~text
+~/.config/abird-tunnel/runtime.key
+~~~
+
+On Unix it is mode 0600 and its directory is mode 0700.
+
+The Admin key used to create a tunnel is never persisted.
+
+When OpenAI is disabled in setup, the Runtime key is not required and a previously saved runtime.key is removed.
+
+Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are removed from child shell environments.
 
 ## Linux Bubblewrap shell
 
-`--allow-shell` enables Bash on Unix. On Linux it runs inside Bubblewrap unless unsandboxed dangerous access was explicitly requested.
+--allow-shell enables Bash on Unix.
+
+On Linux it is Bubblewrap-sandboxed by default.
 
 The sandbox:
 
 - mounts readable grants read-only;
-- mounts paths with effective read + write permission read-write;
-- does not mount a purely write-only grant;
-- masks denied directories;
-- masks the saved tunnel runtime key;
+- mounts effective read+write grants read-write;
+- does not expose purely write-only host grants;
+- masks deny paths;
+- masks the saved OpenAI runtime key when present;
 - uses an empty temporary home;
-- mounts system runtime paths read-only;
-- isolates PID, IPC, and UTS namespaces; and
+- mounts required system runtime paths read-only;
+- isolates PID, IPC, and UTS namespaces;
 - unshares the network namespace by default.
 
-Network is restored only with:
+Enable shell network access with:
 
-```text
+~~~text
 --allow-network
-```
+~~~
 
-Write-only host directories are intentionally not presented to Bash because Bubblewrap cannot safely make an existing directory writable while preventing reads. Use `--allow-rw=DIR` if shell access to that directory is required.
+The shell network namespace is separate from the main abird-tunnel process. OpenAI and ngrok can use outbound networking even while the shell itself has no network.
 
 ## Dangerous unsandboxed shell
 
-`--no-sandbox` alone does not enable shell access.
+--no-sandbox does not grant shell access by itself.
 
-An unsandboxed shell inherits the OS user's real host authority. Because the program cannot reliably restrict that process after removing the OS sandbox, both acknowledgements are required:
+Unsandboxed execution requires:
 
-```text
+~~~text
+--allow-shell
+--no-sandbox
 --allow-rw-all-dangerous
 --allow-network-dangereous
-```
+~~~
 
-plus `--allow-shell --no-sandbox`.
+The corrected alias --allow-network-dangerous is accepted.
 
-The shortcut:
+The full shortcut is:
 
-```text
+~~~text
 --allow-all-dangerous
-```
+~~~
 
-enables unrestricted filesystem tools, network, and unsandboxed shell access.
-
-A Rust-tool `--deny` can still override `--allow-rw-all-dangerous`. However, deny rules cannot constrain an unsandboxed shell. Therefore abird-tunnel refuses to start an unsandboxed shell when any `--deny` rule is present.
+deny rules cannot constrain an arbitrary unsandboxed child process, so unsandboxed shell plus deny is rejected.
 
 ## Windows
 
-The Windows shell tool is `powershell`, preferring `pwsh.exe` and falling back to `powershell.exe`.
+The Windows shell tool is powershell, preferring pwsh.exe and falling back to powershell.exe.
 
-Bubblewrap is Linux-only, so Windows shell execution currently follows the unsandboxed-dangerous requirements above.
+Bubblewrap is Linux-only, so Windows shell execution follows the explicit unsandboxed-dangerous requirements.
 
-Filesystem tools still enforce allow/deny policy in Rust.
-
-## Network
-
-The tunnel itself always needs outbound HTTPS to the OpenAI control plane.
-
-That tunnel process is separate from shell network permissions.
-
-Inside the Linux Bubblewrap child:
-
-- default: no network namespace access;
-- `--allow-network`: host network namespace retained.
-
-Outside the sandbox, network cannot be meaningfully blocked by abird-tunnel; that is why unsandboxed shell requires `--allow-network-dangereous`. The corrected spelling `--allow-network-dangerous` is accepted as an alias.
-
-## Credentials
-
-First-run setup uses two credentials:
-
-1. **Runtime key** — narrowly scoped to Tunnels Read + Use and needed while running.
-2. **Admin key** — used only to create a tunnel and never persisted.
-
-The Runtime key is stored at:
-
-```text
-~/.config/abird-tunnel/runtime.key
-```
-
-On Unix the file is mode `0600` and its directory is `0700`.
-
-Known OpenAI/tunnel credential environment variables are removed from child shell environments.
+Rust filesystem tools still enforce allow/deny policy on Windows.
 
 ## Binary data
 
-`read_binary` can return MCP image/audio/blob content or explicit base64/hex. Read limits still apply.
+read_binary supports MCP typed media/blob content plus explicit base64 and hex.
 
-`write_binary` and `patch_binary` enforce write limits. `patch_binary` additionally caps the total file size it will patch in memory.
+write_binary and patch_binary enforce write limits.
 
-## Tunnel boundary
-
-The local process does not listen on a TCP port. It uses outbound HTTPS to OpenAI's Secure MCP Tunnel.
-
-Control-plane request headers are filtered before MCP dispatch. Only MCP protocol headers are forwarded to the local service.
+patch_binary also caps total file size processed in memory.
 
 ## Resource limits
 
-- tunnel execution concurrency is bounded;
-- shell stdout/stderr are continuously drained with bounded retained output;
-- text and binary reads/writes are bounded;
-- shell commands have a timeout and are terminated on timeout/drop.
+- tunnel concurrency is bounded;
+- shell stdout/stderr are drained continuously with bounded retained output;
+- text/binary reads and writes are bounded;
+- shell calls have a timeout;
+- HTTP and transport lifecycles share cancellation;
+- ngrok forwarding terminates with the HTTP transport/process lifecycle.
 
-These limits reduce accidental resource exhaustion but are not a substitute for the Bubblewrap or OS security boundary.
+## Recommended use
 
-## Recommended modes
+Read-only local MCP:
 
-Safest ordinary mode:
+~~~bash
+abird-tunnel --stdio
+~~~
 
-```bash
-abird-tunnel
-```
+Writable local project:
 
-Writable project:
+~~~bash
+abird-tunnel --stdio --allow-write
+~~~
 
-```bash
-abird-tunnel --allow-write
-```
+Sandboxed build/test shell without shell network:
 
-Sandboxed build/test shell with project writes but no network:
+~~~bash
+abird-tunnel --stdio --allow-write --allow-shell
+~~~
 
-```bash
-abird-tunnel --allow-write --allow-shell
-```
+Local HTTP:
 
-Sandboxed shell with network:
+~~~bash
+abird-tunnel --http
+~~~
 
-```bash
-abird-tunnel --allow-write --allow-shell --allow-network
-```
+Public HTTP through ngrok:
 
-Avoid `--allow-all-dangerous` unless unrestricted host access is explicitly intended. Never run abird-tunnel as root.
+~~~bash
+abird-tunnel --http --ngrok
+~~~
+
+Use --allow-all-dangerous only when unrestricted host access is explicitly intended.

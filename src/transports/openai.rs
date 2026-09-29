@@ -48,6 +48,34 @@ const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
 ];
 
 #[derive(Clone)]
+pub struct Config {
+    pub base_url: String,
+    pub tunnel_id: String,
+    pub runtime_api_key: String,
+    pub organization_id: Option<String>,
+    pub new_tunnel: bool,
+    pub verbose: bool,
+}
+
+pub async fn run(
+    machine: LocalMachine,
+    config: Config,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let embedded = EmbeddedMcp::new(machine, cancellation.child_token());
+    let tunnel = TunnelClient::new(
+        config.base_url,
+        config.tunnel_id,
+        config.runtime_api_key,
+        config.organization_id,
+        config.new_tunnel,
+        config.verbose,
+        cancellation,
+    )?;
+    tunnel.run(embedded).await
+}
+
+#[derive(Clone)]
 pub struct EmbeddedMcp {
     service: StreamableHttpService<LocalMachine, NeverSessionManager>,
 }

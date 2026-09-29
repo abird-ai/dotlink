@@ -1,78 +1,168 @@
 # Architecture
 
-## One process
+## Core split
 
-`abird-tunnel` combines setup, policy enforcement, the MCP server, and the Secure MCP Tunnel client in one Tokio process.
+abird-tunnel is one Tokio process with a transport-neutral MCP core.
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ abird-tunnel                                                 │
-│                                                              │
-│ setup/config                                                 │
-│      │                                                       │
-│      ├──────────────┐                                        │
-│      ▼              ▼                                        │
-│ tunnel client   LocalMachine                                 │
-│      │          ├── access policy                            │
-│      │          ├── rmcp tool router                         │
-│      │          └── Bubblewrap shell launcher (Linux)        │
-│      │                                                       │
-│      └──────────► EmbeddedMcp StreamableHttpService          │
-│                  (in memory; no listening socket)            │
-└──────────────┬───────────────────────────────────────────────┘
-               │ outbound HTTPS
-               ▼
-       OpenAI Secure MCP Tunnel
-```
+~~~text
+                     setup/config
+                         |
+                         v
+                  permission policy
+                         |
+                         v
+                    LocalMachine
+          read/write/edit/ls/binary/shell
+                         |
+          +--------------+---------------+
+          |              |               |
+          v              v               v
+        OpenAI          stdio      Streamable HTTP
+     Secure Tunnel   stdin/stdout       /mcp
+                                         |
+                                         +-- optional ngrok
+~~~
 
-`src/tunnel.rs` converts each polled tunnel command into an in-memory request accepted by `rmcp::StreamableHttpService`.
+The LocalMachine implementation and its dynamic tool router live in src/mcp.rs.
 
-## Startup
+Transport code is isolated under:
 
-1. Parse permission and capability flags.
-2. Canonicalize `--cwd` and all allow/deny directories.
-3. Add the implicit default read grant for cwd.
-4. Resolve additive read/write/rw grants and deny rules.
-5. Validate shell/sandbox/network policy.
-6. Load tunnel configuration and the restricted Runtime key.
-7. Construct the policy-aware `LocalMachine` MCP server.
-8. Start Secure MCP Tunnel polling.
-9. Print ready after the first successful poll.
+~~~text
+src/transports/
+  mod.rs
+  openai.rs
+  stdio.rs
+  http.rs
+~~~
+
+No transport owns filesystem policy.
+
+## Persisted transport support
+
+Setup persists three independent booleans:
+
+~~~text
+openai
+stdio
+http
+~~~
+
+OpenAI starts automatically when configured.
+
+stdio and HTTP are opt-in at runtime:
+
+~~~text
+--stdio
+--http
+~~~
+
+--ngrok modifies the HTTP transport; it is not a fourth MCP transport.
+
+Older configs with no transport section default to OpenAI-only for backward compatibility.
+
+## Runtime transport orchestration
+
+main.rs builds one LocalMachine and one ActiveTransports plan.
+
+Each active transport gets a clone of the same LocalMachine.
+
+Clean termination of one transport does not terminate the others. For example, stdio EOF from a Claude subprocess session does not stop an active HTTP server or OpenAI Tunnel.
+
+A transport error cancels the remaining active transports.
+
+Ctrl-C cancels the shared root cancellation token.
+
+## stdio
+
+stdio uses rmcp's standard stdin/stdout transport.
+
+stdout is reserved for JSON-RPC protocol frames. All human-readable status is written to stderr.
+
+This is intended for MCP clients that launch the server as a subprocess.
+
+## HTTP
+
+HTTP uses rmcp StreamableHttpService mounted at:
+
+~~~text
+/mcp
+~~~
+
+Default persisted bind:
+
+~~~text
+127.0.0.1:3000
+~~~
+
+Runtime override:
+
+~~~text
+--http-bind=<ADDR>
+~~~
+
+HTTP uses LocalSessionManager for normal Streamable HTTP sessions.
+
+## ngrok
+
+When --http --ngrok is selected:
+
+1. the local HTTP MCP listener is bound first;
+2. the ngrok Rust SDK opens a public HTTP endpoint;
+3. ngrok forwards that endpoint to the local HTTP listener;
+4. abird-tunnel prints the public URL with /mcp appended.
+
+The public URL speaks ordinary MCP Streamable HTTP. Clients connect directly to it.
+
+ngrok uses NGROK_AUTHTOKEN through the SDK's authtoken-from-environment flow.
+
+## OpenAI Secure MCP Tunnel
+
+src/transports/openai.rs owns the OpenAI-specific protocol implementation.
+
+It converts tunnel-polled JSON-RPC requests into in-process requests against an rmcp StreamableHttpService and returns the MCP response to the OpenAI control plane.
+
+The OpenAI transport is the only transport that requires:
+
+~~~text
+tunnel_id
+runtime API key
+optional organization ID
+~~~
+
+When OpenAI is disabled, setup skips these fields and no runtime key is loaded.
 
 ## Permission model
 
 The access policy contains:
 
-```text
+~~~text
 cwd
 read_roots[]
 write_roots[]
 deny_roots[]
 rw_all_dangerous
-```
+~~~
 
-Access checks are capability-based rather than tied to one root.
+Rules:
 
-For a path:
+- deny match rejects access;
+- read succeeds when any read root covers the canonical target;
+- write succeeds when any write root covers it;
+- read+write operations require both;
+- allow-read, allow-write, and allow-rw are additive;
+- deny takes precedence.
 
-- deny match → reject;
-- read succeeds if any read root contains the canonical path;
-- write succeeds if any write root contains the canonical path;
-- read+write operations require both.
+The effective cwd is readable by default.
 
-`--allow-rw=DIR` simply inserts DIR into both root sets.
+Bare --allow-write adds write permission to cwd, so cwd becomes read+write.
 
-The effective cwd is always inserted into `read_roots` unless a deny overrides it.
+Existing paths are canonicalized before checks. Create targets canonicalize their nearest existing ancestor before the final path is checked.
 
-Bare `--allow-write` inserts cwd into `write_roots`, producing rw cwd because cwd was already readable.
+## Dynamic tool router
 
-Existing paths are canonicalized before policy checks. Create targets canonicalize their nearest existing ancestor and check the resulting path before mutation.
+The implementation defines:
 
-## Dynamic MCP router
-
-The static Rust implementation defines:
-
-```text
+~~~text
 read
 write
 edit
@@ -82,96 +172,82 @@ write_binary
 patch_binary
 bash
 powershell
-```
+~~~
 
-The server builds a policy-specific router at runtime.
+The visible router is policy-specific.
 
-Default visible surface:
+Default:
 
-```text
+~~~text
 ls
 read
 read_binary
-```
+~~~
 
-Mutation tools are hidden unless at least one write capability exists.
+Write tools are hidden if no write capability exists.
 
-Shell tools are hidden unless shell execution is enabled. Only `bash` is exposed on Unix and only `powershell` on Windows.
+Shell is hidden unless explicitly enabled.
 
-Hidden tools are absent from `tools/list` and rejected as unknown if called directly.
+Only bash is exposed on Unix and only powershell on Windows.
 
-## Bubblewrap translation
+## Linux Bubblewrap mapping
 
-On Linux, when shell is enabled without `--no-sandbox`, filesystem policy is translated to Bubblewrap mounts.
+On Linux, enabled shell runs inside Bubblewrap unless dangerous unsandboxed access was explicitly selected.
 
-For each distinct grant path, effective read/write capability is computed from all overlapping grants:
+Effective filesystem grants become mounts:
 
-- readable + not writable → `--ro-bind`;
-- readable + writable → `--bind`;
-- write-only → not mounted into the shell.
+- readable only -> read-only bind;
+- read+write -> writable bind;
+- write-only -> not mounted into shell.
 
-Mounts are applied from shallow paths to deeper paths, allowing a more specific nested grant to override a broader parent mount.
+More-specific mounts may override broader mounts.
 
-Denied directories are masked after allow mounts with an empty mode-000 tmpfs.
+Denied paths are masked after allow mounts.
 
-The tunnel runtime key is masked separately.
+The saved OpenAI runtime credential is masked when present.
 
-Bubblewrap uses a temporary home and temp directory plus read-only system runtime mounts.
+Bubblewrap provides an empty temporary home and temporary directory.
 
 ## Network isolation
 
-Sandboxed shell starts with `--unshare-net`.
+Sandboxed shell starts with an unshared network namespace.
 
-`--allow-network` removes that isolation and mounts minimal network-related system files such as resolver/certificate paths when present.
+--allow-network restores host network access for the shell child.
 
-Network permission affects only the shell child. The main abird-tunnel process always needs outbound HTTPS to the OpenAI tunnel service.
+This policy applies only to the shell child.
+
+The main abird-tunnel process may still need outbound network access for:
+
+- OpenAI Secure MCP Tunnel;
+- ngrok SDK ingress.
 
 ## Unsandboxed shell
 
-An unsandboxed shell cannot be constrained by Rust path checks after execution begins.
+An unsandboxed shell cannot be constrained by Rust path checks.
 
-Therefore unsandboxed shell is enabled only when the user explicitly combines:
+Therefore it requires explicit unrestricted filesystem and network acknowledgements:
 
-```text
+~~~text
 --allow-shell
 --no-sandbox
 --allow-rw-all-dangerous
 --allow-network-dangereous
-```
+~~~
 
-`--allow-all-dangerous` is the shortcut for that full capability set.
+--allow-all-dangerous is the full shorthand.
 
-Because deny rules cannot be enforced against an unsandboxed process, startup rejects unsandboxed shell + `--deny`.
+Unsandboxed shell plus deny rules is rejected because deny cannot be enforced after arbitrary process execution begins.
 
-## Binary transport
+## Binary MCP content
 
-`read_binary(format=mcp)` maps bytes into typed MCP content:
+read_binary(format=mcp) maps bytes to MCP typed content:
 
-- image MIME → `ContentBlock::image`;
-- audio MIME → `ContentBlock::audio`;
-- other MIME → embedded `BlobResourceContents`.
+- image MIME -> image content;
+- audio MIME -> audio content;
+- other MIME -> embedded blob resource.
 
-`base64` and `hex` modes return encoded text for byte-level work.
+base64 and hex modes return encoded text.
 
-`write_binary` decodes base64/hex to bytes.
+write_binary decodes base64 or hex.
 
-`patch_binary` loads a bounded file, replaces the requested byte range, then writes it back.
-
-## Tunnel lifecycle
-
-The client polls:
-
-```text
-GET /v1/tunnels/{id}/poll?limit=25&timeout_ms=15000
-```
-
-Results are posted to:
-
-```text
-POST /v1/tunnels/{id}/response
-X-Tunnel-Shard-Token: <opaque token>
-```
-
-A Tokio semaphore limits concurrent commands. Tunnel response deadlines cover local MCP execution and response delivery.
-
-Polling and terminal response delivery use bounded retry/backoff for transient failures. Authentication/configuration failures remain fatal.
+patch_binary edits a bounded byte range in a bounded file.

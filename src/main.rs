@@ -1,8 +1,8 @@
 mod mcp;
 mod setup;
-mod tunnel;
+mod transports;
 
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -12,23 +12,39 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     mcp::{AccessSpec, LocalMachine, MachineConfig},
     setup::load_or_setup,
-    tunnel::{EmbeddedMcp, TunnelClient},
+    transports::ActiveTransports,
 };
 
 #[derive(Debug, Parser)]
 #[command(
     name = "abird-tunnel",
     version,
-    about = "Connect ChatGPT to this machine over OpenAI Secure MCP Tunnel"
+    about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP"
 )]
 struct Args {
     /// Re-run the interactive first-use setup and replace the saved configuration.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["stdio", "http", "ngrok"])]
     setup: bool,
 
     /// Default working directory. Defaults to the directory where abird-tunnel is launched.
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
+
+    /// Start the stdio MCP server. Must be enabled in persisted transport config.
+    #[arg(long)]
+    stdio: bool,
+
+    /// Start the HTTP MCP server. Must be enabled in persisted transport config.
+    #[arg(long)]
+    http: bool,
+
+    /// Override the configured HTTP listen address for this run.
+    #[arg(long, value_name = "ADDR", requires = "http")]
+    http_bind: Option<SocketAddr>,
+
+    /// Publish the HTTP MCP server through ngrok. Requires --http and NGROK_AUTHTOKEN.
+    #[arg(long, requires = "http")]
+    ngrok: bool,
 
     /// Add a readable directory. May be repeated. The cwd is readable by default.
     #[arg(long, value_name = "DIR")]
@@ -221,9 +237,72 @@ async fn main() -> Result<()> {
 
     let setup = load_or_setup(args.setup).await?;
 
-    if args.print_id {
-        println!("{}", setup.config.tunnel_id);
+    if args.setup {
         return Ok(());
+    }
+
+    if args.print_id {
+        let tunnel_id = setup
+            .config
+            .tunnel_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
+        println!("{tunnel_id}");
+        return Ok(());
+    }
+
+    if args.stdio && !setup.config.transports.stdio {
+        bail!("stdio transport is disabled in config; run 'abird-tunnel --setup' to enable it");
+    }
+    if args.http && !setup.config.transports.http {
+        bail!("HTTP transport is disabled in config; run 'abird-tunnel --setup' to enable it");
+    }
+
+    let http_bind = if args.http {
+        Some(match args.http_bind {
+            Some(bind) => bind,
+            None => setup
+                .config
+                .transports
+                .http_bind
+                .parse::<SocketAddr>()
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid configured HTTP bind address: {error}")
+                })?,
+        })
+    } else {
+        None
+    };
+
+    let openai = if setup.config.transports.openai {
+        let tunnel_id = setup.config.tunnel_id.clone().ok_or_else(|| {
+            anyhow::anyhow!("OpenAI transport is enabled but tunnel_id is missing")
+        })?;
+        Some(transports::openai::Config {
+            base_url: setup.config.base_url.clone(),
+            tunnel_id,
+            runtime_api_key: setup.config.runtime_api_key.clone(),
+            organization_id: setup.config.organization_id.clone(),
+            new_tunnel: setup.new_tunnel,
+            verbose: args.verbose,
+        })
+    } else {
+        None
+    };
+
+    let active_transports = ActiveTransports {
+        openai,
+        stdio: args.stdio,
+        http: http_bind.map(|bind| transports::http::Config {
+            bind,
+            ngrok: args.ngrok,
+        }),
+    };
+
+    if active_transports.is_empty() {
+        bail!(
+            "no MCP transport is active; enable OpenAI in setup or start a configured local transport with --stdio and/or --http"
+        );
     }
 
     let machine = LocalMachine::new(MachineConfig {
@@ -246,27 +325,16 @@ async fn main() -> Result<()> {
     .await?;
 
     let cancellation = CancellationToken::new();
-    let embedded_mcp = EmbeddedMcp::new(machine.clone(), cancellation.child_token());
-    let tunnel = TunnelClient::new(
-        setup.config.base_url.clone(),
-        setup.config.tunnel_id.clone(),
-        setup.config.runtime_api_key.clone(),
-        setup.config.organization_id.clone(),
-        setup.new_tunnel,
-        args.verbose,
-        cancellation.child_token(),
-    )?;
 
     print_banner(
-        &setup.config.tunnel_id,
+        &active_transports,
         &machine,
-        setup.new_tunnel,
         args.verbose,
         args.allow_all_dangerous,
     );
 
     tokio::select! {
-        result = tunnel.run(embedded_mcp) => result?,
+        result = active_transports.run(machine, cancellation.child_token()) => result?,
         signal = tokio::signal::ctrl_c() => {
             signal?;
             cancellation.cancel();
@@ -278,25 +346,33 @@ async fn main() -> Result<()> {
 }
 
 fn print_banner(
-    tunnel_id: &str,
+    transports: &ActiveTransports,
     machine: &LocalMachine,
-    new_tunnel: bool,
     verbose: bool,
     allow_all_dangerous: bool,
 ) {
-    println!();
-    println!("abird-tunnel {}", env!("CARGO_PKG_VERSION"));
-    println!("────────────────────────────────────────────────────────");
-    println!("• Tunnel     {tunnel_id}");
-    println!("• Cwd        {}", machine.cwd().display());
+    eprintln!();
+    eprintln!("abird-tunnel {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("────────────────────────────────────────────────────────");
+    eprintln!("• Transports {}", transports.names().join(", "));
+    if let Some(openai) = &transports.openai {
+        eprintln!("• Tunnel     {}", openai.tunnel_id);
+    }
+    if let Some(http) = transports.http {
+        eprintln!("• HTTP       http://{}/mcp", http.bind);
+        if http.ngrok {
+            eprintln!("• ngrok      enabled; public URL will be printed after connection");
+        }
+    }
+    eprintln!("• Cwd        {}", machine.cwd().display());
     let access_summary = if allow_all_dangerous {
         "ALL DANGEROUS (unrestricted fs + shell + network)".to_owned()
     } else {
         machine.access_summary()
     };
-    println!("• Access     {access_summary}");
+    eprintln!("• Access     {access_summary}");
     if machine.shell_enabled() {
-        println!(
+        eprintln!(
             "• Sandbox    {}",
             if machine.shell_sandboxed() {
                 "Bubblewrap"
@@ -304,7 +380,7 @@ fn print_banner(
                 "disabled"
             }
         );
-        println!(
+        eprintln!(
             "• Network    {}",
             if machine.network_enabled() {
                 "enabled"
@@ -313,21 +389,19 @@ fn print_banner(
             }
         );
     }
-    println!(
-        "• Status     {}",
-        if new_tunnel {
-            "new tunnel; connecting…"
-        } else {
-            "connecting…"
-        }
-    );
     if verbose {
-        println!("• Verbose    enabled");
+        eprintln!("• Verbose    enabled");
     }
-    println!();
-    println!("ChatGPT → Plugins → Tunnel → paste the Tunnel ID above.");
-    println!("Ctrl-C to stop.");
-    println!();
+    eprintln!("• Status     starting…");
+    eprintln!();
+    if transports.openai.is_some() {
+        eprintln!("OpenAI Secure MCP Tunnel active.");
+    }
+    if transports.stdio {
+        eprintln!("stdio MCP server active; stdout is reserved for MCP.");
+    }
+    eprintln!("Ctrl-C to stop.");
+    eprintln!();
 }
 
 fn print_tools(policy: &Policy) {
@@ -438,5 +512,19 @@ mod tests {
     fn no_sandbox_requires_shell() {
         let args = Args::try_parse_from(["abird-tunnel", "--no-sandbox"]).unwrap();
         assert!(Policy::from_args(&args, PathBuf::from("/workspace")).is_err());
+    }
+
+    #[test]
+    fn ngrok_requires_http() {
+        assert!(Args::try_parse_from(["abird-tunnel", "--ngrok"]).is_err());
+        let args = Args::try_parse_from(["abird-tunnel", "--http", "--ngrok"]).unwrap();
+        assert!(args.http);
+        assert!(args.ngrok);
+    }
+
+    #[test]
+    fn setup_is_not_mixed_with_protocol_stdio_or_http() {
+        assert!(Args::try_parse_from(["abird-tunnel", "--setup", "--stdio"]).is_err());
+        assert!(Args::try_parse_from(["abird-tunnel", "--setup", "--http"]).is_err());
     }
 }
