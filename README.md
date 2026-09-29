@@ -1,4 +1,4 @@
-# abird-tunnel
+# abird-link
 
 A small Rust MCP bridge for permission-scoped local files and optional local command execution.
 
@@ -17,14 +17,28 @@ The same LocalMachine MCP server can be exposed through three independent transp
                                                  public HTTPS /mcp
 ~~~
 
-The transports are modular: OpenAI, stdio, and HTTP can each be enabled or disabled in persisted setup.
+The transports are modular: OpenAI, stdio, and HTTP can each be enabled or disabled in persisted setup. Profiles can also persist default rw-cwd and shell permissions.
 
-## Setup
+## Setup and profiles
 
-Run once:
+Run the default setup:
 
 ~~~bash
-abird-tunnel --setup
+abird-link --setup
+~~~
+
+Or create a named profile:
+
+~~~bash
+abird-link --setup --profile work
+abird-link -s -p work
+~~~
+
+Use it later with:
+
+~~~bash
+abird-link --profile work
+abird-link -p work
 ~~~
 
 Setup begins with:
@@ -34,8 +48,13 @@ Setup begins with:
    • openai — OpenAI Secure MCP Tunnel; starts automatically
    • stdio  — local stdio MCP server; start with --stdio
    • http   — local HTTP MCP server; start with --http
-   • Enter comma-separated names, or 'all'.
+   • Enter comma-separated names, 'all', or 'none'.
    Enabled [openai]:
+
+2. Choose default local permissions
+   • cwd is always readable unless denied.
+   Allow read+write cwd by default? [y/N]:
+   Allow shell by default? [y/N]:
 ~~~
 
 Examples:
@@ -47,30 +66,55 @@ http
 stdio,http
 openai,stdio,http
 all
+none
 ~~~
 
 If OpenAI is not selected, every OpenAI credential/tunnel question is skipped and no OpenAI runtime key is required.
 
-The selection is persisted in:
+Configuration is JSON:
 
 ~~~text
-~/.config/abird-tunnel/config.toml
+~/.config/abird-link/config.json
+~/.config/abird-link/config.work.json
+~/.config/abird-link/config.personal.json
 ~~~
+
+The default profile uses config.json. --profile work uses config.work.json.
+
+OpenAI runtime keys are kept separately per profile:
+
+~~~text
+~/.config/abird-link/runtime.key
+~/.config/abird-link/runtime.work.key
+~~~
+
+A config can persist these safe defaults:
+
+~~~json
+{
+  "permissions": {
+    "allow_rw": true,
+    "allow_shell": true
+  }
+}
+~~~
+
+allow_rw means rw on the launch cwd. allow_shell enables the normal platform shell; on Linux it remains Bubblewrap-sandboxed and network remains disabled unless separately allowed.
 
 ## Transport activation
 
 Configured OpenAI Tunnel starts automatically:
 
 ~~~bash
-abird-tunnel
+abird-link
 ~~~
 
 stdio and HTTP start when explicitly requested:
 
 ~~~bash
-abird-tunnel --stdio
-abird-tunnel --http
-abird-tunnel --stdio --http
+abird-link --stdio
+abird-link --http
+abird-link --stdio --http
 ~~~
 
 These runtime flags are authoritative additions: they start the requested transport even if that transport is disabled in persisted setup. Persisted transport selection acts as the default preference; explicit CLI flags override it for the current run.
@@ -87,7 +131,7 @@ Typical client shape:
 {
   "mcpServers": {
     "abird": {
-      "command": "abird-tunnel",
+      "command": "abird-link",
       "args": ["--stdio"]
     }
   }
@@ -107,13 +151,13 @@ http://127.0.0.1:3000/mcp
 Start it with:
 
 ~~~bash
-abird-tunnel --http
+abird-link --http
 ~~~
 
 Override the bind address for one run:
 
 ~~~bash
-abird-tunnel --http --http-bind=127.0.0.1:8080
+abird-link --http --http-bind=127.0.0.1:8080
 ~~~
 
 HTTP-capable MCP clients connect directly to /mcp.
@@ -125,7 +169,7 @@ HTTP and ngrok can each use a fresh hard-to-guess MCP path for one process run.
 Use the shorthand for both:
 
 ~~~bash
-abird-tunnel --http --ngrok --ephemeral-url
+abird-link --http --ngrok --ephemeral-url
 ~~~
 
 This gives local HTTP and ngrok independent fresh paths such as:
@@ -139,17 +183,17 @@ Control them independently:
 
 ~~~bash
 # local HTTP ephemeral, ngrok stable
-abird-tunnel --http --ngrok --http-ephemeral-url
+abird-link --http --ngrok --http-ephemeral-url
 
 # local HTTP stable, ngrok ephemeral
-abird-tunnel --http --ngrok --ngrok-ephemeral-url
+abird-link --http --ngrok --ngrok-ephemeral-url
 ~~~
 
 Per-transport flags override the shorthand, including explicit false:
 
 ~~~bash
-abird-tunnel --http --ngrok --ephemeral-url --http-ephemeral-url=false
-abird-tunnel --http --ngrok --ephemeral-url --ngrok-ephemeral-url=false
+abird-link --http --ngrok --ephemeral-url --http-ephemeral-url=false
+abird-link --http --ngrok --ephemeral-url --ngrok-ephemeral-url=false
 ~~~
 
 Each ephemeral route is generated fresh at process start using two UUIDv4 values (~244 random bits). The ordinary /mcp path is not mounted for that transport when its ephemeral mode is enabled.
@@ -169,10 +213,10 @@ export NGROK_AUTHTOKEN='...'
 Then:
 
 ~~~bash
-abird-tunnel --http --ngrok
+abird-link --http --ngrok
 ~~~
 
-abird-tunnel starts the local Streamable HTTP MCP server, opens a public ngrok endpoint using the ngrok Rust SDK, and prints a URL such as:
+abird-link starts the local Streamable HTTP MCP server, opens a public ngrok endpoint using the ngrok Rust SDK, and prints a URL such as:
 
 ~~~text
 ✓ ngrok MCP: https://example.ngrok.app/mcp
@@ -180,42 +224,61 @@ abird-tunnel starts the local Streamable HTTP MCP server, opens a public ngrok e
 
 Any Streamable HTTP MCP client can connect directly to that public /mcp URL.
 
-The public URL exposes whatever MCP permissions were granted to this abird-tunnel process. Treat it as sensitive or add appropriate ngrok access controls.
+The public URL exposes whatever MCP permissions were granted to this abird-link process. Treat it as sensitive or add appropriate ngrok access controls.
 
-## Filesystem permissions
+## Filesystem and capability permissions
 
-Permissions are additive. --deny always wins.
+Allow rules are additive. Deny rules always take precedence over profile defaults and runtime allow flags.
 
-Default:
+The cwd is readable by default.
 
-~~~text
---allow-read=<cwd>
-~~~
-
-Additional grants:
+### Filesystem grants
 
 ~~~bash
-abird-tunnel --allow-read=/data/reference
-abird-tunnel --allow-write=/data/output
-abird-tunnel --allow-rw=/src/project
-abird-tunnel --deny=/src/project/secrets
+abird-link --allow-read=/data/reference
+abird-link --allow-write=/data/output
+abird-link --allow-rw=/src/project
 ~~~
 
-- --allow-read=DIR adds read permission.
-- --allow-write=DIR adds write permission without adding read permission.
-- --allow-rw=DIR adds both.
-- --deny=PATH overrides matching allow rules.
-
-Bare write grants:
+Bare forms use cwd:
 
 ~~~bash
-abird-tunnel --allow-write
-abird-tunnel --allow-rw
+abird-link --allow-read
+abird-link --allow-write
+abird-link --allow-rw
 ~~~
 
-both mean read+write on cwd.
+Bare --allow-write keeps its historical ergonomic behavior and means rw-cwd. With an explicit DIR, --allow-write=DIR is write-only. --allow-rw always grants both.
 
-With explicit paths, --allow-write=DIR remains write-only while --allow-rw=DIR grants both read and write.
+### Symmetric denies
+
+~~~bash
+abird-link --deny-read=/data/private
+abird-link --deny-write=/src/generated
+abird-link --deny-rw=/src/secret
+abird-link --deny-shell
+abird-link --deny-network
+~~~
+
+Bare filesystem deny forms use cwd:
+
+~~~bash
+abird-link --deny-read
+abird-link --deny-write
+abird-link --deny-rw
+~~~
+
+The older --deny=PATH remains a synonym for denying both read and write.
+
+- --deny-read=DIR blocks reads while writes may still be allowed.
+- --deny-write=DIR blocks writes while reads may still be allowed.
+- --deny-rw=DIR blocks both.
+- --deny-shell hides the shell even if the profile or --allow-all-dangerous enabled it.
+- --deny-network keeps shell networking off.
+
+On Linux, filesystem or network denies force shell execution into Bubblewrap even if --no-sandbox or --allow-all-dangerous was also requested, because the sandbox is required to enforce those denies. On systems without an enforceable shell sandbox, shell + deny combinations are rejected.
+
+Filesystem denies also constrain --allow-rw-all-dangerous and --allow-all-dangerous.
 
 Relative MCP paths resolve from --cwd. Absolute paths work when granted. Existing paths and ancestors are canonicalized before Rust policy checks to prevent symlink escapes.
 
@@ -250,9 +313,9 @@ powershell   # Windows
 Inspect the visible tool surface without starting a transport:
 
 ~~~bash
-abird-tunnel --list-tools
-abird-tunnel --allow-write --list-tools
-abird-tunnel --allow-shell --list-tools
+abird-link --list-tools
+abird-link --allow-write --list-tools
+abird-link --allow-shell --list-tools
 ~~~
 
 ## Text and binary tools
@@ -294,7 +357,7 @@ patch_binary works by byte offset and can replace, insert with length=0, or dele
 Enable shell explicitly:
 
 ~~~bash
-abird-tunnel --allow-shell
+abird-link --allow-shell
 ~~~
 
 On Linux, Bash runs inside Bubblewrap by default.
@@ -317,10 +380,10 @@ The host Nix daemon socket is not mounted by default, because daemon-mediated bu
 Enable network inside the sandbox with:
 
 ~~~bash
-abird-tunnel --allow-shell --allow-network
+abird-link --allow-shell --allow-network
 ~~~
 
-This shell-network policy does not affect the main abird-tunnel process. OpenAI Tunnel and ngrok use outbound networking from that main process.
+This shell-network policy does not affect the main abird-link process. OpenAI Tunnel and ngrok use outbound networking from that main process.
 
 ## Dangerous unsandboxed access
 
@@ -329,7 +392,7 @@ Unsandboxed shell execution inherently has the OS user's filesystem and network 
 It therefore requires:
 
 ~~~bash
-abird-tunnel \
+abird-link \
   --allow-shell \
   --no-sandbox \
   --allow-rw-all-dangerous \
@@ -341,12 +404,10 @@ The corrected alias --allow-network-dangerous is also accepted.
 The full escape hatch is:
 
 ~~~bash
-abird-tunnel --allow-all-dangerous
+abird-link --allow-all-dangerous
 ~~~
 
-That means unrestricted filesystem + unsandboxed shell + network.
-
---deny cannot constrain an unsandboxed shell, so that combination is rejected.
+That is a grant shortcut for unrestricted filesystem + unsandboxed shell + network. Explicit deny flags still win. On Linux, a filesystem/network deny automatically restores Bubblewrap so the deny can be enforced; --deny-shell disables shell entirely.
 
 ## OpenAI Secure MCP Tunnel
 
@@ -360,13 +421,14 @@ Setup asks for:
 
 The Admin key is never persisted.
 
-The Runtime key is stored separately at:
+The Runtime key is stored separately from JSON config and follows the selected profile:
 
 ~~~text
-~/.config/abird-tunnel/runtime.key
+~/.config/abird-link/runtime.key
+~/.config/abird-link/runtime.work.key
 ~~~
 
-When OpenAI transport is disabled, that key is not required and setup removes a previously saved runtime key.
+When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
 
 Useful locations:
 
@@ -378,34 +440,42 @@ Useful locations:
 ## CLI summary
 
 ~~~text
-abird-tunnel --setup           configure supported transports
+abird-link -s, --setup          interactive setup for selected profile
+-p, --profile <NAME>            use config.<NAME>.json
 
---stdio                        start stdio MCP for this run
---http                         start HTTP MCP for this run
---http-bind=<ADDR>             override HTTP listen address
---ngrok                        publish --http through ngrok
---ephemeral-url                ephemeral local HTTP + ngrok paths
---http-ephemeral-url[=BOOL]    override local HTTP path behavior
---ngrok-ephemeral-url[=BOOL]   override ngrok path behavior
+--stdio                         start stdio MCP for this run
+--http                          start HTTP MCP for this run
+--http-bind=<ADDR>              override HTTP listen address
+--ngrok                         publish --http through ngrok
+--ephemeral-url                 ephemeral local HTTP + ngrok paths
+--http-ephemeral-url[=BOOL]     override local HTTP path behavior
+--ngrok-ephemeral-url[=BOOL]    override ngrok path behavior
 
---cwd=<DIR>                    default cwd
+--cwd=<DIR>                     default cwd
 
---allow-read=<DIR>             add read
---allow-write[=<DIR>]          bare: rw cwd; with DIR: write-only
---allow-rw[=<DIR>]             bare: rw cwd; with DIR: read+write
---deny=<PATH>                  deny; always wins
+--allow-read[=<DIR>]            add read; bare means cwd
+--allow-write[=<DIR>]           bare: rw cwd; with DIR: write-only
+--allow-rw[=<DIR>]              add rw; bare means cwd
 
---allow-shell                  add platform shell
---allow-network                network inside Linux shell sandbox
---no-sandbox                   disable Bubblewrap
+--deny-read[=<DIR>]             deny read; bare means cwd
+--deny-write[=<DIR>]            deny write; bare means cwd
+--deny-rw[=<DIR>]               deny rw; bare means cwd
+--deny=<PATH>                   legacy synonym for deny-rw
+--deny-shell                    deny shell; always wins
+--deny-network                  deny shell network; always wins
+--deny-rw-all-dangerous         cancel unrestricted filesystem grant
 
---allow-rw-all-dangerous       unrestricted Rust filesystem tools
---allow-network-dangereous     acknowledge unsandboxed network
---allow-all-dangerous          unrestricted rw + network + unsandboxed shell
+--allow-shell                   add platform shell
+--allow-network                 network inside Linux shell sandbox
+--no-sandbox                    disable Bubblewrap when no deny requires it
 
---list-tools                   show exposed tools
--v, --verbose                  concise request/tool logs
---print-id                     print configured OpenAI Tunnel ID
+--allow-rw-all-dangerous        unrestricted Rust filesystem grant
+--allow-network-dangereous      acknowledge unsandboxed network
+--allow-all-dangerous           unrestricted rw + shell + network grant shortcut
+
+--list-tools                    show exposed tools
+-v, --verbose                   concise request/tool logs
+--print-id                      print configured OpenAI Tunnel ID
 ~~~
 
 ## Build

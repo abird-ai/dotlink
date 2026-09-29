@@ -11,30 +11,34 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     mcp::{AccessSpec, LocalMachine, MachineConfig},
-    setup::load_or_setup,
+    setup::{PermissionConfig, load_or_setup},
     transports::ActiveTransports,
 };
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "abird-tunnel",
+    name = "abird-link",
     version,
     about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP"
 )]
 struct Args {
-    /// Re-run the interactive first-use setup and replace the saved configuration.
-    #[arg(long, conflicts_with_all = ["stdio", "http", "ngrok"])]
+    /// Run interactive setup for the selected profile.
+    #[arg(short = 's', long, conflicts_with_all = ["stdio", "http", "ngrok"])]
     setup: bool,
 
-    /// Default working directory. Defaults to the directory where abird-tunnel is launched.
+    /// Select a named config profile (config.<profile>.json).
+    #[arg(short = 'p', long, value_name = "NAME")]
+    profile: Option<String>,
+
+    /// Default working directory. Defaults to the directory where abird-link is launched.
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// Start the stdio MCP server for this run, overriding persisted transport selection.
+    /// Start the stdio MCP server for this run.
     #[arg(long)]
     stdio: bool,
 
-    /// Start the HTTP MCP server for this run, overriding persisted transport selection.
+    /// Start the HTTP MCP server for this run.
     #[arg(long)]
     http: bool,
 
@@ -74,11 +78,17 @@ struct Args {
     )]
     ngrok_ephemeral_url: Option<bool>,
 
-    /// Add a readable directory. May be repeated. The cwd is readable by default.
-    #[arg(long, value_name = "DIR")]
+    /// Add readable access. Bare --allow-read means cwd.
+    #[arg(
+        long,
+        value_name = "DIR",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        require_equals = true
+    )]
     allow_read: Vec<PathBuf>,
 
-    /// Add a writable directory. May be repeated. Bare --allow-write means read+write cwd.
+    /// Add writable access. Bare --allow-write means read+write cwd.
     #[arg(
         long,
         value_name = "DIR",
@@ -88,7 +98,7 @@ struct Args {
     )]
     allow_write: Vec<PathBuf>,
 
-    /// Add a directory with both read and write permission. May be repeated. Bare --allow-rw means cwd.
+    /// Add read+write access. Bare --allow-rw means cwd.
     #[arg(
         long,
         value_name = "DIR",
@@ -98,35 +108,78 @@ struct Args {
     )]
     allow_rw: Vec<PathBuf>,
 
-    /// Deny a path even if another allow rule covers it. May be repeated.
+    /// Deny reads. Bare --deny-read means cwd. Denies override allows.
+    #[arg(
+        long,
+        value_name = "DIR",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        require_equals = true
+    )]
+    deny_read: Vec<PathBuf>,
+
+    /// Deny writes. Bare --deny-write means cwd. Denies override allows.
+    #[arg(
+        long,
+        value_name = "DIR",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        require_equals = true
+    )]
+    deny_write: Vec<PathBuf>,
+
+    /// Deny both reads and writes. Bare --deny-rw means cwd.
+    #[arg(
+        long,
+        value_name = "DIR",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        require_equals = true
+    )]
+    deny_rw: Vec<PathBuf>,
+
+    /// Legacy synonym for --deny-rw=<PATH>.
     #[arg(long, value_name = "PATH")]
     deny: Vec<PathBuf>,
 
-    /// Enable the platform shell tool (bash on Unix, PowerShell on Windows).
+    /// Enable the platform shell (Bash on Unix, PowerShell on Windows).
     #[arg(long)]
     allow_shell: bool,
+
+    /// Disable shell even if config or another flag enables it.
+    #[arg(long)]
+    deny_shell: bool,
 
     /// Allow network access from a Bubblewrap-sandboxed shell.
     #[arg(long)]
     allow_network: bool,
 
-    /// Allow network access for an unsandboxed shell. Deliberately dangerous.
+    /// Deny shell network access. On Linux this forces sandboxing when needed.
+    #[arg(long)]
+    deny_network: bool,
+
+    /// Acknowledge network access for an unsandboxed shell.
     #[arg(long, alias = "allow-network-dangerous")]
     allow_network_dangereous: bool,
 
-    /// Allow filesystem read/write everywhere. Deliberately dangerous.
+    /// Allow filesystem read/write everywhere. Path denies still take precedence.
     #[arg(long)]
     allow_rw_all_dangerous: bool,
+
+    /// Deny the unrestricted filesystem grant, overriding dangerous grant shortcuts.
+    #[arg(long)]
+    deny_rw_all_dangerous: bool,
 
     /// Disable the Linux Bubblewrap shell sandbox.
     #[arg(long)]
     no_sandbox: bool,
 
-    /// Allow unrestricted filesystem, unsandboxed shell, and network access.
+    /// Shortcut for unrestricted filesystem + unsandboxed shell + network.
+    /// Explicit deny flags still take precedence.
     #[arg(long)]
     allow_all_dangerous: bool,
 
-    /// Print the saved tunnel id and exit.
+    /// Print the configured OpenAI Tunnel ID and exit.
     #[arg(long)]
     print_id: bool,
 
@@ -134,7 +187,7 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
-    /// List the MCP tools exposed under the selected capability flags and exit.
+    /// List the MCP tools exposed under the effective policy and exit.
     #[arg(long)]
     list_tools: bool,
 }
@@ -144,7 +197,8 @@ struct Policy {
     cwd: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
-    deny_roots: Vec<PathBuf>,
+    deny_read_roots: Vec<PathBuf>,
+    deny_write_roots: Vec<PathBuf>,
     unrestricted_fs: bool,
     allow_shell: bool,
     sandbox_shell: bool,
@@ -152,75 +206,76 @@ struct Policy {
 }
 
 impl Policy {
-    fn from_args(args: &Args, launch_cwd: PathBuf) -> Result<Self> {
+    fn from_args(args: &Args, launch_cwd: PathBuf, defaults: &PermissionConfig) -> Result<Self> {
         let cwd = args.cwd.clone().unwrap_or(launch_cwd);
         let allow_all = args.allow_all_dangerous;
-        let unrestricted_fs = args.allow_rw_all_dangerous || allow_all;
-        let allow_shell = args.allow_shell || allow_all;
-        let no_sandbox = args.no_sandbox || allow_all;
+        let unrestricted_fs =
+            (args.allow_rw_all_dangerous || allow_all) && !args.deny_rw_all_dangerous;
+
+        let requested_shell = defaults.allow_shell || args.allow_shell || allow_all;
+        let allow_shell = requested_shell && !args.deny_shell;
+        let requested_no_sandbox = args.no_sandbox || allow_all;
         let dangerous_network = args.allow_network_dangereous || allow_all;
 
-        if args.allow_network && !allow_shell {
-            bail!("--allow-network requires --allow-shell");
-        }
-        if args.no_sandbox && !allow_shell && !allow_all {
-            bail!("--no-sandbox requires --allow-shell");
-        }
-        if args.allow_network_dangereous && !allow_shell && !allow_all {
-            bail!("--allow-network-dangereous requires --allow-shell");
-        }
-
-        if args.allow_network && no_sandbox {
-            bail!(
-                "--allow-network is only for the sandbox; unsandboxed network requires --allow-network-dangereous or --allow-all-dangerous"
-            );
-        }
-
-        if args.allow_network_dangereous && !no_sandbox && !allow_all {
-            bail!(
-                "--allow-network-dangereous is only for an unsandboxed shell; use --allow-network with Bubblewrap"
-            );
-        }
-
-        if no_sandbox && allow_shell && !args.deny.is_empty() {
-            bail!(
-                "--deny cannot constrain an unsandboxed shell; remove --deny or keep the Bubblewrap sandbox enabled"
-            );
-        }
-
-        if no_sandbox && allow_shell && !unrestricted_fs {
-            bail!(
-                "unsandboxed shell access requires --allow-rw-all-dangerous (or --allow-all-dangerous)"
-            );
-        }
-        if no_sandbox && allow_shell && !dangerous_network {
-            bail!(
-                "unsandboxed shell access inherently has network access; add --allow-network-dangereous or use --allow-all-dangerous"
-            );
-        }
+        let has_filesystem_denies = !args.deny_read.is_empty()
+            || !args.deny_write.is_empty()
+            || !args.deny_rw.is_empty()
+            || !args.deny.is_empty();
+        let deny_requires_sandbox =
+            args.deny_network || has_filesystem_denies || args.deny_rw_all_dangerous;
 
         #[cfg(not(target_os = "linux"))]
-        if allow_shell && !no_sandbox {
+        if allow_shell && deny_requires_sandbox {
+            bail!(
+                "filesystem/network deny rules cannot be enforced for shell execution on this OS; use --deny-shell or remove the deny rules"
+            );
+        }
+
+        // Denies win over --no-sandbox/--allow-all-dangerous on Linux because
+        // Bubblewrap is the subprocess enforcement boundary.
+        let effective_no_sandbox = requested_no_sandbox
+            && !(allow_shell && deny_requires_sandbox && cfg!(target_os = "linux"));
+
+        #[cfg(not(target_os = "linux"))]
+        if allow_shell && !effective_no_sandbox {
             bail!(
                 "this OS has no Bubblewrap sandbox; shell access requires --no-sandbox plus the dangerous filesystem/network opt-ins, or --allow-all-dangerous"
             );
         }
 
-        let sandbox_shell = cfg!(target_os = "linux") && allow_shell && !no_sandbox;
-        let allow_network = if sandbox_shell {
+        let sandbox_shell = cfg!(target_os = "linux") && allow_shell && !effective_no_sandbox;
+
+        let allow_network = if !allow_shell || args.deny_network {
+            false
+        } else if sandbox_shell {
             args.allow_network
         } else {
-            allow_shell && dangerous_network
+            if !unrestricted_fs {
+                bail!(
+                    "unsandboxed shell access requires --allow-rw-all-dangerous (or --allow-all-dangerous)"
+                );
+            }
+            if !dangerous_network {
+                bail!(
+                    "unsandboxed shell access inherently has network access; add --allow-network-dangereous or use --allow-all-dangerous"
+                );
+            }
+            true
         };
 
-        // The cwd is always readable unless unrestricted access supersedes path grants.
         let mut read_roots = vec![cwd.clone()];
-        read_roots.extend(args.allow_read.iter().cloned());
-
         let mut write_roots = Vec::new();
+
+        if defaults.allow_rw {
+            write_roots.push(cwd.clone());
+        }
+
+        for path in &args.allow_read {
+            read_roots.push(cwd_or_path(path, &cwd));
+        }
         for path in &args.allow_write {
-            if path.as_path() == PathBuf::from(".").as_path() {
-                // Bare --allow-write is the ergonomic shorthand for --allow-rw=<cwd>.
+            if path == &PathBuf::from(".") {
+                // Historical ergonomic behavior: bare --allow-write means rw cwd.
                 read_roots.push(cwd.clone());
                 write_roots.push(cwd.clone());
             } else {
@@ -228,21 +283,32 @@ impl Policy {
             }
         }
         for path in &args.allow_rw {
-            if path.as_path() == PathBuf::from(".").as_path() {
-                // Bare --allow-rw is the ergonomic shorthand for rw on cwd.
-                read_roots.push(cwd.clone());
-                write_roots.push(cwd.clone());
-            } else {
-                read_roots.push(path.clone());
-                write_roots.push(path.clone());
-            }
+            let path = cwd_or_path(path, &cwd);
+            read_roots.push(path.clone());
+            write_roots.push(path);
+        }
+
+        let mut deny_read_roots = Vec::new();
+        let mut deny_write_roots = Vec::new();
+
+        for path in &args.deny_read {
+            deny_read_roots.push(cwd_or_path(path, &cwd));
+        }
+        for path in &args.deny_write {
+            deny_write_roots.push(cwd_or_path(path, &cwd));
+        }
+        for path in args.deny_rw.iter().chain(args.deny.iter()) {
+            let path = cwd_or_path(path, &cwd);
+            deny_read_roots.push(path.clone());
+            deny_write_roots.push(path);
         }
 
         Ok(Self {
             cwd,
             read_roots,
             write_roots,
-            deny_roots: args.deny.clone(),
+            deny_read_roots,
+            deny_write_roots,
             unrestricted_fs,
             allow_shell,
             sandbox_shell,
@@ -255,29 +321,37 @@ impl Policy {
     }
 }
 
+fn cwd_or_path(path: &PathBuf, cwd: &std::path::Path) -> PathBuf {
+    if path == &PathBuf::from(".") {
+        cwd.to_path_buf()
+    } else {
+        path.clone()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let launch_cwd = std::env::current_dir()?;
-    let policy = Policy::from_args(&args, launch_cwd)?;
-
-    if args.list_tools {
-        print_tools(&policy);
-        return Ok(());
-    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("abird_tunnel=warn")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("abird_link=warn")),
         )
         .with_writer(std::io::stderr)
         .with_ansi(true)
         .init();
 
-    let setup = load_or_setup(args.setup).await?;
+    let setup = load_or_setup(args.setup, args.profile.as_deref()).await?;
 
     if args.setup {
+        return Ok(());
+    }
+
+    let policy = Policy::from_args(&args, launch_cwd, &setup.config.permissions)?;
+
+    if args.list_tools {
+        print_tools(&policy);
         return Ok(());
     }
 
@@ -347,7 +421,8 @@ async fn main() -> Result<()> {
             cwd: policy.cwd.clone(),
             read_roots: policy.read_roots.clone(),
             write_roots: policy.write_roots.clone(),
-            deny_roots: policy.deny_roots.clone(),
+            deny_read_roots: policy.deny_read_roots.clone(),
+            deny_write_roots: policy.deny_write_roots.clone(),
             rw_all_dangerous: policy.unrestricted_fs,
         },
         allow_shell: policy.allow_shell,
@@ -366,6 +441,7 @@ async fn main() -> Result<()> {
     print_banner(
         &active_transports,
         &machine,
+        args.profile.as_deref(),
         args.verbose,
         args.allow_all_dangerous,
     );
@@ -375,7 +451,7 @@ async fn main() -> Result<()> {
         signal = tokio::signal::ctrl_c() => {
             signal?;
             cancellation.cancel();
-            eprintln!("\nabird-tunnel stopped.");
+            eprintln!("\nabird-link stopped.");
         }
     }
 
@@ -392,12 +468,14 @@ fn ephemeral_url_policy(args: &Args) -> (bool, bool) {
 fn print_banner(
     transports: &ActiveTransports,
     machine: &LocalMachine,
+    profile: Option<&str>,
     verbose: bool,
     allow_all_dangerous: bool,
 ) {
     eprintln!();
-    eprintln!("abird-tunnel {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("abird-link {}", env!("CARGO_PKG_VERSION"));
     eprintln!("────────────────────────────────────────────────────────");
+    eprintln!("• Profile    {}", profile.unwrap_or("default"));
     eprintln!("• Transports {}", transports.names().join(", "));
     if let Some(openai) = &transports.openai {
         eprintln!("• Tunnel     {}", openai.tunnel_id);
@@ -418,7 +496,10 @@ fn print_banner(
     }
     eprintln!("• Cwd        {}", machine.cwd().display());
     let access_summary = if allow_all_dangerous {
-        "ALL DANGEROUS (unrestricted fs + shell + network)".to_owned()
+        format!(
+            "{} (allow-all requested; explicit denies still win)",
+            machine.access_summary()
+        )
     } else {
         machine.access_summary()
     };
@@ -460,7 +541,7 @@ fn print_tools(policy: &Policy) {
     let tools =
         LocalMachine::tool_router_for_policy(policy.has_write(), policy.allow_shell).list_all();
 
-    println!("abird-tunnel tools");
+    println!("abird-link tools");
     println!("────────────────────────────────────────────────────────");
     for tool in tools {
         let title = tool
@@ -477,121 +558,163 @@ fn print_tools(policy: &Policy) {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> (Args, Policy) {
+    fn parse(args: &[&str], defaults: PermissionConfig) -> (Args, Policy) {
         let args = Args::try_parse_from(args).unwrap();
-        let policy = Policy::from_args(&args, PathBuf::from("/workspace")).unwrap();
+        let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &defaults).unwrap();
         (args, policy)
+    }
+
+    fn no_defaults() -> PermissionConfig {
+        PermissionConfig::default()
     }
 
     #[test]
     fn default_is_read_only_cwd() {
-        let (_, policy) = parse(&["abird-tunnel"]);
+        let (_, policy) = parse(&["abird-link"], no_defaults());
         assert_eq!(policy.read_roots, [PathBuf::from("/workspace")]);
         assert!(policy.write_roots.is_empty());
         assert!(!policy.allow_shell);
     }
 
     #[test]
-    fn bare_allow_write_means_rw_cwd() {
-        let (_, policy) = parse(&["abird-tunnel", "--allow-write"]);
-        assert!(policy.read_roots.contains(&PathBuf::from("/workspace")));
+    fn config_defaults_can_enable_rw_and_shell() {
+        let defaults = PermissionConfig {
+            allow_rw: true,
+            allow_shell: true,
+        };
+        let (_, policy) = parse(&["abird-link"], defaults);
         assert!(policy.write_roots.contains(&PathBuf::from("/workspace")));
+        assert!(policy.allow_shell);
     }
 
     #[test]
-    fn bare_allow_rw_means_rw_cwd() {
-        let (_, policy) = parse(&["abird-tunnel", "--allow-rw"]);
-        assert!(policy.read_roots.contains(&PathBuf::from("/workspace")));
-        assert!(policy.write_roots.contains(&PathBuf::from("/workspace")));
+    fn bare_allow_write_and_allow_rw_mean_rw_cwd() {
+        for flag in ["--allow-write", "--allow-rw"] {
+            let (_, policy) = parse(&["abird-link", flag], no_defaults());
+            assert!(policy.read_roots.contains(&PathBuf::from("/workspace")));
+            assert!(policy.write_roots.contains(&PathBuf::from("/workspace")));
+        }
+    }
+
+    #[test]
+    fn deny_flags_are_symmetric_and_additive() {
+        let (_, policy) = parse(
+            &[
+                "abird-link",
+                "--allow-rw=/both",
+                "--deny-read=/read-secret",
+                "--deny-write=/write-secret",
+                "--deny-rw=/both/secret",
+                "--deny=/legacy-secret",
+            ],
+            no_defaults(),
+        );
+
+        assert!(
+            policy
+                .deny_read_roots
+                .contains(&PathBuf::from("/read-secret"))
+        );
+        assert!(
+            policy
+                .deny_write_roots
+                .contains(&PathBuf::from("/write-secret"))
+        );
+        for path in ["/both/secret", "/legacy-secret"] {
+            let path = PathBuf::from(path);
+            assert!(policy.deny_read_roots.contains(&path));
+            assert!(policy.deny_write_roots.contains(&path));
+        }
+    }
+
+    #[test]
+    fn deny_shell_overrides_config_and_dangerous_grants() {
+        let defaults = PermissionConfig {
+            allow_rw: false,
+            allow_shell: true,
+        };
+        let (_, policy) = parse(&["abird-link", "--deny-shell"], defaults);
+        assert!(!policy.allow_shell);
+
+        let (_, policy) = parse(
+            &["abird-link", "--allow-all-dangerous", "--deny-shell"],
+            no_defaults(),
+        );
+        assert!(!policy.allow_shell);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deny_network_forces_sandbox_and_wins_over_dangerous_allow() {
+        let (_, policy) = parse(
+            &["abird-link", "--allow-all-dangerous", "--deny-network"],
+            no_defaults(),
+        );
+        assert!(policy.allow_shell);
+        assert!(policy.sandbox_shell);
+        assert!(!policy.allow_network);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deny_rw_all_dangerous_overrides_allow_all_and_forces_sandbox() {
+        let (_, policy) = parse(
+            &[
+                "abird-link",
+                "--allow-all-dangerous",
+                "--deny-rw-all-dangerous",
+            ],
+            no_defaults(),
+        );
+        assert!(!policy.unrestricted_fs);
+        assert!(policy.allow_shell);
+        assert!(policy.sandbox_shell);
+        assert!(!policy.allow_network);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_deny_forces_sandbox_and_wins_over_no_sandbox() {
+        let (_, policy) = parse(
+            &["abird-link", "--allow-all-dangerous", "--deny-rw=/secret"],
+            no_defaults(),
+        );
+        assert!(policy.allow_shell);
+        assert!(policy.sandbox_shell);
+        assert!(policy.deny_read_roots.contains(&PathBuf::from("/secret")));
+        assert!(policy.deny_write_roots.contains(&PathBuf::from("/secret")));
     }
 
     #[test]
     fn explicit_local_transport_flags_parse_as_runtime_overrides() {
-        let args = Args::try_parse_from(["abird-tunnel", "--stdio", "--http"]).unwrap();
+        let args = Args::try_parse_from(["abird-link", "--stdio", "--http"]).unwrap();
         assert!(args.stdio);
         assert!(args.http);
     }
 
     #[test]
-    fn path_grants_are_additive() {
-        let (_, policy) = parse(&[
-            "abird-tunnel",
-            "--allow-read=/read",
-            "--allow-write=/write",
-            "--allow-rw=/both",
-            "--deny=/both/secret",
-        ]);
-        assert!(policy.read_roots.contains(&PathBuf::from("/read")));
-        assert!(policy.read_roots.contains(&PathBuf::from("/both")));
-        assert!(policy.write_roots.contains(&PathBuf::from("/write")));
-        assert!(policy.write_roots.contains(&PathBuf::from("/both")));
-        assert_eq!(policy.deny_roots, [PathBuf::from("/both/secret")]);
-    }
+    fn profile_and_setup_can_be_combined() {
+        let args = Args::try_parse_from(["abird-link", "--setup", "-p", "work"]).unwrap();
+        assert!(args.setup);
+        assert_eq!(args.profile.as_deref(), Some("work"));
 
-    #[test]
-    fn sandbox_network_is_explicit() {
-        let args =
-            Args::try_parse_from(["abird-tunnel", "--allow-shell", "--allow-network"]).unwrap();
-        let policy = Policy::from_args(&args, PathBuf::from("/workspace")).unwrap();
-        assert_eq!(policy.sandbox_shell, cfg!(target_os = "linux"));
-        if cfg!(target_os = "linux") {
-            assert!(policy.allow_network);
-        }
-    }
-
-    #[test]
-    fn allow_all_dangerous_is_the_full_escape_hatch() {
-        let (_, policy) = parse(&["abird-tunnel", "--allow-all-dangerous"]);
-        assert!(policy.unrestricted_fs);
-        assert!(policy.allow_shell);
-        assert!(!policy.sandbox_shell);
-        assert!(policy.allow_network);
-    }
-
-    #[test]
-    fn unsandboxed_shell_requires_both_dangerous_opt_ins() {
-        let args = Args::try_parse_from(["abird-tunnel", "--allow-shell", "--no-sandbox"]).unwrap();
-        assert!(Policy::from_args(&args, PathBuf::from("/workspace")).is_err());
-    }
-
-    #[test]
-    fn corrected_network_dangerous_alias_is_accepted() {
-        let args = Args::try_parse_from([
-            "abird-tunnel",
-            "--allow-shell",
-            "--no-sandbox",
-            "--allow-rw-all-dangerous",
-            "--allow-network-dangerous",
-        ])
-        .unwrap();
-        let policy = Policy::from_args(&args, PathBuf::from("/workspace")).unwrap();
-        assert!(policy.allow_network);
-    }
-
-    #[test]
-    fn network_flag_requires_shell() {
-        let args = Args::try_parse_from(["abird-tunnel", "--allow-network"]).unwrap();
-        assert!(Policy::from_args(&args, PathBuf::from("/workspace")).is_err());
-    }
-
-    #[test]
-    fn no_sandbox_requires_shell() {
-        let args = Args::try_parse_from(["abird-tunnel", "--no-sandbox"]).unwrap();
-        assert!(Policy::from_args(&args, PathBuf::from("/workspace")).is_err());
+        let args = Args::try_parse_from(["abird-link", "-s", "-p", "work"]).unwrap();
+        assert!(args.setup);
+        assert_eq!(args.profile.as_deref(), Some("work"));
     }
 
     #[test]
     fn ngrok_requires_http() {
-        assert!(Args::try_parse_from(["abird-tunnel", "--ngrok"]).is_err());
-        let args = Args::try_parse_from(["abird-tunnel", "--http", "--ngrok"]).unwrap();
+        assert!(Args::try_parse_from(["abird-link", "--ngrok"]).is_err());
+        let args = Args::try_parse_from(["abird-link", "--http", "--ngrok"]).unwrap();
         assert!(args.http);
         assert!(args.ngrok);
     }
 
     #[test]
     fn ephemeral_url_requires_http() {
-        assert!(Args::try_parse_from(["abird-tunnel", "--ephemeral-url"]).is_err());
-        let args = Args::try_parse_from(["abird-tunnel", "--http", "--ephemeral-url"]).unwrap();
+        assert!(Args::try_parse_from(["abird-link", "--ephemeral-url"]).is_err());
+        let args = Args::try_parse_from(["abird-link", "--http", "--ephemeral-url"]).unwrap();
         assert!(args.http);
         assert!(args.ephemeral_url);
     }
@@ -599,7 +722,7 @@ mod tests {
     #[test]
     fn transport_ephemeral_overrides_parse_independently() {
         let args = Args::try_parse_from([
-            "abird-tunnel",
+            "abird-link",
             "--http",
             "--ngrok",
             "--ephemeral-url",
@@ -607,15 +730,13 @@ mod tests {
             "--ngrok-ephemeral-url",
         ])
         .unwrap();
-        assert!(args.ephemeral_url);
-        assert_eq!(args.http_ephemeral_url, Some(false));
-        assert_eq!(args.ngrok_ephemeral_url, Some(true));
+        assert_eq!(ephemeral_url_policy(&args), (false, true));
     }
 
     #[test]
     fn global_ephemeral_url_can_be_overridden_per_transport() {
         let args = Args::try_parse_from([
-            "abird-tunnel",
+            "abird-link",
             "--http",
             "--ngrok",
             "--ephemeral-url",
@@ -625,7 +746,7 @@ mod tests {
         assert_eq!(ephemeral_url_policy(&args), (false, true));
 
         let args = Args::try_parse_from([
-            "abird-tunnel",
+            "abird-link",
             "--http",
             "--ngrok",
             "--ephemeral-url",
@@ -637,26 +758,23 @@ mod tests {
 
     #[test]
     fn individual_ephemeral_flags_are_independent() {
-        let args =
-            Args::try_parse_from(["abird-tunnel", "--http", "--http-ephemeral-url"]).unwrap();
+        let args = Args::try_parse_from(["abird-link", "--http", "--http-ephemeral-url"]).unwrap();
         assert_eq!(ephemeral_url_policy(&args), (true, false));
 
         let args =
-            Args::try_parse_from(["abird-tunnel", "--http", "--ngrok", "--ngrok-ephemeral-url"])
+            Args::try_parse_from(["abird-link", "--http", "--ngrok", "--ngrok-ephemeral-url"])
                 .unwrap();
         assert_eq!(ephemeral_url_policy(&args), (false, true));
     }
 
     #[test]
     fn ngrok_ephemeral_override_requires_ngrok() {
-        assert!(
-            Args::try_parse_from(["abird-tunnel", "--http", "--ngrok-ephemeral-url",]).is_err()
-        );
+        assert!(Args::try_parse_from(["abird-link", "--http", "--ngrok-ephemeral-url"]).is_err());
     }
 
     #[test]
     fn setup_is_not_mixed_with_protocol_stdio_or_http() {
-        assert!(Args::try_parse_from(["abird-tunnel", "--setup", "--stdio"]).is_err());
-        assert!(Args::try_parse_from(["abird-tunnel", "--setup", "--http"]).is_err());
+        assert!(Args::try_parse_from(["abird-link", "--setup", "--stdio"]).is_err());
+        assert!(Args::try_parse_from(["abird-link", "--setup", "--http"]).is_err());
     }
 }

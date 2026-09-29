@@ -3,12 +3,12 @@
 Replace `<PLUGIN_ASDK_APP_ID>` with the technical ID of the developer-mode MCP connection you created in ChatGPT.
 
 ```text
-@plugin-creator create a private plugin for ChatGPT and Codex named "Abird Tunnel" using my already registered MCP connection:
+@plugin-creator create a private plugin for ChatGPT and Codex named "Abird Link" using my already registered MCP connection:
 
 <PLUGIN_ASDK_APP_ID>
 
 Purpose:
-Abird Tunnel connects ChatGPT to local files and optional local command execution through the abird-tunnel Rust process over OpenAI Secure MCP Tunnel.
+Abird Link connects ChatGPT to local files and optional local command execution through the abird-link Rust process over OpenAI Secure MCP Tunnel.
 
 Wire the plugin to the registered MCP connection using the supported OpenAI app mapping (.app.json). Do not invent a public MCP URL, do not add another MCP server, and never include tunnel credentials or API keys in the plugin.
 
@@ -21,8 +21,8 @@ Create one skill named local-workspace with these rules:
 - Use write_binary and patch_binary only when those tools are exposed.
 - On Unix, bash may be exposed. On Windows, powershell may be exposed.
 - If no shell tool is present, do not attempt to work around that restriction.
-- Filesystem paths may be relative to the local cwd or absolute when permitted by the local abird-tunnel policy.
-- The local process enforces additive read/write/rw grants and deny rules. A denied or ungranted path must be treated as unavailable.
+- Filesystem paths may be relative to the local cwd or absolute when permitted by the local abird-link policy.
+- The local process enforces additive read/write/rw grants plus independent deny-read/deny-write/deny-rw rules; denies take precedence. deny-shell and deny-network similarly override grants. A denied or ungranted capability must be treated as unavailable.
 - On Linux, bash normally runs inside a Bubblewrap sandbox with network disabled unless the local user explicitly enabled network.
 - Do not attempt sandbox escapes, permission bypasses, path traversal, credential discovery, or access outside the granted paths.
 - Treat write-only locations as destinations; do not assume they can be read back.
@@ -34,9 +34,9 @@ Create one skill named local-workspace with these rules:
 
 Presentation:
 
-Display name: Abird Tunnel
-Short description: Work securely with local files and tools exposed by abird-tunnel.
-Long description: Connect ChatGPT to a locally running abird-tunnel process through OpenAI Secure MCP Tunnel, with explicit filesystem grants, binary file support, and optional sandboxed shell execution.
+Display name: Abird Link
+Short description: Work securely with local files and tools exposed by abird-link.
+Long description: Connect ChatGPT to a locally running abird-link process through OpenAI Secure MCP Tunnel, with explicit filesystem grants, binary file support, and optional sandboxed shell execution.
 Category: Productivity or the closest developer-tools category.
 
 Suggested default prompts:

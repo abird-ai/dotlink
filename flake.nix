@@ -1,5 +1,5 @@
 {
-  description = "abird-tunnel — native Rust Secure MCP Tunnel bridge";
+  description = "abird-link — native Rust Secure MCP Tunnel bridge";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -38,9 +38,9 @@
               name != "target" && name != ".git";
           };
 
-          abird-tunnel = pkgs.rustPlatform.buildRustPackage {
-            pname = "abird-tunnel";
-            version = "0.4.1";
+          abird-link = pkgs.rustPlatform.buildRustPackage {
+            pname = "abird-link";
+            version = "0.5.0";
             inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;
@@ -56,7 +56,7 @@
             '';
 
             postInstall = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-              wrapProgram $out/bin/abird-tunnel                 --prefix PATH : ${
+              wrapProgram $out/bin/abird-link                 --prefix PATH : ${
                 pkgs.lib.makeBinPath [
                   pkgs.bash
                   pkgs.bubblewrap
@@ -67,21 +67,21 @@
             meta = {
               description = "Native Rust Secure MCP Tunnel bridge for local workspaces";
               license = pkgs.lib.licenses.mit;
-              mainProgram = "abird-tunnel";
+              mainProgram = "abird-link";
               platforms = pkgs.lib.platforms.unix;
             };
           };
         in
         {
-          default = abird-tunnel;
-          inherit abird-tunnel;
+          default = abird-link;
+          inherit abird-link;
         }
       );
 
       apps = forAllSystems (pkgs: {
         default = {
           type = "app";
-          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/abird-tunnel";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/abird-link";
         };
       });
 
@@ -96,7 +96,7 @@
           package-and-tests = package;
 
           rustfmt =
-            pkgs.runCommand "abird-tunnel-rustfmt"
+            pkgs.runCommand "abird-link-rustfmt"
               {
                 nativeBuildInputs = [
                   pkgs.cargo
@@ -110,8 +110,8 @@
               '';
 
           clippy = pkgs.rustPlatform.buildRustPackage {
-            pname = "abird-tunnel-clippy";
-            version = "0.4.1";
+            pname = "abird-link-clippy";
+            version = "0.5.0";
             inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;

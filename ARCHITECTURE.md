@@ -2,7 +2,7 @@
 
 ## Core split
 
-abird-tunnel is one Tokio process with a transport-neutral MCP core.
+abird-link is one Tokio process with a transport-neutral MCP core.
 
 ~~~text
                      setup/config
@@ -37,9 +37,20 @@ src/transports/
 
 No transport owns filesystem policy.
 
-## Persisted transport support
+## Profiles and persisted defaults
 
-Setup persists three independent booleans:
+The default config is ~/.config/abird-link/config.json. Named profiles use config.<profile>.json and are selected with -p/--profile. Setup can target the same profile with -s/--setup -p <name>.
+
+Each profile persists transport support plus safe local defaults:
+
+~~~text
+permissions.allow_rw
+permissions.allow_shell
+~~~
+
+allow_rw means rw on the launch cwd. allow_shell enables the normal platform shell; Linux still applies Bubblewrap and leaves network disabled by default.
+
+Setup also persists three independent transport booleans:
 
 ~~~text
 openai
@@ -60,7 +71,7 @@ Persisted transport booleans are defaults/preferences, not hard runtime gates. E
 
 --ngrok modifies the HTTP transport; it is not a fourth MCP transport.
 
-Older configs with no transport section default to OpenAI-only for backward compatibility.
+A profile may configure no transport at all; explicit --stdio/--http can still activate local transports for a run.
 
 ## Runtime transport orchestration
 
@@ -128,7 +139,7 @@ When --http --ngrok is selected:
 1. the local HTTP MCP listener is bound first;
 2. the ngrok Rust SDK opens a public HTTP endpoint;
 3. ngrok forwards that endpoint to the local HTTP listener;
-4. abird-tunnel prints the public URL with /mcp appended.
+4. abird-link prints the public URL with /mcp appended.
 
 The public URL speaks ordinary MCP Streamable HTTP. Clients connect directly to it.
 
@@ -158,22 +169,25 @@ The access policy contains:
 cwd
 read_roots[]
 write_roots[]
-deny_roots[]
+deny_read_roots[]
+deny_write_roots[]
 rw_all_dangerous
 ~~~
 
 Rules:
 
-- deny match rejects access;
-- read succeeds when any read root covers the canonical target;
-- write succeeds when any write root covers it;
-- read+write operations require both;
+- read succeeds when a read grant covers the canonical target and no read deny covers it;
+- write succeeds when a write grant covers the canonical target and no write deny covers it;
+- read+write operations require both capabilities;
 - allow-read, allow-write, and allow-rw are additive;
-- deny takes precedence.
+- deny-read, deny-write, and deny-rw are additive and take precedence over grants;
+- legacy --deny maps to both read and write deny sets;
+- deny-shell and deny-network override profile defaults and runtime allows;
+- deny-rw-all-dangerous cancels the unrestricted filesystem grant, including the filesystem portion of allow-all-dangerous.
 
-The effective cwd is readable by default.
+The effective cwd is readable by default. A profile may also add write-cwd and shell defaults.
 
-Bare --allow-write adds write permission to cwd, so cwd becomes read+write.
+Bare --allow-write and --allow-rw add rw permission to cwd. Bare deny-read/deny-write/deny-rw target cwd symmetrically.
 
 Existing paths are canonicalized before checks. Create targets canonicalize their nearest existing ancestor before the final path is checked.
 
@@ -221,7 +235,7 @@ Effective filesystem grants become mounts:
 
 More-specific mounts may override broader mounts.
 
-Denied paths are masked after allow mounts.
+Read-denied paths are masked after allow mounts. Write-denied paths inside otherwise writable trees are rebound read-only, preserving reads while preventing writes.
 
 The saved OpenAI runtime credential is masked when present.
 
@@ -249,7 +263,7 @@ Sandboxed shell starts with an unshared network namespace.
 
 This policy applies only to the shell child.
 
-The main abird-tunnel process may still need outbound network access for:
+The main abird-link process may still need outbound network access for:
 
 - OpenAI Secure MCP Tunnel;
 - ngrok SDK ingress.
@@ -267,9 +281,9 @@ Therefore it requires explicit unrestricted filesystem and network acknowledgeme
 --allow-network-dangereous
 ~~~
 
---allow-all-dangerous is the full shorthand.
+--allow-all-dangerous is the full grant shorthand.
 
-Unsandboxed shell plus deny rules is rejected because deny cannot be enforced after arbitrary process execution begins.
+Explicit denies still win. On Linux, a filesystem or network deny forces shell execution back into Bubblewrap even if --no-sandbox or --allow-all-dangerous was requested. On platforms without an enforceable shell sandbox, shell + filesystem/network deny combinations are rejected. deny-shell simply removes shell capability.
 
 ## Binary MCP content
 

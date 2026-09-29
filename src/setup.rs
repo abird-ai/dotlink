@@ -40,10 +40,6 @@ impl Default for TransportConfig {
 }
 
 impl TransportConfig {
-    pub fn any_enabled(&self) -> bool {
-        self.openai || self.stdio || self.http
-    }
-
     pub fn enabled_names(&self) -> Vec<&'static str> {
         let mut names = Vec::new();
         if self.openai {
@@ -59,6 +55,17 @@ impl TransportConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PermissionConfig {
+    /// Grant read+write access to the process cwd by default.
+    #[serde(default)]
+    pub allow_rw: bool,
+
+    /// Expose the platform shell by default. Linux still uses Bubblewrap.
+    #[serde(default)]
+    pub allow_shell: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "config_version")]
@@ -66,6 +73,9 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub transports: TransportConfig,
+
+    #[serde(default)]
+    pub permissions: PermissionConfig,
 
     #[serde(default)]
     pub tunnel_id: Option<String>,
@@ -98,7 +108,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    4
+    5
 }
 
 fn default_true() -> bool {
@@ -125,10 +135,14 @@ fn default_file_bytes() -> usize {
     DEFAULT_MAX_FILE_BYTES
 }
 
-pub async fn load_or_setup(force_setup: bool) -> Result<SetupResult> {
+pub async fn load_or_setup(force_setup: bool, profile: Option<&str>) -> Result<SetupResult> {
+    validate_profile(profile)?;
+
     if !force_setup {
-        if let Some(config) = config_from_env()? {
-            let protected_paths = protected_paths_for_config(&config)?;
+        if profile.is_none()
+            && let Some(config) = config_from_env()?
+        {
+            let protected_paths = protected_paths_for_config(&config, profile)?;
             return Ok(SetupResult {
                 config,
                 new_tunnel: false,
@@ -136,20 +150,20 @@ pub async fn load_or_setup(force_setup: bool) -> Result<SetupResult> {
             });
         }
 
-        let path = config_path()?;
+        let path = config_path(profile)?;
         if path.exists() {
             let text = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            let mut config: AppConfig = toml::from_str(&text)
+            let mut config: AppConfig = serde_json::from_str(&text)
                 .with_context(|| format!("failed to parse {}", path.display()))?;
 
             if config.transports.openai {
-                config.runtime_api_key = read_saved_runtime_key()?;
+                config.runtime_api_key = read_saved_runtime_key(profile)?;
             }
 
             apply_nonsecret_env_overrides(&mut config)?;
             validate_config(&config)?;
-            let protected_paths = protected_paths_for_config(&config)?;
+            let protected_paths = protected_paths_for_config(&config, profile)?;
             return Ok(SetupResult {
                 config,
                 new_tunnel: false,
@@ -159,17 +173,20 @@ pub async fn load_or_setup(force_setup: bool) -> Result<SetupResult> {
     }
 
     if !io::stdin().is_terminal() {
+        let profile_hint = profile
+            .map(|name| format!(" --profile {name}"))
+            .unwrap_or_default();
         bail!(
-            "abird-tunnel needs first-run setup, but stdin is not interactive. Run 'abird-tunnel --setup' in a terminal first, or provide OpenAI tunnel credentials through the supported environment variables"
+            "abird-link needs first-run setup, but stdin is not interactive. Run 'abird-link --setup{profile_hint}' in a terminal first"
         );
     }
 
-    interactive_setup().await
+    interactive_setup(profile).await
 }
 
 fn config_from_env() -> Result<Option<AppConfig>> {
-    let tunnel_id = env_first(&["ABIRD_TUNNEL_ID", "CONTROL_PLANE_TUNNEL_ID"]);
-    let runtime_api_key = env_first(&["ABIRD_TUNNEL_API_KEY", "CONTROL_PLANE_API_KEY"]);
+    let tunnel_id = env_first(&["ABIRD_LINK_ID", "CONTROL_PLANE_TUNNEL_ID"]);
+    let runtime_api_key = env_first(&["ABIRD_LINK_API_KEY", "CONTROL_PLANE_API_KEY"]);
 
     let (Some(tunnel_id), Some(runtime_api_key)) = (tunnel_id, runtime_api_key) else {
         return Ok(None);
@@ -178,10 +195,11 @@ fn config_from_env() -> Result<Option<AppConfig>> {
     let mut config = AppConfig {
         version: config_version(),
         transports: TransportConfig::default(),
+        permissions: PermissionConfig::default(),
         tunnel_id: Some(tunnel_id),
         runtime_api_key,
         organization_id: env_first(&[
-            "ABIRD_TUNNEL_ORGANIZATION_ID",
+            "ABIRD_LINK_ORGANIZATION_ID",
             "CONTROL_PLANE_ORGANIZATION_ID",
             "OPENAI_ORGANIZATION",
         ]),
@@ -197,11 +215,11 @@ fn config_from_env() -> Result<Option<AppConfig>> {
 }
 
 fn apply_nonsecret_env_overrides(config: &mut AppConfig) -> Result<()> {
-    if let Some(base_url) = env_first(&["ABIRD_TUNNEL_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
+    if let Some(base_url) = env_first(&["ABIRD_LINK_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
         config.base_url = base_url;
     }
     if let Some(value) = env_first(&[
-        "ABIRD_TUNNEL_ORGANIZATION_ID",
+        "ABIRD_LINK_ORGANIZATION_ID",
         "CONTROL_PLANE_ORGANIZATION_ID",
         "OPENAI_ORGANIZATION",
     ]) {
@@ -210,17 +228,37 @@ fn apply_nonsecret_env_overrides(config: &mut AppConfig) -> Result<()> {
     Ok(())
 }
 
-async fn interactive_setup() -> Result<SetupResult> {
+async fn interactive_setup(profile: Option<&str>) -> Result<SetupResult> {
     println!();
-    println!("abird-tunnel setup");
+    println!("abird-link setup");
     println!("────────────────────────────────────────────────────────");
+    if let Some(profile) = profile {
+        println!("Profile: {profile}");
+        println!();
+    }
+
     println!("1. Choose MCP transports");
     println!("   • openai — OpenAI Secure MCP Tunnel; starts automatically");
-    println!("   • stdio  — local stdio MCP server; start with --stdio");
-    println!("   • http   — local HTTP MCP server; start with --http");
-    println!("   • Enter comma-separated names, or 'all'.");
+    println!("   • stdio  — local stdio MCP server; can also be added with --stdio");
+    println!("   • http   — local HTTP MCP server; can also be added with --http");
+    println!("   • Enter comma-separated names, 'all', or 'none'.");
     let selection = prompt_line("   Enabled [openai]: ")?;
     let transports = parse_transport_selection(&selection)?;
+
+    println!();
+    println!("2. Choose default local permissions");
+    println!("   • cwd is always readable unless a deny rule overrides it.");
+    let allow_rw = prompt_yes_no("   Allow read+write cwd by default? [y/N]: ", false)?;
+    let allow_shell = prompt_yes_no("   Allow shell by default? [y/N]: ", false)?;
+    if allow_shell {
+        println!(
+            "   • Linux shell remains Bubblewrap-sandboxed; network stays disabled by default."
+        );
+    }
+    let permissions = PermissionConfig {
+        allow_rw,
+        allow_shell,
+    };
 
     let (tunnel_id, runtime_api_key, organization_id, new_tunnel) = if transports.openai {
         setup_openai().await?
@@ -231,6 +269,7 @@ async fn interactive_setup() -> Result<SetupResult> {
     let config = AppConfig {
         version: config_version(),
         transports,
+        permissions,
         tunnel_id,
         runtime_api_key,
         organization_id,
@@ -242,16 +281,35 @@ async fn interactive_setup() -> Result<SetupResult> {
     };
 
     validate_config(&config)?;
-    save_config(&config)?;
+    save_config(&config, profile)?;
 
     println!();
     println!("✓ Setup complete");
+    println!("  • Config: {}", config_path(profile)?.display());
+    let enabled = config.transports.enabled_names();
     println!(
-        "  • Enabled transports: {}",
-        config.transports.enabled_names().join(", ")
+        "  • Configured transports: {}",
+        if enabled.is_empty() {
+            "none".to_owned()
+        } else {
+            enabled.join(", ")
+        }
+    );
+    println!(
+        "  • Default permissions: read cwd{}{}",
+        if config.permissions.allow_rw {
+            " + write cwd"
+        } else {
+            ""
+        },
+        if config.permissions.allow_shell {
+            " + shell"
+        } else {
+            ""
+        },
     );
     if config.transports.openai {
-        println!("  • Runtime key saved securely for future runs.");
+        println!("  • Runtime key saved securely for this profile.");
         if new_tunnel {
             println!("  • Admin key was not saved — you can delete it now.");
         }
@@ -264,9 +322,8 @@ async fn interactive_setup() -> Result<SetupResult> {
             config.transports.http_bind
         );
     }
-    println!("  • Safe default: read-only. Add filesystem/shell grants when needed.");
 
-    let protected_paths = protected_paths_for_config(&config)?;
+    let protected_paths = protected_paths_for_config(&config, profile)?;
     Ok(SetupResult {
         config,
         new_tunnel,
@@ -298,15 +355,16 @@ fn parse_transport_selection(input: &str) -> Result<TransportConfig> {
                 config.stdio = true;
                 config.http = true;
             }
+            "none" => {
+                config.openai = false;
+                config.stdio = false;
+                config.http = false;
+            }
             "openai" | "tunnel" => config.openai = true,
             "stdio" => config.stdio = true,
             "http" => config.http = true,
-            other => bail!("unknown transport {other:?}; choose openai, stdio, http, or all"),
+            other => bail!("unknown transport {other:?}; choose openai, stdio, http, all, or none"),
         }
-    }
-
-    if !config.any_enabled() {
-        bail!("at least one transport must be enabled");
     }
 
     Ok(config)
@@ -314,7 +372,7 @@ fn parse_transport_selection(input: &str) -> Result<TransportConfig> {
 
 async fn setup_openai() -> Result<(Option<String>, String, Option<String>, bool)> {
     println!();
-    println!("2. Configure OpenAI Secure MCP Tunnel");
+    println!("3. Configure OpenAI Secure MCP Tunnel");
     println!("   Create a Runtime API key");
     println!("   • Permissions: Tunnels Read + Use");
     println!("   • https://platform.openai.com/settings/organization/api-keys");
@@ -402,8 +460,8 @@ async fn create_tunnel(
         .unwrap_or_else(|| "local-machine".to_owned());
 
     let mut body = serde_json::json!({
-        "name": format!("abird-tunnel · {host}"),
-        "description": "Permission-scoped local MCP access via abird-tunnel"
+        "name": format!("abird-link · {host}"),
+        "description": "Permission-scoped local MCP access via abird-link"
     });
     if !workspace_id.is_empty() {
         body["workspace_ids"] = serde_json::json!([workspace_id]);
@@ -413,7 +471,7 @@ async fn create_tunnel(
     }
 
     let client = reqwest::Client::builder()
-        .user_agent(format!("abird-tunnel/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("abird-link/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
     let url = format!("{}/v1/tunnels", base_url.trim_end_matches('/'));
     let response = client
@@ -438,16 +496,22 @@ async fn create_tunnel(
     Ok(record.id)
 }
 
-fn save_config(config: &AppConfig) -> Result<()> {
-    let path = config_path()?;
+fn save_config(config: &AppConfig, profile: Option<&str>) -> Result<()> {
+    let path = config_path(profile)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("configuration path has no parent"))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     set_private_dir_permissions(parent)?;
 
-    let text = toml::to_string_pretty(config)?;
-    let temp = parent.join(format!(".config.toml.tmp-{}", std::process::id()));
+    let text = serde_json::to_string_pretty(config)?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("config.json"),
+        std::process::id()
+    ));
 
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
@@ -461,6 +525,7 @@ fn save_config(config: &AppConfig) -> Result<()> {
         .open(&temp)
         .with_context(|| format!("failed to create {}", temp.display()))?;
     file.write_all(text.as_bytes())?;
+    file.write_all(b"\n")?;
     file.sync_all()?;
     drop(file);
 
@@ -469,32 +534,92 @@ fn save_config(config: &AppConfig) -> Result<()> {
     set_private_file_permissions(&path)?;
 
     if config.transports.openai {
-        save_runtime_key(&config.runtime_api_key)?;
+        save_runtime_key(&config.runtime_api_key, profile)?;
     } else {
-        remove_saved_runtime_key()?;
+        remove_saved_runtime_key(profile)?;
     }
 
     Ok(())
 }
 
-fn credential_path() -> Result<PathBuf> {
-    let config = config_path()?;
+fn profiled_path(base: &Path, profile: Option<&str>) -> Result<PathBuf> {
+    let Some(profile) = profile else {
+        return Ok(base.to_path_buf());
+    };
+    validate_profile(Some(profile))?;
+
+    let parent = base
+        .parent()
+        .ok_or_else(|| anyhow!("configuration path has no parent"))?;
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("configuration filename is invalid"))?;
+    let extension = base.extension().and_then(|value| value.to_str());
+
+    let filename = match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem}.{profile}.{extension}"),
+        _ => format!("{stem}.{profile}"),
+    };
+    Ok(parent.join(filename))
+}
+
+fn config_path(profile: Option<&str>) -> Result<PathBuf> {
+    let base = if let Some(path) = env::var_os("ABIRD_LINK_CONFIG") {
+        PathBuf::from(path)
+    } else if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg).join("abird-link/config.json")
+    } else {
+        home_dir()?.join(".config/abird-link/config.json")
+    };
+    profiled_path(&base, profile)
+}
+
+fn credential_path(profile: Option<&str>) -> Result<PathBuf> {
+    let config = config_path(profile)?;
+    let parent = config
+        .parent()
+        .ok_or_else(|| anyhow!("credential path has no parent"))?;
+    Ok(match profile {
+        Some(profile) => parent.join(format!("runtime.{profile}.key")),
+        None => parent.join("runtime.key"),
+    })
+}
+
+fn runtime_key_paths(parent: &Path) -> Result<Vec<PathBuf>> {
+    let mut protected = Vec::new();
+    if !parent.exists() {
+        return Ok(protected);
+    }
+
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "runtime.key" || (name.starts_with("runtime.") && name.ends_with(".key")) {
+            protected.push(entry.path());
+        }
+    }
+    protected.sort();
+    Ok(protected)
+}
+
+fn protected_paths_for_config(_config: &AppConfig, profile: Option<&str>) -> Result<Vec<PathBuf>> {
+    let config = config_path(profile)?;
     let parent = config
         .parent()
         .ok_or_else(|| anyhow!("configuration path has no parent"))?;
-    Ok(parent.join("runtime.key"))
-}
 
-fn protected_paths_for_config(config: &AppConfig) -> Result<Vec<PathBuf>> {
-    if !config.transports.openai {
-        return Ok(Vec::new());
+    let mut protected = runtime_key_paths(parent)?;
+    let current = credential_path(profile)?;
+    if current.exists() && !protected.iter().any(|path| path == &current) {
+        protected.push(current);
     }
-    let path = credential_path()?;
-    Ok(path.exists().then_some(path).into_iter().collect())
+    Ok(protected)
 }
 
-fn save_runtime_key(key: &str) -> Result<()> {
-    let path = credential_path()?;
+fn save_runtime_key(key: &str, profile: Option<&str>) -> Result<()> {
+    let path = credential_path(profile)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("credential path has no parent"))?;
@@ -519,8 +644,8 @@ fn save_runtime_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn remove_saved_runtime_key() -> Result<()> {
-    let path = credential_path()?;
+fn remove_saved_runtime_key(profile: Option<&str>) -> Result<()> {
+    let path = credential_path(profile)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -528,29 +653,37 @@ fn remove_saved_runtime_key() -> Result<()> {
     }
 }
 
-fn read_saved_runtime_key() -> Result<String> {
-    let path = credential_path()?;
+fn read_saved_runtime_key(profile: Option<&str>) -> Result<String> {
+    let path = credential_path(profile)?;
     let key = fs::read_to_string(&path).with_context(|| {
         format!(
-            "failed to read {}; run 'abird-tunnel --setup' to repair credentials",
-            path.display()
+            "failed to read {}; run 'abird-link --setup{}' to repair credentials",
+            path.display(),
+            profile
+                .map(|name| format!(" --profile {name}"))
+                .unwrap_or_default()
         )
     })?;
     let key = key.trim().to_owned();
     if key.is_empty() {
-        bail!("saved runtime API key is empty; run 'abird-tunnel --setup'");
+        bail!("saved runtime API key is empty; rerun abird-link setup");
     }
     Ok(key)
 }
 
-fn config_path() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("ABIRD_TUNNEL_CONFIG") {
-        return Ok(PathBuf::from(path));
+fn validate_profile(profile: Option<&str>) -> Result<()> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    if profile.is_empty()
+        || profile.len() > 64
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("invalid profile name; use 1-64 letters, digits, '-' or '_'");
     }
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(xdg).join("abird-tunnel/config.toml"));
-    }
-    Ok(home_dir()?.join(".config/abird-tunnel/config.toml"))
+    Ok(())
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -561,22 +694,16 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn validate_config(config: &AppConfig) -> Result<()> {
-    if !config.transports.any_enabled() {
-        bail!("configuration must enable at least one MCP transport");
-    }
-
-    if config.transports.http {
-        config
-            .transports
-            .http_bind
-            .parse::<SocketAddr>()
-            .with_context(|| {
-                format!(
-                    "invalid HTTP bind address {:?}",
-                    config.transports.http_bind
-                )
-            })?;
-    }
+    config
+        .transports
+        .http_bind
+        .parse::<SocketAddr>()
+        .with_context(|| {
+            format!(
+                "invalid HTTP bind address {:?}",
+                config.transports.http_bind
+            )
+        })?;
 
     if config.transports.openai {
         let tunnel_id = config
@@ -619,6 +746,20 @@ fn prompt_line(prompt: &str) -> Result<String> {
     let mut value = String::new();
     io::stdin().read_line(&mut value)?;
     Ok(value.trim().to_owned())
+}
+
+fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
+    loop {
+        let value = prompt_line(prompt)?;
+        if value.is_empty() {
+            return Ok(default);
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "y" | "yes" | "true" | "1" => return Ok(true),
+            "n" | "no" | "false" | "0" => return Ok(false),
+            _ => println!("   Please enter y or n."),
+        }
+    }
 }
 
 fn prompt_secret(prompt: &str) -> Result<String> {
@@ -666,6 +807,22 @@ fn set_private_dir_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn example_config() -> AppConfig {
+        AppConfig {
+            version: config_version(),
+            transports: TransportConfig::default(),
+            permissions: PermissionConfig::default(),
+            tunnel_id: Some("tunnel_0123456789abcdef0123456789abcdef".to_owned()),
+            runtime_api_key: "secret-runtime-key".to_owned(),
+            organization_id: None,
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            max_shell_timeout_secs: 120,
+            max_output_bytes: 1024,
+            max_read_bytes: 1024,
+            max_write_bytes: 1024,
+        }
+    }
+
     #[test]
     fn transport_selection_defaults_to_openai() {
         let transports = parse_transport_selection("").unwrap();
@@ -675,11 +832,43 @@ mod tests {
     }
 
     #[test]
-    fn transport_selection_is_modular() {
+    fn transport_selection_is_modular_and_allows_none() {
         let transports = parse_transport_selection("stdio,http").unwrap();
         assert!(!transports.openai);
         assert!(transports.stdio);
         assert!(transports.http);
+
+        let none = parse_transport_selection("none").unwrap();
+        assert!(!none.openai && !none.stdio && !none.http);
+    }
+
+    #[test]
+    fn all_profile_runtime_keys_are_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("runtime.key"), b"default").unwrap();
+        std::fs::write(temp.path().join("runtime.work.key"), b"work").unwrap();
+        std::fs::write(temp.path().join("runtime.personal.key"), b"personal").unwrap();
+        std::fs::write(temp.path().join("runtime.txt"), b"not-a-key").unwrap();
+
+        let paths = runtime_key_paths(temp.path()).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&temp.path().join("runtime.key")));
+        assert!(paths.contains(&temp.path().join("runtime.work.key")));
+        assert!(paths.contains(&temp.path().join("runtime.personal.key")));
+    }
+
+    #[test]
+    fn profile_paths_are_predictable() {
+        let base = Path::new("/tmp/abird-link/config.json");
+        assert_eq!(
+            profiled_path(base, None).unwrap(),
+            PathBuf::from("/tmp/abird-link/config.json")
+        );
+        assert_eq!(
+            profiled_path(base, Some("work")).unwrap(),
+            PathBuf::from("/tmp/abird-link/config.work.json")
+        );
+        assert!(profiled_path(base, Some("../bad")).is_err());
     }
 
     #[test]
@@ -692,60 +881,31 @@ mod tests {
     }
 
     #[test]
-    fn runtime_key_is_never_serialized_into_config() {
-        let config = AppConfig {
-            version: 4,
-            transports: TransportConfig::default(),
-            tunnel_id: Some("tunnel_0123456789abcdef0123456789abcdef".to_owned()),
-            runtime_api_key: "secret-runtime-key".to_owned(),
-            organization_id: None,
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            max_shell_timeout_secs: 120,
-            max_output_bytes: 1024,
-            max_read_bytes: 1024,
-            max_write_bytes: 1024,
-        };
-
-        let serialized = toml::to_string(&config).unwrap();
+    fn runtime_key_is_never_serialized_into_json() {
+        let serialized = serde_json::to_string_pretty(&example_config()).unwrap();
         assert!(!serialized.contains("secret-runtime-key"));
         assert!(!serialized.contains("runtime_api_key"));
     }
 
     #[test]
     fn local_only_config_needs_no_openai_fields() {
-        let config = AppConfig {
-            version: 4,
-            transports: TransportConfig {
-                openai: false,
-                stdio: true,
-                http: true,
-                http_bind: DEFAULT_HTTP_BIND.to_owned(),
-            },
-            tunnel_id: None,
-            runtime_api_key: String::new(),
-            organization_id: None,
-            base_url: default_base_url(),
-            max_shell_timeout_secs: 120,
-            max_output_bytes: 1024,
-            max_read_bytes: 1024,
-            max_write_bytes: 1024,
-        };
-
+        let mut config = example_config();
+        config.transports.openai = false;
+        config.transports.stdio = true;
+        config.tunnel_id = None;
+        config.runtime_api_key.clear();
         validate_config(&config).unwrap();
     }
 
     #[test]
-    fn old_config_shape_defaults_to_openai_transport() {
-        let config: AppConfig = toml::from_str(
-            r#"
-version = 3
-tunnel_id = "tunnel_old"
-base_url = "https://api.openai.com"
-"#,
-        )
-        .unwrap();
-        assert!(config.transports.openai);
-        assert!(!config.transports.stdio);
-        assert!(!config.transports.http);
+    fn permissions_round_trip_in_json() {
+        let mut config = example_config();
+        config.permissions.allow_rw = true;
+        config.permissions.allow_shell = true;
+
+        let serialized = serde_json::to_string_pretty(&config).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(parsed.permissions.allow_rw);
+        assert!(parsed.permissions.allow_shell);
     }
 }

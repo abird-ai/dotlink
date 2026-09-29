@@ -29,7 +29,8 @@ pub struct AccessSpec {
     pub cwd: PathBuf,
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
-    pub deny_roots: Vec<PathBuf>,
+    pub deny_read_roots: Vec<PathBuf>,
+    pub deny_write_roots: Vec<PathBuf>,
     pub rw_all_dangerous: bool,
 }
 
@@ -51,7 +52,8 @@ struct AccessPolicy {
     cwd: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
-    deny_roots: Vec<PathBuf>,
+    deny_read_roots: Vec<PathBuf>,
+    deny_write_roots: Vec<PathBuf>,
     rw_all_dangerous: bool,
 }
 
@@ -427,7 +429,8 @@ impl AccessPolicy {
         if !spec.cwd.is_absolute()
             || spec.read_roots.iter().any(|path| !path.is_absolute())
             || spec.write_roots.iter().any(|path| !path.is_absolute())
-            || spec.deny_roots.iter().any(|path| !path.is_absolute())
+            || spec.deny_read_roots.iter().any(|path| !path.is_absolute())
+            || spec.deny_write_roots.iter().any(|path| !path.is_absolute())
         {
             bail!("internal error: access policy paths must be canonical absolute paths");
         }
@@ -436,7 +439,8 @@ impl AccessPolicy {
             cwd: spec.cwd,
             read_roots: spec.read_roots,
             write_roots: spec.write_roots,
-            deny_roots: spec.deny_roots,
+            deny_read_roots: spec.deny_read_roots,
+            deny_write_roots: spec.deny_write_roots,
             rw_all_dangerous: spec.rw_all_dangerous,
         })
     }
@@ -453,8 +457,16 @@ impl AccessPolicy {
         }
     }
 
-    fn denied(&self, path: &Path) -> bool {
-        self.deny_roots.iter().any(|root| path.starts_with(root))
+    fn denied_read(&self, path: &Path) -> bool {
+        self.deny_read_roots
+            .iter()
+            .any(|root| path.starts_with(root))
+    }
+
+    fn denied_write(&self, path: &Path) -> bool {
+        self.deny_write_roots
+            .iter()
+            .any(|root| path.starts_with(root))
     }
 
     fn grant_read(&self, path: &Path) -> bool {
@@ -466,18 +478,24 @@ impl AccessPolicy {
     }
 
     fn can_read(&self, path: &Path) -> bool {
-        !self.denied(path) && self.grant_read(path)
+        !self.denied_read(path) && self.grant_read(path)
     }
 
     fn can_write(&self, path: &Path) -> bool {
-        !self.denied(path) && self.grant_write(path)
+        !self.denied_write(path) && self.grant_write(path)
     }
 
     fn check(&self, path: &Path, need: AccessNeed) -> Result<()> {
-        if self.denied(path) {
-            bail!("path is denied by policy: {}", path.display());
-        }
         match need {
+            AccessNeed::Read if self.denied_read(path) => {
+                bail!("read access is denied by policy: {}", path.display())
+            }
+            AccessNeed::Write if self.denied_write(path) => {
+                bail!("write access is denied by policy: {}", path.display())
+            }
+            AccessNeed::ReadWrite if self.denied_read(path) || self.denied_write(path) => {
+                bail!("read+write access is denied by policy: {}", path.display())
+            }
             AccessNeed::Read if !self.can_read(path) => {
                 bail!("read access is not allowed: {}", path.display())
             }
@@ -560,22 +578,27 @@ impl AccessPolicy {
         let mut candidates = BTreeSet::new();
         candidates.extend(self.read_roots.iter().cloned());
         candidates.extend(self.write_roots.iter().cloned());
+        candidates.extend(self.deny_write_roots.iter().cloned());
 
         let mut mounts = candidates
             .into_iter()
             .filter_map(|path| {
-                if !self.grant_read(&path) || self.denied(&path) {
+                if !self.can_read(&path) {
                     return None;
                 }
-                Some((path.clone(), self.grant_write(&path)))
+                Some((path.clone(), self.can_write(&path)))
             })
             .collect::<Vec<_>>();
         mounts.sort_by_key(|(path, _)| path_depth(path));
         mounts
     }
 
-    fn deny_roots(&self) -> &[PathBuf] {
-        &self.deny_roots
+    fn deny_read_roots(&self) -> &[PathBuf] {
+        &self.deny_read_roots
+    }
+
+    fn deny_write_roots(&self) -> &[PathBuf] {
+        &self.deny_write_roots
     }
 }
 
@@ -596,16 +619,21 @@ impl LocalMachine {
         for path in &args.access.write_roots {
             write_roots.push(canonicalize_grant(&cwd, path).await?);
         }
-        let mut deny_roots = Vec::with_capacity(args.access.deny_roots.len());
-        for path in &args.access.deny_roots {
-            deny_roots.push(canonicalize_deny(&cwd, path).await?);
+        let mut deny_read_roots = Vec::with_capacity(args.access.deny_read_roots.len());
+        for path in &args.access.deny_read_roots {
+            deny_read_roots.push(canonicalize_deny(&cwd, path).await?);
+        }
+        let mut deny_write_roots = Vec::with_capacity(args.access.deny_write_roots.len());
+        for path in &args.access.deny_write_roots {
+            deny_write_roots.push(canonicalize_deny(&cwd, path).await?);
         }
 
         let access = AccessPolicy::from_spec(AccessSpec {
             cwd,
             read_roots,
             write_roots,
-            deny_roots,
+            deny_read_roots,
+            deny_write_roots,
             rw_all_dangerous: args.access.rw_all_dangerous,
         })?;
 
@@ -636,10 +664,18 @@ impl LocalMachine {
 
         #[cfg(target_os = "linux")]
         if args.allow_shell && args.sandbox_shell {
-            for denied in access.deny_roots() {
-                if access.grant_read(denied) && !denied.exists() {
+            for denied in access.deny_read_roots() {
+                if (access.grant_read(denied) || access.grant_write(denied)) && !denied.exists() {
                     bail!(
-                        "sandboxed --deny paths inside readable grants must already exist: {}",
+                        "sandboxed deny-read paths inside granted trees must already exist: {}",
+                        denied.display()
+                    );
+                }
+            }
+            for denied in access.deny_write_roots() {
+                if access.grant_read(denied) && access.grant_write(denied) && !denied.exists() {
+                    bail!(
+                        "sandboxed deny-write paths inside read+write trees must already exist: {}",
                         denied.display()
                     );
                 }
@@ -695,10 +731,11 @@ impl LocalMachine {
             return "unrestricted read+write".to_owned();
         }
         format!(
-            "read:{} write:{} deny:{}{}",
+            "read:{} write:{} deny-read:{} deny-write:{}{}",
             self.config.access.read_roots.len(),
             self.config.access.write_roots.len(),
-            self.config.access.deny_roots.len(),
+            self.config.access.deny_read_roots.len(),
+            self.config.access.deny_write_roots.len(),
             if self.config.allow_shell {
                 " + shell"
             } else {
@@ -739,7 +776,7 @@ impl LocalMachine {
         for protected in &self.config.protected_paths {
             if path == protected || path.starts_with(protected) {
                 bail!(
-                    "path is protected by abird-tunnel and cannot be accessed through filesystem tools"
+                    "path is protected by abird-link and cannot be accessed through filesystem tools"
                 );
             }
         }
@@ -773,7 +810,9 @@ impl LocalMachine {
             while let Some(entry) = reader.next_entry().await? {
                 let path = entry.path();
 
-                if self.config.access.denied(&path) || self.ensure_not_protected(&path).is_err() {
+                if self.config.access.denied_read(&path)
+                    || self.ensure_not_protected(&path).is_err()
+                {
                     continue;
                 }
 
@@ -869,7 +908,7 @@ impl LocalMachine {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env_remove("ABIRD_TUNNEL_API_KEY")
+            .env_remove("ABIRD_LINK_API_KEY")
             .env_remove("CONTROL_PLANE_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("OPENAI_ADMIN_KEY")
@@ -985,6 +1024,18 @@ impl LocalMachine {
             command.arg("--bind").arg("/").arg("/");
         }
 
+        if !self.config.allow_network {
+            for daemon_socket in [
+                Path::new("/nix/var/nix/daemon-socket/socket"),
+                Path::new("/run/nix-daemon/socket"),
+            ] {
+                if daemon_socket.exists() {
+                    add_parent_dirs(&mut command, daemon_socket);
+                    command.arg("--ro-bind").arg("/dev/null").arg(daemon_socket);
+                }
+            }
+        }
+
         command
             .arg("--proc")
             .arg("/proc")
@@ -1033,8 +1084,21 @@ impl LocalMachine {
             }
         }
 
-        for denied in self.config.access.deny_roots() {
-            if !self.config.access.grant_read(denied) {
+        for denied in self.config.access.deny_write_roots() {
+            if self.config.access.denied_read(denied)
+                || !self.config.access.grant_read(denied)
+                || !self.config.access.grant_write(denied)
+            {
+                continue;
+            }
+            add_parent_dirs(&mut command, denied);
+            if denied.exists() {
+                command.arg("--ro-bind").arg(denied).arg(denied);
+            }
+        }
+
+        for denied in self.config.access.deny_read_roots() {
+            if !(self.config.access.grant_read(denied) || self.config.access.grant_write(denied)) {
                 continue;
             }
             add_parent_dirs(&mut command, denied);
@@ -1051,13 +1115,15 @@ impl LocalMachine {
                     command.arg("--ro-bind").arg("/dev/null").arg(denied);
                 }
                 Err(_) => {
-                    // Startup validation rejects this case for readable sandbox grants.
+                    // Startup validation rejects this case for sandboxed granted trees.
                 }
             }
         }
 
         for protected in &self.config.protected_paths {
-            if self.config.access.grant_read(protected) && !self.config.access.denied(protected) {
+            if self.config.access.grant_read(protected)
+                && !self.config.access.denied_read(protected)
+            {
                 add_parent_dirs(&mut command, protected);
                 command.arg("--ro-bind").arg("/dev/null").arg(protected);
             }
@@ -1541,7 +1607,7 @@ impl LocalMachine {
 
 #[rmcp::tool_handler(
     router = self.policy_tool_router(),
-    name = "abird-tunnel",
+    name = "abird-link",
     instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
 )]
 impl rmcp::ServerHandler for LocalMachine {}
@@ -1555,7 +1621,8 @@ mod tests {
             cwd: root.to_path_buf(),
             read_roots: vec![root.to_path_buf()],
             write_roots: Vec::new(),
-            deny_roots: Vec::new(),
+            deny_read_roots: Vec::new(),
+            deny_write_roots: Vec::new(),
             rw_all_dangerous: false,
         })
         .unwrap()
@@ -1581,7 +1648,8 @@ mod tests {
             cwd: root.clone(),
             read_roots: vec![root],
             write_roots: vec![child.clone()],
-            deny_roots: Vec::new(),
+            deny_read_roots: Vec::new(),
+            deny_write_roots: Vec::new(),
             rw_all_dangerous: false,
         })
         .unwrap();
@@ -1601,13 +1669,39 @@ mod tests {
             cwd: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![root],
-            deny_roots: vec![denied.clone()],
+            deny_read_roots: vec![denied.clone()],
+            deny_write_roots: vec![denied.clone()],
             rw_all_dangerous: false,
         })
         .unwrap();
 
         assert!(!policy.can_read(&denied));
         assert!(!policy.can_write(&denied));
+    }
+
+    #[test]
+    fn read_and_write_denies_are_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let read_denied = root.join("read-denied");
+        let write_denied = root.join("write-denied");
+        std::fs::create_dir(&read_denied).unwrap();
+        std::fs::create_dir(&write_denied).unwrap();
+
+        let policy = AccessPolicy::from_spec(AccessSpec {
+            cwd: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![root],
+            deny_read_roots: vec![read_denied.clone()],
+            deny_write_roots: vec![write_denied.clone()],
+            rw_all_dangerous: false,
+        })
+        .unwrap();
+
+        assert!(!policy.can_read(&read_denied));
+        assert!(policy.can_write(&read_denied));
+        assert!(policy.can_read(&write_denied));
+        assert!(!policy.can_write(&write_denied));
     }
 
     #[cfg(unix)]
@@ -1642,7 +1736,8 @@ mod tests {
             cwd: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![root],
-            deny_roots: Vec::new(),
+            deny_read_roots: Vec::new(),
+            deny_write_roots: Vec::new(),
             rw_all_dangerous: false,
         })
         .unwrap();
@@ -1673,7 +1768,8 @@ mod tests {
                 cwd: root.clone(),
                 read_roots: vec![root],
                 write_roots: Vec::new(),
-                deny_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
                 rw_all_dangerous: false,
             },
             allow_shell: false,
@@ -1788,7 +1884,8 @@ mod tests {
             cwd: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![writable.clone()],
-            deny_roots: vec![denied.clone()],
+            deny_read_roots: vec![denied.clone()],
+            deny_write_roots: vec![denied.clone()],
             rw_all_dangerous: false,
         })
         .unwrap();
@@ -1797,6 +1894,29 @@ mod tests {
         assert!(mounts.contains(&(root.clone(), false)));
         assert!(mounts.contains(&(writable, true)));
         assert!(!mounts.iter().any(|(path, _)| path == &denied));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_write_deny_downgrades_rw_subtree_to_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let denied = root.join("readable-but-not-writable");
+        std::fs::create_dir(&denied).unwrap();
+
+        let access = AccessPolicy::from_spec(AccessSpec {
+            cwd: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![root.clone()],
+            deny_read_roots: Vec::new(),
+            deny_write_roots: vec![denied.clone()],
+            rw_all_dangerous: false,
+        })
+        .unwrap();
+
+        let mounts = access.sandbox_mounts();
+        assert!(mounts.contains(&(root, true)));
+        assert!(mounts.contains(&(denied, false)));
     }
 
     #[cfg(target_os = "linux")]
@@ -1815,7 +1935,8 @@ mod tests {
                     cwd: root.clone(),
                     read_roots: vec![root.clone()],
                     write_roots: Vec::new(),
-                    deny_roots: vec![denied.clone()],
+                    deny_read_roots: vec![denied.clone()],
+                    deny_write_roots: vec![denied.clone()],
                     rw_all_dangerous: false,
                 })
                 .unwrap(),
@@ -1836,6 +1957,22 @@ mod tests {
         let args: Vec<_> = command.as_std().get_args().collect();
 
         assert!(args.iter().any(|arg| *arg == OsStr::new("--unshare-net")));
+
+        for socket in [
+            Path::new("/nix/var/nix/daemon-socket/socket"),
+            Path::new("/run/nix-daemon/socket"),
+        ] {
+            if socket.exists() {
+                assert!(
+                    args.windows(3).any(|window| {
+                        window[0] == OsStr::new("--ro-bind")
+                            && window[1] == OsStr::new("/dev/null")
+                            && window[2] == socket.as_os_str()
+                    }),
+                    "Nix daemon socket should be masked when network is denied"
+                );
+            }
+        }
 
         assert!(
             args.windows(2).any(|window| {
@@ -1892,7 +2029,8 @@ mod tests {
                     cwd: root.clone(),
                     read_roots: vec![root.clone()],
                     write_roots: vec![writable.clone()],
-                    deny_roots: vec![denied],
+                    deny_read_roots: vec![denied.clone()],
+                    deny_write_roots: vec![denied],
                     rw_all_dangerous: false,
                 })
                 .unwrap(),

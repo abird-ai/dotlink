@@ -1,6 +1,6 @@
 # Security model
 
-abird-tunnel is least-privilege by default.
+abird-link is least-privilege by default.
 
 Without write or shell flags, the visible tools are:
 
@@ -12,22 +12,29 @@ read_binary
 
 and cwd is the only implicit readable directory.
 
-## Filesystem grants
+## Profiles and permission precedence
 
-Launch-time permissions:
+Profiles may persist allow_rw (rw-cwd) and allow_shell defaults. Named profiles use config.<profile>.json; the default uses config.json.
+
+Runtime allow rules are additive. Denies always take precedence over profile defaults, ordinary allows, and dangerous grant shortcuts.
+
+Filesystem controls are symmetric:
 
 ~~~text
---allow-read=DIR
---allow-write=DIR
---allow-rw=DIR
---deny=PATH
+--allow-read[=DIR]    --deny-read[=DIR]
+--allow-write[=DIR]   --deny-write[=DIR]
+--allow-rw[=DIR]      --deny-rw[=DIR]
 ~~~
 
-Allow rules are additive.
+Bare forms target cwd. Bare --allow-write retains its historical behavior and means rw-cwd. Legacy --deny=PATH is equivalent to denying both read and write.
 
-deny always takes precedence.
+Capability controls are also symmetric:
 
-Bare --allow-write means read+write cwd.
+~~~text
+--allow-shell             --deny-shell
+--allow-network           --deny-network
+--allow-rw-all-dangerous  --deny-rw-all-dangerous
+~~~
 
 Rust file tools canonicalize existing targets and ancestors before policy checks so symlink traversal cannot escape a grant.
 
@@ -77,23 +84,22 @@ Anyone who can reach an unprotected public endpoint may be able to exercise thos
 
 Use ngrok access controls when appropriate and grant only the minimum abird filesystem/shell permissions required.
 
-The ngrok SDK credential is read from NGROK_AUTHTOKEN. It authenticates abird-tunnel to ngrok; it is not, by itself, authentication for MCP callers.
+The ngrok SDK credential is read from NGROK_AUTHTOKEN. It authenticates abird-link to ngrok; it is not, by itself, authentication for MCP callers.
 
 ## OpenAI credentials
 
 OpenAI credentials exist only when the OpenAI transport is enabled.
 
-The Runtime key is stored at:
+The Runtime key is stored separately for each profile:
 
 ~~~text
-~/.config/abird-tunnel/runtime.key
+~/.config/abird-link/runtime.key
+~/.config/abird-link/runtime.work.key
 ~~~
 
-On Unix it is mode 0600 and its directory is mode 0700.
+JSON config files are config.json or config.<profile>.json. On Unix config/key files are mode 0600 and their directory is mode 0700.
 
-The Admin key used to create a tunnel is never persisted.
-
-When OpenAI is disabled in setup, the Runtime key is not required and a previously saved runtime.key is removed.
+The Admin key used to create a tunnel is never persisted. A profile with OpenAI disabled does not require a runtime key.
 
 Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are removed from child shell environments.
 
@@ -108,7 +114,7 @@ The sandbox:
 - mounts readable grants read-only;
 - mounts effective read+write grants read-write;
 - does not expose purely write-only host grants;
-- masks deny paths;
+- masks read-denied paths and rebinds write-denied readable subtrees read-only;
 - masks the saved OpenAI runtime key when present;
 - uses an empty temporary home;
 - mounts required system runtime paths read-only;
@@ -125,7 +131,7 @@ Enable shell network access with:
 --allow-network
 ~~~
 
-The shell network namespace is separate from the main abird-tunnel process. OpenAI and ngrok can use outbound networking even while the shell itself has no network.
+The shell network namespace is separate from the main abird-link process. OpenAI and ngrok can use outbound networking even while the shell itself has no network.
 
 ## Dangerous unsandboxed shell
 
@@ -142,13 +148,13 @@ Unsandboxed execution requires:
 
 The corrected alias --allow-network-dangerous is accepted.
 
-The full shortcut is:
+The full grant shortcut is:
 
 ~~~text
 --allow-all-dangerous
 ~~~
 
-deny rules cannot constrain an arbitrary unsandboxed child process, so unsandboxed shell plus deny is rejected.
+Explicit denies still win. On Linux, filesystem or network denies force the shell back into Bubblewrap so those denies remain enforceable even if --no-sandbox or --allow-all-dangerous was requested. deny-shell removes shell capability entirely. On platforms without an enforceable shell sandbox, shell + filesystem/network deny combinations are rejected.
 
 ## Windows
 
@@ -180,31 +186,31 @@ patch_binary also caps total file size processed in memory.
 Read-only local MCP:
 
 ~~~bash
-abird-tunnel --stdio
+abird-link --stdio
 ~~~
 
 Writable local project:
 
 ~~~bash
-abird-tunnel --stdio --allow-write
+abird-link --stdio --allow-write
 ~~~
 
 Sandboxed build/test shell without shell network:
 
 ~~~bash
-abird-tunnel --stdio --allow-write --allow-shell
+abird-link --stdio --allow-write --allow-shell
 ~~~
 
 Local HTTP:
 
 ~~~bash
-abird-tunnel --http
+abird-link --http
 ~~~
 
 Public HTTP through ngrok:
 
 ~~~bash
-abird-tunnel --http --ngrok
+abird-link --http --ngrok
 ~~~
 
 Use --allow-all-dangerous only when unrestricted host access is explicitly intended.

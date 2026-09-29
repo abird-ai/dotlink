@@ -1,6 +1,6 @@
-# Create the ChatGPT plugin for abird-tunnel
+# Create the ChatGPT plugin for abird-link
 
-This is the companion setup for the local `abird-tunnel` binary.
+This is the companion setup for the local `abird-link` binary.
 
 ## 1. Start the bridge
 
@@ -8,28 +8,28 @@ Read-only cwd:
 
 ```bash
 cd ~/src/my-project
-abird-tunnel
+abird-link
 ```
 
 Read/write cwd:
 
 ```bash
-abird-tunnel --allow-write
+abird-link --allow-write
 ```
 
 Linux sandboxed Bash, project rw, network blocked:
 
 ```bash
-abird-tunnel --allow-write --allow-shell
+abird-link --allow-write --allow-shell
 ```
 
 Add network when needed:
 
 ```bash
-abird-tunnel --allow-write --allow-shell --allow-network
+abird-link --allow-write --allow-shell --allow-network
 ```
 
-Additional paths can be granted with repeatable `--allow-read=DIR`, `--allow-write=DIR`, and `--allow-rw=DIR` flags. `--deny=DIR` always takes precedence.
+Additional paths can be granted with repeatable allow-read/allow-write/allow-rw flags. Deny-read, deny-write, deny-rw, deny-shell, and deny-network take precedence. Legacy --deny=DIR denies both read and write.
 
 Copy the printed `tunnel_...` ID.
 
@@ -43,7 +43,7 @@ In ChatGPT:
 2. Enable **Developer mode**.
 3. Open **Plugins** and select **+**.
 4. Create a developer connection:
-   - Name: `Abird Tunnel`
+   - Name: `Abird Link`
    - Connection: **Tunnel**
    - Tunnel ID: the printed `tunnel_...` value.
 5. Create the connection.
@@ -76,8 +76,8 @@ With shell enabled, `bash` on Unix or `powershell` on Windows is added.
 You can always inspect the exact local surface first:
 
 ```bash
-abird-tunnel --list-tools
-abird-tunnel --allow-write --allow-shell --list-tools
+abird-link --list-tools
+abird-link --allow-write --allow-shell --list-tools
 ```
 
 ## 3. Copy the registered connection ID
@@ -122,7 +122,7 @@ Do not provide Plugin Creator with:
 - local credentials;
 - public MCP URL.
 
-Filesystem permissions and sandbox/network policy are selected locally each time `abird-tunnel` starts.
+Filesystem/shell defaults may be persisted per profile, then refined or denied at launch. Use -p/--profile to select config.<profile>.json; explicit deny flags always win.
 
 ## Distribution
 
@@ -139,16 +139,16 @@ References:
 
 The OpenAI plugin flow above uses the OpenAI transport. The same LocalMachine MCP server can also run without OpenAI.
 
-For subprocess MCP clients such as Claude Desktop or Claude Code, launch:
+For subprocess MCP clients such as Claude Desktop or Claude Code, launch (optionally with -p/--profile):
 
 ~~~text
-abird-tunnel --stdio
+abird-link --stdio
 ~~~
 
 For Streamable HTTP clients, run:
 
 ~~~text
-abird-tunnel --http
+abird-link --http
 ~~~
 
 Explicit --stdio and --http flags are runtime overrides: they activate those transports for the current run even if persisted setup has them disabled.
@@ -162,17 +162,17 @@ http://127.0.0.1:3000/mcp
 For a public HTTPS endpoint through the ngrok Rust SDK:
 
 ~~~text
-NGROK_AUTHTOKEN=... abird-tunnel --http --ngrok
+NGROK_AUTHTOKEN=... abird-link --http --ngrok
 ~~~
 
-abird-tunnel prints the final public /mcp URL. A Streamable HTTP MCP client can connect directly to that URL.
+abird-link prints the final public /mcp URL. A Streamable HTTP MCP client can connect directly to that URL.
 
 
 For hard-to-guess per-run HTTP paths:
 
 ~~~text
-abird-tunnel --http --ephemeral-url
-abird-tunnel --http --ngrok --ngrok-ephemeral-url
+abird-link --http --ephemeral-url
+abird-link --http --ngrok --ngrok-ephemeral-url
 ~~~
 
 The local HTTP and ngrok ephemeral settings are independent.

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Rename the package, binary, MCP server identity, Nix outputs, config directory, and environment prefix to abird-link.
+- Replace TOML persistence with JSON: config.json for default and config.<profile>.json for named profiles.
+- Add -p/--profile and allow -s/--setup -p <name> to create or reconfigure named profiles through the same onboarding flow.
+- Persist safe per-profile permission defaults for rw-cwd and shell.
+- Add symmetric deny-read, deny-write, deny-rw, deny-shell, deny-network, and deny-rw-all-dangerous controls; denies override config defaults and allow flags.
+- Keep legacy --deny=PATH as a read+write deny synonym.
+- Force Bubblewrap on Linux when filesystem/network denies must constrain a shell, even if a dangerous no-sandbox grant was requested.
+- Store OpenAI runtime keys separately per profile as runtime.key / runtime.<profile>.key.
+
 - Make explicit --stdio and --http runtime flags activate those transports even when persisted setup has them disabled.
 - Make bare --allow-rw shorthand for read+write on cwd, matching bare --allow-write.
 - Canonicalize shell executables and sandbox PATH entries so Bubblewrap shell execution works correctly on NixOS profile symlinks.
