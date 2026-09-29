@@ -40,11 +40,12 @@
 
           abird-tunnel = pkgs.rustPlatform.buildRustPackage {
             pname = "abird-tunnel";
-            version = "0.2.0";
+            version = "0.3.0";
             inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;
             strictDeps = true;
+            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.makeWrapper ];
 
             # Package builds also run the Rust unit test suite.
             doCheck = true;
@@ -52,6 +53,15 @@
               runHook preCheck
               cargo test --all-features
               runHook postCheck
+            '';
+
+            postInstall = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              wrapProgram $out/bin/abird-tunnel                 --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.bash
+                  pkgs.bubblewrap
+                ]
+              }
             '';
 
             meta = {
@@ -101,7 +111,7 @@
 
           clippy = pkgs.rustPlatform.buildRustPackage {
             pname = "abird-tunnel-clippy";
-            version = "0.2.0";
+            version = "0.3.0";
             inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;
@@ -132,6 +142,9 @@
             pkgs.clippy
             pkgs.rustfmt
             pkgs.nixfmt
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.bubblewrap
           ];
           RUST_BACKTRACE = "1";
         };

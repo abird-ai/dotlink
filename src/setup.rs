@@ -23,10 +23,6 @@ pub struct AppConfig {
     pub runtime_api_key: String,
     #[serde(default)]
     pub organization_id: Option<String>,
-    #[serde(default = "default_true")]
-    pub allow_shell: bool,
-    #[serde(default = "default_shell")]
-    pub shell: String,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default = "default_shell_timeout")]
@@ -51,13 +47,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    2
-}
-fn default_true() -> bool {
-    true
-}
-fn default_shell() -> String {
-    "bash".to_owned()
+    3
 }
 fn default_base_url() -> String {
     DEFAULT_BASE_URL.to_owned()
@@ -125,8 +115,6 @@ fn config_from_env() -> Result<Option<AppConfig>> {
             "CONTROL_PLANE_ORGANIZATION_ID",
             "OPENAI_ORGANIZATION",
         ]),
-        allow_shell: true,
-        shell: default_shell(),
         base_url: default_base_url(),
         max_shell_timeout_secs: default_shell_timeout(),
         max_output_bytes: default_output_bytes(),
@@ -139,14 +127,8 @@ fn config_from_env() -> Result<Option<AppConfig>> {
 }
 
 fn apply_nonsecret_env_overrides(config: &mut AppConfig) -> Result<()> {
-    if let Some(shell) = env_first(&["ABIRD_TUNNEL_SHELL"]) {
-        config.shell = shell;
-    }
     if let Some(base_url) = env_first(&["ABIRD_TUNNEL_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
         config.base_url = base_url;
-    }
-    if let Some(value) = env_first(&["ABIRD_TUNNEL_ALLOW_SHELL"]) {
-        config.allow_shell = parse_bool(&value)?;
     }
     if let Some(value) = env_first(&[
         "ABIRD_TUNNEL_ORGANIZATION_ID",
@@ -232,8 +214,6 @@ async fn interactive_setup() -> Result<SetupResult> {
         tunnel_id,
         runtime_api_key: runtime_api_key.as_str().to_owned(),
         organization_id: runtime_organization_id,
-        allow_shell: true,
-        shell: default_shell(),
         base_url: default_base_url(),
         max_shell_timeout_secs: default_shell_timeout(),
         max_output_bytes: default_output_bytes(),
@@ -249,7 +229,7 @@ async fn interactive_setup() -> Result<SetupResult> {
     if new_tunnel {
         println!("  • Admin key was not saved — you can delete it now.");
     }
-    println!("  • Bash is enabled. Use --no-shell to disable it.");
+    println!("  • Safe default: read-only. Add --allow-write and/or --allow-shell when needed.");
 
     Ok(SetupResult {
         config,
@@ -409,9 +389,6 @@ fn validate_config(config: &AppConfig) -> Result<()> {
     if config.runtime_api_key.trim().is_empty() {
         bail!("runtime API key is empty");
     }
-    if config.shell.trim().is_empty() {
-        bail!("shell executable is empty");
-    }
     if !(config.base_url.starts_with("https://") || config.base_url.starts_with("http://localhost"))
     {
         bail!("control-plane base URL must use HTTPS (localhost is allowed for testing)");
@@ -457,14 +434,6 @@ fn env_first(names: &[&str]) -> Option<String> {
     })
 }
 
-fn parse_bool(value: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => bail!("invalid boolean value: {value}"),
-    }
-}
-
 fn bounded(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -507,20 +476,12 @@ mod tests {
     }
 
     #[test]
-    fn bool_parser_accepts_common_forms() {
-        assert!(parse_bool("yes").unwrap());
-        assert!(!parse_bool("off").unwrap());
-    }
-
-    #[test]
     fn runtime_key_is_never_serialized_into_config() {
         let config = AppConfig {
-            version: 2,
+            version: 3,
             tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".to_owned(),
             runtime_api_key: "secret-runtime-key".to_owned(),
             organization_id: None,
-            allow_shell: true,
-            shell: "bash".to_owned(),
             base_url: DEFAULT_BASE_URL.to_owned(),
             max_shell_timeout_secs: 120,
             max_output_bytes: 1024,

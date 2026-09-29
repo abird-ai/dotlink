@@ -1,209 +1,262 @@
 # abird-tunnel
 
-A single Rust binary that connects ChatGPT to the local workspace it is launched from through OpenAI Secure MCP Tunnel.
+A single Rust binary that connects ChatGPT to local files and tools through OpenAI Secure MCP Tunnel.
 
 ```text
 ChatGPT
-   │
    │ Secure MCP Tunnel (outbound HTTPS)
    ▼
 api.openai.com
    ▲
-   │ long-poll / response
    │
-┌──┴────────────────────────────────────────┐
-│ abird-tunnel                              │
-│                                           │
-│ native Rust tunnel transport              │
-│           │                               │
-│           ▼                               │
-│ in-process rmcp server                    │
-│   ├── machine_info                        │
-│   ├── fs_list                             │
-│   ├── fs_stat                             │
-│   ├── fs_read_text                        │
-│   ├── fs_write_text                       │
-│   ├── fs_mkdir                            │
-│   ├── fs_remove                           │
-│   └── shell_exec → bash                   │
-└───────────────────────────────────────────┘
+abird-tunnel
+   ├── read / write / edit / ls
+   ├── read_binary / write_binary / patch_binary
+   └── bash (Unix) / powershell (Windows)
 ```
 
-There is no Go `tunnel-client`, child MCP process, local HTTP listener, inbound firewall rule, or public endpoint. `abird-tunnel` speaks the OpenAI Secure MCP Tunnel wire protocol directly and dispatches MCP requests into the Rust `rmcp` server in memory.
+There is no Go `tunnel-client`, local MCP listener, inbound firewall rule, or public endpoint. The Rust process speaks the OpenAI tunnel protocol directly and dispatches MCP in memory through `rmcp`.
 
-## One-command UX
-
-Install once:
-
-```bash
-cargo install --path .
-```
-
-Then enter any project and run:
+## Quick start
 
 ```bash
 cd ~/src/my-project
 abird-tunnel
 ```
 
-That directory becomes the filesystem workspace for this process. All `fs_*` tools are restricted to it.
+With no permission flags, only the effective cwd is readable and the exposed tools are:
 
-To expose a different workspace:
+```text
+ls
+read
+read_binary
+```
+
+Choose another default cwd with:
 
 ```bash
 abird-tunnel --cwd=/path/to/project
 ```
 
-`--cwd` is optional and defaults to the current working directory from which `abird-tunnel` was invoked.
+## Filesystem permissions
 
-A normal startup stays intentionally small:
+Permissions are additive. `--deny` always takes precedence.
+
+The default is equivalent to:
 
 ```text
-abird-tunnel 0.2.0
-────────────────────────────────────────────────────────
-• Tunnel     tunnel_0123456789abcdef0123456789abcdef
-• Workspace  /home/pvl/src/my-project
-• Bash       enabled
-• Status     connecting…
-
-ChatGPT → Plugins → Tunnel → paste the Tunnel ID above.
-Ctrl-C to stop.
-
-✓ Connected — ready
+--allow-read=<cwd>
 ```
 
-Detailed transport logs are hidden by default.
-
-For a concise live view of what ChatGPT asks the bridge to do:
+Add repeatable grants:
 
 ```bash
-abird-tunnel --verbose
-# or
+abird-tunnel --allow-read=/data/reference
+abird-tunnel --allow-write=/data/output
+abird-tunnel --allow-rw=/src/project
+abird-tunnel --deny=/src/project/secrets
+```
+
+- `--allow-read=DIR`: read DIR.
+- `--allow-write=DIR`: write DIR without granting read.
+- `--allow-rw=DIR`: read + write DIR.
+- `--deny=DIR`: deny DIR even if a broader allow contains it.
+
+Bare:
+
+```bash
+abird-tunnel --allow-write
+```
+
+is shorthand for:
+
+```text
+--allow-rw=<cwd>
+```
+
+while `--allow-write=/some/dir` is genuinely write-only.
+
+Relative tool paths resolve from `--cwd`. Absolute paths are accepted when allowed. Existing targets and ancestors are canonicalized, so symlink escapes cannot bypass the policy.
+
+`edit` and `patch_binary` require both read and write permission. `write` and `write_binary` require write permission only.
+
+## Linux shell sandbox
+
+Enable the shell explicitly:
+
+```bash
+abird-tunnel --allow-shell
+```
+
+On Linux, Bash runs inside **Bubblewrap** by default. The sandbox:
+
+- mounts readable grants read-only;
+- mounts paths with both read + write permission read-write;
+- leaves write-only grants out of the shell unless a read grant overlaps them;
+- masks `--deny` directories;
+- masks the saved tunnel runtime key;
+- uses an empty temporary home;
+- isolates PID, IPC, and UTS namespaces; and
+- **blocks network access by default**.
+
+Allow network inside the sandbox with:
+
+```bash
+abird-tunnel --allow-shell --allow-network
+```
+
+`--allow-network` is only valid for the Linux sandbox.
+
+Bubblewrap cannot safely expose an existing host directory as truly write-only. Use `--allow-rw=DIR` when the shell itself needs writable access to that directory.
+
+## Dangerous unsandboxed access
+
+`--no-sandbox` does not grant shell access by itself.
+
+An unsandboxed shell inherently has host filesystem and network capability, so both acknowledgements are required:
+
+```bash
+abird-tunnel \
+  --allow-shell \
+  --no-sandbox \
+  --allow-rw-all-dangerous \
+  --allow-network-dangereous
+```
+
+`--allow-rw-all-dangerous` also makes the Rust filesystem tools unrestricted. Explicit `--deny` still wins for Rust tools.
+
+An unsandboxed shell cannot enforce `--deny`, so that combination is rejected.
+
+The full shortcut is:
+
+```bash
+abird-tunnel --allow-all-dangerous
+```
+
+which means unrestricted filesystem + network + unsandboxed shell.
+
+On Windows the shell tool is `powershell`, preferring `pwsh.exe` and then `powershell.exe`. Bubblewrap is Linux-only, so Windows shell execution requires the dangerous unsandboxed acknowledgements.
+
+## Binary tools
+
+The text tools stay Pi-like and text-only:
+
+```text
+read
+write
+edit
+ls
+bash / powershell
+```
+
+Binary operations are separate:
+
+```text
+read_binary
+write_binary
+patch_binary
+```
+
+`read_binary` supports:
+
+```text
+format=mcp      typed MCP image/audio/blob content
+format=base64   base64 text
+format=hex      hexadecimal text
+```
+
+`format=mcp` is the default: images become MCP image content, audio becomes MCP audio content, and other binary types become MCP blob resources.
+
+`write_binary` accepts `encoding=base64|hex`.
+
+`patch_binary` replaces a byte range by offset and supports replacement, insertion (`length=0`), and deletion (empty payload + positive `length`).
+
+## Tool surface
+
+Default:
+
+```bash
+abird-tunnel --list-tools
+```
+
+```text
+ls
+read
+read_binary
+```
+
+With any write grant:
+
+```text
+edit
+ls
+patch_binary
+read
+read_binary
+write
+write_binary
+```
+
+With shell enabled, `bash` on Unix or `powershell` on Windows is added.
+
+Examples:
+
+```bash
+abird-tunnel --allow-write --list-tools
+abird-tunnel --allow-shell --list-tools
+abird-tunnel --allow-rw=/src/project --allow-shell --list-tools
+```
+
+## Verbose request logging
+
+```bash
 abird-tunnel -v
+# or
+abird-tunnel --verbose
 ```
 
 Example:
 
 ```text
-→ initialize
-← initialize  200  1ms
-→ tools/list
-← tools/list  200  0ms
-→ tools/call fs_read_text  path="README.md"
-← fs_read_text  200  2ms
-→ tools/call shell_exec  cwd="." command="cargo test"
-← shell_exec  200  842ms
+→ tools/call read  path="README.md"
+← read  200  2ms
+→ tools/call bash  cwd="." command="cargo test"
+← bash  200  842ms
 ```
 
-Verbose mode shows method/tool names and useful small arguments. Bulk
-`content` and `stdin` values are shown only as byte counts. For lower-level
-transport diagnostics, use `RUST_LOG=abird_tunnel=info`.
-
-## Filesystem boundary
-
-The selected workspace is a hard boundary for every `fs_*` tool.
-
-Filesystem tools:
-
-- accept only paths relative to the workspace;
-- reject absolute paths;
-- reject `..` traversal;
-- canonicalize existing paths and ancestors;
-- reject symlink escapes outside the workspace;
-- do not recursively traverse symlinked directories;
-- refuse to delete the workspace root itself; and
-- enforce bounded reads and writes.
-
-For example, if you run:
-
-```bash
-cd ~/src/abird
-abird-tunnel
-```
-
-then `fs_read_text("README.md")` is allowed, while `/etc/passwd`, `../other-project/file`, and a symlink resolving outside `~/src/abird` are rejected.
-
-### Bash is intentionally different
-
-`shell_exec` starts in the selected workspace (or a relative subdirectory supplied to the tool), but Bash is not an OS sandbox. A command can deliberately use absolute paths, `cd ..`, spawn other programs, access the network, and otherwise exercise the permissions of the Unix user running `abird-tunnel`.
-
-If you want a hard boundary for shell commands too, run `abird-tunnel` inside a dedicated user, container, VM, namespace, or another operating-system sandbox.
+Bulk `content` and `stdin` are logged only as byte counts.
 
 ## First-run OpenAI setup
 
-Setup is designed to be a short one-time checklist:
+Setup asks for:
 
-```text
-abird-tunnel setup
-────────────────────────────────────────────────────────
-1. Create a Runtime API key
-   • Permissions: Tunnels Read + Use
-   • https://platform.openai.com/settings/organization/api-keys
-   Paste key:
+1. a restricted Runtime API key with **Tunnels Read + Use**;
+2. an existing tunnel ID, or a one-time Admin key with **Tunnels Manage** to create one;
+3. a ChatGPT Workspace ID or OpenAI Organization ID when creating a tunnel.
 
-2. Choose a tunnel
-   • Paste an existing Tunnel ID, or press Enter to create one.
-   Tunnel ID [create new]:
-```
+Useful links:
 
-If you create a new tunnel, setup adds only two more short steps:
+- Runtime API keys: https://platform.openai.com/settings/organization/api-keys
+- Admin keys: https://platform.openai.com/settings/organization/admin-keys
+- ChatGPT Workspace ID: https://chatgpt.com/admin
+- OpenAI Organization ID: https://platform.openai.com/settings/organization/general
 
-- create an **Admin API key** with **Tunnels Manage**;
-- choose a ChatGPT workspace ID, or use your OpenAI organization ID.
+The Admin key is used once, never saved, and can be deleted after setup.
 
-ID locations:
+## Build
 
-- **ChatGPT Workspace ID:** https://chatgpt.com/admin — select the workspace,
-  open its settings, and copy the Workspace ID/UUID.
-- **OpenAI Organization ID:** https://platform.openai.com/settings/organization/general
-  — copy the `org-...` identifier.
-
-The Admin key is used exactly once, is **never saved**, and can be deleted as
-soon as setup finishes. The restricted Runtime key is saved separately with
-user-only permissions on Unix and is reused on future launches.
-
-A fresh tunnel can take a short moment to activate; `abird-tunnel` handles
-that automatically.
-
-OpenAI documentation:
-
-- Secure MCP Tunnel: https://developers.openai.com/api/docs/guides/secure-mcp-tunnels
-- Connect/test plugins: https://developers.openai.com/plugins/deploy/connect-chatgpt
-- Package plugins: https://developers.openai.com/plugins/build/plugins
-
-## Connect it to ChatGPT
-
-Once `abird-tunnel` prints its Tunnel ID:
-
-1. In ChatGPT, enable **Settings → Security and login → Developer mode**.
-2. Open **Plugins**, select **+** and create a developer-mode connection.
-3. Use a name such as **Abird Tunnel**.
-4. Under **Connection**, choose **Tunnel**.
-5. Select the tunnel or paste the printed `tunnel_...` ID.
-6. Create the connection and verify the discovered MCP tools.
-7. Copy the connection's technical ID from its ChatGPT browser URL. It begins with `plugin_asdk_app...`.
-8. Give that technical ID to Plugin Creator using the ready prompt in [`prompts/PLUGIN_CREATOR.md`](prompts/PLUGIN_CREATOR.md).
-
-See [`docs/CHATGPT_PLUGIN.md`](docs/CHATGPT_PLUGIN.md) for the complete flow and the exact information you need to provide.
-
-## Building
-
-### Nix — recommended
-
-The flake is a complete build/run/test interface:
+Nix is the recommended Linux path:
 
 ```bash
-nix build                 # build ./result/bin/abird-tunnel
-nix run .                 # run abird-tunnel
-nix run . -- --setup      # pass CLI arguments
-nix flake check           # build + tests + rustfmt + clippy -D warnings
-nix develop               # Rust development shell
+nix build
+nix run .
+nix flake check
+nix develop
 ```
 
-The checked-in `flake.lock` pins Nixpkgs so CI and local builds use the same
-toolchain. The package build itself runs `cargo test --all-features`.
+The Linux Nix package includes Bubblewrap and Bash in the runtime wrapper.
 
-Inside `nix develop`, the equivalent direct Rust checks are:
+Inside `nix develop`:
 
 ```bash
 cargo fmt --check
@@ -212,134 +265,56 @@ cargo test --all-features
 cargo build --release --all-features
 ```
 
-### Cargo
+Cargo install also works; install `bubblewrap` separately on Linux if you want `--allow-shell`.
 
-Rust 1.98.1 is pinned by `rust-toolchain.toml`:
+## CLI summary
 
-```bash
-cargo build --release
-cargo install --path .
+```text
 abird-tunnel
+    read-only cwd
+
+--allow-read=<DIR>          add read
+--allow-write=<DIR>         add write-only
+--allow-rw=<DIR>            add read+write
+--allow-write               shorthand: rw cwd
+--deny=<DIR>                deny; always wins
+
+--allow-shell               add platform shell
+--allow-network             network inside Linux sandbox
+--no-sandbox                disable Bubblewrap only
+
+--allow-rw-all-dangerous    unrestricted Rust filesystem tools
+--allow-network-dangereous   acknowledge unsandboxed network
+                             corrected alias: --allow-network-dangerous
+--allow-all-dangerous       unrestricted rw + network + unsandboxed shell
+
+--cwd=<DIR>                 default cwd
+--list-tools                show exposed tools
+-v, --verbose               concise tool logs
+--setup                     redo tunnel setup
+--print-id                  print Tunnel ID
 ```
 
 ## Persistent state
-
-By default on Linux/macOS:
 
 ```text
 ~/.config/abird-tunnel/config.toml
 ~/.config/abird-tunnel/runtime.key
 ```
 
-`config.toml` contains non-secret tunnel/client settings. It does **not** store a workspace path: the filesystem workspace is selected afresh from the process working directory on every run.
+Filesystem grants are selected fresh on every launch. The runtime key is mode `0600` on Unix and its parent directory is `0700`. Rust filesystem tools reject that credential path, and the Linux sandbox masks it.
 
-`runtime.key` contains the restricted tunnel runtime key and is mode `0600` on Unix; its directory is mode `0700`. The normal `fs_*` tools explicitly protect that credential path if the selected workspace happens to contain it. Bash remains full-user-power.
+## Connect to ChatGPT
 
-Set `ABIRD_TUNNEL_CONFIG` to move the config file; `runtime.key` is stored alongside it.
+After `abird-tunnel` prints the `tunnel_...` ID:
 
-## Environment-only mode
+1. enable ChatGPT Developer mode;
+2. create a Plugin developer connection using **Tunnel**;
+3. paste the tunnel ID;
+4. copy the resulting `plugin_asdk_app...` connection ID;
+5. use `prompts/PLUGIN_CREATOR.md` to create the private plugin package.
 
-For unattended use, persisted config is optional:
-
-```bash
-export CONTROL_PLANE_TUNNEL_ID='tunnel_0123456789abcdef0123456789abcdef'
-export CONTROL_PLANE_API_KEY='...'
-cd /path/to/workspace
-abird-tunnel
-```
-
-Recognized aliases include:
-
-```text
-ABIRD_TUNNEL_ID
-ABIRD_TUNNEL_API_KEY
-ABIRD_TUNNEL_ALLOW_SHELL
-ABIRD_TUNNEL_SHELL
-ABIRD_TUNNEL_ORGANIZATION_ID
-ABIRD_TUNNEL_BASE_URL
-CONTROL_PLANE_TUNNEL_ID
-CONTROL_PLANE_API_KEY
-CONTROL_PLANE_ORGANIZATION_ID
-CONTROL_PLANE_BASE_URL
-OPENAI_ORGANIZATION
-```
-
-Known tunnel/OpenAI credential variables are removed from the environment inherited by `shell_exec`.
-
-## CLI
-
-```text
-abird-tunnel                     start everything; workspace = current directory
-abird-tunnel --cwd=<DIR>         use DIR as the filesystem workspace
-abird-tunnel --setup             redo first-run tunnel setup
-abird-tunnel --print-id          print the configured Tunnel ID and exit
-abird-tunnel --list-tools        list every exposed MCP tool and exit
-abird-tunnel -v                  show concise incoming requests/tool calls
-abird-tunnel --verbose           same as -v
-abird-tunnel --no-shell          disable shell_exec for this run
-```
-
-Flags can be combined, for example:
-
-```bash
-abird-tunnel --cwd=~/src/abird --no-shell
-```
-
-## MCP tools
-
-List the live tool set directly from the MCP router:
-
-```bash
-abird-tunnel --list-tools
-```
-
-| Tool | Purpose | Mutates? |
-|---|---|---:|
-| `machine_info` | Show the workspace boundary, platform, and execution policy | No |
-| `fs_list` | List files/directories inside the workspace | No |
-| `fs_stat` | Inspect a path inside the workspace | No |
-| `fs_read_text` | Read a bounded UTF-8 text file inside the workspace | No |
-| `fs_write_text` | Create/overwrite/append a bounded text file inside the workspace | Yes |
-| `fs_mkdir` | Create a directory inside the workspace | Yes |
-| `fs_remove` | Remove a file/directory inside the workspace | Yes |
-| `shell_exec` | Run `bash --noprofile --norc -lc ...` starting inside the workspace | Potentially anything |
-
-Default limits:
-
-```text
-shell timeout       120 seconds maximum (30 seconds default per call)
-stdout              1 MiB retained
-stderr              1 MiB retained
-text read            4 MiB
-text write           4 MiB
-concurrent commands  8
-```
-
-## Native tunnel implementation
-
-`src/tunnel.rs` implements the Secure MCP Tunnel client contract, including:
-
-- `GET /v1/tunnels/{tunnel_id}/poll`;
-- `POST /v1/tunnels/{tunnel_id}/response`;
-- Bearer runtime authentication;
-- opaque request/shard identifiers;
-- JSON-RPC and notification handling;
-- bounded concurrent command execution;
-- response deadlines;
-- bounded retry/backoff behavior;
-- protocol-relevant MCP header filtering; and
-- MCP JSON/SSE response handling.
-
-Use one active `abird-tunnel` process per Tunnel ID.
-
-## Development checks
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build --release
-```
+See `docs/CHATGPT_PLUGIN.md` for the companion flow.
 
 ## License
 

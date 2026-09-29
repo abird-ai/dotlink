@@ -2,65 +2,97 @@
 
 This is the companion setup for the local `abird-tunnel` binary.
 
-## 1. Start the local workspace bridge
+## 1. Start the bridge
 
-Run it from the project you want ChatGPT to see:
+Read-only cwd:
 
 ```bash
 cd ~/src/my-project
 abird-tunnel
 ```
 
-or explicitly choose a directory:
+Read/write cwd:
 
 ```bash
-abird-tunnel --cwd=~/src/my-project
+abird-tunnel --allow-write
 ```
+
+Linux sandboxed Bash, project rw, network blocked:
+
+```bash
+abird-tunnel --allow-write --allow-shell
+```
+
+Add network when needed:
+
+```bash
+abird-tunnel --allow-write --allow-shell --allow-network
+```
+
+Additional paths can be granted with repeatable `--allow-read=DIR`, `--allow-write=DIR`, and `--allow-rw=DIR` flags. `--deny=DIR` always takes precedence.
 
 Copy the printed `tunnel_...` ID.
 
-Do not give ChatGPT Plugin Creator the runtime API key or Admin API key.
+Do not give Plugin Creator the Runtime API key or Admin API key.
 
-## 2. Register the tunnel connection in ChatGPT
+## 2. Register the tunnel in ChatGPT
 
 In ChatGPT:
 
 1. Open **Settings → Security and login**.
 2. Enable **Developer mode**.
 3. Open **Plugins** and select **+**.
-4. Create a new developer-mode connection with:
+4. Create a developer connection:
    - Name: `Abird Tunnel`
-   - Description: `Secure access to the local workspace exposed by abird-tunnel, with bounded filesystem tools and an explicit Bash shell.`
    - Connection: **Tunnel**
-   - Tunnel ID: the `tunnel_...` value printed by the binary.
+   - Tunnel ID: the printed `tunnel_...` value.
 5. Create the connection.
-6. Review that these tools are discovered:
-   - `machine_info`
-   - `fs_list`
-   - `fs_stat`
-   - `fs_read_text`
-   - `fs_write_text`
-   - `fs_mkdir`
-   - `fs_remove`
-   - `shell_exec`
+6. Review the discovered tools.
 
-The connection is the bridge between the installed plugin and whichever local `abird-tunnel` process is currently running for that tunnel.
+The tool list depends on how the local process was launched.
+
+Default:
+
+```text
+ls
+read
+read_binary
+```
+
+With write permission:
+
+```text
+edit
+ls
+patch_binary
+read
+read_binary
+write
+write_binary
+```
+
+With shell enabled, `bash` on Unix or `powershell` on Windows is added.
+
+You can always inspect the exact local surface first:
+
+```bash
+abird-tunnel --list-tools
+abird-tunnel --allow-write --allow-shell --list-tools
+```
 
 ## 3. Copy the registered connection ID
 
-After ChatGPT creates the connection, copy its technical ID from the browser URL. It starts with:
+After ChatGPT creates the connection, copy the technical ID from the browser URL:
 
 ```text
 plugin_asdk_app...
 ```
 
-This is the only generated identifier Plugin Creator needs.
+This is not the `tunnel_...` ID.
 
-It is **not** the same thing as the `tunnel_...` ID.
+## 4. Create the plugin
 
-## 4. Create the plugin with Plugin Creator
-
-Open Plugin Creator and paste the prompt in:
+Use:
 
 ```text
 prompts/PLUGIN_CREATOR.md
@@ -72,38 +104,29 @@ Replace:
 <PLUGIN_ASDK_APP_ID>
 ```
 
-with the `plugin_asdk_app...` ID from step 3.
+with the `plugin_asdk_app...` ID.
 
-The prompt asks Plugin Creator to wire the plugin through the registered MCP connection in `.app.json`. It intentionally does not ask for a public MCP URL or a portable `mcp.json`, because this development/private connection is tunnel-backed and already registered in ChatGPT.
+The prompt wires the private plugin to the already registered tunnel connection and teaches the agent that the local tool surface is permission-dependent.
 
-## Information you need to provide
+## Information you need
 
-Required for the private/local version:
+For local/private use:
 
-- the `tunnel_...` ID printed by `abird-tunnel` when registering the connection;
-- the resulting `plugin_asdk_app...` technical connection ID when running Plugin Creator.
+- printed `tunnel_...` ID;
+- resulting `plugin_asdk_app...` connection ID.
 
-Optional metadata you may want to customize later:
+Do not provide Plugin Creator with:
 
-- developer/publisher display name;
-- plugin icon/logo;
-- website URL;
-- privacy-policy URL;
-- terms-of-service URL;
-- different default prompts or skill behavior.
+- Runtime API key;
+- one-time Admin API key;
+- local credentials;
+- public MCP URL.
 
-You do **not** need to provide Plugin Creator with:
+Filesystem permissions and sandbox/network policy are selected locally each time `abird-tunnel` starts.
 
-- the restricted runtime API key;
-- the one-time Admin API key;
-- your local filesystem path;
-- an externally reachable MCP URL.
+## Distribution
 
-The workspace path comes dynamically from each invocation of `abird-tunnel`.
-
-## Private testing vs public distribution
-
-Secure MCP Tunnel is intended for private/developer access to MCP servers that are not publicly reachable. Current OpenAI plugin documentation distinguishes that from public plugin submission: a publicly distributed plugin with MCP still requires a public HTTPS MCP endpoint. Therefore this tunnel-backed package should be treated as a private/development plugin unless OpenAI's distribution requirements change.
+Secure MCP Tunnel is a private/developer connection path. Public plugin distribution may require a publicly reachable HTTPS MCP endpoint under current OpenAI distribution requirements.
 
 References:
 

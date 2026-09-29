@@ -960,16 +960,15 @@ mod tests {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "fs_write_text",
+                "name": "write",
                 "arguments": {
                     "path": "src/main.rs",
-                    "content": "secret-ish payload",
-                    "create_parents": true
+                    "content": "secret-ish payload"
                 }
             }
         });
         let summary = verbose_request_summary(&request);
-        assert!(summary.contains("tools/call fs_write_text"));
+        assert!(summary.contains("tools/call write"));
         assert!(summary.contains("path=\"src/main.rs\""));
         assert!(summary.contains("content=<18 bytes>"));
         assert!(!summary.contains("secret-ish payload"));

@@ -2,47 +2,160 @@
 
 ## One process
 
-`abird-tunnel` combines three layers in one Tokio process:
+`abird-tunnel` combines setup, policy enforcement, the MCP server, and the Secure MCP Tunnel client in one Tokio process.
 
 ```text
-┌───────────────────────────────────────────────────────────┐
-│ abird-tunnel                                              │
-│                                                           │
-│  setup/config                                             │
-│      │                                                    │
-│      ├──────────────┐                                     │
-│      ▼              ▼                                     │
-│  tunnel client   LocalMachine                             │
-│      │              │                                     │
-│      │         rmcp tool router                           │
-│      │              │                                     │
-│      └──────► EmbeddedMcp                                 │
-│              StreamableHttpService                        │
-│              (in memory; no listener)                     │
-└─────────────┬─────────────────────────────────────────────┘
-              │
-              │ HTTPS
-              ▼
-      OpenAI Secure MCP Tunnel
+┌──────────────────────────────────────────────────────────────┐
+│ abird-tunnel                                                 │
+│                                                              │
+│ setup/config                                                 │
+│      │                                                       │
+│      ├──────────────┐                                        │
+│      ▼              ▼                                        │
+│ tunnel client   LocalMachine                                 │
+│      │          ├── access policy                            │
+│      │          ├── rmcp tool router                         │
+│      │          └── Bubblewrap shell launcher (Linux)        │
+│      │                                                       │
+│      └──────────► EmbeddedMcp StreamableHttpService          │
+│                  (in memory; no listening socket)            │
+└──────────────┬───────────────────────────────────────────────┘
+               │ outbound HTTPS
+               ▼
+       OpenAI Secure MCP Tunnel
 ```
 
-`src/tunnel.rs` turns each polled tunnel command into an in-memory HTTP request accepted by `rmcp::StreamableHttpService`. This deliberately reuses the official Rust MCP SDK's JSON-RPC/MCP behavior rather than reimplementing MCP method dispatch ourselves.
+`src/tunnel.rs` converts each polled tunnel command into an in-memory request accepted by `rmcp::StreamableHttpService`.
 
 ## Startup
 
-1. Read environment configuration, or the saved config + runtime credential.
-2. If neither exists, run interactive bootstrap.
-3. Capture `--cwd`, or the process launch directory when the flag is absent, and canonicalize it as the filesystem workspace boundary.
-4. Instantiate `LocalMachine` with that workspace and the filesystem/shell policy.
-5. Instantiate a stateless `rmcp` Streamable HTTP service without binding a socket.
-6. Begin Secure MCP Tunnel long-polling.
-7. Print ready after the first successful control-plane poll.
+1. Parse permission and capability flags.
+2. Canonicalize `--cwd` and all allow/deny directories.
+3. Add the implicit default read grant for cwd.
+4. Resolve additive read/write/rw grants and deny rules.
+5. Validate shell/sandbox/network policy.
+6. Load tunnel configuration and the restricted Runtime key.
+7. Construct the policy-aware `LocalMachine` MCP server.
+8. Start Secure MCP Tunnel polling.
+9. Print ready after the first successful poll.
 
-## First-run bootstrap
+## Permission model
 
-If no Tunnel ID exists, setup can create one with `POST /v1/tunnels` using a one-time Admin key. The Admin key lives only in a `Zeroizing<String>` during setup and is not persisted.
+The access policy contains:
 
-The runtime key is saved separately from ordinary configuration.
+```text
+cwd
+read_roots[]
+write_roots[]
+deny_roots[]
+rw_all_dangerous
+```
+
+Access checks are capability-based rather than tied to one root.
+
+For a path:
+
+- deny match → reject;
+- read succeeds if any read root contains the canonical path;
+- write succeeds if any write root contains the canonical path;
+- read+write operations require both.
+
+`--allow-rw=DIR` simply inserts DIR into both root sets.
+
+The effective cwd is always inserted into `read_roots` unless a deny overrides it.
+
+Bare `--allow-write` inserts cwd into `write_roots`, producing rw cwd because cwd was already readable.
+
+Existing paths are canonicalized before policy checks. Create targets canonicalize their nearest existing ancestor and check the resulting path before mutation.
+
+## Dynamic MCP router
+
+The static Rust implementation defines:
+
+```text
+read
+write
+edit
+ls
+read_binary
+write_binary
+patch_binary
+bash
+powershell
+```
+
+The server builds a policy-specific router at runtime.
+
+Default visible surface:
+
+```text
+ls
+read
+read_binary
+```
+
+Mutation tools are hidden unless at least one write capability exists.
+
+Shell tools are hidden unless shell execution is enabled. Only `bash` is exposed on Unix and only `powershell` on Windows.
+
+Hidden tools are absent from `tools/list` and rejected as unknown if called directly.
+
+## Bubblewrap translation
+
+On Linux, when shell is enabled without `--no-sandbox`, filesystem policy is translated to Bubblewrap mounts.
+
+For each distinct grant path, effective read/write capability is computed from all overlapping grants:
+
+- readable + not writable → `--ro-bind`;
+- readable + writable → `--bind`;
+- write-only → not mounted into the shell.
+
+Mounts are applied from shallow paths to deeper paths, allowing a more specific nested grant to override a broader parent mount.
+
+Denied directories are masked after allow mounts with an empty mode-000 tmpfs.
+
+The tunnel runtime key is masked separately.
+
+Bubblewrap uses a temporary home and temp directory plus read-only system runtime mounts.
+
+## Network isolation
+
+Sandboxed shell starts with `--unshare-net`.
+
+`--allow-network` removes that isolation and mounts minimal network-related system files such as resolver/certificate paths when present.
+
+Network permission affects only the shell child. The main abird-tunnel process always needs outbound HTTPS to the OpenAI tunnel service.
+
+## Unsandboxed shell
+
+An unsandboxed shell cannot be constrained by Rust path checks after execution begins.
+
+Therefore unsandboxed shell is enabled only when the user explicitly combines:
+
+```text
+--allow-shell
+--no-sandbox
+--allow-rw-all-dangerous
+--allow-network-dangereous
+```
+
+`--allow-all-dangerous` is the shortcut for that full capability set.
+
+Because deny rules cannot be enforced against an unsandboxed process, startup rejects unsandboxed shell + `--deny`.
+
+## Binary transport
+
+`read_binary(format=mcp)` maps bytes into typed MCP content:
+
+- image MIME → `ContentBlock::image`;
+- audio MIME → `ContentBlock::audio`;
+- other MIME → embedded `BlobResourceContents`.
+
+`base64` and `hex` modes return encoded text for byte-level work.
+
+`write_binary` decodes base64/hex to bytes.
+
+`patch_binary` loads a bounded file, replaces the requested byte range, then writes it back.
 
 ## Tunnel lifecycle
 
@@ -52,17 +165,6 @@ The client polls:
 GET /v1/tunnels/{id}/poll?limit=25&timeout_ms=15000
 ```
 
-A `204` is an empty successful poll. A `200` contains a command batch. The receipt time is captured immediately after response headers arrive and is used as the origin for `response_timeout` enforcement.
-
-Known command types:
-
-```text
-jsonrpc
-session_termination
-```
-
-Unknown types are logged and ignored rather than guessed from payload shape.
-
 Results are posted to:
 
 ```text
@@ -70,40 +172,6 @@ POST /v1/tunnels/{id}/response
 X-Tunnel-Shard-Token: <opaque token>
 ```
 
-The shard token is never put in the JSON body.
+A Tokio semaphore limits concurrent commands. Tunnel response deadlines cover local MCP execution and response delivery.
 
-## MCP dispatch
-
-For each `jsonrpc` command the adapter builds an in-memory POST request with:
-
-```text
-Content-Type: application/json
-Accept: application/json, text/event-stream
-Host: localhost
-```
-
-Only MCP protocol headers are copied from the control-plane command.
-
-`rmcp` returns either ordinary JSON or an SSE stream. Ordinary request/response tools use JSON because the embedded server is configured with `json_response=true`; SSE is parsed as a compatibility path for intermediate MCP notifications.
-
-## Statelessness
-
-The main channel uses `rmcp` stateless Streamable HTTP semantics and advertises that it accepts self-contained MCP `2026-07-28` requests. It also advertises process affinity because the local-machine binding itself is process/machine local.
-
-The implementation intentionally does not advertise `wrong-cluster-v1` until that optional correction protocol is actually implemented.
-
-## Backpressure
-
-The tunnel can return up to 25 commands per poll, but that is not the execution concurrency. A Tokio semaphore caps actual work at eight simultaneous commands. Polling naturally backpressures when all permits are occupied.
-
-## Deadlines
-
-A valid tunnel `response_timeout` is parsed using the documented integer + unit grammar (`ns`, `us`, `ms`, `s`, `m`, `h`). Malformed/unknown/overflowing values fail open to legacy no-deadline behavior. Valid zero means immediate expiry.
-
-The deadline spans local MCP work and the response POST. Late commands/results are dropped rather than synthesizing a late reply.
-
-## Retry policy
-
-Polls retry transient network failures, `408`, `429`, and server errors with bounded exponential backoff and jitter. `401`/`403` are fatal configuration/authentication failures.
-
-Terminal response delivery retries transport failures plus the tunnel contract's transient HTTP statuses. Intermediate notifications are best-effort and are not blindly replayed.
+Polling and terminal response delivery use bounded retry/backoff for transient failures. Authentication/configuration failures remain fatal.

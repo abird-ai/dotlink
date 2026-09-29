@@ -1,19 +1,22 @@
 [package]
 name = "abird-tunnel"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "One-command native Rust Secure MCP Tunnel exposing a local filesystem and Bash shell to ChatGPT."
+description = "One-command native Rust Secure MCP Tunnel for permission-scoped local files and optional shell access."
 license = "MIT"
 publish = false
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 fastrand = "2"
+hex = "0.4"
 hostname = "0.4"
 http = "1"
 http-body-util = "0.1"
+mime_guess = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "3", features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
 rpassword = "7"

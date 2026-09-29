@@ -1,90 +1,172 @@
 # Security model
 
-`abird-tunnel` is a remote-administration bridge by design. If Bash is enabled, a model action approved through the connected ChatGPT surface can execute commands with the permissions of the OS user running the process.
+`abird-tunnel` is least-privilege by default.
 
-That is substantially more authority than a normal read-only MCP connector.
-
-## Trust boundaries
-
-### No inbound listener
-
-`abird-tunnel` opens outbound HTTPS requests to the OpenAI tunnel control plane. It does not bind a local/public MCP port.
-
-### Filesystem tools are rooted
-
-The `fs_*` tools operate below one workspace root selected for each process. By default this is the directory from which `abird-tunnel` is launched; `--cwd=<dir>` overrides it. They:
-
-- reject absolute paths;
-- reject `..` traversal;
-- canonicalize existing targets;
-- validate existing ancestors before creates;
-- do not recursively follow directory symlinks;
-- handle final symlinks safely for stat/remove operations;
-- enforce bounded read/write sizes; and
-- deny the saved tunnel runtime credential path.
-
-### Bash is intentionally not rooted
-
-`shell_exec` executes:
+With no permission flags it exposes only:
 
 ```text
-bash --noprofile --norc -lc <command>
+ls
+read
+read_binary
 ```
 
-with the OS identity of `abird-tunnel`. Its working directory must start inside the selected workspace, but the command can use absolute paths, spawn other programs, access the network, and modify anything the account can modify.
+and only the effective cwd is readable.
 
-This means the selected `--cwd` workspace is **not a security boundary for Bash**.
+## Filesystem grants
 
-Known OpenAI/tunnel credential environment variables are removed from shell child processes. This reduces accidental disclosure, but it does not create a security boundary against arbitrary code running as the same OS user.
+Filesystem permissions are selected on every launch.
 
-If you need a real privilege boundary, run `abird-tunnel` under a dedicated OS user, VM, container, or sandbox whose filesystem/network permissions are exactly what you intend to expose.
+```text
+--allow-read=DIR
+--allow-write=DIR
+--allow-rw=DIR
+--deny=DIR
+```
+
+Rules are additive. `--deny` always takes precedence.
+
+The effective cwd is read-enabled by default. Bare `--allow-write` is shorthand for rw on cwd.
+
+Rust filesystem tools canonicalize existing targets and ancestors before access checks. Symlink escapes therefore do not bypass the grant policy.
+
+Text and binary mutations use the same checks:
+
+- `write` / `write_binary` require write permission;
+- `edit` / `patch_binary` require read + write permission;
+- `read` / `read_binary` / `ls` require read permission.
+
+The saved tunnel runtime credential is separately protected even if a broad read grant would otherwise contain it.
+
+## Linux Bubblewrap shell
+
+`--allow-shell` enables Bash on Unix. On Linux it runs inside Bubblewrap unless unsandboxed dangerous access was explicitly requested.
+
+The sandbox:
+
+- mounts readable grants read-only;
+- mounts paths with effective read + write permission read-write;
+- does not mount a purely write-only grant;
+- masks denied directories;
+- masks the saved tunnel runtime key;
+- uses an empty temporary home;
+- mounts system runtime paths read-only;
+- isolates PID, IPC, and UTS namespaces; and
+- unshares the network namespace by default.
+
+Network is restored only with:
+
+```text
+--allow-network
+```
+
+Write-only host directories are intentionally not presented to Bash because Bubblewrap cannot safely make an existing directory writable while preventing reads. Use `--allow-rw=DIR` if shell access to that directory is required.
+
+## Dangerous unsandboxed shell
+
+`--no-sandbox` alone does not enable shell access.
+
+An unsandboxed shell inherits the OS user's real host authority. Because the program cannot reliably restrict that process after removing the OS sandbox, both acknowledgements are required:
+
+```text
+--allow-rw-all-dangerous
+--allow-network-dangereous
+```
+
+plus `--allow-shell --no-sandbox`.
+
+The shortcut:
+
+```text
+--allow-all-dangerous
+```
+
+enables unrestricted filesystem tools, network, and unsandboxed shell access.
+
+A Rust-tool `--deny` can still override `--allow-rw-all-dangerous`. However, deny rules cannot constrain an unsandboxed shell. Therefore abird-tunnel refuses to start an unsandboxed shell when any `--deny` rule is present.
+
+## Windows
+
+The Windows shell tool is `powershell`, preferring `pwsh.exe` and falling back to `powershell.exe`.
+
+Bubblewrap is Linux-only, so Windows shell execution currently follows the unsandboxed-dangerous requirements above.
+
+Filesystem tools still enforce allow/deny policy in Rust.
+
+## Network
+
+The tunnel itself always needs outbound HTTPS to the OpenAI control plane.
+
+That tunnel process is separate from shell network permissions.
+
+Inside the Linux Bubblewrap child:
+
+- default: no network namespace access;
+- `--allow-network`: host network namespace retained.
+
+Outside the sandbox, network cannot be meaningfully blocked by abird-tunnel; that is why unsandboxed shell requires `--allow-network-dangereous`. The corrected spelling `--allow-network-dangerous` is accepted as an alias.
 
 ## Credentials
 
-There are two different credentials in first-run setup:
+First-run setup uses two credentials:
 
-1. **Runtime key** — should have only Tunnels Read + Use. This is needed every time the tunnel runs.
-2. **Admin key** — needs tunnel management permission and is used only if `abird-tunnel` creates the tunnel for you.
+1. **Runtime key** — narrowly scoped to Tunnels Read + Use and needed while running.
+2. **Admin key** — used only to create a tunnel and never persisted.
 
-The Admin key is never written to disk.
-
-The restricted runtime key is stored separately at:
+The Runtime key is stored at:
 
 ```text
 ~/.config/abird-tunnel/runtime.key
 ```
 
-with mode `0600` on Unix; its parent directory is mode `0700`. The non-secret config is stored in `config.toml` next to it.
+On Unix the file is mode `0600` and its directory is `0700`.
 
-The normal filesystem MCP tools explicitly reject the runtime credential path. A fully privileged Bash process running as the same user can still access same-user files. Therefore the runtime credential must remain narrowly scoped and must never be an Admin key.
+Known OpenAI/tunnel credential environment variables are removed from child shell environments.
 
-## Tunnel request filtering
+## Binary data
 
-The control plane can supply MCP request headers. `abird-tunnel` forwards only the headers needed by MCP protocol handling:
+`read_binary` can return MCP image/audio/blob content or explicit base64/hex. Read limits still apply.
 
-- `Mcp-Session-Id`
-- `Mcp-Protocol-Version`
-- `Mcp-Method`
-- `Mcp-Name`
-- `Mcp-Param-*`
-- `Last-Event-ID`
+`write_binary` and `patch_binary` enforce write limits. `patch_binary` additionally caps the total file size it will patch in memory.
 
-It does not forward OpenAI internal routing/authentication headers to the local MCP handler.
+## Tunnel boundary
 
-On the response path it returns only protocol-relevant headers documented by the tunnel contract.
+The local process does not listen on a TCP port. It uses outbound HTTPS to OpenAI's Secure MCP Tunnel.
+
+Control-plane request headers are filtered before MCP dispatch. Only MCP protocol headers are forwarded to the local service.
 
 ## Resource limits
 
-The tunnel queue is bounded to eight concurrently executing commands. Shell stdout/stderr are drained without unbounded accumulation. File reads/writes and command output are bounded. Shell commands have a configurable maximum timeout and are killed on timeout/drop.
+- tunnel execution concurrency is bounded;
+- shell stdout/stderr are continuously drained with bounded retained output;
+- text and binary reads/writes are bounded;
+- shell commands have a timeout and are terminated on timeout/drop.
 
-These are guardrails, not a sandbox. A shell command can intentionally consume CPU, memory, disk, processes, or network resources available to the OS account.
+These limits reduce accidental resource exhaustion but are not a substitute for the Bubblewrap or OS security boundary.
 
-## Symlinks
+## Recommended modes
 
-Filesystem read/write/create operations verify canonical targets/ancestors remain under the selected workspace. Removal and stat of a final symlink operate on the link itself rather than following it to its target. Recursive listing does not traverse symlinked directories.
+Safest ordinary mode:
 
-## Recommended deployment
+```bash
+abird-tunnel
+```
 
-For a personal workstation, use a dedicated restricted runtime key and keep ChatGPT tool approvals enabled for destructive/open-world actions.
+Writable project:
 
-For stronger separation, run `abird-tunnel` under a dedicated user or container with only the directories and commands you want exposed. Do not run it as root.
+```bash
+abird-tunnel --allow-write
+```
+
+Sandboxed build/test shell with project writes but no network:
+
+```bash
+abird-tunnel --allow-write --allow-shell
+```
+
+Sandboxed shell with network:
+
+```bash
+abird-tunnel --allow-write --allow-shell --allow-network
+```
+
+Avoid `--allow-all-dangerous` unless unrestricted host access is explicitly intended. Never run abird-tunnel as root.

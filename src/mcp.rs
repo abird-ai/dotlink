@@ -1,29 +1,44 @@
 use std::{
+    collections::BTreeSet,
+    env,
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     ErrorData as McpError,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResult, ContentBlock, ResourceContents},
     schemars, tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
     time::timeout,
 };
 
+const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct AccessSpec {
+    pub cwd: PathBuf,
+    pub read_roots: Vec<PathBuf>,
+    pub write_roots: Vec<PathBuf>,
+    pub deny_roots: Vec<PathBuf>,
+    pub rw_all_dangerous: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct MachineConfig {
-    pub workspace_root: PathBuf,
+    pub access: AccessSpec,
     pub allow_shell: bool,
-    pub shell: String,
+    pub sandbox_shell: bool,
+    pub allow_network: bool,
     pub max_shell_timeout_secs: u64,
     pub max_output_bytes: usize,
     pub max_read_bytes: usize,
@@ -32,19 +47,44 @@ pub struct MachineConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct LocalMachine {
-    config: MachineConfig,
+struct AccessPolicy {
+    cwd: PathBuf,
+    read_roots: Vec<PathBuf>,
+    write_roots: Vec<PathBuf>,
+    deny_roots: Vec<PathBuf>,
+    rw_all_dangerous: bool,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct PathArgs {
-    /// Path relative to the workspace root selected by --cwd. Use "." for the workspace itself.
-    path: String,
+#[derive(Clone, Debug)]
+struct RuntimeConfig {
+    access: AccessPolicy,
+    allow_shell: bool,
+    sandbox_shell: bool,
+    allow_network: bool,
+    shell_program: Option<PathBuf>,
+    bwrap_program: Option<PathBuf>,
+    max_shell_timeout_secs: u64,
+    max_output_bytes: usize,
+    max_read_bytes: usize,
+    max_write_bytes: usize,
+    protected_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalMachine {
+    config: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AccessNeed {
+    Read,
+    Write,
+    ReadWrite,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListArgs {
-    /// Directory path relative to the workspace root selected by --cwd. Defaults to ".".
+    /// Directory path. Relative paths resolve from --cwd; absolute paths are allowed only when permitted.
     #[serde(default = "dot")]
     path: String,
 
@@ -58,66 +98,119 @@ struct ListArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ReadTextArgs {
-    /// UTF-8 text file path relative to the workspace root selected by --cwd.
+struct ReadArgs {
+    /// UTF-8 text file path. Relative paths resolve from --cwd.
     path: String,
 
-    /// Optional per-call byte limit, capped by the server's configured maximum.
+    /// First 1-based line to return. Defaults to 1.
     #[serde(default)]
-    max_bytes: Option<usize>,
+    offset: Option<usize>,
+
+    /// Maximum number of lines to return. Omit to return all remaining lines.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct WriteTextArgs {
-    /// File path relative to the workspace root selected by --cwd.
+struct WriteArgs {
+    /// File path. Relative paths resolve from --cwd.
     path: String,
 
-    /// UTF-8 content to write.
+    /// UTF-8 content. Missing parent directories are created automatically.
     content: String,
+}
 
-    /// Create missing parent directories before writing.
-    #[serde(default)]
-    create_parents: bool,
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EditArgs {
+    /// Existing UTF-8 text file path.
+    path: String,
 
-    /// Write mode. "overwrite" replaces/truncates; "append" appends or creates.
+    /// Exact text to find.
+    old_text: String,
+
+    /// Replacement text. May be empty.
+    new_text: String,
+
+    /// Replace every exact occurrence. Without this flag, the match must be unique.
     #[serde(default)]
-    mode: WriteMode,
+    replace_all: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum WriteMode {
+enum ReadBinaryFormat {
     #[default]
-    Overwrite,
-    Append,
+    Mcp,
+    Base64,
+    Hex,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BinaryEncoding {
+    #[default]
+    Base64,
+    Hex,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct MkdirArgs {
-    /// Directory path relative to the workspace root selected by --cwd.
+struct ReadBinaryArgs {
+    /// Binary file path.
     path: String,
 
-    /// Create missing parent directories as needed.
-    #[serde(default = "yes")]
-    parents: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct RemoveArgs {
-    /// File or directory path relative to the workspace root selected by --cwd.
-    path: String,
-
-    /// Required for removing a non-empty directory tree.
+    /// "mcp" returns typed MCP image/audio/blob content; base64/hex return encoded text.
     #[serde(default)]
-    recursive: bool,
+    format: ReadBinaryFormat,
+
+    /// Byte offset for base64/hex reads. MCP format requires offset 0.
+    #[serde(default)]
+    offset: Option<u64>,
+
+    /// Maximum bytes to read. MCP format requires the complete file.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WriteBinaryArgs {
+    /// File path.
+    path: String,
+
+    /// Encoded binary payload.
+    data: String,
+
+    /// Encoding of data.
+    #[serde(default)]
+    encoding: BinaryEncoding,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PatchBinaryArgs {
+    /// Existing binary file path.
+    path: String,
+
+    /// Zero-based byte offset where replacement begins.
+    offset: usize,
+
+    /// Number of existing bytes to replace. Defaults to the decoded payload length.
+    /// Use 0 to insert. Use empty data with a positive length to delete.
+    #[serde(default)]
+    length: Option<usize>,
+
+    /// Replacement bytes encoded as base64 or hex. May be empty.
+    data: String,
+
+    /// Encoding of data.
+    #[serde(default)]
+    encoding: BinaryEncoding,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ShellArgs {
-    /// Bash command string executed as: bash --noprofile --norc -lc <command>.
+    /// Command string to execute.
     command: String,
 
-    /// Working directory relative to the workspace root selected by --cwd. Defaults to ".".
+    /// Working directory. Relative paths resolve from --cwd.
     #[serde(default = "dot")]
     cwd: String,
 
@@ -145,16 +238,21 @@ fn dot() -> String {
     ".".to_owned()
 }
 
-fn yes() -> bool {
-    true
-}
-
 fn ok_text(text: impl Into<String>) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text.into())])
 }
 
 fn tool_error(error: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+}
+
+fn contains_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| component == Component::ParentDir)
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
 }
 
 async fn drain_capped<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
@@ -184,132 +282,169 @@ where
     Ok((kept, truncated))
 }
 
-impl LocalMachine {
-    pub fn workspace_root(&self) -> &Path {
-        self.config.workspace_root.as_path()
-    }
-    pub async fn new(args: MachineConfig) -> Result<Self> {
-        let root = fs::canonicalize(&args.workspace_root)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to canonicalize workspace {}",
-                    args.workspace_root.display()
-                )
-            })?;
-        let metadata = fs::metadata(&root).await?;
-        if !metadata.is_dir() {
-            bail!("workspace is not a directory: {}", root.display());
-        }
-
-        let mut protected_paths = Vec::with_capacity(args.protected_paths.len());
-        for path in args.protected_paths {
-            let canonical = fs::canonicalize(&path).await.unwrap_or(path);
-            protected_paths.push(canonical);
-        }
-
-        Ok(Self {
-            config: MachineConfig {
-                workspace_root: root,
-                allow_shell: args.allow_shell,
-                shell: args.shell,
-                max_shell_timeout_secs: args.max_shell_timeout_secs.max(1),
-                max_output_bytes: args.max_output_bytes.max(1024),
-                max_read_bytes: args.max_read_bytes.max(1024),
-                max_write_bytes: args.max_write_bytes.max(1024),
-                protected_paths,
-            },
-        })
+fn resolve_executable(name: &str) -> Option<PathBuf> {
+    let candidate = Path::new(name);
+    if candidate.components().count() > 1 {
+        return candidate.exists().then(|| candidate.to_path_buf());
     }
 
-    fn ensure_not_protected(&self, path: &Path) -> Result<()> {
-        for protected in &self.config.protected_paths {
-            if path == protected || path.starts_with(protected) {
-                bail!(
-                    "path is protected by abird-tunnel and cannot be accessed through filesystem tools"
-                );
+    env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+async fn canonicalize_grant(cwd: &Path, path: &Path) -> Result<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let canonical = fs::canonicalize(&joined)
+        .await
+        .with_context(|| format!("grant path does not exist: {}", joined.display()))?;
+    if !fs::metadata(&canonical).await?.is_dir() {
+        bail!("grant path is not a directory: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
+async fn canonicalize_deny(cwd: &Path, path: &Path) -> Result<PathBuf> {
+    let target = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    if let Ok(canonical) = fs::canonicalize(&target).await {
+        return Ok(canonical);
+    }
+
+    let mut ancestor = target.clone();
+    loop {
+        match fs::canonicalize(&ancestor).await {
+            Ok(canonical_ancestor) => {
+                let remainder = target
+                    .strip_prefix(&ancestor)
+                    .map_err(|_| anyhow!("failed to resolve deny path {}", target.display()))?;
+                return Ok(canonical_ancestor.join(remainder));
             }
-        }
-        Ok(())
-    }
-
-    fn lexical_target(&self, input: &str) -> Result<PathBuf> {
-        let rel = Path::new(input);
-        if rel.is_absolute() {
-            bail!(
-                "absolute paths are not accepted; paths must be relative to the selected workspace"
-            );
-        }
-
-        let mut clean = PathBuf::new();
-        for component in rel.components() {
-            match component {
-                Component::CurDir => {}
-                Component::Normal(part) => clean.push(part),
-                Component::ParentDir => bail!("parent traversal ('..') is not allowed"),
-                Component::RootDir | Component::Prefix(_) => {
-                    bail!("absolute paths are not allowed")
+            Err(_) => {
+                if !ancestor.pop() {
+                    bail!("could not resolve deny path {}", target.display());
                 }
             }
         }
+    }
+}
 
-        Ok(self.config.workspace_root.join(clean))
+fn decode_binary(data: &str, encoding: BinaryEncoding, max_bytes: usize) -> Result<Vec<u8>> {
+    if data.len() > max_bytes.saturating_mul(2).saturating_add(16) {
+        bail!("encoded payload is too large");
     }
 
-    async fn resolve_existing(&self, input: &str) -> Result<PathBuf> {
+    let bytes = match encoding {
+        BinaryEncoding::Base64 => BASE64.decode(data).context("invalid base64 payload")?,
+        BinaryEncoding::Hex => hex::decode(data).context("invalid hex payload")?,
+    };
+    if bytes.len() > max_bytes {
+        bail!(
+            "decoded payload is {} bytes, above the {} byte limit",
+            bytes.len(),
+            max_bytes
+        );
+    }
+    Ok(bytes)
+}
+
+impl AccessPolicy {
+    fn from_spec(spec: AccessSpec) -> Result<Self> {
+        if !spec.cwd.is_absolute()
+            || spec.read_roots.iter().any(|path| !path.is_absolute())
+            || spec.write_roots.iter().any(|path| !path.is_absolute())
+            || spec.deny_roots.iter().any(|path| !path.is_absolute())
+        {
+            bail!("internal error: access policy paths must be canonical absolute paths");
+        }
+
+        Ok(Self {
+            cwd: spec.cwd,
+            read_roots: spec.read_roots,
+            write_roots: spec.write_roots,
+            deny_roots: spec.deny_roots,
+            rw_all_dangerous: spec.rw_all_dangerous,
+        })
+    }
+
+    fn lexical_target(&self, input: &str) -> Result<PathBuf> {
+        let path = Path::new(input);
+        if contains_parent_component(path) {
+            bail!("parent traversal ('..') is not accepted; use a canonical path instead");
+        }
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(self.cwd.join(path))
+        }
+    }
+
+    fn denied(&self, path: &Path) -> bool {
+        self.deny_roots.iter().any(|root| path.starts_with(root))
+    }
+
+    fn grant_read(&self, path: &Path) -> bool {
+        self.rw_all_dangerous || self.read_roots.iter().any(|root| path.starts_with(root))
+    }
+
+    fn grant_write(&self, path: &Path) -> bool {
+        self.rw_all_dangerous || self.write_roots.iter().any(|root| path.starts_with(root))
+    }
+
+    fn can_read(&self, path: &Path) -> bool {
+        !self.denied(path) && self.grant_read(path)
+    }
+
+    fn can_write(&self, path: &Path) -> bool {
+        !self.denied(path) && self.grant_write(path)
+    }
+
+    fn check(&self, path: &Path, need: AccessNeed) -> Result<()> {
+        if self.denied(path) {
+            bail!("path is denied by policy: {}", path.display());
+        }
+        match need {
+            AccessNeed::Read if !self.can_read(path) => {
+                bail!("read access is not allowed: {}", path.display())
+            }
+            AccessNeed::Write if !self.can_write(path) => {
+                bail!("write access is not allowed: {}", path.display())
+            }
+            AccessNeed::ReadWrite if !(self.can_read(path) && self.can_write(path)) => {
+                bail!("read+write access is not allowed: {}", path.display())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn resolve_existing(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
         let target = self.lexical_target(input)?;
         let canonical = fs::canonicalize(&target)
             .await
             .with_context(|| format!("path does not exist or cannot be resolved: {input}"))?;
-        self.ensure_in_root(&canonical)?;
-        self.ensure_not_protected(&canonical)?;
+        self.check(&canonical, need)?;
         Ok(canonical)
     }
 
-    /// Validate every parent component against the selected workspace while preserving the
-    /// final path component itself. This is useful for operations such as stat/remove,
-    /// where following a final symlink would change which object is inspected or deleted.
-    async fn resolve_existing_no_follow_final(&self, input: &str) -> Result<PathBuf> {
-        let target = self.lexical_target(input)?;
-        if target.as_path() == self.config.workspace_root.as_path() {
-            return Ok(target);
-        }
-
-        fs::symlink_metadata(&target)
-            .await
-            .with_context(|| format!("path does not exist or cannot be resolved: {input}"))?;
-
-        let parent = target
-            .parent()
-            .ok_or_else(|| anyhow!("path has no parent: {input}"))?;
-        let final_name = target
-            .file_name()
-            .ok_or_else(|| anyhow!("path has no final component: {input}"))?;
-        let canonical_parent = fs::canonicalize(parent)
-            .await
-            .with_context(|| format!("parent cannot be resolved: {input}"))?;
-        self.ensure_in_root(&canonical_parent)?;
-
-        // Follow parent symlinks, but deliberately preserve the final component so
-        // stat/remove act on a final symlink itself rather than its target.
-        let resolved = canonical_parent.join(final_name);
-        self.ensure_not_protected(&resolved)?;
-        Ok(resolved)
-    }
-
-    async fn resolve_for_create(&self, input: &str) -> Result<PathBuf> {
+    async fn resolve_for_create(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
         let target = self.lexical_target(input)?;
 
-        // symlink_metadata observes a final symlink even when it is dangling. Using
-        // try_exists here would treat a dangling symlink as absent and could let a
-        // subsequent open/create follow it outside the selected workspace.
         match fs::symlink_metadata(&target).await {
             Ok(_) => {
                 let canonical = fs::canonicalize(&target)
                     .await
                     .with_context(|| format!("existing path cannot be safely resolved: {input}"))?;
-                self.ensure_in_root(&canonical)?;
-                self.ensure_not_protected(&canonical)?;
+                self.check(&canonical, need)?;
                 return Ok(target);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -332,32 +467,235 @@ impl LocalMachine {
         let canonical_ancestor = fs::canonicalize(&ancestor)
             .await
             .with_context(|| format!("existing ancestor cannot be safely resolved: {input}"))?;
-        self.ensure_in_root(&canonical_ancestor)?;
-
         let remainder = target
             .strip_prefix(&ancestor)
             .map_err(|_| anyhow!("failed to resolve path below existing ancestor: {input}"))?;
         let resolved = canonical_ancestor.join(remainder);
-        self.ensure_not_protected(&resolved)?;
+        self.check(&resolved, need)?;
         Ok(resolved)
     }
 
-    fn ensure_in_root(&self, path: &Path) -> Result<()> {
-        if !path.starts_with(self.config.workspace_root.as_path()) {
-            bail!("resolved path escapes the selected workspace");
+    fn relative_display(&self, path: &Path) -> String {
+        path.strip_prefix(&self.cwd)
+            .map(|relative| {
+                let value = relative.to_string_lossy().to_string();
+                if value.is_empty() {
+                    ".".to_owned()
+                } else {
+                    value
+                }
+            })
+            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+    }
+
+    fn sandbox_mounts(&self) -> Vec<(PathBuf, bool)> {
+        if self.rw_all_dangerous {
+            return vec![(PathBuf::from("/"), true)];
+        }
+
+        let mut candidates = BTreeSet::new();
+        candidates.extend(self.read_roots.iter().cloned());
+        candidates.extend(self.write_roots.iter().cloned());
+
+        let mut mounts = candidates
+            .into_iter()
+            .filter_map(|path| {
+                if !self.grant_read(&path) || self.denied(&path) {
+                    return None;
+                }
+                Some((path.clone(), self.grant_write(&path)))
+            })
+            .collect::<Vec<_>>();
+        mounts.sort_by_key(|(path, _)| path_depth(path));
+        mounts
+    }
+
+    fn deny_roots(&self) -> &[PathBuf] {
+        &self.deny_roots
+    }
+}
+
+impl LocalMachine {
+    pub async fn new(args: MachineConfig) -> Result<Self> {
+        let cwd = fs::canonicalize(&args.access.cwd)
+            .await
+            .with_context(|| format!("cwd does not exist: {}", args.access.cwd.display()))?;
+        if !fs::metadata(&cwd).await?.is_dir() {
+            bail!("cwd is not a directory: {}", cwd.display());
+        }
+
+        let mut read_roots = Vec::with_capacity(args.access.read_roots.len());
+        for path in &args.access.read_roots {
+            read_roots.push(canonicalize_grant(&cwd, path).await?);
+        }
+        let mut write_roots = Vec::with_capacity(args.access.write_roots.len());
+        for path in &args.access.write_roots {
+            write_roots.push(canonicalize_grant(&cwd, path).await?);
+        }
+        let mut deny_roots = Vec::with_capacity(args.access.deny_roots.len());
+        for path in &args.access.deny_roots {
+            deny_roots.push(canonicalize_deny(&cwd, path).await?);
+        }
+
+        let access = AccessPolicy::from_spec(AccessSpec {
+            cwd,
+            read_roots,
+            write_roots,
+            deny_roots,
+            rw_all_dangerous: args.access.rw_all_dangerous,
+        })?;
+
+        let mut protected_paths = Vec::with_capacity(args.protected_paths.len());
+        for path in args.protected_paths {
+            protected_paths.push(fs::canonicalize(&path).await.unwrap_or(path));
+        }
+
+        let shell_program = if args.allow_shell {
+            #[cfg(windows)]
+            {
+                Some(
+                    resolve_executable("pwsh.exe")
+                        .or_else(|| resolve_executable("powershell.exe"))
+                        .ok_or_else(|| anyhow!("PowerShell was not found in PATH"))?,
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                Some(
+                    resolve_executable("bash")
+                        .ok_or_else(|| anyhow!("bash was not found in PATH"))?,
+                )
+            }
+        } else {
+            None
+        };
+
+        #[cfg(target_os = "linux")]
+        if args.allow_shell && args.sandbox_shell {
+            for denied in access.deny_roots() {
+                if access.grant_read(denied) && !denied.exists() {
+                    bail!(
+                        "sandboxed --deny paths inside readable grants must already exist: {}",
+                        denied.display()
+                    );
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        let bwrap_program = if args.allow_shell && args.sandbox_shell {
+            Some(resolve_executable("bwrap").ok_or_else(|| {
+                anyhow!("Bubblewrap (bwrap) is required for sandboxed shell access")
+            })?)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let bwrap_program = None;
+
+        Ok(Self {
+            config: RuntimeConfig {
+                access,
+                allow_shell: args.allow_shell,
+                sandbox_shell: args.sandbox_shell,
+                allow_network: args.allow_network,
+                shell_program,
+                bwrap_program,
+                max_shell_timeout_secs: args.max_shell_timeout_secs.max(1),
+                max_output_bytes: args.max_output_bytes.max(1024),
+                max_read_bytes: args.max_read_bytes.max(1024),
+                max_write_bytes: args.max_write_bytes.max(1024),
+                protected_paths,
+            },
+        })
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.config.access.cwd
+    }
+
+    pub fn shell_enabled(&self) -> bool {
+        self.config.allow_shell
+    }
+
+    pub fn shell_sandboxed(&self) -> bool {
+        self.config.sandbox_shell
+    }
+
+    pub fn network_enabled(&self) -> bool {
+        self.config.allow_network
+    }
+
+    pub fn access_summary(&self) -> String {
+        if self.config.access.rw_all_dangerous {
+            return "unrestricted read+write".to_owned();
+        }
+        format!(
+            "read:{} write:{} deny:{}{}",
+            self.config.access.read_roots.len(),
+            self.config.access.write_roots.len(),
+            self.config.access.deny_roots.len(),
+            if self.config.allow_shell {
+                " + shell"
+            } else {
+                ""
+            }
+        )
+    }
+
+    pub fn tool_router_for_policy(any_write: bool, allow_shell: bool) -> ToolRouter<Self> {
+        let mut router = Self::tool_router();
+
+        if !any_write {
+            for name in ["write", "edit", "write_binary", "patch_binary"] {
+                router.disable_route(name.to_owned());
+            }
+        }
+
+        if !allow_shell {
+            router.disable_route("bash".to_owned());
+            router.disable_route("powershell".to_owned());
+        } else if cfg!(windows) {
+            router.disable_route("bash".to_owned());
+        } else {
+            router.disable_route("powershell".to_owned());
+        }
+
+        router
+    }
+
+    fn policy_tool_router(&self) -> ToolRouter<Self> {
+        Self::tool_router_for_policy(
+            self.config.access.rw_all_dangerous || !self.config.access.write_roots.is_empty(),
+            self.config.allow_shell,
+        )
+    }
+
+    fn ensure_not_protected(&self, path: &Path) -> Result<()> {
+        for protected in &self.config.protected_paths {
+            if path == protected || path.starts_with(protected) {
+                bail!(
+                    "path is protected by abird-tunnel and cannot be accessed through filesystem tools"
+                );
+            }
         }
         Ok(())
     }
 
-    fn relative_display(&self, path: &Path) -> String {
-        path.strip_prefix(self.config.workspace_root.as_path())
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string()
+    async fn resolve_existing(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
+        let path = self.config.access.resolve_existing(input, need).await?;
+        self.ensure_not_protected(&path)?;
+        Ok(path)
     }
 
-    async fn list_dir_impl(&self, args: ListArgs) -> Result<Vec<FsEntry>> {
-        let root = self.resolve_existing(&args.path).await?;
+    async fn resolve_for_create(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
+        let path = self.config.access.resolve_for_create(input, need).await?;
+        self.ensure_not_protected(&path)?;
+        Ok(path)
+    }
+
+    async fn list_impl(&self, args: ListArgs) -> Result<Vec<FsEntry>> {
+        let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         if !fs::metadata(&root).await?.is_dir() {
             bail!("not a directory: {}", args.path);
         }
@@ -370,10 +708,11 @@ impl LocalMachine {
             let mut reader = fs::read_dir(&dir).await?;
             while let Some(entry) = reader.next_entry().await? {
                 let path = entry.path();
-                // Do not even reveal protected credential filenames through fs_list.
-                if self.ensure_not_protected(&path).is_err() {
+
+                if self.config.access.denied(&path) || self.ensure_not_protected(&path).is_err() {
                     continue;
                 }
+
                 let metadata = fs::symlink_metadata(&path).await?;
                 let file_type = metadata.file_type();
                 let kind = if file_type.is_symlink() {
@@ -387,16 +726,14 @@ impl LocalMachine {
                 };
 
                 output.push(FsEntry {
-                    path: self.relative_display(&path),
+                    path: self.config.access.relative_display(&path),
                     kind,
                     size: metadata.len(),
                 });
-
                 if output.len() >= max_entries {
                     return Ok(output);
                 }
-
-                if args.recursive && file_type.is_dir() {
+                if args.recursive && file_type.is_dir() && self.config.access.can_read(&path) {
                     pending.push(path);
                 }
             }
@@ -411,291 +748,12 @@ impl LocalMachine {
             .unwrap_or(self.config.max_output_bytes)
             .clamp(1, self.config.max_output_bytes)
     }
-}
 
-#[tool_router(vis = "pub")]
-impl LocalMachine {
-    #[tool(
-        description = "Show this MCP server's workspace directory, filesystem boundary, and execution policy without modifying anything.",
-        annotations(
-            title = "Machine bridge info",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn machine_info(&self) -> CallToolResult {
-        ok_text(
-            serde_json::json!({
-                "cwd": self.config.workspace_root.to_string_lossy(),
-                "filesystem_boundary": self.config.workspace_root.to_string_lossy(),
-                "shell_enabled": self.config.allow_shell,
-                "shell": self.config.shell.as_str(),
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-                "max_shell_timeout_secs": self.config.max_shell_timeout_secs,
-                "max_read_bytes": self.config.max_read_bytes,
-                "max_write_bytes": self.config.max_write_bytes,
-            })
-            .to_string(),
-        )
-    }
-
-    #[tool(
-        description = "List files and directories inside the workspace selected by --cwd. Paths are relative to that workspace and cannot escape it. Does not follow symlinked directories.",
-        annotations(
-            title = "List local files",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn fs_list(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
-        match self.list_dir_impl(args).await {
-            Ok(entries) => match serde_json::to_string_pretty(&entries) {
-                Ok(json) => ok_text(json),
-                Err(error) => tool_error(error),
-            },
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Return metadata for one local filesystem path inside the workspace selected by --cwd. Paths cannot escape the workspace.",
-        annotations(
-            title = "Stat local path",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn fs_stat(&self, Parameters(args): Parameters<PathArgs>) -> CallToolResult {
-        let path = match self.resolve_existing_no_follow_final(&args.path).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        match fs::symlink_metadata(&path).await {
-            Ok(metadata) => {
-                let ft = metadata.file_type();
-                ok_text(
-                    serde_json::json!({
-                        "path": self.relative_display(&path),
-                        "kind": if ft.is_symlink() { "symlink" } else if ft.is_dir() { "dir" } else if ft.is_file() { "file" } else { "other" },
-                        "size": metadata.len(),
-                        "readonly": metadata.permissions().readonly(),
-                    })
-                    .to_string(),
-                )
-            }
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Read a UTF-8 text file inside the workspace selected by --cwd. Refuses paths outside the workspace and files above the configured byte limit.",
-        annotations(
-            title = "Read local text file",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn fs_read_text(&self, Parameters(args): Parameters<ReadTextArgs>) -> CallToolResult {
-        let path = match self.resolve_existing(&args.path).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let limit = args
-            .max_bytes
-            .unwrap_or(self.config.max_read_bytes)
-            .clamp(1, self.config.max_read_bytes);
-
-        let file = match fs::File::open(&path).await {
-            Ok(file) => file,
-            Err(error) => return tool_error(error),
-        };
-        match file.metadata().await {
-            Ok(metadata) if !metadata.is_file() => return tool_error("path is not a regular file"),
-            Ok(metadata) if metadata.len() > limit as u64 => {
-                return tool_error(format!(
-                    "file is {} bytes, above the {} byte limit",
-                    metadata.len(),
-                    limit
-                ));
-            }
-            Err(error) => return tool_error(error),
-            _ => {}
-        }
-
-        // Read through a bounded handle as well as checking metadata, so a file that grows
-        // between metadata() and read cannot force an unbounded allocation.
-        let mut bounded = file.take(limit as u64 + 1);
-        let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-        match bounded.read_to_end(&mut bytes).await {
-            Ok(_) if bytes.len() > limit => tool_error(format!(
-                "file grew above the {} byte limit while it was being read",
-                limit
-            )),
-            Ok(_) => match String::from_utf8(bytes) {
-                Ok(text) => ok_text(text),
-                Err(_) => tool_error(
-                    "file is not valid UTF-8; binary reads are intentionally disabled in v0.1",
-                ),
-            },
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Write UTF-8 text to a file inside the workspace selected by --cwd. Refuses paths outside the workspace. Can overwrite existing data, so treat as a destructive write action.",
-        annotations(
-            title = "Write local text file",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn fs_write_text(&self, Parameters(args): Parameters<WriteTextArgs>) -> CallToolResult {
-        if args.content.len() > self.config.max_write_bytes {
-            return tool_error(format!(
-                "content is {} bytes, above the {} byte write limit",
-                args.content.len(),
-                self.config.max_write_bytes
-            ));
-        }
-
-        let path = match self.resolve_for_create(&args.path).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-
-        if args.create_parents
-            && let Some(parent) = path.parent()
-            && let Err(error) = fs::create_dir_all(parent).await
-        {
-            return tool_error(error);
-        }
-
-        let mut options = fs::OpenOptions::new();
-        options.create(true).write(true);
-        match args.mode {
-            WriteMode::Overwrite => {
-                options.truncate(true);
-            }
-            WriteMode::Append => {
-                options.append(true);
-            }
-        }
-
-        match options.open(&path).await {
-            Ok(mut file) => {
-                use tokio::io::AsyncWriteExt;
-                match file.write_all(args.content.as_bytes()).await {
-                    Ok(()) => ok_text(format!(
-                        "wrote {} bytes to {}",
-                        args.content.len(),
-                        args.path
-                    )),
-                    Err(error) => tool_error(error),
-                }
-            }
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Create a directory inside the workspace selected by --cwd. Refuses paths outside the workspace.",
-        annotations(
-            title = "Create local directory",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn fs_mkdir(&self, Parameters(args): Parameters<MkdirArgs>) -> CallToolResult {
-        let path = match self.resolve_for_create(&args.path).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let result = if args.parents {
-            fs::create_dir_all(&path).await
-        } else {
-            fs::create_dir(&path).await
-        };
-        match result {
-            Ok(()) => ok_text(format!("created directory {}", args.path)),
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Remove a file or directory inside the workspace selected by --cwd. Refuses paths outside the workspace. recursive=true can delete entire directory trees.",
-        annotations(
-            title = "Remove local path",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn fs_remove(&self, Parameters(args): Parameters<RemoveArgs>) -> CallToolResult {
-        if args.path == "." || args.path.trim().is_empty() {
-            return tool_error("refusing to remove the workspace root");
-        }
-        let path = match self.resolve_existing_no_follow_final(&args.path).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        if path.as_path() == self.config.workspace_root.as_path() {
-            return tool_error("refusing to remove the workspace root");
-        }
-
-        let metadata = match fs::symlink_metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) => return tool_error(error),
-        };
-
-        let result = if metadata.file_type().is_dir() {
-            if args.recursive {
-                fs::remove_dir_all(&path).await
-            } else {
-                fs::remove_dir(&path).await
-            }
-        } else {
-            fs::remove_file(&path).await
-        };
-
-        match result {
-            Ok(()) => ok_text(format!("removed {}", args.path)),
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Execute an arbitrary Bash command on the local machine when shell access is enabled. It starts in a directory inside the --cwd workspace, but Bash itself is not sandboxed and may read/write outside that workspace via absolute paths or parent traversal. Treat it as fully privileged within the OS user's account.",
-        annotations(
-            title = "Run local Bash command",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn shell_exec(
+    async fn execute_shell(
         &self,
-        Parameters(args): Parameters<ShellArgs>,
+        args: ShellArgs,
+        powershell: bool,
     ) -> Result<CallToolResult, McpError> {
-        if !self.config.allow_shell {
-            return Ok(tool_error(
-                "shell execution is disabled; restart abird-tunnel with shell access enabled to enable it",
-            ));
-        }
         if args.command.trim().is_empty() {
             return Err(McpError::invalid_params("command must not be empty", None));
         }
@@ -709,28 +767,37 @@ impl LocalMachine {
             )));
         }
 
-        let cwd = match self.resolve_existing(&args.cwd).await {
+        let cwd = match self.resolve_existing(&args.cwd, AccessNeed::Read).await {
             Ok(path) => path,
             Err(error) => return Ok(tool_error(error)),
         };
-        match fs::metadata(&cwd).await {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Ok(tool_error("cwd is not a directory")),
-            Err(error) => return Ok(tool_error(error)),
+        if !fs::metadata(&cwd)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return Ok(tool_error("cwd is not a directory"));
         }
 
         let timeout_secs = args
             .timeout_secs
             .unwrap_or(30)
             .clamp(1, self.config.max_shell_timeout_secs);
+        let shell_program = match &self.config.shell_program {
+            Some(path) => path,
+            None => return Ok(tool_error("shell execution is disabled")),
+        };
 
-        let mut command = Command::new(self.config.shell.as_str());
+        #[cfg(target_os = "linux")]
+        let mut command = if self.config.sandbox_shell && !powershell {
+            self.bubblewrap_command(shell_program, &cwd, &args.command)
+        } else {
+            direct_shell_command(shell_program, powershell, &cwd, &args.command)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut command = direct_shell_command(shell_program, powershell, &cwd, &args.command);
+
         command
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg("-lc")
-            .arg(&args.command)
-            .current_dir(&cwd)
             .stdin(if args.stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -752,7 +819,6 @@ impl LocalMachine {
         if let Some(stdin_text) = args.stdin
             && let Some(mut stdin) = child.stdin.take()
         {
-            use tokio::io::AsyncWriteExt;
             match timeout(
                 Duration::from_secs(timeout_secs),
                 stdin.write_all(stdin_text.as_bytes()),
@@ -783,9 +849,6 @@ impl LocalMachine {
             Some(stderr) => stderr,
             None => return Ok(tool_error("failed to capture child stderr")),
         };
-
-        // Drain both pipes for the entire process lifetime while retaining only the bounded prefix.
-        // This prevents an untrusted command from growing this server's memory without bound.
         let stdout_task = tokio::spawn(drain_capped(stdout, output_limit));
         let stderr_task = tokio::spawn(drain_capped(stderr, output_limit));
 
@@ -822,7 +885,9 @@ impl LocalMachine {
             serde_json::json!({
                 "exit_code": status.code(),
                 "success": status.success(),
-                "cwd": self.relative_display(&cwd),
+                "cwd": self.config.access.relative_display(&cwd),
+                "sandboxed": self.config.sandbox_shell,
+                "network": self.config.allow_network,
                 "stdout": String::from_utf8_lossy(&stdout_bytes),
                 "stderr": String::from_utf8_lossy(&stderr_bytes),
                 "stdout_truncated": stdout_truncated,
@@ -831,11 +896,599 @@ impl LocalMachine {
             .to_string(),
         ))
     }
+
+    #[cfg(target_os = "linux")]
+    fn bubblewrap_command(&self, shell: &Path, cwd: &Path, script: &str) -> Command {
+        let bwrap = self
+            .config
+            .bwrap_program
+            .as_ref()
+            .expect("bwrap validated at startup");
+        let mut command = Command::new(bwrap);
+
+        command
+            .arg("--die-with-parent")
+            .arg("--new-session")
+            .arg("--unshare-pid")
+            .arg("--unshare-ipc")
+            .arg("--unshare-uts");
+        if !self.config.allow_network {
+            command.arg("--unshare-net");
+        }
+
+        if self.config.access.rw_all_dangerous {
+            command.arg("--bind").arg("/").arg("/");
+        }
+
+        command
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--dev")
+            .arg("/dev")
+            .arg("--tmpfs")
+            .arg("/tmp")
+            .arg("--dir")
+            .arg("/tmp/home");
+        if !self.config.access.rw_all_dangerous {
+            command.arg("--dir").arg("/etc");
+        }
+
+        let mounts = self.config.access.sandbox_mounts();
+        if !self.config.access.rw_all_dangerous {
+            for system_path in [
+                "/nix/store",
+                "/run/current-system/sw",
+                "/usr",
+                "/bin",
+                "/sbin",
+                "/lib",
+                "/lib64",
+            ] {
+                let path = Path::new(system_path);
+                if path.exists() {
+                    add_parent_dirs(&mut command, path);
+                    command.arg("--ro-bind").arg(path).arg(path);
+                }
+            }
+
+            if self.config.allow_network {
+                for network_path in [
+                    "/etc/resolv.conf",
+                    "/etc/hosts",
+                    "/etc/nsswitch.conf",
+                    "/etc/ssl",
+                    "/etc/ca-certificates",
+                    "/etc/pki",
+                ] {
+                    let path = Path::new(network_path);
+                    if path.exists() {
+                        add_parent_dirs(&mut command, path);
+                        command.arg("--ro-bind").arg(path).arg(path);
+                    }
+                }
+            }
+
+            for (path, writable) in mounts {
+                add_parent_dirs(&mut command, &path);
+                if writable {
+                    command.arg("--bind");
+                } else {
+                    command.arg("--ro-bind");
+                }
+                command.arg(&path).arg(&path);
+            }
+        }
+
+        for denied in self.config.access.deny_roots() {
+            if !self.config.access.grant_read(denied) {
+                continue;
+            }
+            add_parent_dirs(&mut command, denied);
+            match std::fs::symlink_metadata(denied) {
+                Ok(metadata) if metadata.is_dir() => {
+                    command
+                        .arg("--tmpfs")
+                        .arg(denied)
+                        .arg("--chmod")
+                        .arg("000")
+                        .arg(denied);
+                }
+                Ok(_) => {
+                    command.arg("--ro-bind").arg("/dev/null").arg(denied);
+                }
+                Err(_) => {
+                    // Startup validation rejects this case for readable sandbox grants.
+                }
+            }
+        }
+
+        for protected in &self.config.protected_paths {
+            if self.config.access.grant_read(protected) && !self.config.access.denied(protected) {
+                add_parent_dirs(&mut command, protected);
+                command.arg("--ro-bind").arg("/dev/null").arg(protected);
+            }
+        }
+
+        command
+            .arg("--chdir")
+            .arg(cwd)
+            .arg("--clearenv")
+            .arg("--setenv")
+            .arg("HOME")
+            .arg("/tmp/home")
+            .arg("--setenv")
+            .arg("TMPDIR")
+            .arg("/tmp")
+            .arg("--setenv")
+            .arg("PATH")
+            .arg(env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned()));
+
+        for name in ["LANG", "LC_ALL", "TERM", "USER"] {
+            if let Ok(value) = env::var(name) {
+                command.arg("--setenv").arg(name).arg(value);
+            }
+        }
+
+        command
+            .arg("--")
+            .arg(shell)
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-lc")
+            .arg(script);
+        command
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn add_parent_dirs(command: &mut Command, path: &Path) {
+    if path == Path::new("/") {
+        return;
+    }
+
+    let mut current = PathBuf::from("/");
+    let components = path.components().collect::<Vec<_>>();
+    let final_is_file = path.is_file();
+
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => continue,
+            Component::CurDir | Component::ParentDir => continue,
+            Component::Normal(part) => current.push(part),
+        }
+        if final_is_file && index + 1 == components.len() {
+            break;
+        }
+        command.arg("--dir").arg(&current);
+    }
+}
+
+fn direct_shell_command(shell: &Path, powershell: bool, cwd: &Path, script: &str) -> Command {
+    let mut command = Command::new(shell);
+    if powershell {
+        command
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(script);
+    } else {
+        command
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-lc")
+            .arg(script);
+    }
+    command.current_dir(cwd);
+    command
+}
+
+#[tool_router(vis = "pub")]
+impl LocalMachine {
+    #[tool(
+        description = "List files and directories allowed by the active read policy.",
+        annotations(
+            title = "List files",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn ls(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
+        match self.list_impl(args).await {
+            Ok(entries) => match serde_json::to_string_pretty(&entries) {
+                Ok(json) => ok_text(json),
+                Err(error) => tool_error(error),
+            },
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Read an allowed UTF-8 text file. Use read_binary for non-text files.",
+        annotations(
+            title = "Read text file",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> CallToolResult {
+        let path = match self.resolve_existing(&args.path, AccessNeed::Read).await {
+            Ok(path) => path,
+            Err(error) => return tool_error(error),
+        };
+        let metadata = match fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return tool_error("path is not a regular file"),
+            Err(error) => return tool_error(error),
+        };
+        if metadata.len() > self.config.max_read_bytes as u64 {
+            return tool_error(format!(
+                "file is {} bytes, above the {} byte text-read limit",
+                metadata.len(),
+                self.config.max_read_bytes
+            ));
+        }
+
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => return tool_error(error),
+        };
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return tool_error("binary file; use read_binary"),
+        };
+
+        let offset = args.offset.unwrap_or(1).max(1);
+        let limit = args.limit.unwrap_or(usize::MAX);
+        ok_text(
+            text.lines()
+                .skip(offset - 1)
+                .take(limit)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    #[tool(
+        description = "Create or replace an allowed UTF-8 text file. Missing parent directories are created automatically.",
+        annotations(
+            title = "Write text file",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn write(&self, Parameters(args): Parameters<WriteArgs>) -> CallToolResult {
+        if args.content.len() > self.config.max_write_bytes {
+            return tool_error(format!(
+                "content is {} bytes, above the {} byte write limit",
+                args.content.len(),
+                self.config.max_write_bytes
+            ));
+        }
+        let path = match self.resolve_for_create(&args.path, AccessNeed::Write).await {
+            Ok(path) => path,
+            Err(error) => return tool_error(error),
+        };
+        if let Some(parent) = path.parent()
+            && let Err(error) = fs::create_dir_all(parent).await
+        {
+            return tool_error(error);
+        }
+        match fs::write(&path, args.content.as_bytes()).await {
+            Ok(()) => ok_text(format!(
+                "wrote {} bytes to {}",
+                args.content.len(),
+                args.path
+            )),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Replace exact text inside an existing file. Requires both read and write permission.",
+        annotations(
+            title = "Edit text file",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> CallToolResult {
+        if args.old_text.is_empty() {
+            return tool_error("old_text must not be empty");
+        }
+        let path = match self
+            .resolve_existing(&args.path, AccessNeed::ReadWrite)
+            .await
+        {
+            Ok(path) => path,
+            Err(error) => return tool_error(error),
+        };
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) if bytes.len() <= self.config.max_read_bytes => bytes,
+            Ok(bytes) => {
+                return tool_error(format!(
+                    "file is {} bytes, above the {} byte edit limit",
+                    bytes.len(),
+                    self.config.max_read_bytes
+                ));
+            }
+            Err(error) => return tool_error(error),
+        };
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return tool_error("binary file; use patch_binary"),
+        };
+        let matches = text.match_indices(&args.old_text).count();
+        if matches == 0 {
+            return tool_error("old_text was not found");
+        }
+        if !args.replace_all && matches != 1 {
+            return tool_error(format!(
+                "old_text occurs {matches} times; make the match unique or set replace_all=true"
+            ));
+        }
+
+        let edited = if args.replace_all {
+            text.replace(&args.old_text, &args.new_text)
+        } else {
+            text.replacen(&args.old_text, &args.new_text, 1)
+        };
+        if edited.len() > self.config.max_write_bytes {
+            return tool_error(format!(
+                "edited file would be {} bytes, above the {} byte write limit",
+                edited.len(),
+                self.config.max_write_bytes
+            ));
+        }
+
+        match fs::write(&path, edited.as_bytes()).await {
+            Ok(()) => ok_text(format!("edited {}", args.path)),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Read an allowed binary file. format=mcp returns typed MCP image/audio/blob content; base64 or hex returns encoded bytes.",
+        annotations(
+            title = "Read binary file",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn read_binary(&self, Parameters(args): Parameters<ReadBinaryArgs>) -> CallToolResult {
+        let path = match self.resolve_existing(&args.path, AccessNeed::Read).await {
+            Ok(path) => path,
+            Err(error) => return tool_error(error),
+        };
+        let metadata = match fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return tool_error("path is not a regular file"),
+            Err(error) => return tool_error(error),
+        };
+        let total_size = metadata.len();
+
+        match args.format {
+            ReadBinaryFormat::Mcp => {
+                if args.offset.unwrap_or(0) != 0 {
+                    return tool_error("format=mcp requires offset=0");
+                }
+                let limit = args.limit.unwrap_or(self.config.max_read_bytes);
+                if total_size > limit.min(self.config.max_read_bytes) as u64 {
+                    return tool_error(
+                        "format=mcp requires the complete file within the read limit; use base64 or hex for chunked reads",
+                    );
+                }
+                let bytes = match fs::read(&path).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => return tool_error(error),
+                };
+                let encoded = BASE64.encode(bytes);
+                let mime = mime_guess::from_path(&path)
+                    .first_or_octet_stream()
+                    .essence_str()
+                    .to_owned();
+                let content = if mime.starts_with("image/") {
+                    ContentBlock::image(encoded, mime)
+                } else if mime.starts_with("audio/") {
+                    ContentBlock::audio(encoded, mime)
+                } else {
+                    let uri = format!(
+                        "abird://file/{}",
+                        self.config.access.relative_display(&path)
+                    );
+                    ContentBlock::resource(
+                        ResourceContents::blob(encoded, uri).with_mime_type(mime),
+                    )
+                };
+                CallToolResult::success(vec![content])
+            }
+            ReadBinaryFormat::Base64 | ReadBinaryFormat::Hex => {
+                let offset = args.offset.unwrap_or(0);
+                if offset > total_size {
+                    return tool_error("offset is beyond end of file");
+                }
+                let limit = args
+                    .limit
+                    .unwrap_or(self.config.max_read_bytes)
+                    .clamp(1, self.config.max_read_bytes);
+                let mut file = match fs::File::open(&path).await {
+                    Ok(file) => file,
+                    Err(error) => return tool_error(error),
+                };
+                if let Err(error) = file.seek(std::io::SeekFrom::Start(offset)).await {
+                    return tool_error(error);
+                }
+                let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+                if let Err(error) = file.take(limit as u64).read_to_end(&mut bytes).await {
+                    return tool_error(error);
+                }
+                let (format, encoded) = match args.format {
+                    ReadBinaryFormat::Base64 => ("base64", BASE64.encode(&bytes)),
+                    ReadBinaryFormat::Hex => ("hex", hex::encode(&bytes)),
+                    ReadBinaryFormat::Mcp => unreachable!(),
+                };
+                let truncated = offset + (bytes.len() as u64) < total_size;
+                ok_text(
+                    serde_json::json!({
+                        "path": args.path,
+                        "format": format,
+                        "offset": offset,
+                        "bytes": bytes.len(),
+                        "total_size": total_size,
+                        "truncated": truncated,
+                        "data": encoded,
+                    })
+                    .to_string(),
+                )
+            }
+        }
+    }
+
+    #[tool(
+        description = "Create or replace an allowed binary file using base64 or hex data.",
+        annotations(
+            title = "Write binary file",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn write_binary(&self, Parameters(args): Parameters<WriteBinaryArgs>) -> CallToolResult {
+        let bytes = match decode_binary(&args.data, args.encoding, self.config.max_write_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => return tool_error(error),
+        };
+        let path = match self.resolve_for_create(&args.path, AccessNeed::Write).await {
+            Ok(path) => path,
+            Err(error) => return tool_error(error),
+        };
+        if let Some(parent) = path.parent()
+            && let Err(error) = fs::create_dir_all(parent).await
+        {
+            return tool_error(error);
+        }
+        match fs::write(&path, &bytes).await {
+            Ok(()) => ok_text(format!("wrote {} bytes to {}", bytes.len(), args.path)),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Patch an existing binary file by replacing a byte range. Requires read+write permission.",
+        annotations(
+            title = "Patch binary file",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn patch_binary(&self, Parameters(args): Parameters<PatchBinaryArgs>) -> CallToolResult {
+        let replacement =
+            match decode_binary(&args.data, args.encoding, self.config.max_write_bytes) {
+                Ok(bytes) => bytes,
+                Err(error) => return tool_error(error),
+            };
+        let path = match self
+            .resolve_existing(&args.path, AccessNeed::ReadWrite)
+            .await
+        {
+            Ok(path) => path,
+            Err(error) => return tool_error(error),
+        };
+        let metadata = match fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return tool_error("path is not a regular file"),
+            Err(error) => return tool_error(error),
+        };
+        if metadata.len() > MAX_PATCH_FILE_BYTES as u64 {
+            return tool_error(format!(
+                "patch target is {} bytes; maximum patchable file size is {} bytes",
+                metadata.len(),
+                MAX_PATCH_FILE_BYTES
+            ));
+        }
+
+        let mut bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => return tool_error(error),
+        };
+        if args.offset > bytes.len() {
+            return tool_error("offset is beyond end of file");
+        }
+        let length = args.length.unwrap_or(replacement.len());
+        let end = match args.offset.checked_add(length) {
+            Some(end) if end <= bytes.len() => end,
+            _ => return tool_error("patch range extends beyond end of file"),
+        };
+        let resulting_size = bytes.len() - length + replacement.len();
+        if resulting_size > MAX_PATCH_FILE_BYTES {
+            return tool_error(format!(
+                "patched file would exceed the {} byte limit",
+                MAX_PATCH_FILE_BYTES
+            ));
+        }
+
+        bytes.splice(args.offset..end, replacement);
+        match fs::write(&path, &bytes).await {
+            Ok(()) => ok_text(format!(
+                "patched {} at offset {} (replaced {} bytes)",
+                args.path, args.offset, length
+            )),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Run Bash. On Linux it is Bubblewrap-sandboxed unless dangerous unsandboxed access was explicitly enabled.",
+        annotations(
+            title = "Run Bash command",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn bash(
+        &self,
+        Parameters(args): Parameters<ShellArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.execute_shell(args, false).await
+    }
+
+    #[tool(
+        description = "Run PowerShell on Windows. Unsandboxed use requires explicit dangerous access.",
+        annotations(
+            title = "Run PowerShell command",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn powershell(
+        &self,
+        Parameters(args): Parameters<ShellArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.execute_shell(args, true).await
+    }
 }
 
 #[rmcp::tool_handler(
+    router = self.policy_tool_router(),
     name = "abird-tunnel",
-    instructions = "Private local-machine bridge for the workspace selected when abird-tunnel started. Prefer fs_* tools: they are hard-bounded to that workspace and reject escape attempts. Use shell_exec only when shell behavior is actually required; Bash starts in the workspace but is not sandboxed, can modify data outside it, and can access the network. Never request secrets unless the user explicitly asks."
+    instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
 )]
 impl rmcp::ServerHandler for LocalMachine {}
 
@@ -843,79 +1496,343 @@ impl rmcp::ServerHandler for LocalMachine {}
 mod tests {
     use super::*;
 
-    async fn test_machine(root: PathBuf, protected_paths: Vec<PathBuf>) -> LocalMachine {
-        LocalMachine::new(MachineConfig {
-            workspace_root: root,
-            allow_shell: true,
-            shell: "bash".to_owned(),
-            max_shell_timeout_secs: 5,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths,
+    fn access(root: &Path) -> AccessPolicy {
+        AccessPolicy::from_spec(AccessSpec {
+            cwd: root.to_path_buf(),
+            read_roots: vec![root.to_path_buf()],
+            write_roots: Vec::new(),
+            deny_roots: Vec::new(),
+            rw_all_dangerous: false,
         })
-        .await
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn rejects_parent_traversal() {
+    #[test]
+    fn default_access_is_read_only() {
         let temp = tempfile::tempdir().unwrap();
-        let machine = test_machine(temp.path().to_path_buf(), Vec::new()).await;
-        assert!(machine.resolve_existing("../outside").await.is_err());
+        let root = temp.path().canonicalize().unwrap();
+        let policy = access(&root);
+        assert!(policy.can_read(&root));
+        assert!(!policy.can_write(&root));
+    }
+
+    #[test]
+    fn additive_read_and_write_combine_to_rw() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let child = root.join("child");
+        std::fs::create_dir(&child).unwrap();
+
+        let policy = AccessPolicy::from_spec(AccessSpec {
+            cwd: root.clone(),
+            read_roots: vec![root],
+            write_roots: vec![child.clone()],
+            deny_roots: Vec::new(),
+            rw_all_dangerous: false,
+        })
+        .unwrap();
+
+        assert!(policy.can_read(&child));
+        assert!(policy.can_write(&child));
+    }
+
+    #[test]
+    fn deny_takes_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let denied = root.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+
+        let policy = AccessPolicy::from_spec(AccessSpec {
+            cwd: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![root],
+            deny_roots: vec![denied.clone()],
+            rw_all_dangerous: false,
+        })
+        .unwrap();
+
+        assert!(!policy.can_read(&denied));
+        assert!(!policy.can_write(&denied));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn protected_path_stays_protected_through_symlinked_parent() {
+    async fn symlink_escape_is_rejected() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let secret_dir = root.join(".config/abird-tunnel");
-        let secret = secret_dir.join("runtime.key");
-        std::fs::create_dir_all(&secret_dir).unwrap();
-        std::fs::write(&secret, b"secret").unwrap();
-        symlink(&secret_dir, root.join("alias")).unwrap();
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"secret").unwrap();
+        symlink(outside.path(), allowed.path().join("escape")).unwrap();
 
-        let machine = test_machine(root, vec![secret]).await;
+        let root = allowed.path().canonicalize().unwrap();
+        let policy = AccessPolicy::from_spec(AccessSpec {
+            cwd: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![root],
+            deny_roots: Vec::new(),
+            rw_all_dangerous: false,
+        })
+        .unwrap();
+
         assert!(
-            machine
-                .resolve_existing_no_follow_final("alias/runtime.key")
+            policy
+                .resolve_existing("escape/secret", AccessNeed::Read)
+                .await
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve_for_create("escape/new-file", AccessNeed::Write)
                 .await
                 .is_err()
         );
     }
 
     #[tokio::test]
-    async fn protected_files_are_hidden_from_listings() {
+    async fn protected_credentials_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let secret_dir = root.join(".config/abird-tunnel");
-        let secret = secret_dir.join("runtime.key");
-        std::fs::create_dir_all(&secret_dir).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let secret = root.join("runtime.key");
         std::fs::write(&secret, b"secret").unwrap();
-        std::fs::write(secret_dir.join("config.toml"), b"version = 1").unwrap();
 
-        let machine = test_machine(root, vec![secret]).await;
-        let entries = machine
-            .list_dir_impl(ListArgs {
-                path: ".config/abird-tunnel".to_owned(),
-                recursive: false,
-                max_entries: None,
-            })
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                cwd: root.clone(),
+                read_roots: vec![root],
+                write_roots: Vec::new(),
+                deny_roots: Vec::new(),
+                rw_all_dangerous: false,
+            },
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: vec![secret],
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            machine
+                .resolve_existing("runtime.key", AccessNeed::Read)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn default_tool_policy_is_read_only() {
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(false, false)
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(names, ["ls", "read", "read_binary"]);
+    }
+
+    #[test]
+    fn write_policy_adds_mutators() {
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, false)
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "edit",
+                "ls",
+                "patch_binary",
+                "read",
+                "read_binary",
+                "write",
+                "write_binary",
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_policy_is_platform_specific() {
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(false, true)
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        if cfg!(windows) {
+            assert_eq!(names, ["ls", "powershell", "read", "read_binary"]);
+        } else {
+            assert_eq!(names, ["bash", "ls", "read", "read_binary"]);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_mounts_follow_additive_policy_and_deny() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let writable = root.join("writable");
+        let denied = root.join("denied");
+        std::fs::create_dir(&writable).unwrap();
+        std::fs::create_dir(&denied).unwrap();
+
+        let access = AccessPolicy::from_spec(AccessSpec {
+            cwd: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![writable.clone()],
+            deny_roots: vec![denied.clone()],
+            rw_all_dangerous: false,
+        })
+        .unwrap();
+
+        let mounts = access.sandbox_mounts();
+        assert!(mounts.contains(&(root.clone(), false)));
+        assert!(mounts.contains(&(writable, true)));
+        assert!(!mounts.iter().any(|(path, _)| path == &denied));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_blocks_network_by_default_and_masks_denies() {
+        use std::ffi::OsStr;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let denied = root.join("denied");
+        std::fs::create_dir(&denied).unwrap();
+
+        let machine = LocalMachine {
+            config: RuntimeConfig {
+                access: AccessPolicy::from_spec(AccessSpec {
+                    cwd: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    deny_roots: vec![denied.clone()],
+                    rw_all_dangerous: false,
+                })
+                .unwrap(),
+                allow_shell: true,
+                sandbox_shell: true,
+                allow_network: false,
+                shell_program: Some(PathBuf::from("/bin/bash")),
+                bwrap_program: Some(PathBuf::from("/bin/bwrap")),
+                max_shell_timeout_secs: 5,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                protected_paths: Vec::new(),
+            },
+        };
+
+        let command = machine.bubblewrap_command(Path::new("/bin/bash"), &root, "true");
+        let args: Vec<_> = command.as_std().get_args().collect();
+
+        assert!(args.iter().any(|arg| *arg == OsStr::new("--unshare-net")));
+
+        assert!(
+            args.windows(2).any(|window| {
+                window[0] == OsStr::new("--tmpfs") && window[1] == denied.as_os_str()
+            }),
+            "denied directory should be hidden behind a tmpfs mount"
+        );
+        assert!(
+            args.windows(3).any(|window| {
+                window[0] == OsStr::new("--chmod")
+                    && window[1] == OsStr::new("000")
+                    && window[2] == denied.as_os_str()
+            }),
+            "denied directory mask should be mode 000"
+        );
+
+        let mut networked = machine.clone();
+        networked.config.allow_network = true;
+        let command = networked.bubblewrap_command(Path::new("/bin/bash"), &root, "true");
+        assert!(
+            !command
+                .as_std()
+                .get_args()
+                .any(|arg| arg == OsStr::new("--unshare-net"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_runtime_smoke_when_requested() {
+        if std::env::var_os("ABIRD_TEST_BWRAP").is_none() {
+            return;
+        }
+
+        let Some(bwrap) = resolve_executable("bwrap") else {
+            panic!("ABIRD_TEST_BWRAP requested but bwrap is not installed");
+        };
+        let Some(bash) = resolve_executable("bash") else {
+            panic!("ABIRD_TEST_BWRAP requested but bash is not installed");
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let writable = root.join("writable");
+        let denied = root.join("denied");
+        std::fs::create_dir(&writable).unwrap();
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::write(root.join("visible.txt"), b"visible").unwrap();
+        std::fs::write(denied.join("secret.txt"), b"secret").unwrap();
+
+        let machine = LocalMachine {
+            config: RuntimeConfig {
+                access: AccessPolicy::from_spec(AccessSpec {
+                    cwd: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: vec![writable.clone()],
+                    deny_roots: vec![denied],
+                    rw_all_dangerous: false,
+                })
+                .unwrap(),
+                allow_shell: true,
+                sandbox_shell: true,
+                allow_network: false,
+                shell_program: Some(bash),
+                bwrap_program: Some(bwrap),
+                max_shell_timeout_secs: 10,
+                max_output_bytes: 16 * 1024,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                protected_paths: Vec::new(),
+            },
+        };
+
+        let result = machine
+            .execute_shell(
+                ShellArgs {
+                    command: concat!(
+                        "set -eu; ",
+                        "cat visible.txt >/dev/null; ",
+                        "if cat denied/secret.txt >/dev/null 2>&1; then exit 11; fi; ",
+                        "if touch should-not-work >/dev/null 2>&1; then exit 12; fi; ",
+                        "touch writable/works; ",
+                        "test ! -e /etc/resolv.conf"
+                    )
+                    .to_owned(),
+                    cwd: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(10),
+                    max_output_bytes: Some(16 * 1024),
+                },
+                false,
+            )
             .await
             .unwrap();
 
+        let serialized = serde_json::to_string(&result).unwrap();
         assert!(
-            entries
-                .iter()
-                .all(|entry| !entry.path.ends_with("runtime.key"))
+            serialized.contains("\\\"exit_code\\\":0"),
+            "sandbox smoke failed: {serialized}"
         );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.path.ends_with("config.toml"))
-        );
+        assert!(writable.join("works").exists());
+        assert!(!root.join("should-not-work").exists());
     }
 }
