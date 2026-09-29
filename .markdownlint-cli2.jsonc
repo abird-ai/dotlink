@@ -1,0 +1,9 @@
+{
+  "globs": ["**/*.md", ".agents/**/*.md"],
+  "ignores": ["target/**", ".kilo/**", "node_modules/**", "dist/**"],
+  "config": {
+    // Prose uses editor soft wrapping; changelog sections repeat standard headings.
+    "MD013": false,
+    "MD024": { "siblings_only": true }
+  }
+}

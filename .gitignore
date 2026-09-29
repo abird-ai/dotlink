@@ -1,0 +1,20 @@
+# Rust build output and local backup artifacts.
+/target/
+*.rs.bk
+/Cargo.toml.orig
+
+# Nix / direnv build links and local environments.
+/result
+/result-*
+/.direnv/
+
+# Local environment, logs, and generated release output.
+.env
+.env.*
+!.env.example
+*.log
+/dist/
+
+# Agent scratch checklists and run directories; the plan record lives in
+# .agents/plans/.
+/.agents/runs/
