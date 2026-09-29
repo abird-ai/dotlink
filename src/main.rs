@@ -30,11 +30,11 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// Start the stdio MCP server. Must be enabled in persisted transport config.
+    /// Start the stdio MCP server for this run, overriding persisted transport selection.
     #[arg(long)]
     stdio: bool,
 
-    /// Start the HTTP MCP server. Must be enabled in persisted transport config.
+    /// Start the HTTP MCP server for this run, overriding persisted transport selection.
     #[arg(long)]
     http: bool,
 
@@ -88,8 +88,14 @@ struct Args {
     )]
     allow_write: Vec<PathBuf>,
 
-    /// Add a directory with both read and write permission. May be repeated.
-    #[arg(long, value_name = "DIR")]
+    /// Add a directory with both read and write permission. May be repeated. Bare --allow-rw means cwd.
+    #[arg(
+        long,
+        value_name = "DIR",
+        num_args = 0..=1,
+        default_missing_value = ".",
+        require_equals = true
+    )]
     allow_rw: Vec<PathBuf>,
 
     /// Deny a path even if another allow rule covers it. May be repeated.
@@ -222,8 +228,14 @@ impl Policy {
             }
         }
         for path in &args.allow_rw {
-            read_roots.push(path.clone());
-            write_roots.push(path.clone());
+            if path.as_path() == PathBuf::from(".").as_path() {
+                // Bare --allow-rw is the ergonomic shorthand for rw on cwd.
+                read_roots.push(cwd.clone());
+                write_roots.push(cwd.clone());
+            } else {
+                read_roots.push(path.clone());
+                write_roots.push(path.clone());
+            }
         }
 
         Ok(Self {
@@ -279,13 +291,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if args.stdio && !setup.config.transports.stdio {
-        bail!("stdio transport is disabled in config; run 'abird-tunnel --setup' to enable it");
-    }
-    if args.http && !setup.config.transports.http {
-        bail!("HTTP transport is disabled in config; run 'abird-tunnel --setup' to enable it");
-    }
-
     let http_bind = if args.http {
         Some(match args.http_bind {
             Some(bind) => bind,
@@ -333,7 +338,7 @@ async fn main() -> Result<()> {
 
     if active_transports.is_empty() {
         bail!(
-            "no MCP transport is active; enable OpenAI in setup or start a configured local transport with --stdio and/or --http"
+            "no MCP transport is active; enable OpenAI in setup or start a local transport with --stdio and/or --http"
         );
     }
 
@@ -491,6 +496,20 @@ mod tests {
         let (_, policy) = parse(&["abird-tunnel", "--allow-write"]);
         assert!(policy.read_roots.contains(&PathBuf::from("/workspace")));
         assert!(policy.write_roots.contains(&PathBuf::from("/workspace")));
+    }
+
+    #[test]
+    fn bare_allow_rw_means_rw_cwd() {
+        let (_, policy) = parse(&["abird-tunnel", "--allow-rw"]);
+        assert!(policy.read_roots.contains(&PathBuf::from("/workspace")));
+        assert!(policy.write_roots.contains(&PathBuf::from("/workspace")));
+    }
+
+    #[test]
+    fn explicit_local_transport_flags_parse_as_runtime_overrides() {
+        let args = Args::try_parse_from(["abird-tunnel", "--stdio", "--http"]).unwrap();
+        assert!(args.stdio);
+        assert!(args.http);
     }
 
     #[test]

@@ -284,15 +284,79 @@ where
 
 fn resolve_executable(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
-    if candidate.components().count() > 1 {
-        return candidate.exists().then(|| candidate.to_path_buf());
+    let found = if candidate.components().count() > 1 {
+        candidate.exists().then(|| candidate.to_path_buf())
+    } else {
+        env::var_os("PATH").and_then(|path| {
+            env::split_paths(&path)
+                .map(|dir| dir.join(name))
+                .find(|path| path.is_file())
+        })
+    }?;
+
+    Some(std::fs::canonicalize(&found).unwrap_or(found))
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_visible_path(access: &AccessPolicy) -> std::ffi::OsString {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
+            let system_visible = [
+                Path::new("/nix/store"),
+                Path::new("/run/current-system"),
+                Path::new("/etc/profiles"),
+                Path::new("/nix/var/nix/profiles"),
+                Path::new("/usr"),
+                Path::new("/bin"),
+                Path::new("/sbin"),
+            ]
+            .iter()
+            .any(|root| canonical.starts_with(root));
+
+            if (system_visible || access.can_read(&canonical)) && seen.insert(canonical.clone()) {
+                paths.push(canonical);
+            }
+        }
     }
 
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|dir| dir.join(name))
-            .find(|path| path.is_file())
-    })
+    for fallback in [
+        PathBuf::from("/run/current-system/sw/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ] {
+        if fallback.exists() && seen.insert(fallback.clone()) {
+            paths.push(fallback);
+        }
+    }
+
+    env::join_paths(paths)
+        .unwrap_or_else(|_| std::ffi::OsString::from("/run/current-system/sw/bin:/usr/bin:/bin"))
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_runtime_mounts() -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from("/nix/store"),
+        PathBuf::from("/run/current-system"),
+        PathBuf::from("/etc/profiles"),
+        PathBuf::from("/nix/var/nix/profiles"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/sbin"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+    ];
+
+    if let Some(home) = env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".nix-profile"));
+    }
+
+    paths.retain(|path| path.exists());
+    paths
 }
 
 async fn canonicalize_grant(cwd: &Path, path: &Path) -> Result<PathBuf> {
@@ -936,20 +1000,9 @@ impl LocalMachine {
 
         let mounts = self.config.access.sandbox_mounts();
         if !self.config.access.rw_all_dangerous {
-            for system_path in [
-                "/nix/store",
-                "/run/current-system/sw",
-                "/usr",
-                "/bin",
-                "/sbin",
-                "/lib",
-                "/lib64",
-            ] {
-                let path = Path::new(system_path);
-                if path.exists() {
-                    add_parent_dirs(&mut command, path);
-                    command.arg("--ro-bind").arg(path).arg(path);
-                }
+            for path in sandbox_runtime_mounts() {
+                add_parent_dirs(&mut command, &path);
+                command.arg("--ro-bind").arg(&path).arg(&path);
             }
 
             if self.config.allow_network {
@@ -1022,7 +1075,7 @@ impl LocalMachine {
             .arg("/tmp")
             .arg("--setenv")
             .arg("PATH")
-            .arg(env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned()));
+            .arg(sandbox_visible_path(&self.config.access));
 
         for name in ["LANG", "LC_ALL", "TERM", "USER"] {
             if let Ok(value) = env::var(name) {
@@ -1558,6 +1611,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn resolve_executable_canonicalizes_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real-bash");
+        let link = temp.path().join("bash");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            resolve_executable(link.to_str().unwrap()).unwrap(),
+            real.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_escape_is_rejected() {
         use std::os::unix::fs::symlink;
@@ -1668,6 +1738,39 @@ mod tests {
             assert_eq!(names, ["ls", "powershell", "read", "read_binary"]);
         } else {
             assert_eq!(names, ["bash", "ls", "read", "read_binary"]);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_runtime_mounts_include_available_nix_profiles_without_home_root() {
+        let mounts = sandbox_runtime_mounts();
+
+        for expected in [
+            PathBuf::from("/nix/store"),
+            PathBuf::from("/run/current-system"),
+            PathBuf::from("/etc/profiles"),
+            PathBuf::from("/nix/var/nix/profiles"),
+        ] {
+            if expected.exists() {
+                assert!(
+                    mounts.contains(&expected),
+                    "expected runtime mount {}",
+                    expected.display()
+                );
+            }
+        }
+
+        if let Some(home) = env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            let profile = home.join(".nix-profile");
+            if profile.exists() {
+                assert!(mounts.contains(&profile));
+            }
+            assert!(
+                !mounts.contains(&home),
+                "sandbox runtime mounts must not expose the whole home directory"
+            );
         }
     }
 

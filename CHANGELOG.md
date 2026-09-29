@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Make explicit --stdio and --http runtime flags activate those transports even when persisted setup has them disabled.
+- Make bare --allow-rw shorthand for read+write on cwd, matching bare --allow-write.
+- Canonicalize shell executables and sandbox PATH entries so Bubblewrap shell execution works correctly on NixOS profile symlinks.
+- Mount the standard Nix store/profile graph read-only inside Bubblewrap while keeping the user's home and Nix daemon socket out of the default sandbox.
+
 - Add --ephemeral-url for fresh high-entropy HTTP/ngrok MCP paths.
 - Add independent --http-ephemeral-url and --ngrok-ephemeral-url overrides, including explicit =false.
 - Use a separate loopback-only ngrok backend so local and public MCP routes can differ without cross-exposure.

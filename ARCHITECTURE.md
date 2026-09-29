@@ -56,6 +56,8 @@ stdio and HTTP are opt-in at runtime:
 --http
 ~~~
 
+Persisted transport booleans are defaults/preferences, not hard runtime gates. Explicit --stdio and --http flags add those transports for the current run even when persisted setup has them disabled.
+
 --ngrok modifies the HTTP transport; it is not a fourth MCP transport.
 
 Older configs with no transport section default to OpenAI-only for backward compatibility.
@@ -224,6 +226,20 @@ Denied paths are masked after allow mounts.
 The saved OpenAI runtime credential is masked when present.
 
 Bubblewrap provides an empty temporary home and temporary directory.
+
+On NixOS, the sandbox also preserves the standard Nix executable/profile graph read-only when those paths exist:
+
+~~~text
+/nix/store
+/run/current-system
+/etc/profiles
+/nix/var/nix/profiles
+~/.nix-profile
+~~~
+
+Only the ~/.nix-profile entry is exposed; the user's home directory itself is not mounted for this purpose. PATH entries are canonicalized and filtered to sandbox-visible locations, so profile symlinks resolve to their mounted /nix/store targets.
+
+The Nix daemon socket is intentionally not mounted by default: exposing it would let a sandboxed command ask the host daemon to perform work outside the shell's direct filesystem/network namespace.
 
 ## Network isolation
 

@@ -139,17 +139,19 @@ References:
 
 The OpenAI plugin flow above uses the OpenAI transport. The same LocalMachine MCP server can also run without OpenAI.
 
-For subprocess MCP clients such as Claude Desktop or Claude Code, enable stdio during abird-tunnel --setup, then configure the client to launch:
+For subprocess MCP clients such as Claude Desktop or Claude Code, launch:
 
 ~~~text
 abird-tunnel --stdio
 ~~~
 
-For Streamable HTTP clients, enable http during setup and run:
+For Streamable HTTP clients, run:
 
 ~~~text
 abird-tunnel --http
 ~~~
+
+Explicit --stdio and --http flags are runtime overrides: they activate those transports for the current run even if persisted setup has them disabled.
 
 The default endpoint is:
 

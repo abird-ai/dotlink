@@ -112,8 +112,12 @@ The sandbox:
 - masks the saved OpenAI runtime key when present;
 - uses an empty temporary home;
 - mounts required system runtime paths read-only;
+- on NixOS, mounts the standard Nix store/profile symlink graph read-only (/nix/store, /run/current-system, /etc/profiles, /nix/var/nix/profiles, and ~/.nix-profile when present) without mounting the whole home directory;
+- canonicalizes and filters PATH entries so only sandbox-visible tool directories remain;
 - isolates PID, IPC, and UTS namespaces;
 - unshares the network namespace by default.
+
+The Nix daemon socket is deliberately not exposed by default. Giving a sandboxed shell access to the host Nix daemon could bypass the intended filesystem/network isolation through daemon-mediated builds or fetches.
 
 Enable shell network access with:
 

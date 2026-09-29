@@ -65,7 +65,7 @@ Configured OpenAI Tunnel starts automatically:
 abird-tunnel
 ~~~
 
-Configured stdio and HTTP start only when explicitly requested:
+stdio and HTTP start when explicitly requested:
 
 ~~~bash
 abird-tunnel --stdio
@@ -73,9 +73,9 @@ abird-tunnel --http
 abird-tunnel --stdio --http
 ~~~
 
-If OpenAI is also enabled, it runs alongside requested local transports.
+These runtime flags are authoritative additions: they start the requested transport even if that transport is disabled in persisted setup. Persisted transport selection acts as the default preference; explicit CLI flags override it for the current run.
 
-A transport disabled in setup cannot be started until it is enabled with abird-tunnel --setup.
+If OpenAI is also enabled in persisted config, it runs alongside requested local transports.
 
 ### stdio
 
@@ -206,13 +206,16 @@ abird-tunnel --deny=/src/project/secrets
 - --allow-rw=DIR adds both.
 - --deny=PATH overrides matching allow rules.
 
-Bare:
+Bare write grants:
 
 ~~~bash
 abird-tunnel --allow-write
+abird-tunnel --allow-rw
 ~~~
 
-is shorthand for read+write on cwd.
+both mean read+write on cwd.
+
+With explicit paths, --allow-write=DIR remains write-only while --allow-rw=DIR grants both read and write.
 
 Relative MCP paths resolve from --cwd. Absolute paths work when granted. Existing paths and ancestors are canonicalized before Rust policy checks to prevent symlink escapes.
 
@@ -304,8 +307,12 @@ The sandbox:
 - masks denied paths;
 - masks the saved OpenAI tunnel runtime key when present;
 - uses an empty temporary home;
+- on NixOS, mounts the Nix store/profile graph read-only (`/nix/store`, `/run/current-system`, `/etc/profiles`, `/nix/var/nix/profiles`, and `~/.nix-profile` when present) so Bash, Cargo, Git, Rust and other profile-provided tools remain executable without exposing the whole home directory;
+- canonicalizes and filters PATH to directories that are actually visible in the sandbox;
 - isolates PID, IPC, and UTS namespaces;
 - blocks shell network access by default.
+
+The host Nix daemon socket is not mounted by default, because daemon-mediated builds/fetches could bypass the shell sandbox's direct filesystem/network restrictions.
 
 Enable network inside the sandbox with:
 
@@ -373,8 +380,8 @@ Useful locations:
 ~~~text
 abird-tunnel --setup           configure supported transports
 
---stdio                        start configured stdio MCP
---http                         start configured HTTP MCP
+--stdio                        start stdio MCP for this run
+--http                         start HTTP MCP for this run
 --http-bind=<ADDR>             override HTTP listen address
 --ngrok                        publish --http through ngrok
 --ephemeral-url                ephemeral local HTTP + ngrok paths
@@ -384,9 +391,8 @@ abird-tunnel --setup           configure supported transports
 --cwd=<DIR>                    default cwd
 
 --allow-read=<DIR>             add read
---allow-write=<DIR>            add write-only
---allow-rw=<DIR>               add read+write
---allow-write                  shorthand: rw cwd
+--allow-write[=<DIR>]          bare: rw cwd; with DIR: write-only
+--allow-rw[=<DIR>]             bare: rw cwd; with DIR: read+write
 --deny=<PATH>                  deny; always wins
 
 --allow-shell                  add platform shell
