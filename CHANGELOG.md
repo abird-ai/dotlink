@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Refocus the README's front-page story on giving normal ChatGPT web workflows permission-scoped access to local files and tools through OpenAI Secure MCP Tunnel, with MCP server + policy engine + Linux Bubblewrap sandbox in one binary.
+- Add a representative startup/tool-activity transcript and document that normal TOOL attempts/completions are logged locally by default without intentionally logging file contents or raw payload bodies.
+
 - Add developer-cache autodiscovery during onboarding for Cargo, npm, pnpm, Yarn, pip, uv, Go, Maven, Gradle, sccache, and ccache.
 - Persist typed cache grants with none/read-only/read+write choices and mount approved caches only into the sandboxed shell's private home.
 - Keep shared caches outside the MCP filesystem permission surface; filesystem deny rules still remove or downgrade matching cache grants.

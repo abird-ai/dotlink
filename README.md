@@ -1,26 +1,23 @@
 # abird-link
 
-**Connect ChatGPT, Claude.ai, and other MCP-capable AI tools to your computer files and shell securely — from a single binary.**
+**Connect ChatGPT on the web to the files and tools on your computer — securely, from one local binary.**
 
-abird-link is an open-source local bridge that lets AI tools work directly with files and tools on your computer — without handing them unrestricted access to your machine.
+abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memory when enabled, and supported Codex/Work workflows — permission-scoped access to your local computer** through MCP. ChatGPT can read project files and use the tools you already have locally: Git, builds, tests, scripts, compilers, package managers, and more.
 
-One `abird-link` binary can serve multiple kinds of clients at once:
+For ChatGPT, `abird-link` opens an outbound **OpenAI Secure MCP Tunnel directly from your machine to OpenAI**. Your MCP server stays local: no public inbound port, no ngrok, and no third-party relay in the ChatGPT path. One binary provides the MCP server, tunnel transport, permission engine, profiles, activity logging, and — on Linux — a Bubblewrap shell sandbox.
 
-- **ChatGPT** through OpenAI Secure MCP Tunnel — no public inbound port required.
-- **Claude.ai and other remote AI/MCP clients** through Streamable HTTP, optionally published over an HTTPS ngrok tunnel.
+It also works beyond ChatGPT:
+
+- **Claude.ai and other remote MCP clients** through Streamable HTTP, optionally published over HTTPS/ngrok.
 - **Local MCP clients** through stdio or loopback Streamable HTTP.
+- **One permission model everywhere** — every transport reaches the same policy-controlled tool surface.
 
-All transports terminate at the same local permission engine and expose the same policy-controlled tool surface.
+Security is opt-in and local. The working directory starts read-only; write access, shell, network, extra paths, and shared developer caches are separate grants. Deny rules take precedence, unavailable capabilities disappear from the MCP tool list, and Linux shell execution is Bubblewrap-sandboxed by default.
 
-Start read-only. Add write access, a sandboxed shell, or network access only when you want them. Save different permission sets as profiles for different projects and workflows.
-
-- **Work with local files** — inspect, edit, create, and patch text or binary files.
-- **Run local tools** — optionally let the assistant use Bash or PowerShell for builds, tests, Git, scripts, and developer tooling.
-- **Least privilege by default** — the working directory starts read-only unless you grant more.
-- **Explicit allow + deny controls** — independently control read, write, shell, and network access; deny rules always win.
-- **Sandboxed shell on Linux** — Bubblewrap limits filesystem and network access.
-- **Private ChatGPT connectivity** — OpenAI Secure MCP Tunnel connects your local machine without exposing a public inbound port.
-- **Reusable profiles** — keep separate configs for work, personal projects, or different levels of access.
+- **Use your real local tools** — Bash, Git, Cargo, npm, test runners, scripts, compilers, and anything else you explicitly expose.
+- **Keep private machines private** — ChatGPT can reach a local/private MCP server through OpenAI Secure MCP Tunnel without publishing it to the internet.
+- **See what the AI is doing** — tool attempts and completions are logged locally by default.
+- **Reuse trust profiles** — keep different cwd, filesystem, shell, network, and cache policies for different projects.
 
 ## 60-second quick start
 
@@ -58,6 +55,43 @@ abird-link --allow-rw --allow-shell --allow-network
 ~~~
 
 You decide what the assistant can access. abird-link enforces those permissions locally.
+
+### What it looks like
+
+A normal ChatGPT/OpenAI profile starts with a compact security summary, then shows each MCP tool call as it happens:
+
+~~~text
+$ abird-link -p aw
+
+abird-link 0.5.0
+────────────────────────────────────────────────────────
+• Profile    aw
+• Transports openai
+• Tunnel     tunnel_…
+• Cwd        /home/pvl/spaces/abird/src/aw
+• Access     read:2 write:1 deny-read:0 deny-write:0 caches:0 + shell
+• Sandbox    Bubblewrap
+• Network    enabled
+• Status     starting…
+
+OpenAI Secure MCP Tunnel active.
+Ctrl-C to stop.
+
+✓ Connected — ready
+
+[10:59:19.184] TOOL read       → path=.agents/plans/MASTER-HANDOFF.md
+[10:59:19.194] TOOL read       ← ok  9ms
+[10:59:20.534] TOOL read       → path=.agents/plans/PHASE19-23-CONTINUATION-STATUS.md
+[10:59:20.538] TOOL read       ← ok  4ms
+[10:59:21.650] TOOL read       → path=.agents/plans/FULL-HANDOFF.md
+[10:59:21.653] TOOL read       ← ok  2ms
+[10:59:22.700] TOOL read       → path=.agents/plans/ROADMAP.md
+[10:59:22.701] TOOL read       ← ok  1ms
+[10:59:49.623] TOOL read       → path=.agents/plans/MASTER-HANDOFF.md offset=1261 limit=400
+[10:59:49.624] TOOL read       ← ok  1ms
+~~~
+
+By default, abird-link logs every MCP tool attempt and completion locally to stderr, including safe metadata such as paths, flags, status, and latency. It does **not** intentionally log file contents, binary payloads, API keys, or raw request bodies. Use `-s/--silent` to hide normal TOOL activity; use `-v/--verbose` to additionally show transport/request-level REQ diagnostics.
 
 ## Connect abird-link to ChatGPT
 
