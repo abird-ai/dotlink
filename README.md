@@ -6,6 +6,8 @@ abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memo
 
 That context also gives you continuity when the machine or tunnel is temporarily offline: you can keep discussing architecture, planning changes, or designing against project context already present in ChatGPT, then reconnect later and have ChatGPT re-read the live repository, verify what changed, and continue from the current state.
 
+Your local project can also act as a shared source of truth between **ChatGPT and Codex**. Both can work against the same repository, Git history, plans, handoff files, generated artifacts, and local tooling, so work started in one can be picked up and reconciled by the other through the machine itself — without pretending their private model context or memory is literally the same.
+
 For ChatGPT, `abird-link` opens an outbound **OpenAI Secure MCP Tunnel directly from your machine to OpenAI**. Your MCP server stays local: no public inbound port, no ngrok, and no third-party relay in the ChatGPT path. One binary provides the MCP server, tunnel transport, permission engine, profiles, activity logging, and — on Linux — a Bubblewrap shell sandbox.
 
 It also works beyond ChatGPT:
