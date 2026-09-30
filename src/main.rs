@@ -10,5 +10,6 @@ mod oauth;
 #[cfg(target_os = "linux")]
 mod secure_fs;
 mod setup;
+mod transports;
 
 fn main() {}
