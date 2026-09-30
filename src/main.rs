@@ -5,6 +5,7 @@ mod hardware;
 #[cfg(target_os = "linux")]
 mod host_services;
 mod logging;
+mod mcp;
 mod oauth;
 #[cfg(target_os = "linux")]
 mod secure_fs;
