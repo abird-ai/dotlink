@@ -14,7 +14,19 @@ if (-not $InstallDir) {
 
 $Repo = if ($env:DOTLINK_REPO) { $env:DOTLINK_REPO } else { "abird-ai/dotlink" }
 $BaseUrl = $env:DOTLINK_RELEASE_BASE_URL
-$Asset = "dotlink-windows-x86_64.exe"
+
+$OsArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+switch ($OsArchitecture) {
+    ([System.Runtime.InteropServices.Architecture]::X64) {
+        $Asset = "dotlink-windows-x86_64.exe"
+    }
+    ([System.Runtime.InteropServices.Architecture]::Arm64) {
+        $Asset = "dotlink-windows-aarch64.exe"
+    }
+    default {
+        throw "Unsupported Windows architecture: $OsArchitecture. Published: x64, arm64."
+    }
+}
 
 if (-not $BaseUrl) {
     if ($Version -eq "latest") {

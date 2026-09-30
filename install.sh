@@ -29,8 +29,12 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
         ASSET="dotlink-linux-x86_64"
         BINARY="dotlink"
         ;;
+      aarch64|arm64)
+        ASSET="dotlink-linux-aarch64"
+        BINARY="dotlink"
+        ;;
       *)
-        die "unsupported Linux architecture: $(uname -m). Currently published: x86_64."
+        die "unsupported Linux architecture: $(uname -m). Published: x86_64, aarch64."
         ;;
     esac
     ;;
@@ -40,13 +44,25 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
         ASSET="dotlink-windows-x86_64.exe"
         BINARY="dotlink.exe"
         ;;
+      aarch64|arm64)
+        ASSET="dotlink-windows-aarch64.exe"
+        BINARY="dotlink.exe"
+        ;;
       *)
-        die "unsupported Windows architecture: $(uname -m). Currently published: x86_64."
+        die "unsupported Windows architecture: $(uname -m). Published: x86_64, arm64."
         ;;
     esac
     ;;
   Darwin)
-    die "prebuilt macOS releases are not configured yet; build from source with Cargo. Apple Silicon can also use 'nix build'."
+    case "$(uname -m 2>/dev/null || printf unknown)" in
+      arm64|aarch64)
+        ASSET="dotlink-macos-aarch64"
+        BINARY="dotlink"
+        ;;
+      *)
+        die "unsupported macOS architecture: $(uname -m). Published: Apple Silicon (arm64)."
+        ;;
+    esac
     ;;
   *)
     die "unsupported OS: $(uname -s 2>/dev/null || printf unknown)"

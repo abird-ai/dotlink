@@ -1,0 +1,40 @@
+name: Build binaries
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Reproducible release bundle
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Build every release binary
+        run: nix build .#release-all --out-link result-release
+
+      - name: Materialize artifact directory
+        run: |
+          mkdir -p artifacts
+          cp -L result-release/* artifacts/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotlink-binaries
+          path: artifacts/
+          if-no-files-found: error

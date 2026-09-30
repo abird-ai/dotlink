@@ -325,21 +325,21 @@ deps
 dotlink
 ~~~
 
-On x86_64-linux, release CI can additionally build:
+On x86_64-linux, the release graph cross-builds every published binary:
 
 ~~~text
-cross-linux-x86_64-deps
-cross-linux-x86_64
-dist-linux-x86_64
-
-cross-windows-x86_64-deps
-cross-windows-x86_64
-dist-windows-x86_64
+Linux x86_64   x86_64-unknown-linux-musl
+Linux ARM64    aarch64-unknown-linux-musl
+Windows x86_64 x86_64-pc-windows-gnu
+Windows ARM64  aarch64-pc-windows-gnullvm
+macOS ARM64    aarch64-apple-darwin
 ~~~
 
-The Linux release target is x86_64-unknown-linux-musl with static CRT linking, intended to run on Debian and other x86_64 Linux distributions without a Nix runtime. The Windows target is x86_64-pc-windows-gnu.
+Each target exposes `cross-*-deps`, `cross-*`, and `dist-*` outputs. `dist-nixos-*` and `dist-debian-*` are aliases to the same static musl Linux artifact for each architecture. `release-all` aggregates every published binary, checksum sidecar, `VERSION`, and `PLATFORMS.txt` into one derivation.
 
-Dist outputs use stable filenames plus SHA-256 sidecars so a release workflow can upload the same names on every tagged release. install.sh and install.ps1 consume those assets. The canonical upstream repository is `https://github.com/abird-ai/dotlink`; installers default to that repository while still allowing `DOTLINK_REPO` or a custom release base URL for forks and mirrors.
+Windows ARM64 uses nixpkgs' pinned LLVM-MinGW/UCRT toolchain. macOS ARM64 uses the hashed Apple SDK 14.4 fetch derivation directly with Linux-hosted clang/ld64.lld and a macOS 11.0 deployment target, avoiding a host-specific Darwin build step.
+
+Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases consume identical Nix results. `scripts/build-release-artifacts.sh` and the GitHub workflow both delegate target logic to `release-all`. `install.sh` selects Linux x86_64/ARM64 or macOS ARM64 automatically; `install.ps1` selects Windows x86_64/ARM64. The canonical upstream repository is `https://github.com/abird-ai/dotlink`; installers default to that repository while still allowing `DOTLINK_REPO` or a custom release base URL for forks and mirrors.
 
 ## Binary MCP content
 

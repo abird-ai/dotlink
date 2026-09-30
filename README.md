@@ -21,13 +21,13 @@ Security is local and opt-in: the launch directory is read-only by default; writ
 
 ### Install
 
-Linux x86_64:
+Linux x86_64/ARM64 or macOS Apple Silicon:
 
 ~~~bash
 curl -fsSL https://raw.githubusercontent.com/abird-ai/dotlink/main/install.sh | sh
 ~~~
 
-Windows PowerShell:
+Windows x86_64/ARM64 PowerShell:
 
 ~~~powershell
 irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
@@ -482,11 +482,15 @@ cargo test --all-features
 cargo build --release --all-features
 ~~~
 
-Build stable Linux + Windows release artifacts:
+Build the complete reproducible release bundle from an x86_64 Linux host:
 
 ~~~bash
+nix build .#release-all
+# or copy the bundle into ./dist:
 ./scripts/build-release-artifacts.sh
 ~~~
+
+The bundle contains static Linux x86_64/ARM64 binaries (the same bits work on NixOS and Debian), Windows x86_64/ARM64, and macOS ARM64. Individual Nix outputs are also available, including `dist-nixos-*`, `dist-debian-*`, `dist-windows-*`, and `dist-macos-aarch64`.
 
 Cross-build outputs, stable filenames, installer overrides, and platform release details: `.agents/docs/release-install.md`.
 
@@ -519,7 +523,7 @@ Native Windows can still use the Rust filesystem tools with allow/deny enforceme
 
 macOS can use the Rust filesystem tools with the same allow/deny policy, plus stdio/HTTP/OpenAI transports. Because Bubblewrap is unavailable, shell execution requires `--allow-all --no-sandbox` until a macOS-native sandbox backend is added.
 
-The current nixpkgs unstable used by the flake supports Apple Silicon macOS but has dropped x86_64-darwin, so Intel macOS should build from source with Cargo for now rather than relying on `nix build`.
+Apple Silicon release binaries are cross-built reproducibly from the same x86_64 Linux Nix release graph using a pinned Apple SDK and LLVM's Mach-O linker. Intel macOS is not currently published; build it from source with Cargo if needed.
 
 ## License
 

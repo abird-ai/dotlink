@@ -4,13 +4,13 @@ Canonical upstream: `https://github.com/abird-ai/dotlink`.
 
 ## Installer behavior
 
-Linux x86_64:
+Linux x86_64/ARM64 or macOS Apple Silicon:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/abird-ai/dotlink/main/install.sh | sh
 ```
 
-Windows PowerShell:
+Windows x86_64/ARM64 PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
@@ -34,13 +34,26 @@ Default Unix install path: `~/.local/bin`.
 ```text
 dotlink-linux-x86_64
 dotlink-linux-x86_64.sha256
+dotlink-linux-aarch64
+dotlink-linux-aarch64.sha256
+
 dotlink-windows-x86_64.exe
 dotlink-windows-x86_64.exe.sha256
+dotlink-windows-aarch64.exe
+dotlink-windows-aarch64.exe.sha256
+
+dotlink-macos-aarch64
+dotlink-macos-aarch64.sha256
+
+VERSION
+PLATFORMS.txt
 ```
+
+The Linux binaries are static musl builds. NixOS and Debian outputs intentionally alias the same binary per architecture; there is no distro-specific glibc dependency.
 
 ## Nix / Crane outputs
 
-Native:
+Native development:
 
 ```bash
 nix build
@@ -50,33 +63,54 @@ nix develop
 nix build .#deps
 ```
 
-Portable Linux x86_64 (musl):
+Complete release bundle from x86_64 Linux:
 
 ```bash
-nix build .#cross-linux-x86_64-deps
+nix build .#release-all
+```
+
+The build host distribution is not part of the target ABI: the GitHub workflow uses an x86_64 Linux hosted runner, while the same `release-all` output can be built directly from your NixOS x86_64 machine. All target compilers, SDKs, and linkers are pinned by Nix.
+
+Individual cross outputs:
+
+```bash
+# Linux x86_64 / ARM64 (static musl)
 nix build .#cross-linux-x86_64
+nix build .#cross-linux-aarch64
 nix build .#dist-linux-x86_64
-```
+nix build .#dist-linux-aarch64
 
-Windows x86_64 (GNU/MinGW):
+# Explicit distro aliases to the same static Linux artifacts
+nix build .#dist-nixos-x86_64
+nix build .#dist-nixos-aarch64
+nix build .#dist-debian-x86_64
+nix build .#dist-debian-aarch64
 
-```bash
-nix build .#cross-windows-x86_64-deps
+# Windows x86_64 / ARM64
 nix build .#cross-windows-x86_64
+nix build .#cross-windows-aarch64
 nix build .#dist-windows-x86_64
+nix build .#dist-windows-aarch64
+
+# macOS ARM64, cross-built from Linux
+nix build .#cross-macos-aarch64
+nix build .#dist-macos-aarch64
 ```
 
-Build both stable-named release artifacts:
+Dependency-layer outputs are available as the matching `*-deps` attributes. Windows ARM64 uses the pinned LLVM-MinGW/UCRT toolchain from nixpkgs. macOS ARM64 uses a pinned Apple SDK fetched by Nix plus Linux-hosted LLVM/ld64.lld.
+
+To materialize the complete bundle under `./dist`:
 
 ```bash
 ./scripts/build-release-artifacts.sh
 ```
 
-The helper enables `nix-command` and `flakes` explicitly.
+The helper enables `nix-command` and `flakes` explicitly and delegates all target logic to `release-all`.
 
 ## Platform notes
 
-- Linux package includes Bash + Bubblewrap.
-- Apple Silicon macOS is supported by the current flake.
-- Intel macOS should build from Cargo because the pinned nixpkgs line no longer supports x86_64-darwin.
+- Linux x86_64/ARM64 release binaries are static and run on NixOS, Debian, and other compatible Linux distributions without a Nix runtime.
+- Windows x86_64 uses GNU/MinGW; Windows ARM64 uses LLVM-MinGW/UCRT.
+- Apple Silicon macOS is cross-built from x86_64 Linux with SDK 14.4 and deployment target macOS 11.0.
+- Intel macOS is not currently published; build from Cargo if needed.
 - Native Windows/macOS filesystem tools retain Rust allow/deny enforcement, but shell execution has no Bubblewrap equivalent; WSL2 is the recommended Windows sandbox path.

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add a single-host Nix release graph: x86_64 Linux now cross-builds static Linux x86_64/ARM64, Windows x86_64/ARM64, and macOS ARM64, aggregated by `nix build .#release-all`.
+- Add NixOS/Debian release aliases to the same distro-independent static Linux binaries, Windows ARM64 via pinned LLVM-MinGW/UCRT, and macOS ARM64 via pinned Apple SDK 14.4 + clang/ld64.lld.
+- Add a minimal GitHub Actions workflow that installs Nix, builds `release-all`, and uploads the resulting bundle; all target/toolchain logic remains in `flake.nix`.
+- Extend installers to select Linux ARM64, Windows ARM64, and Apple Silicon macOS artifacts automatically; simplify the local release helper to delegate entirely to `release-all`.
+
 - Offer an Admin-key-free OpenAI Tunnel setup path: create/manage the tunnel in OpenAI Platform and paste its existing `tunnel_...` ID; keep the one-time Admin-key flow as the optional automated path.
 - Fresh correctness/security review: make Runtime-key writes atomic, keep credentials in dotlink's owned XDG directory even with `DOTLINK_CONFIG`, and protect active config/credentials from MCP and shell self-modification.
 - Make tool discovery use the canonical runtime policy, including write-only and deny-shadowed capability handling; existing write symlinks now resolve to their canonical target before protected-path checks.
@@ -51,11 +56,9 @@
 - Add tool-specific sandbox cache environment mapping and Bubblewrap RO/RW cache regression tests.
 
 - Refactor Nix builds to Crane with a separate buildDepsOnly dependency artifact layer reused by package, tests, and Clippy.
-- Add portable x86_64 Linux/musl and x86_64 Windows GNU cross-build outputs, with separate dependency-cache outputs for CI.
 - Add stable release-artifact outputs with SHA-256 sidecars and a scripts/build-release-artifacts.sh helper.
 - Add curl-able install.sh and PowerShell install.ps1 installers using stable release asset names.
 - Refresh `flake.lock` for Crane v0.24.0 and rust-overlay.
-- Keep flake-native macOS support on aarch64-darwin; stop advertising x86_64-darwin now that nixpkgs 26.11 has dropped it, with Intel macOS documented as a Cargo-from-source path.
 - Harden Bubblewrap Nix-daemon isolation by masking the daemon endpoint roots (/nix/var/nix/daemon-socket and /run/nix-daemon) instead of assuming a specific socket leaf/type; centralize type-aware path masking for directories and non-directories.
 
 - Use JSONC profiles: config.jsonc for default and config.<profile>.jsonc for named profiles, with comments and trailing commas.
