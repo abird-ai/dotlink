@@ -404,7 +404,7 @@ If OpenAI is not chosen, skip OpenAI configuration entirely.
 
 ### Profile management
 
-`dotlink profile` supports list/show/create/edit/delete, allow/deny rule add/remove, and persisted boolean enable/disable. `default` addresses the unnamed default profile. OpenAI secrets are never printed; `profile show` reports only `[existing key]`.
+`dotlink profile` supports list/show/create/edit/delete, allow/deny rule add/remove, and persisted boolean enable/disable. `default` addresses the unnamed default profile. Dependent toggles auto-enable prerequisites and disable safely in cascades. OpenAI secrets are never printed; `profile show` reports only `[existing key]`.
 
 ### Local permission step
 
@@ -601,6 +601,10 @@ dotlink --http --ngrok --ngrok-ephemeral-url
 
 Register printed URL as custom connector.
 
+## Runtime terminal controls
+
+Interactive non-stdio runs show `Ctrl-C: exit · Ctrl-R: restart · v: verbosity`. `v` mutates shared logging state live, `Ctrl+R` tears down and reconstructs the runtime, and stdio disables key capture to protect protocol stdin.
+
 ## 15. Logging
 
 Activity logging is quiet by default; use `-v` for TOOL and `-vv` for TOOL + REQ:
@@ -693,7 +697,7 @@ git diff --check
 Latest observed full test pass:
 
 ```text
-85 tests
+88 tests
 ```
 
 The 2026-09-30 continuation pass also revalidated the current source with the intended Rust 1.98.1 toolchain:
@@ -705,7 +709,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-All 85 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
+All 88 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
 
 Live smokes have validated:
 

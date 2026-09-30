@@ -281,7 +281,7 @@ dotlink profile enable <name> <setting>
 dotlink profile disable <name> <setting>
 ```
 
-`default` is the manager alias for the unnamed default profile. Boolean settings are `openai`, `stdio`, `http`, `http-ephemeral`, `ngrok`, `ngrok-ephemeral`, `default-allow`, `shell`, and `network`. Parent dependencies are enforced; disabling a parent cascades dependent booleans off. Disabling OpenAI preserves tunnel/key data; deleting the profile removes the saved key.
+`default` is the manager alias for the unnamed default profile. Boolean settings are `openai`, `stdio`, `http`, `http-ephemeral-url`, `ngrok`, `ngrok-ephemeral-url`, `default-allow`, `shell`, and `network`. Enabling a dependent setting automatically enables its prerequisites; disabling a parent cascades dependent booleans off. Disabling OpenAI preserves tunnel/key data; deleting the profile removes the saved key.
 
 ## Cache kinds
 

@@ -107,15 +107,15 @@ Boolean settings are:
 openai
 stdio
 http
-http-ephemeral
+http-ephemeral-url
 ngrok
-ngrok-ephemeral
+ngrok-ephemeral-url
 default-allow
 shell
 network
 ```
 
-Enabling dependent settings requires their parent (`network` → `shell`, `ngrok` → `http`, `ngrok-ephemeral` → `ngrok`, `http-ephemeral` → `http`). Disabling `shell`, `ngrok`, or `http` also disables dependent booleans so the profile remains valid. Disabling OpenAI preserves its tunnel/key for later re-enable; deleting the profile removes its saved runtime key. `profile show` never prints key material and reports only `[existing key]` when one is stored.
+Enabling a dependent setting automatically enables its prerequisite (`network` → `shell`, `ngrok` → `http`, `ngrok-ephemeral-url` → `ngrok` + `http`, `http-ephemeral-url` → `http`). Disabling `shell`, `ngrok`, or `http` also disables dependent booleans so the profile remains valid. Disabling OpenAI preserves its tunnel/key for later re-enable; deleting the profile removes its saved runtime key. `profile show` never prints key material and reports only `[existing key]` when one is stored.
 
 ## Transport precedence
 
@@ -154,6 +154,18 @@ Allow rules are additive. Deny rules win. Bare path flags target the launch dire
 `--allow-rw=/` grants root filesystem read+write but does not disable Bubblewrap or enable shell/network. `--allow-all --no-sandbox` is the explicit full-host escape hatch.
 
 Shell access requires at least one readable directory.
+
+## Runtime terminal controls
+
+Interactive runs without stdio expose immediate key controls:
+
+```text
+Ctrl-C    exit
+Ctrl-R    reload profile/policy/transports
+v         cycle quiet → TOOL → TOOL + REQ → quiet
+```
+
+The current verbosity state is shared by all logger clones, so TOOL/REQ behavior changes immediately without restarting. Every `v` press emits a `LOG verbosity ...` line. Runtime controls are intentionally disabled when stdio MCP is active because stdin is reserved for the MCP protocol.
 
 ## Developer caches
 

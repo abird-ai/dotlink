@@ -182,6 +182,10 @@ Local HTTP default:
 http://127.0.0.1:3000/mcp
 ```
 
+## Runtime terminal controls
+
+Interactive non-stdio runs use raw terminal key controls: `v` cycles quiet/TOOL/TOOL+REQ, `Ctrl+R` fully reloads the runtime, and `Ctrl+C` exits. stdio disables key capture to preserve protocol stdin.
+
 ## Logging model
 
 ```text
@@ -264,7 +268,7 @@ dotlink-windows-x86_64.exe.sha256
 Validated on 2026-09-30:
 
 - `flake.lock` locks Crane v0.24.0 and rust-overlay.
-- Rust fmt/test/Clippy passes; 85/85 tests, including profile-manager, transactional setup, tunnel recovery, and restart-backoff coverage.
+- Rust fmt/test/Clippy passes; 88/88 tests, including profile-manager, transactional setup, tunnel recovery, and restart-backoff coverage.
 - real Bubblewrap runtime and cache-mount smokes pass.
 - full x86_64-linux `nix flake check` passes using an isolated writable Nix store without exposing the host daemon.
 - `nix flake check --all-systems --no-build` evaluates x86_64 Linux, aarch64 Linux and aarch64 Darwin.

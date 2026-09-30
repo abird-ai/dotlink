@@ -229,7 +229,7 @@ Clean stdio EOF must not stop active HTTP/OpenAI.
 
 A transport error cancels peers.
 
-Ctrl-C cancels root cancellation token.
+Interactive non-stdio runs handle `Ctrl+C` as exit, `Ctrl+R` as full runtime restart, and `v` as live verbosity cycling; stdio disables runtime key capture to protect protocol stdin.
 
 ## Logging model
 

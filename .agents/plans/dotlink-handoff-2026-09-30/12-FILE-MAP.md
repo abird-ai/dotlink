@@ -49,6 +49,16 @@ Owns:
 - central optional TOOL activity logging;
 - security/runtime regression tests.
 
+### `src/controls.rs`
+
+Owns:
+
+- interactive runtime key handling;
+- raw terminal mode lifecycle;
+- `v` live verbosity cycling;
+- `Ctrl+R` restart and `Ctrl+C` exit events;
+- stdio-safe disabling of key capture.
+
 ### `src/logging.rs`
 
 Owns:

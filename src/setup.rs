@@ -304,11 +304,12 @@ pub enum ProfileBool {
     Openai,
     Stdio,
     Http,
-    #[value(alias = "http-ephemeral-url")]
+    #[value(name = "http-ephemeral-url", alias = "http-ephemeral")]
     HttpEphemeral,
     Ngrok,
-    #[value(alias = "ngrok-ephemeral-url")]
+    #[value(name = "ngrok-ephemeral-url", alias = "ngrok-ephemeral")]
     NgrokEphemeral,
+    #[value(alias = "default-read")]
     DefaultAllow,
     Shell,
     Network,
@@ -1793,16 +1794,12 @@ fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: boo
             config.transports.ngrok_ephemeral_url = false;
         }
         (ProfileBool::HttpEphemeral, true) => {
-            if !config.transports.http {
-                bail!("http-ephemeral requires http to be enabled");
-            }
+            config.transports.http = true;
             config.transports.http_ephemeral_url = true;
         }
         (ProfileBool::HttpEphemeral, false) => config.transports.http_ephemeral_url = false,
         (ProfileBool::Ngrok, true) => {
-            if !config.transports.http {
-                bail!("ngrok requires http to be enabled");
-            }
+            config.transports.http = true;
             config.transports.ngrok = true;
         }
         (ProfileBool::Ngrok, false) => {
@@ -1810,9 +1807,8 @@ fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: boo
             config.transports.ngrok_ephemeral_url = false;
         }
         (ProfileBool::NgrokEphemeral, true) => {
-            if !config.transports.ngrok {
-                bail!("ngrok-ephemeral requires ngrok to be enabled");
-            }
+            config.transports.http = true;
+            config.transports.ngrok = true;
             config.transports.ngrok_ephemeral_url = true;
         }
         (ProfileBool::NgrokEphemeral, false) => config.transports.ngrok_ephemeral_url = false,
@@ -1823,9 +1819,7 @@ fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: boo
             config.permissions.allow_network = false;
         }
         (ProfileBool::Network, true) => {
-            if !config.permissions.allow_shell {
-                bail!("network requires shell to be enabled");
-            }
+            config.permissions.allow_shell = true;
             config.permissions.allow_network = true;
         }
         (ProfileBool::Network, false) => config.permissions.allow_network = false,
@@ -2376,18 +2370,15 @@ mod tests {
         config.permissions.allow_shell = false;
         config.permissions.allow_network = false;
 
-        assert!(apply_profile_bool(&mut config, ProfileBool::Ngrok, true).is_err());
-        assert!(apply_profile_bool(&mut config, ProfileBool::HttpEphemeral, true).is_err());
-        assert!(apply_profile_bool(&mut config, ProfileBool::Network, true).is_err());
-
-        apply_profile_bool(&mut config, ProfileBool::Http, true).unwrap();
-        apply_profile_bool(&mut config, ProfileBool::Ngrok, true).unwrap();
         apply_profile_bool(&mut config, ProfileBool::NgrokEphemeral, true).unwrap();
         apply_profile_bool(&mut config, ProfileBool::HttpEphemeral, true).unwrap();
+        apply_profile_bool(&mut config, ProfileBool::Network, true).unwrap();
         assert!(config.transports.http);
         assert!(config.transports.ngrok);
         assert!(config.transports.ngrok_ephemeral_url);
         assert!(config.transports.http_ephemeral_url);
+        assert!(config.permissions.allow_shell);
+        assert!(config.permissions.allow_network);
 
         apply_profile_bool(&mut config, ProfileBool::Http, false).unwrap();
         assert!(!config.transports.http);

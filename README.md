@@ -72,7 +72,7 @@ dotlink profile enable work network
 dotlink profile disable work network
 ~~~
 
-Use `default` as the profile name to manage the unnamed default profile. Persisted booleans can be toggled with `profile enable/disable`: `openai`, `stdio`, `http`, `http-ephemeral`, `ngrok`, `ngrok-ephemeral`, `default-allow`, `shell`, and `network`. Dependent settings are validated; disabling a parent safely disables its dependents.
+Use `default` as the profile name to manage the unnamed default profile. Persisted booleans can be toggled with `profile enable/disable`: `openai`, `stdio`, `http`, `http-ephemeral-url`, `ngrok`, `ngrok-ephemeral-url`, `default-allow`, `shell`, and `network`. Enabling a dependent setting automatically enables its prerequisite (`network` → `shell`, `ngrok` → `http`); disabling a parent safely disables its dependents.
 
 ### What it looks like
 
@@ -92,7 +92,7 @@ abird dotlink 0.5.0
 • Logging    TOOL
 
 OpenAI Secure MCP Tunnel connecting…
-Ctrl-C to stop.
+Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity
 
 ✓ Connected — ready
 
@@ -100,7 +100,7 @@ Ctrl-C to stop.
 [10:59:19.194] TOOL read       ← ok  9ms
 ~~~
 
-`-v` shows TOOL activity. `-vv` also shows transport/request REQ diagnostics. File contents, binary payloads, API keys, and raw request bodies are not intentionally logged.
+`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` without restarting. Each change emits a compact `LOG verbosity …` line. `Ctrl+R` fully reloads the profile/policy/transports; `Ctrl+C` exits. Runtime key controls are disabled when stdio MCP is active so protocol stdin is never intercepted. File contents, binary payloads, API keys, and raw request bodies are not intentionally logged.
 
 ## Connect dotlink to ChatGPT
 
@@ -352,7 +352,7 @@ With `-vv`, transport diagnostics are added:
 
 Logs include safe metadata such as paths, methods, status, and latency; file contents, binary payloads, runtime keys, and raw request bodies are not intentionally logged.
 
-Color is automatic on interactive stderr. Override with `--color=always`, `--color=never`, or `--color=auto`.
+Color is automatic on interactive stderr. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio runs keep stdin protocol-clean and therefore expose only `Ctrl+C`.
 
 ## CLI summary
 

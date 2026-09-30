@@ -180,17 +180,14 @@ fn mcp_router(
             server_config,
         );
 
-    let router = Router::new().nest_service(path, service);
-    if log.developer_enabled() {
-        router.layer(middleware::from_fn(
+    Router::new()
+        .nest_service(path, service)
+        .layer(middleware::from_fn(
             move |request: Request<Body>, next: Next| {
                 let log = log.clone();
                 async move { log_http_request(log, request, next).await }
             },
         ))
-    } else {
-        router
-    }
 }
 
 async fn log_http_request(log: LogConfig, request: Request<Body>, next: Next) -> Response {

@@ -65,7 +65,7 @@ Filesystem deny rules remain authoritative: deny-read removes a matching cache m
 
 stdio is local subprocess IPC over stdin/stdout.
 
-When --stdio is active, stdout is protocol-only. Status and diagnostics are written to stderr.
+When --stdio is active, stdout is protocol-only. Status and diagnostics are written to stderr. Runtime key capture (`v` / `Ctrl+R`) is disabled whenever stdio is active, so dotlink never competes for protocol stdin.
 
 ### local HTTP
 
@@ -189,7 +189,7 @@ patch_binary also caps total file size processed in memory.
 
 At `-v`, TOOL logs show safe metadata such as paths, directories, flags, status, latency, and timestamps. Content/data fields are summarized by size instead of printing file contents or binary payloads.
 
-Verbose mode adds request-level transport/protocol metadata. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the dotlink request logger.
+At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/protocol metadata is added. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the dotlink request logger.
 
 `--silent` suppresses TOOL activity. With `-vv`, it leaves REQ diagnostics visible while hiding TOOL lines.
 

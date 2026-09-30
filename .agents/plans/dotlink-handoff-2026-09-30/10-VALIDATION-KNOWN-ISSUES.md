@@ -16,7 +16,7 @@ git diff --check
 Final observed suite:
 
 ```text
-85 tests passed
+88 tests passed
 Clippy clean
 fmt clean
 diff check clean
@@ -37,6 +37,10 @@ The opt-in real runtime smokes passed with `DOTLINK_TEST_BWRAP=1`, including:
 - deny-write RO downgrade;
 - typed cache RO/RW mounts;
 - cache-specific environment mapping.
+
+## Runtime key-control validation
+
+A pseudo-terminal smoke verified: banner key hint, three-step live `v` verbosity cycle with log notices, full `Ctrl+R` transport/runtime restart with a second banner, preserved verbosity state, and clean `Ctrl+C` exit. stdio intentionally does not enable runtime key capture.
 
 ## Logging validation
 

@@ -1,3 +1,4 @@
+mod controls;
 mod logging;
 mod mcp;
 mod setup;
@@ -9,12 +10,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    controls::{RuntimeControl, RuntimeControls},
     logging::{ColorMode, LogConfig},
     mcp::{AccessSpec, LocalMachine, MachineConfig, SandboxCacheMount},
     setup::{
@@ -458,17 +460,19 @@ fn runtime_restart_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeOutcome {
+    Exit,
+    Restart,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     let launch_dir = std::env::current_dir()?;
 
     let log = LogConfig::new(args.verbose, args.silent, args.color);
-    let default_filter = if args.verbose >= 2 {
-        "dotlink=debug"
-    } else {
-        "dotlink=warn"
-    };
+    let default_filter = "dotlink=warn";
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
@@ -485,7 +489,11 @@ async fn main() -> Result<()> {
     let mut runtime_restarts = 0_u32;
     loop {
         match run_runtime(&args, &launch_dir, &log).await {
-            Ok(()) => return Ok(()),
+            Ok(RuntimeOutcome::Exit) => return Ok(()),
+            Ok(RuntimeOutcome::Restart) => {
+                runtime_restarts = 0;
+                log.notice("runtime", "restarting");
+            }
             Err(error) => {
                 let Some(restart) = transports::runtime_restart_request(&error) else {
                     return Err(error);
@@ -576,22 +584,22 @@ async fn run_command(command: &Command, color: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<()> {
+async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<RuntimeOutcome> {
     let Some(setup) =
         load_or_setup(args.setup, args.profile.as_deref(), log.color_enabled()).await?
     else {
-        return Ok(());
+        return Ok(RuntimeOutcome::Exit);
     };
 
     if args.setup {
-        return Ok(());
+        return Ok(RuntimeOutcome::Exit);
     }
 
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
 
     if args.list_tools {
         print_tools(&policy);
-        return Ok(());
+        return Ok(RuntimeOutcome::Exit);
     }
 
     if args.print_id {
@@ -601,7 +609,7 @@ async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
         println!("{tunnel_id}");
-        return Ok(());
+        return Ok(RuntimeOutcome::Exit);
     }
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
@@ -697,6 +705,8 @@ async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<
     .await?;
 
     let cancellation = CancellationToken::new();
+    let mut controls = RuntimeControls::start(log.clone(), active_transports.stdio);
+    let controls_available = controls.is_some();
 
     print_banner(
         &active_transports,
@@ -704,18 +714,75 @@ async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<
         args.profile.as_deref(),
         log,
         args.allow_all,
+        controls_available,
     );
 
-    tokio::select! {
-        result = active_transports.run(machine, cancellation.child_token()) => result?,
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            cancellation.cancel();
-            eprintln!("\ndotlink stopped.");
-        }
+    let mut transport_task =
+        tokio::spawn(active_transports.run(machine, cancellation.child_token()));
+
+    enum RuntimeEvent {
+        Transport(Result<()>),
+        Exit,
+        Restart,
     }
 
-    Ok(())
+    let event = tokio::select! {
+        result = &mut transport_task => {
+            RuntimeEvent::Transport(match result {
+                Ok(result) => result,
+                Err(error) => Err(anyhow!("transport supervisor task failed: {error}")),
+            })
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            RuntimeEvent::Exit
+        }
+        control = async {
+            match controls.as_mut() {
+                Some(controls) => controls.recv().await,
+                None => std::future::pending::<Option<RuntimeControl>>().await,
+            }
+        } => {
+            match control.unwrap_or(RuntimeControl::Exit) {
+                RuntimeControl::Exit => RuntimeEvent::Exit,
+                RuntimeControl::Restart => RuntimeEvent::Restart,
+            }
+        }
+    };
+
+    if let Some(controls) = controls.take() {
+        controls.shutdown().await;
+    }
+
+    match event {
+        RuntimeEvent::Transport(result) => {
+            result?;
+            Ok(RuntimeOutcome::Exit)
+        }
+        RuntimeEvent::Exit => {
+            stop_runtime_transports(&mut transport_task, &cancellation).await;
+            eprintln!("\ndotlink stopped.");
+            Ok(RuntimeOutcome::Exit)
+        }
+        RuntimeEvent::Restart => {
+            stop_runtime_transports(&mut transport_task, &cancellation).await;
+            Ok(RuntimeOutcome::Restart)
+        }
+    }
+}
+
+async fn stop_runtime_transports(
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    cancellation: &CancellationToken,
+) {
+    cancellation.cancel();
+    if tokio::time::timeout(std::time::Duration::from_secs(6), &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -778,6 +845,7 @@ fn print_banner(
     profile: Option<&str>,
     log: &LogConfig,
     allow_all: bool,
+    controls_available: bool,
 ) {
     eprintln!();
     eprintln!(
@@ -837,11 +905,7 @@ fn print_banner(
             }
         );
     }
-    if log.developer_enabled() {
-        eprintln!("• Logging    TOOL + REQ");
-    } else if log.activity_enabled() {
-        eprintln!("• Logging    TOOL");
-    }
+    eprintln!("• Logging    {}", log.verbosity_label());
     eprintln!();
     if transports.openai.is_some() {
         eprintln!("OpenAI Secure MCP Tunnel connecting…");
@@ -849,7 +913,17 @@ fn print_banner(
     if transports.stdio {
         eprintln!("stdio MCP server active; stdout is reserved for MCP.");
     }
-    eprintln!("Ctrl-C to stop.");
+    if controls_available {
+        eprintln!(
+            "{}",
+            log.style(
+                "2",
+                "Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity"
+            )
+        );
+    } else {
+        eprintln!("{}", log.style("2", "Keys        Ctrl-C: exit"));
+    }
     eprintln!();
 }
 

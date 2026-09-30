@@ -2,9 +2,13 @@
 
 ## Unreleased
 
+- Add live terminal controls for interactive runs: `v` cycles quiet/TOOL/TOOL+REQ verbosity, `Ctrl+R` fully restarts the runtime, and `Ctrl+C` exits.
+- Make runtime verbosity shared/mutable so all transports react immediately; HTTP REQ logging can now turn on after startup.
+- Keep stdio protocol-safe by disabling runtime key capture whenever stdio transport is active.
+
 - Make setup transactional: cancel/none exits successfully without writing a profile, so first-run setup restarts cleanly on the next launch.
 - Make re-setup profile-aware: existing transport/access/cache/tunnel values become prompt defaults, stored Runtime API keys display only as `[existing key]`, and blank secret input preserves them.
-- Add `dotlink profile` management for list/show/create/edit/delete, allow/deny rule add/remove, and persisted boolean enable/disable operations.
+- Add `dotlink profile` management for list/show/create/edit/delete, allow/deny rule add/remove, and persisted boolean enable/disable operations; dependent toggles auto-enable prerequisites and disable safely in cascades.
 - Preserve OpenAI tunnel/key data when OpenAI is disabled and remove the saved key only when the profile is deleted.
 
 - Rebrand the project as **abird dotlink** for human-facing branding and `dotlink` for the crate, executable, MCP identity, config/env namespace, Nix outputs, installers, and release assets.

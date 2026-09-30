@@ -89,7 +89,7 @@ Clean termination of one transport does not terminate the others. For example, s
 
 A transport error cancels the remaining active transports.
 
-Ctrl-C cancels the shared root cancellation token.
+Interactive non-stdio runs also start a terminal-control loop: `v` mutates shared logging verbosity live, `Ctrl+R` cancels/drains the active transports and rebuilds the runtime from the current profile/CLI state, and `Ctrl+C` exits. stdio disables key capture so protocol stdin remains exclusive.
 
 ## stdio
 
@@ -310,9 +310,9 @@ Then add --allow-shell and/or --allow-network separately.
 Logging has two layers:
 
 - normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP all produce the same timestamped TOOL start/completion lines;
-- verbose developer logging records incoming request metadata at the transport boundary without dumping request bodies.
+- REQ logging records incoming request metadata at the transport boundary without dumping request bodies.
 
-Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. `-s/--silent` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
+Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. In interactive non-stdio runs, `v` cycles `quiet → TOOL → TOOL + REQ → quiet` immediately across all logger clones. `-s/--silent` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
 
 ## Build and release architecture
 
