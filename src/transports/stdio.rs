@@ -18,6 +18,8 @@ struct RequestLoggingReader<R> {
     log: LogConfig,
     pending: Vec<u8>,
     overflow: bool,
+    in_line: bool,
+    capture_line: bool,
 }
 
 impl<R> RequestLoggingReader<R> {
@@ -27,19 +29,38 @@ impl<R> RequestLoggingReader<R> {
             log,
             pending: Vec::new(),
             overflow: false,
+            in_line: false,
+            capture_line: false,
         }
     }
 
     fn observe(&mut self, bytes: &[u8]) {
-        if !self.log.developer_enabled() {
-            return;
-        }
-
         for &byte in bytes {
+            let enabled = self.log.developer_enabled();
             if byte == b'\n' {
-                self.log_pending();
+                if self.capture_line {
+                    self.log_pending();
+                }
                 self.pending.clear();
                 self.overflow = false;
+                self.in_line = false;
+                self.capture_line = false;
+                continue;
+            }
+
+            if !self.in_line {
+                self.in_line = true;
+                self.capture_line = enabled;
+            } else if self.capture_line && !enabled {
+                // Verbosity was turned off mid-request. Drop the partial line;
+                // if it is turned back on before newline we still wait for the
+                // next complete JSON-RPC frame instead of splicing fragments.
+                self.capture_line = false;
+                self.pending.clear();
+                self.overflow = false;
+            }
+
+            if !self.capture_line {
                 continue;
             }
 

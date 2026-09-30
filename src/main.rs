@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    controls::{RuntimeControl, RuntimeControls},
+    controls::{RuntimeControl, RuntimeControls, StdioInterruptGuard},
     logging::{ColorMode, LogConfig},
     mcp::{AccessSpec, LocalMachine, MachineConfig, SandboxCacheMount},
     setup::{
@@ -211,8 +211,8 @@ struct Args {
     print_id: bool,
 
     /// Suppress TOOL activity even when verbosity enables it.
-    #[arg(short = 's', long)]
-    silent: bool,
+    #[arg(short = 'q', long)]
+    quiet: bool,
 
     /// Increase logging verbosity: -v shows TOOL activity; -vv also shows REQ diagnostics.
     #[arg(short = 'v', long, action = ArgAction::Count)]
@@ -409,15 +409,16 @@ impl Policy {
             true
         };
 
-        if allow_shell && read_roots.is_empty() {
+        let effective_read = capability_available(&read_roots, &deny_read_roots, unrestricted_fs);
+        let effective_write =
+            capability_available(&write_roots, &deny_write_roots, unrestricted_fs);
+        if allow_shell && !effective_read {
             bail!(
-                "shell access requires at least one readable directory; omit --no-default-allow or add --allow-read/--allow-rw"
+                "shell access requires at least one effectively readable directory after deny rules"
             );
         }
-        if read_roots.is_empty() && write_roots.is_empty() && !allow_shell {
-            bail!(
-                "no local capability is enabled; allow a path (or omit --no-default-allow) or enable shell access"
-            );
+        if !effective_read && !effective_write && !allow_shell {
+            bail!("no effective local capability remains after applying deny rules");
         }
 
         Ok(Self {
@@ -433,9 +434,70 @@ impl Policy {
         })
     }
 
-    fn has_write(&self) -> bool {
-        self.unrestricted_fs || !self.write_roots.is_empty()
+    fn has_read(&self) -> bool {
+        capability_available(
+            &self.read_roots,
+            &self.deny_read_roots,
+            self.unrestricted_fs,
+        )
     }
+
+    fn has_write(&self) -> bool {
+        capability_available(
+            &self.write_roots,
+            &self.deny_write_roots,
+            self.unrestricted_fs,
+        )
+    }
+
+    fn has_read_write(&self) -> bool {
+        read_write_capability_available(
+            &self.read_roots,
+            &self.write_roots,
+            &self.deny_read_roots,
+            &self.deny_write_roots,
+            self.unrestricted_fs,
+        )
+    }
+}
+
+fn root_fully_denied(root: &Path, denies: &[PathBuf]) -> bool {
+    denies.iter().any(|deny| root.starts_with(deny))
+}
+
+fn capability_available(grants: &[PathBuf], denies: &[PathBuf], unrestricted: bool) -> bool {
+    if unrestricted && !root_fully_denied(Path::new("/"), denies) {
+        return true;
+    }
+    grants.iter().any(|root| !root_fully_denied(root, denies))
+}
+
+fn read_write_capability_available(
+    reads: &[PathBuf],
+    writes: &[PathBuf],
+    deny_reads: &[PathBuf],
+    deny_writes: &[PathBuf],
+    unrestricted: bool,
+) -> bool {
+    if unrestricted
+        && !root_fully_denied(Path::new("/"), deny_reads)
+        && !root_fully_denied(Path::new("/"), deny_writes)
+    {
+        return true;
+    }
+
+    reads.iter().any(|read| {
+        writes.iter().any(|write| {
+            let overlap = if read.starts_with(write) {
+                read.as_path()
+            } else if write.starts_with(read) {
+                write.as_path()
+            } else {
+                return false;
+            };
+            !root_fully_denied(overlap, deny_reads) && !root_fully_denied(overlap, deny_writes)
+        })
+    })
 }
 
 fn base_or_path(path: &PathBuf, base_dir: &Path) -> PathBuf {
@@ -471,7 +533,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let launch_dir = std::env::current_dir()?;
 
-    let log = LogConfig::new(args.verbose, args.silent, args.color);
+    let log = LogConfig::new(args.verbose, args.quiet, args.color);
+    let setup_color = args.color.stdout_enabled();
     let default_filter = "dotlink=warn";
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -482,13 +545,13 @@ async fn main() -> Result<()> {
         .init();
 
     if let Some(command) = &args.command {
-        run_command(command, log.color_enabled()).await?;
+        run_command(command, setup_color).await?;
         return Ok(());
     }
 
     let mut runtime_restarts = 0_u32;
     loop {
-        match run_runtime(&args, &launch_dir, &log).await {
+        match run_runtime(&args, &launch_dir, &log, setup_color).await {
             Ok(RuntimeOutcome::Exit) => return Ok(()),
             Ok(RuntimeOutcome::Restart) => {
                 runtime_restarts = 0;
@@ -508,6 +571,7 @@ async fn main() -> Result<()> {
                     delay_secs = delay.as_secs(),
                     "OpenAI transport remained unhealthy; restarting dotlink runtime"
                 );
+                log.developer("runtime", format!("restart reason: {error:#}"));
                 tracing::debug!(%error, "runtime restart reason");
                 eprintln!(
                     "\nOpenAI tunnel unhealthy — restarting dotlink runtime in {}s…",
@@ -584,10 +648,13 @@ async fn run_command(command: &Command, color: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<RuntimeOutcome> {
-    let Some(setup) =
-        load_or_setup(args.setup, args.profile.as_deref(), log.color_enabled()).await?
-    else {
+async fn run_runtime(
+    args: &Args,
+    launch_dir: &Path,
+    log: &LogConfig,
+    setup_color: bool,
+) -> Result<RuntimeOutcome> {
+    let Some(setup) = load_or_setup(args.setup, args.profile.as_deref(), setup_color).await? else {
         return Ok(RuntimeOutcome::Exit);
     };
 
@@ -705,6 +772,7 @@ async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<
     .await?;
 
     let cancellation = CancellationToken::new();
+    let _stdio_interrupt = StdioInterruptGuard::start(active_transports.stdio);
     let mut controls = RuntimeControls::start(log.clone(), active_transports.stdio);
     let controls_available = controls.is_some();
 
@@ -751,7 +819,7 @@ async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<
     };
 
     if let Some(controls) = controls.take() {
-        controls.shutdown().await;
+        controls.shutdown();
     }
 
     match event {
@@ -928,8 +996,13 @@ fn print_banner(
 }
 
 fn print_tools(policy: &Policy) {
-    let tools =
-        LocalMachine::tool_router_for_policy(policy.has_write(), policy.allow_shell).list_all();
+    let tools = LocalMachine::tool_router_for_policy(
+        policy.has_read(),
+        policy.has_write(),
+        policy.has_read_write(),
+        policy.allow_shell,
+    )
+    .list_all();
 
     println!("abird dotlink tools");
     println!("────────────────────────────────────────────────────────");
@@ -978,6 +1051,14 @@ mod tests {
     }
 
     #[test]
+    fn deny_can_remove_the_last_effective_capability() {
+        let args = Args::try_parse_from(["dotlink", "--deny-read"]).unwrap();
+        let error =
+            Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap_err();
+        assert!(error.to_string().contains("no effective local capability"));
+    }
+
+    #[test]
     fn default_is_read_only_launch_directory() {
         let (_, policy) = parse(&["dotlink"], no_defaults());
         assert_eq!(policy.base_dir, PathBuf::from("/workspace"));
@@ -1007,11 +1088,9 @@ mod tests {
             Args::try_parse_from(["dotlink", "--no-default-allow", "--allow-shell"]).unwrap();
         let error =
             Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("shell access requires at least one readable directory")
-        );
+        assert!(error.to_string().contains(
+            "shell access requires at least one effectively readable directory after deny rules"
+        ));
 
         let args = Args::try_parse_from([
             "dotlink",
@@ -1195,20 +1274,20 @@ mod tests {
 
     #[test]
     fn logging_flags_have_distinct_cli_meanings() {
-        let silent = Args::try_parse_from(["dotlink", "-s"]).unwrap();
-        assert!(silent.silent);
-        assert_eq!(silent.verbose, 0);
-        assert!(!silent.setup);
+        let quiet = Args::try_parse_from(["dotlink", "-q"]).unwrap();
+        assert!(quiet.quiet);
+        assert_eq!(quiet.verbose, 0);
+        assert!(!quiet.setup);
 
         let verbose = Args::try_parse_from(["dotlink", "-v"]).unwrap();
         assert_eq!(verbose.verbose, 1);
-        assert!(!verbose.silent);
+        assert!(!verbose.quiet);
 
         let developer = Args::try_parse_from(["dotlink", "-vv"]).unwrap();
         assert_eq!(developer.verbose, 2);
 
-        let both = Args::try_parse_from(["dotlink", "--silent", "-vv", "--color=never"]).unwrap();
-        assert!(both.silent);
+        let both = Args::try_parse_from(["dotlink", "--quiet", "-vv", "--color=never"]).unwrap();
+        assert!(both.quiet);
         assert_eq!(both.verbose, 2);
         assert_eq!(both.color, ColorMode::Never);
     }
@@ -1217,7 +1296,7 @@ mod tests {
     fn setup_uses_uppercase_s_short_flag() {
         let args = Args::try_parse_from(["dotlink", "-S"]).unwrap();
         assert!(args.setup);
-        assert!(!args.silent);
+        assert!(!args.quiet);
     }
 
     #[test]

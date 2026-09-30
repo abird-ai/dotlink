@@ -44,7 +44,7 @@ Complete:
 - developer cache discovery/sharing;
 - cache deny precedence;
 - timestamped TOOL logging;
-- silent/verbose/color semantics;
+- quiet/verbose/color semantics;
 - NixOS/Bubblewrap hardening;
 - Nix daemon isolation;
 - simplified `--allow-rw=/` and paired `--allow-all --no-sandbox`.
@@ -136,7 +136,7 @@ The current typed profile/onboarding model may already be sufficient.
 - do not restore `fs_*` tool names;
 - do not overload text read/write with binary encodings;
 - do not enable TOOL logging by default;
-- do not reuse `-s` for setup;
+- do not reuse `-q` for setup;
 - do not silently enable network because a package manager misses a dependency;
 - do not weaken path canonicalization or deny precedence to make a test pass;
 - keep the canonical upstream as `https://github.com/abird-ai/dotlink`.

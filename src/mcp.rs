@@ -26,7 +26,7 @@ use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
-    time::timeout,
+    time::{Instant, timeout_at},
 };
 
 const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
@@ -620,6 +620,37 @@ impl AccessPolicy {
     fn deny_write_roots(&self) -> &[PathBuf] {
         &self.deny_write_roots
     }
+    fn has_read_capability(&self) -> bool {
+        self.unrestricted_fs && !self.denied_read(Path::new("/"))
+            || self.read_roots.iter().any(|root| !self.denied_read(root))
+    }
+
+    fn has_write_capability(&self) -> bool {
+        self.unrestricted_fs && !self.denied_write(Path::new("/"))
+            || self.write_roots.iter().any(|root| !self.denied_write(root))
+    }
+
+    fn has_read_write_capability(&self) -> bool {
+        if self.unrestricted_fs
+            && !self.denied_read(Path::new("/"))
+            && !self.denied_write(Path::new("/"))
+        {
+            return true;
+        }
+
+        self.read_roots.iter().any(|read| {
+            self.write_roots.iter().any(|write| {
+                let overlap = if read.starts_with(write) {
+                    read.as_path()
+                } else if write.starts_with(read) {
+                    write.as_path()
+                } else {
+                    return false;
+                };
+                !self.denied_read(overlap) && !self.denied_write(overlap)
+            })
+        })
+    }
 }
 
 impl LocalMachine {
@@ -654,6 +685,16 @@ impl LocalMachine {
         let mut deny_write_roots = Vec::with_capacity(args.access.deny_write_roots.len());
         for path in &args.access.deny_write_roots {
             deny_write_roots.push(canonicalize_deny(&base_dir, path).await?);
+        }
+
+        for roots in [
+            &mut read_roots,
+            &mut write_roots,
+            &mut deny_read_roots,
+            &mut deny_write_roots,
+        ] {
+            roots.sort();
+            roots.dedup();
         }
 
         let access = AccessPolicy::from_spec(AccessSpec {
@@ -709,7 +750,11 @@ impl LocalMachine {
 
         let mut protected_paths = Vec::with_capacity(args.protected_paths.len());
         for path in args.protected_paths {
-            protected_paths.push(fs::canonicalize(&path).await.unwrap_or(path));
+            protected_paths.push(
+                canonicalize_deny(&access.base_dir, &path)
+                    .await
+                    .unwrap_or(path),
+            );
         }
 
         let shell_program = if args.allow_shell {
@@ -818,11 +863,26 @@ impl LocalMachine {
         )
     }
 
-    pub fn tool_router_for_policy(any_write: bool, allow_shell: bool) -> ToolRouter<Self> {
+    pub fn tool_router_for_policy(
+        any_read: bool,
+        any_write: bool,
+        any_read_write: bool,
+        allow_shell: bool,
+    ) -> ToolRouter<Self> {
         let mut router = Self::tool_router();
 
+        if !any_read {
+            for name in ["ls", "read", "read_binary"] {
+                router.disable_route(name.to_owned());
+            }
+        }
         if !any_write {
-            for name in ["write", "edit", "write_binary", "patch_binary"] {
+            for name in ["write", "write_binary"] {
+                router.disable_route(name.to_owned());
+            }
+        }
+        if !any_read_write {
+            for name in ["edit", "patch_binary"] {
                 router.disable_route(name.to_owned());
             }
         }
@@ -841,7 +901,9 @@ impl LocalMachine {
 
     fn policy_tool_router(&self) -> ToolRouter<Self> {
         Self::tool_router_for_policy(
-            self.config.access.unrestricted_fs || !self.config.access.write_roots.is_empty(),
+            self.config.access.has_read_capability(),
+            self.config.access.has_write_capability(),
+            self.config.access.has_read_write_capability(),
             self.config.allow_shell,
         )
     }
@@ -926,6 +988,11 @@ impl LocalMachine {
             .clamp(1, self.config.max_output_bytes)
     }
 
+    async fn terminate_child(child: &mut tokio::process::Child) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
     async fn execute_shell(
         &self,
         args: ShellArgs,
@@ -995,23 +1062,19 @@ impl LocalMachine {
             Err(error) => return Ok(tool_error(error)),
         };
 
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
         if let Some(stdin_text) = args.stdin
             && let Some(mut stdin) = child.stdin.take()
         {
-            match timeout(
-                Duration::from_secs(timeout_secs),
-                stdin.write_all(stdin_text.as_bytes()),
-            )
-            .await
-            {
+            match timeout_at(deadline, stdin.write_all(stdin_text.as_bytes())).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let _ = child.kill().await;
+                    Self::terminate_child(&mut child).await;
                     return Ok(tool_error(format!("failed writing stdin: {error}")));
                 }
                 Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    Self::terminate_child(&mut child).await;
                     return Ok(tool_error(format!(
                         "writing command stdin timed out after {timeout_secs} seconds"
                     )));
@@ -1022,25 +1085,31 @@ impl LocalMachine {
         let output_limit = self.output_limit(args.max_output_bytes);
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
-            None => return Ok(tool_error("failed to capture child stdout")),
+            None => {
+                Self::terminate_child(&mut child).await;
+                return Ok(tool_error("failed to capture child stdout"));
+            }
         };
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
-            None => return Ok(tool_error("failed to capture child stderr")),
+            None => {
+                Self::terminate_child(&mut child).await;
+                return Ok(tool_error("failed to capture child stderr"));
+            }
         };
         let stdout_task = tokio::spawn(drain_capped(stdout, output_limit));
         let stderr_task = tokio::spawn(drain_capped(stderr, output_limit));
 
-        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        let status = match timeout_at(deadline, child.wait()).await {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
+                Self::terminate_child(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 return Ok(tool_error(error));
             }
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                Self::terminate_child(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 return Ok(tool_error(format!(
@@ -1970,7 +2039,7 @@ mod tests {
 
     #[test]
     fn default_tool_policy_is_read_only() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(false, false)
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, false, false, false)
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
@@ -1980,7 +2049,7 @@ mod tests {
 
     #[test]
     fn write_policy_adds_mutators() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, false)
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, true, true, false)
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
@@ -2000,8 +2069,31 @@ mod tests {
     }
 
     #[test]
+    fn write_only_policy_advertises_only_write_tools() {
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(false, true, false, false)
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(names, ["write", "write_binary"]);
+    }
+
+    #[test]
+    fn split_read_write_without_overlap_does_not_advertise_edit_tools() {
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, true, false, false)
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["ls", "read", "read_binary", "write", "write_binary"]
+        );
+    }
+
+    #[test]
     fn shell_policy_is_platform_specific() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(false, true)
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, false, false, true)
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())

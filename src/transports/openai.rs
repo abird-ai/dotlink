@@ -389,8 +389,8 @@ impl TunnelClient {
                             failures = 0;
                             not_ready_failures = 0;
                             if !announced {
-                                println!("✓ Connected — ready");
-                                println!();
+                                eprintln!("✓ Connected — ready");
+                                eprintln!();
                                 info!(tunnel_id = %self.tunnel_id, "secure MCP tunnel connected");
                                 announced = true;
                             }
@@ -404,12 +404,20 @@ impl TunnelClient {
                                     attempt = failures,
                                     "tunnel poll failure threshold reached; restarting dotlink runtime"
                                 );
+                                self.log.developer(
+                                    "openai",
+                                    format!("poll failure triggering runtime restart: {error:#}"),
+                                );
                                 debug!(%error, "OpenAI tunnel poll failure triggering runtime restart");
                                 reconnect_reason = Some(error);
                                 break;
                             }
 
                             warn!(attempt = failures, "tunnel poll failed; retrying");
+                            self.log.developer(
+                                "openai",
+                                format!("poll failure attempt {failures}: {error:#}"),
+                            );
                             debug!(%error, attempt = failures, "OpenAI tunnel poll failure detail");
                             self.sleep_backoff(failures).await;
                             continue;

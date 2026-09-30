@@ -148,6 +148,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_transport_modules_do_not_write_human_status_to_stdout() {
+        for (name, source) in [
+            ("openai", include_str!("openai.rs")),
+            ("http", include_str!("http.rs")),
+            ("stdio", include_str!("stdio.rs")),
+        ] {
+            assert!(
+                !source.contains("println!("),
+                "{name} transport must keep stdout protocol-clean"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_restart_marker_survives_transport_context() {
         let error = anyhow::Error::new(RuntimeRestartRequested::new("restart".into(), true))
             .context("OpenAI transport failed");

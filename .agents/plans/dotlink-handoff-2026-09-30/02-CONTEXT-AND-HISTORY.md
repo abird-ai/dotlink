@@ -135,7 +135,7 @@ Original `-v` was user-facing concise tool logging.
 Decision changed:
 
 - TOOL activity is available on demand with `-v`;
-- `-s` should suppress it;
+- `-q` should suppress it;
 - `-v` should mean developer request/protocol logging;
 - setup short flag moves to `-S`;
 - colors should auto-follow interactive stderr.

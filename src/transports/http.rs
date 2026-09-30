@@ -192,7 +192,7 @@ fn mcp_router(
 
 async fn log_http_request(log: LogConfig, request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
-    let uri = request.uri().path().to_owned();
+    let uri = safe_log_path(request.uri().path());
     let label = format!("{method} {uri}");
     let started = log.request("http", &label);
     let response = next.run(request).await;
@@ -203,6 +203,14 @@ async fn log_http_request(log: LogConfig, request: Request<Body>, next: Next) ->
         response.status().as_u16().to_string(),
     );
     response
+}
+
+fn safe_log_path(path: &str) -> &str {
+    if path.starts_with("/mcp/") {
+        "/mcp/<ephemeral>"
+    } else {
+        path
+    }
 }
 
 fn mcp_path(ephemeral: bool) -> String {
@@ -234,6 +242,13 @@ fn ngrok_upstream(bind: SocketAddr) -> Result<Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_log_path_redacts_ephemeral_mcp_tokens() {
+        assert_eq!(safe_log_path("/mcp"), "/mcp");
+        assert_eq!(safe_log_path("/mcp/0123456789abcdef"), "/mcp/<ephemeral>");
+        assert_eq!(safe_log_path("/health"), "/health");
+    }
 
     #[test]
     fn normal_mcp_path_is_stable() {

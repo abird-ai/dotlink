@@ -352,7 +352,7 @@ dotlink -p work
 dotlink -S -p work
 ```
 
-`-s` is silent; setup shorthand is uppercase `-S`.
+`-q` is quiet; setup shorthand is uppercase `-S`.
 
 JSONC supports:
 
@@ -614,11 +614,11 @@ Activity logging is quiet by default; use `-v` for TOOL and `-vv` for TOOL + REQ
 [01:06:47.411] TOOL read ← ok 1ms
 ```
 
-`-s/--silent` suppresses TOOL activity.
+`-q/--quiet` suppresses TOOL activity.
 
 `-v` enables TOOL logs; `-vv` adds developer REQ logs.
 
-`--silent -vv` means REQ-only.
+`--quiet -vv` means REQ-only.
 
 `--color=auto|always|never` controls ANSI; auto checks interactive stderr.
 
@@ -697,7 +697,7 @@ git diff --check
 Latest observed full test pass:
 
 ```text
-88 tests
+94 tests
 ```
 
 The 2026-09-30 continuation pass also revalidated the current source with the intended Rust 1.98.1 toolchain:
@@ -709,7 +709,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-All 88 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
+All 94 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
 
 Live smokes have validated:
 
@@ -723,7 +723,7 @@ Live smokes have validated:
 - Nix daemon hiding;
 - cache RO/RW mounts;
 - cache denies;
-- normal/silent/verbose logging;
+- normal/quiet/verbose logging;
 - HTTP request logging;
 - color forcing.
 
@@ -764,7 +764,7 @@ The implementation/release phase is complete. Remaining work is operational rath
 - do not restore `fs_*` naming;
 - do not overload text read/write with binary modes;
 - do not enable TOOL activity by default; keep it opt-in with `-v`;
-- do not reuse `-s` for setup;
+- do not reuse `-q` for setup;
 - do not silently enable network because a package manager wants a dependency;
 - do not weaken path canonicalization/deny precedence just to get a build passing;
 - do not hard-code an invented GitHub owner.

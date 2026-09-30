@@ -59,7 +59,7 @@ Important current product intent:
 - OpenAI Tunnel, stdio, Streamable HTTP, and optional ngrok share one policy engine.
 - Profiles use schema-v9 JSONC and persist default launch-directory read behavior, path grants/denies, shell, sandbox network, transport/HTTP/ngrok defaults, and typed cache grants. Older profile schemas are not accepted.
 - Shared developer caches are shell-only and do not expand MCP filesystem tool roots.
-- Activity logging is quiet by default; `-v` shows TOOL lines, `-vv` adds REQ diagnostics, `-s` suppresses TOOL lines, and `--color` controls ANSI.
+- Activity logging is quiet by default; `-v` shows TOOL lines, `-vv` adds REQ diagnostics, `-q` suppresses TOOL lines, and `--color` controls ANSI.
 - Full unsandboxed host authority is intentionally paired as `--allow-all --no-sandbox`.
 - `--allow-rw=/` means filesystem-wide RW while preserving the normal Linux sandbox model.
 - Crane dependency caching, native checks, Linux-musl release builds, Windows-GNU release builds, checksums, release helper, Unix installer and PowerShell installer logic were all validated on 2026-09-30.

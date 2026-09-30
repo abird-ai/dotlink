@@ -95,7 +95,7 @@ Interactive non-stdio runs also start a terminal-control loop: `v` mutates share
 
 stdio uses rmcp's standard stdin/stdout transport.
 
-stdout is reserved for JSON-RPC protocol frames. All human-readable status is written to stderr.
+stdout is reserved for JSON-RPC protocol frames. All human-readable status is written to stderr. For manual stdio runs on a TTY, dotlink temporarily enables the terminal interrupt signal for `Ctrl+C`; piped stdio clients are untouched.
 
 This is intended for MCP clients that launch the server as a subprocess.
 
@@ -312,7 +312,7 @@ Logging has two layers:
 - normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP all produce the same timestamped TOOL start/completion lines;
 - REQ logging records incoming request metadata at the transport boundary without dumping request bodies.
 
-Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. In interactive non-stdio runs, `v` cycles `quiet → TOOL → TOOL + REQ → quiet` immediately across all logger clones. `-s/--silent` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
+Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. In interactive non-stdio runs, `v` cycles `quiet → TOOL → TOOL + REQ → quiet` immediately across all logger clones. `-q/--quiet` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
 
 ## Build and release architecture
 

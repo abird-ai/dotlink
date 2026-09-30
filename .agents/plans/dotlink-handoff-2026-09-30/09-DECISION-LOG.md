@@ -176,7 +176,7 @@ Rationale: loud deliberate acknowledgement; avoid proliferating intermediate `*-
 
 **Decision:** activity logging is quiet by default; `-v` enables TOOL activity and `-vv` adds REQ diagnostics.
 
-`-s/--silent` hides TOOL activity.
+`-q/--quiet` hides TOOL activity.
 
 `-v` enables TOOL logging; `-vv` adds developer REQ logging.
 

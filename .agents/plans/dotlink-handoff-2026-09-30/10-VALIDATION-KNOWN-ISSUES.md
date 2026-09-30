@@ -16,7 +16,7 @@ git diff --check
 Final observed suite:
 
 ```text
-88 tests passed
+94 tests passed
 Clippy clean
 fmt clean
 diff check clean
@@ -50,7 +50,7 @@ Verified behavior:
 default             no TOOL / REQ
 -v                  TOOL
 -vv                 TOOL + REQ
---silent -vv         REQ only
+--quiet -vv         REQ only
 ```
 
 Also verified:
@@ -58,7 +58,7 @@ Also verified:
 - timestamps;
 - forced ANSI color;
 - HTTP method/path/status request logging;
-- stdio stdout remains protocol-only;
+- stdio stdout remains protocol-only; default stdio is quiet, explicit `-v` diagnostics remain on stderr only, and a pseudo-TTY smoke verified `Ctrl+C` exits even when inherited `ISIG`/VINTR are broken while restoring the exact pre-run terminal state;
 - verbose summaries avoid raw bulk payload/file-content logging.
 
 ## Cache validation

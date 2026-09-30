@@ -115,7 +115,7 @@ Older boolean `allow_rw: true` remains compatible and maps to `["."]`.
 --allow-all --no-sandbox
 
 --print-id
--s, --silent
+-q, --quiet
 -v, --verbose
 --color <auto|always|never>
 --list-tools
@@ -123,7 +123,7 @@ Older boolean `allow_rw: true` remains compatible and maps to `["."]`.
 
 Important:
 
-- `-s` means silent.
+- `-q` means quiet.
 - setup shorthand is uppercase `-S`.
 - every transport enabled in the selected profile starts automatically.
 - explicit `--stdio` / `--http` add those transports for one run; `--no-stdio` / `--no-http` suppress profile defaults.
@@ -192,7 +192,7 @@ Interactive non-stdio runs use raw terminal key controls: `v` cycles quiet/TOOL/
 default    no TOOL / REQ
 -v         TOOL activity
 -vv        TOOL + REQ developer diagnostics
--s -vv     REQ only
+-q -vv     REQ only
 ```
 
 `--color=auto|always|never` controls ANSI rendering.
@@ -268,7 +268,7 @@ dotlink-windows-x86_64.exe.sha256
 Validated on 2026-09-30:
 
 - `flake.lock` locks Crane v0.24.0 and rust-overlay.
-- Rust fmt/test/Clippy passes; 88/88 tests, including profile-manager, transactional setup, tunnel recovery, and restart-backoff coverage.
+- Rust fmt/test/Clippy passes; 94/94 tests, including profile-manager, transactional setup, tunnel recovery, and restart-backoff coverage.
 - real Bubblewrap runtime and cache-mount smokes pass.
 - full x86_64-linux `nix flake check` passes using an isolated writable Nix store without exposing the host daemon.
 - `nix flake check --all-systems --no-build` evaluates x86_64 Linux, aarch64 Linux and aarch64 Darwin.

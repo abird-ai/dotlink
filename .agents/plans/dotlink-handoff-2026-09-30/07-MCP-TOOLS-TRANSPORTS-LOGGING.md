@@ -241,7 +241,7 @@ Activity logging is quiet by default.
 default    no TOOL / REQ
 -v         TOOL
 -vv        TOOL + REQ
--s -vv     REQ only
+-q -vv     REQ only
 ```
 
 TOOL lines are centralized around the MCP tool router, so all transports share the same format. REQ diagnostics stay at transport boundaries and include safe metadata only.

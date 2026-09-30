@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Rename `-s/--silent` to `-q/--quiet`; default logging remains quiet, and `-q -vv` provides REQ-only diagnostics.
+- Keep stdio human/status/diagnostic output on stderr while stdout remains exclusively MCP protocol traffic; stdio is quiet by default unless verbosity is explicitly enabled.
+- Make manual TTY stdio robust to inherited broken terminal modes by temporarily enabling `Ctrl+C` interrupt signaling and restoring the exact original terminal state on exit.
+
 - Fix runtime-control terminal output by preserving the terminal's original output flags while raw input is active, preventing stair-stepped/garbled banners and logs.
 - Snapshot the exact pre-dotlink terminal state and restore it via RAII on normal exit, `Ctrl+R` restart, transport errors, and unwind/error paths.
 
@@ -86,7 +90,7 @@
 - Hide verbose tunnel INFO logs by default while keeping them available through RUST_LOG.
 - Add a complete Nix flake package, app, development shell, formatter, Bubblewrap runtime, and nix flake check checks.
 - Add timestamped TOOL activity logging across all transports.
-- Add -s/--silent to suppress normal tool activity, repurposing -s from setup; setup now uses -S.
+- Add -q/--quiet to suppress TOOL activity; setup remains available as -S.
 - Make activity logging quiet by default: -v shows TOOL activity and -vv adds developer REQ diagnostics.
 - Add --color=auto|always|never with TTY-aware automatic ANSI color output.
 - Add --list-tools generated from the live policy-aware MCP router.

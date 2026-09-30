@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -12,6 +12,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{process::Command, time::timeout};
+use url::Url;
 use zeroize::Zeroizing;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -394,17 +395,6 @@ pub async fn load_or_setup(
     validate_profile(profile)?;
 
     if !force_setup {
-        if profile.is_none()
-            && let Some(config) = config_from_env()?
-        {
-            let protected_paths = protected_paths_for_config(&config, profile)?;
-            return Ok(Some(SetupResult {
-                config,
-                new_tunnel: false,
-                protected_paths,
-            }));
-        }
-
         let path = config_path(profile)?;
 
         if path.exists() {
@@ -413,12 +403,20 @@ pub async fn load_or_setup(
             let mut config: AppConfig = parse_jsonc(&text)
                 .with_context(|| format!("failed to parse {}", path.display()))?;
 
-            if config.transports.openai {
-                config.runtime_api_key = read_saved_runtime_key(profile)?;
-            }
-
-            apply_nonsecret_env_overrides(&mut config)?;
+            config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
+            apply_env_overrides(&mut config, profile.is_none())?;
             validate_config(&config)?;
+            let protected_paths = protected_paths_for_config(&config, profile)?;
+            return Ok(Some(SetupResult {
+                config,
+                new_tunnel: false,
+                protected_paths,
+            }));
+        }
+
+        if profile.is_none()
+            && let Some(config) = config_from_env()?
+        {
             let protected_paths = protected_paths_for_config(&config, profile)?;
             return Ok(Some(SetupResult {
                 config,
@@ -441,38 +439,41 @@ pub async fn load_or_setup(
     interactive_setup(profile, color, existing).await
 }
 
-fn config_from_env() -> Result<Option<AppConfig>> {
+fn secret_env_connection() -> Result<Option<(String, String)>> {
     let tunnel_id = env_first(&["DOTLINK_ID", "CONTROL_PLANE_TUNNEL_ID"]);
     let runtime_api_key = env_first(&["DOTLINK_API_KEY", "CONTROL_PLANE_API_KEY"]);
+    match (tunnel_id, runtime_api_key) {
+        (None, None) => Ok(None),
+        (Some(tunnel_id), Some(runtime_api_key)) => Ok(Some((tunnel_id, runtime_api_key))),
+        _ => bail!(
+            "DOTLINK_ID and DOTLINK_API_KEY (or their CONTROL_PLANE aliases) must be set together"
+        ),
+    }
+}
 
-    let (Some(tunnel_id), Some(runtime_api_key)) = (tunnel_id, runtime_api_key) else {
+fn config_from_env() -> Result<Option<AppConfig>> {
+    let Some((tunnel_id, runtime_api_key)) = secret_env_connection()? else {
         return Ok(None);
     };
 
-    let mut config = AppConfig {
-        version: config_version(),
-        transports: TransportConfig::default(),
-        permissions: PermissionConfig::default(),
-        caches: Vec::new(),
-        tunnel_id: Some(tunnel_id),
-        runtime_api_key,
-        organization_id: env_first(&[
-            "DOTLINK_ORGANIZATION_ID",
-            "CONTROL_PLANE_ORGANIZATION_ID",
-            "OPENAI_ORGANIZATION",
-        ]),
-        base_url: default_base_url(),
-        max_shell_timeout_secs: default_shell_timeout(),
-        max_output_bytes: default_output_bytes(),
-        max_read_bytes: default_file_bytes(),
-        max_write_bytes: default_file_bytes(),
-    };
-    apply_nonsecret_env_overrides(&mut config)?;
+    let mut config = default_app_config();
+    config.transports.openai = true;
+    config.tunnel_id = Some(tunnel_id);
+    config.runtime_api_key = runtime_api_key;
+    apply_env_overrides(&mut config, false)?;
     validate_config(&config)?;
     Ok(Some(config))
 }
 
-fn apply_nonsecret_env_overrides(config: &mut AppConfig) -> Result<()> {
+fn apply_env_overrides(config: &mut AppConfig, include_secret_connection: bool) -> Result<()> {
+    if include_secret_connection
+        && let Some((tunnel_id, runtime_api_key)) = secret_env_connection()?
+    {
+        config.transports.openai = true;
+        config.tunnel_id = Some(tunnel_id);
+        config.runtime_api_key = runtime_api_key;
+    }
+
     if let Some(base_url) = env_first(&["DOTLINK_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
         config.base_url = base_url;
     }
@@ -1375,45 +1376,130 @@ async fn create_tunnel(
     Ok(record.id)
 }
 
-fn save_config(config: &AppConfig, profile: Option<&str>) -> Result<()> {
-    let path = config_path(profile)?;
+#[cfg(not(windows))]
+fn atomic_replace_file(temp: &Path, path: &Path) -> Result<()> {
+    fs::rename(temp, path).with_context(|| format!("failed to replace {}", path.display()))
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(temp: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let mut from = temp.as_os_str().encode_wide().collect::<Vec<_>>();
+    from.push(0);
+    let mut to = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    to.push(0);
+
+    // SAFETY: from/to are valid NUL-terminated UTF-16 path buffers for the
+    // duration of the call and the flags request an atomic replace.
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("failed to replace {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("configuration path has no parent"))?;
+        .ok_or_else(|| anyhow!("private file path has no parent"))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn atomic_write_private(path: &Path, contents: &[u8], harden_parent: bool) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("private file path has no parent"))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    set_private_dir_permissions(parent)?;
-
-    let text = serialize_jsonc(config)?;
-    let temp = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("config.jsonc"),
-        std::process::id()
-    ));
-
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    if harden_parent {
+        set_private_dir_permissions(parent)?;
     }
 
-    let mut file = options
-        .open(&temp)
-        .with_context(|| format!("failed to create {}", temp.display()))?;
-    file.write_all(text.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    drop(file);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dotlink-private");
+    let temp = parent.join(format!(
+        ".{file_name}.tmp-{}-{:016x}",
+        std::process::id(),
+        fastrand::u64(..)
+    ));
 
-    set_private_file_permissions(&temp)?;
-    fs::rename(&temp, &path).with_context(|| format!("failed to replace {}", path.display()))?;
-    set_private_file_permissions(&path)?;
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
 
-    if !config.runtime_api_key.trim().is_empty() {
-        save_runtime_key(&config.runtime_api_key, profile)?;
+        let mut file = options
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+
+        set_private_file_permissions(&temp)?;
+        atomic_replace_file(&temp, path)?;
+        set_private_file_permissions(path)?;
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn save_config(config: &AppConfig, profile: Option<&str>) -> Result<()> {
+    let path = config_path(profile)?;
+    let config_bytes = serialize_jsonc(config)?.into_bytes();
+    let existing_key = try_read_saved_runtime_key(profile)?;
+    let desired_key = config.runtime_api_key.trim();
+    let key_changed = !desired_key.is_empty() && existing_key.as_deref() != Some(desired_key);
+
+    // Write a changed secret first so a new config can never point at a
+    // missing/truncated key. If the config replace then fails, roll the secret
+    // back atomically to preserve the previous profile state.
+    if key_changed {
+        save_runtime_key(desired_key, profile)?;
+    }
+
+    if let Err(config_error) =
+        atomic_write_private(&path, &config_bytes, config_parent_is_dotlink_owned())
+    {
+        if key_changed {
+            let rollback = match existing_key {
+                Some(ref previous) => save_runtime_key(previous, profile),
+                None => remove_runtime_key_file(profile),
+            };
+            if let Err(rollback_error) = rollback {
+                return Err(config_error).context(format!(
+                    "profile config update failed and runtime-key rollback also failed: {rollback_error:#}"
+                ));
+            }
+        }
+        return Err(config_error);
     }
 
     Ok(())
@@ -1575,6 +1661,10 @@ fn profiled_path(base: &Path, profile: Option<&str>) -> Result<PathBuf> {
     Ok(parent.join(filename))
 }
 
+fn config_parent_is_dotlink_owned() -> bool {
+    env::var_os("DOTLINK_CONFIG").is_none()
+}
+
 fn config_path(profile: Option<&str>) -> Result<PathBuf> {
     let base = if let Some(path) = env::var_os("DOTLINK_CONFIG") {
         PathBuf::from(path)
@@ -1615,18 +1705,41 @@ fn runtime_key_paths(parent: &Path) -> Result<Vec<PathBuf>> {
     Ok(protected)
 }
 
-fn protected_paths_for_config(_config: &AppConfig, profile: Option<&str>) -> Result<Vec<PathBuf>> {
-    let config = config_path(profile)?;
+fn control_plane_paths(
+    config: PathBuf,
+    current_key: PathBuf,
+    protect_parent: bool,
+) -> Result<Vec<PathBuf>> {
     let parent = config
         .parent()
-        .ok_or_else(|| anyhow!("configuration path has no parent"))?;
+        .ok_or_else(|| anyhow!("configuration path has no parent"))?
+        .to_path_buf();
 
-    let mut protected = runtime_key_paths(parent)?;
-    let current = credential_path(profile)?;
-    if current.exists() && !protected.iter().any(|path| path == &current) {
-        protected.push(current);
-    }
+    // Standard dotlink config lives in a dedicated control-plane directory.
+    // Protecting that directory also covers every profile and atomic temp file.
+    // Custom DOTLINK_CONFIG paths stay file-scoped so an ordinary project
+    // directory is never hidden just because it contains the selected config.
+    let mut protected = if protect_parent {
+        vec![parent.clone()]
+    } else {
+        vec![config]
+    };
+    protected.extend(runtime_key_paths(&parent)?);
+
+    // Protect the selected key path even if it does not exist yet, so a local
+    // tool cannot pre-create credential material for a later profile change.
+    protected.push(current_key);
+    protected.sort();
+    protected.dedup();
     Ok(protected)
+}
+
+fn protected_paths_for_config(_config: &AppConfig, profile: Option<&str>) -> Result<Vec<PathBuf>> {
+    control_plane_paths(
+        config_path(profile)?,
+        credential_path(profile)?,
+        config_parent_is_dotlink_owned(),
+    )
 }
 
 fn profile_target(name: &str) -> Result<Option<&str>> {
@@ -1738,15 +1851,29 @@ pub async fn edit_profile(name: &str, color: bool) -> Result<bool> {
         .is_some())
 }
 
-pub fn delete_profile(name: &str) -> Result<()> {
-    let target = profile_target(name)?;
-    let path = config_path(target)?;
-    if !path.exists() {
+fn delete_profile_artifacts(name: &str, config: &Path, key: &Path) -> Result<()> {
+    if !config.exists() && !key.exists() {
         bail!("profile {name:?} does not exist");
     }
-    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
-    remove_saved_runtime_key(target)?;
+
+    // Never remove the key while the config is still live: if config removal
+    // fails, preserving the key keeps the existing profile runnable.
+    if config.exists() {
+        fs::remove_file(config)
+            .with_context(|| format!("failed to remove {}; key was preserved", config.display()))?;
+    }
+
+    if key.exists() {
+        fs::remove_file(key).with_context(|| {
+            format!("profile was removed but failed to remove {}", key.display())
+        })?;
+    }
     Ok(())
+}
+
+pub fn delete_profile(name: &str) -> Result<()> {
+    let target = profile_target(name)?;
+    delete_profile_artifacts(name, &config_path(target)?, &credential_path(target)?)
 }
 
 fn rule_paths_mut(config: &mut AppConfig, allow: bool, kind: ProfileRuleKind) -> &mut Vec<PathBuf> {
@@ -1841,39 +1968,20 @@ pub fn set_profile_bool(name: &str, setting: ProfileBool, enabled: bool) -> Resu
     save_config(&config, target)
 }
 
-fn save_runtime_key(key: &str, profile: Option<&str>) -> Result<()> {
-    let path = credential_path(profile)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("credential path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    set_private_dir_permissions(parent)?;
-
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(key.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    set_private_file_permissions(&path)?;
-    Ok(())
-}
-
-fn remove_saved_runtime_key(profile: Option<&str>) -> Result<()> {
+fn remove_runtime_key_file(profile: Option<&str>) -> Result<()> {
     let path = credential_path(profile)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
     }
+}
+
+fn save_runtime_key(key: &str, profile: Option<&str>) -> Result<()> {
+    let path = credential_path(profile)?;
+    let mut contents = key.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
+    contents.push(b'\n');
+    atomic_write_private(&path, &contents, config_parent_is_dotlink_owned())
 }
 
 fn try_read_saved_runtime_key(profile: Option<&str>) -> Result<Option<String>> {
@@ -1940,6 +2048,17 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
     if config.permissions.allow_network && !config.permissions.allow_shell {
         bail!("permissions.allow_network requires permissions.allow_shell");
     }
+    let has_read = config.permissions.default_allow
+        || !config.permissions.allow_read.is_empty()
+        || !config.permissions.allow_rw.is_empty();
+    let has_write =
+        !config.permissions.allow_write.is_empty() || !config.permissions.allow_rw.is_empty();
+    if config.permissions.allow_shell && !has_read {
+        bail!("permissions.allow_shell requires at least one readable path");
+    }
+    if !has_read && !has_write && !config.permissions.allow_shell {
+        bail!("profile has no local capability; enable default read access or add an allow rule");
+    }
     if config.transports.http_ephemeral_url && !config.transports.http {
         bail!("transports.http_ephemeral_url requires transports.http");
     }
@@ -1978,11 +2097,37 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
     if let Some(tunnel_id) = config.tunnel_id.as_deref() {
         validate_tunnel_id(tunnel_id)?;
     }
-    if !(config.base_url.starts_with("https://") || config.base_url.starts_with("http://localhost"))
+    validate_control_plane_base_url(&config.base_url)?;
+    if config.max_shell_timeout_secs == 0
+        || config.max_output_bytes == 0
+        || config.max_read_bytes == 0
+        || config.max_write_bytes == 0
     {
-        bail!("control-plane base URL must use HTTPS (localhost is allowed for testing)");
+        bail!("resource limits must all be greater than zero");
     }
 
+    Ok(())
+}
+
+fn validate_control_plane_base_url(value: &str) -> Result<()> {
+    let url = Url::parse(value).context("control-plane base URL is invalid")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("control-plane base URL must not contain credentials, query, or fragment");
+    }
+
+    let https = url.scheme() == "https" && url.host_str().is_some();
+    let loopback_http = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        });
+    if !https && !loopback_http {
+        bail!("control-plane base URL must use HTTPS (loopback HTTP is allowed for testing)");
+    }
     Ok(())
 }
 
@@ -2141,6 +2286,67 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_paths_include_active_config_all_keys_and_missing_selected_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.work.jsonc");
+        let selected_key = temp.path().join("runtime.work.key");
+        std::fs::write(&config, b"{}").unwrap();
+        std::fs::write(temp.path().join("runtime.key"), b"default").unwrap();
+        std::fs::write(temp.path().join("runtime.other.key"), b"other").unwrap();
+
+        let paths = control_plane_paths(config.clone(), selected_key.clone(), false).unwrap();
+        assert!(paths.contains(&config));
+        assert!(paths.contains(&selected_key));
+        assert!(paths.contains(&temp.path().join("runtime.key")));
+        assert!(paths.contains(&temp.path().join("runtime.other.key")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_config_write_does_not_chmod_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = temp.path().join("custom.jsonc");
+        atomic_write_private(&path, b"{}\n", false).unwrap();
+
+        let parent_mode = std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o755);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn atomic_private_write_replaces_existing_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.jsonc");
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_write_private(&path, b"new\n", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn delete_profile_artifacts_cleans_orphaned_key_and_is_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.work.jsonc");
+        let key = temp.path().join("runtime.work.key");
+        std::fs::write(&key, b"secret").unwrap();
+
+        delete_profile_artifacts("work", &config, &key).unwrap();
+        assert!(!key.exists());
+        assert!(!config.exists());
+        assert!(delete_profile_artifacts("work", &config, &key).is_err());
+    }
+
+    #[test]
     fn cache_candidates_require_existing_directories() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
@@ -2255,6 +2461,34 @@ mod tests {
     fn jsonc_rejects_unterminated_block_comment() {
         let result = parse_jsonc::<serde_json::Value>("{ /* never closed");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn control_plane_base_url_requires_https_or_true_loopback_http() {
+        for allowed in [
+            "https://api.openai.com",
+            "https://example.com:8443/base",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://[::1]:8000",
+        ] {
+            validate_control_plane_base_url(allowed).unwrap();
+        }
+
+        for rejected in [
+            "http://localhost.evil.example",
+            "http://127.0.0.2",
+            "http://example.com",
+            "https://user:pass@example.com",
+            "https://example.com/path?token=secret",
+            "https://example.com/path#fragment",
+            "not a url",
+        ] {
+            assert!(
+                validate_control_plane_base_url(rejected).is_err(),
+                "{rejected:?} should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2449,6 +2683,26 @@ mod tests {
                 .deny_rw
                 .contains(&PathBuf::from("/deny-rw"))
         );
+    }
+
+    #[test]
+    fn config_validation_rejects_unusable_local_capabilities() {
+        let mut config = example_config();
+        config.transports.openai = false;
+        config.tunnel_id = None;
+        config.runtime_api_key.clear();
+        config.permissions.default_allow = false;
+        config.permissions.allow_read.clear();
+        config.permissions.allow_write.clear();
+        config.permissions.allow_rw.clear();
+        config.permissions.allow_shell = false;
+        assert!(validate_config(&config).is_err());
+
+        config.permissions.allow_shell = true;
+        assert!(validate_config(&config).is_err());
+
+        config.permissions.allow_read.push(PathBuf::from("."));
+        validate_config(&config).unwrap();
     }
 
     #[test]

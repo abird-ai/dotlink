@@ -113,7 +113,7 @@ dotlink -S -p work
 dotlink --setup --profile work
 ```
 
-`-s` is reserved for silent logging.
+`-q` is reserved for quiet logging.
 
 ## JSONC requirements
 

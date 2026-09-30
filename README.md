@@ -333,7 +333,7 @@ Logging is quiet by default:
 default   no TOOL / REQ activity
 -v        TOOL activity
 -vv       TOOL + transport/request REQ diagnostics
--s        suppress TOOL activity (useful with -vv for REQ-only)
+-q        suppress TOOL activity (useful with -vv for REQ-only)
 ~~~
 
 Example with `-v`:
@@ -352,7 +352,7 @@ With `-vv`, transport diagnostics are added:
 
 Logs include safe metadata such as paths, methods, status, and latency; file contents, binary payloads, runtime keys, and raw request bodies are not intentionally logged.
 
-Color is automatic on interactive stderr. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio runs keep stdin protocol-clean and therefore expose only `Ctrl+C`.
+Color is automatic on interactive stderr. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
 
 ## CLI summary
 
@@ -391,7 +391,7 @@ dotlink profile <COMMAND>       list/create/edit/delete/mutate persisted profile
 --no-sandbox                    disable shell sandbox; requires --allow-all
 
 --list-tools                    show exposed tools
--s, --silent                    suppress TOOL activity
+-q, --quiet                    suppress TOOL activity
 -v, --verbose                   repeatable: -v TOOL, -vv TOOL + REQ
 --color=<auto|always|never>     control ANSI colors (default: auto)
 --print-id                      print configured OpenAI Tunnel ID

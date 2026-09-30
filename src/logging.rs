@@ -18,10 +18,28 @@ pub enum ColorMode {
     Never,
 }
 
+impl ColorMode {
+    pub fn stdout_enabled(self) -> bool {
+        match self {
+            Self::Auto => io::stdout().is_terminal(),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+
+    fn stderr_enabled(self) -> bool {
+        match self {
+            Self::Auto => io::stderr().is_terminal(),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LogState {
     verbosity: AtomicU8,
-    silent_activity: AtomicBool,
+    quiet_activity: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,16 +55,12 @@ impl Default for LogConfig {
 }
 
 impl LogConfig {
-    pub fn new(verbose: u8, silent_activity: bool, color_mode: ColorMode) -> Self {
-        let color = match color_mode {
-            ColorMode::Auto => io::stderr().is_terminal(),
-            ColorMode::Always => true,
-            ColorMode::Never => false,
-        };
+    pub fn new(verbose: u8, quiet_activity: bool, color_mode: ColorMode) -> Self {
+        let color = color_mode.stderr_enabled();
         Self {
             state: Arc::new(LogState {
                 verbosity: AtomicU8::new(verbose.min(2)),
-                silent_activity: AtomicBool::new(silent_activity),
+                quiet_activity: AtomicBool::new(quiet_activity),
             }),
             color,
         }
@@ -58,7 +72,7 @@ impl LogConfig {
 
     pub fn activity_enabled(&self) -> bool {
         self.state.verbosity.load(Ordering::Relaxed) >= 1
-            && !self.state.silent_activity.load(Ordering::Relaxed)
+            && !self.state.quiet_activity.load(Ordering::Relaxed)
     }
 
     pub fn developer_enabled(&self) -> bool {
@@ -67,8 +81,8 @@ impl LogConfig {
 
     pub fn verbosity_label(&self) -> &'static str {
         let verbosity = self.state.verbosity.load(Ordering::Relaxed);
-        let silent = self.state.silent_activity.load(Ordering::Relaxed);
-        match (verbosity, silent) {
+        let quiet = self.state.quiet_activity.load(Ordering::Relaxed);
+        match (verbosity, quiet) {
             (0, _) => "quiet",
             (1, true) => "quiet",
             (1, false) => "TOOL",
@@ -78,7 +92,7 @@ impl LogConfig {
     }
 
     pub fn cycle_verbosity(&self) -> &'static str {
-        self.state.silent_activity.store(false, Ordering::Relaxed);
+        self.state.quiet_activity.store(false, Ordering::Relaxed);
         let mut current = self.state.verbosity.load(Ordering::Relaxed).min(2);
         loop {
             let next = (current + 1) % 3;
@@ -96,6 +110,12 @@ impl LogConfig {
 
     pub fn notice(&self, scope: &str, message: impl AsRef<str>) {
         self.line("LOG", scope, message.as_ref(), "33");
+    }
+
+    pub fn developer(&self, scope: &str, message: impl AsRef<str>) {
+        if self.developer_enabled() {
+            self.line("DBG", scope, message.as_ref(), "90");
+        }
     }
 
     pub fn activity_start(&self, tool: &str, detail: impl AsRef<str>) -> Option<Instant> {
@@ -143,12 +163,10 @@ impl LogConfig {
         started: Option<Instant>,
         outcome: impl AsRef<str>,
     ) {
-        if !self.developer_enabled() {
+        let Some(started) = started else {
             return;
-        }
-        let elapsed = started
-            .map(|started| format!("  {}ms", started.elapsed().as_millis()))
-            .unwrap_or_default();
+        };
+        let elapsed = format!("  {}ms", started.elapsed().as_millis());
         self.line(
             "REQ",
             transport,
@@ -217,14 +235,14 @@ mod tests {
         assert!(developer.activity_enabled());
         assert!(developer.developer_enabled());
 
-        let silent_developer = LogConfig::new(2, true, ColorMode::Never);
-        assert!(!silent_developer.activity_enabled());
-        assert!(silent_developer.developer_enabled());
-        assert_eq!(silent_developer.verbosity_label(), "REQ");
+        let quiet_developer = LogConfig::new(2, true, ColorMode::Never);
+        assert!(!quiet_developer.activity_enabled());
+        assert!(quiet_developer.developer_enabled());
+        assert_eq!(quiet_developer.verbosity_label(), "REQ");
     }
 
     #[test]
-    fn runtime_verbosity_cycles_and_clears_silent_override() {
+    fn runtime_verbosity_cycles_and_clears_quiet_override() {
         let log = LogConfig::new(0, true, ColorMode::Never);
         assert_eq!(log.verbosity_label(), "quiet");
         assert_eq!(log.cycle_verbosity(), "TOOL");

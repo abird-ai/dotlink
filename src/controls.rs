@@ -11,7 +11,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled},
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::sync::mpsc;
 
 use crate::logging::LogConfig;
 
@@ -28,6 +28,10 @@ struct TerminalStateGuard {
     fd: std::os::fd::RawFd,
     #[cfg(unix)]
     original: libc::termios,
+    #[cfg(windows)]
+    input_handle: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(windows)]
+    original_input_mode: u32,
 }
 
 impl TerminalStateGuard {
@@ -58,7 +62,33 @@ impl TerminalStateGuard {
             })
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::{
+                Foundation::INVALID_HANDLE_VALUE,
+                System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE},
+            };
+
+            // SAFETY: GetStdHandle/GetConsoleMode are process console queries.
+            let input_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            if input_handle.is_null() || input_handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let mut original_input_mode = 0_u32;
+            // SAFETY: input_handle is valid and mode points to writable storage.
+            if unsafe { GetConsoleMode(input_handle, &mut original_input_mode) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(Self {
+                was_raw,
+                enabled_by_us: false,
+                input_handle,
+                original_input_mode,
+            })
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             Ok(Self {
                 was_raw,
@@ -81,22 +111,38 @@ impl TerminalStateGuard {
 
     #[cfg(unix)]
     fn restore_original_output_flags(&self) -> io::Result<()> {
+        let mut current = self.current_termios()?;
+        current.c_oflag = self.original.c_oflag;
+        self.apply_termios(&current)
+    }
+
+    #[cfg(unix)]
+    fn ensure_ctrl_c_signal(&self) -> io::Result<()> {
+        let mut current = self.current_termios()?;
+        current.c_lflag |= libc::ISIG;
+        current.c_cc[libc::VINTR] = 3;
+        self.apply_termios(&current)
+    }
+
+    #[cfg(unix)]
+    fn current_termios(&self) -> io::Result<libc::termios> {
         let mut current = std::mem::MaybeUninit::<libc::termios>::uninit();
 
-        // SAFETY: fd remains a live terminal fd while RuntimeControls owns this guard.
+        // SAFETY: fd remains a live terminal fd while the guard owns this snapshot.
         if unsafe { libc::tcgetattr(self.fd, current.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
 
         // SAFETY: tcgetattr succeeded, so the struct is initialized.
-        let mut current = unsafe { current.assume_init() };
-        current.c_oflag = self.original.c_oflag;
+        Ok(unsafe { current.assume_init() })
+    }
 
-        // SAFETY: fd is live and current is an initialized termios value.
-        if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &current) } != 0 {
+    #[cfg(unix)]
+    fn apply_termios(&self, termios: &libc::termios) -> io::Result<()> {
+        // SAFETY: fd is live and termios is fully initialized.
+        if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, termios) } != 0 {
             return Err(io::Error::last_os_error());
         }
-
         Ok(())
     }
 
@@ -117,6 +163,13 @@ impl TerminalStateGuard {
             // original is a fully initialized termios snapshot.
             let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
         }
+
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::SetConsoleMode;
+            // SAFETY: input_handle is the console handle captured at construction.
+            let _ = unsafe { SetConsoleMode(self.input_handle, self.original_input_mode) };
+        }
     }
 }
 
@@ -126,10 +179,31 @@ impl Drop for TerminalStateGuard {
     }
 }
 
+pub struct StdioInterruptGuard {
+    _terminal: TerminalStateGuard,
+}
+
+impl StdioInterruptGuard {
+    pub fn start(stdio_active: bool) -> Option<Self> {
+        if !stdio_active || !io::stdin().is_terminal() {
+            return None;
+        }
+
+        let terminal = TerminalStateGuard::capture().ok()?;
+
+        #[cfg(unix)]
+        terminal.ensure_ctrl_c_signal().ok()?;
+
+        Some(Self {
+            _terminal: terminal,
+        })
+    }
+}
+
 pub struct RuntimeControls {
     receiver: mpsc::UnboundedReceiver<RuntimeControl>,
     stop: Arc<AtomicBool>,
-    task: Option<JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
     _terminal: TerminalStateGuard,
 }
 
@@ -145,7 +219,7 @@ impl RuntimeControls {
         let (sender, receiver) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = stop.clone();
-        let task = tokio::task::spawn_blocking(move || {
+        let thread = std::thread::spawn(move || {
             while !task_stop.load(Ordering::Relaxed) {
                 match event::poll(Duration::from_millis(100)) {
                     Ok(true) => match event::read() {
@@ -166,7 +240,7 @@ impl RuntimeControls {
         Some(Self {
             receiver,
             stop,
-            task: Some(task),
+            thread: Some(thread),
             _terminal: terminal,
         })
     }
@@ -175,17 +249,24 @@ impl RuntimeControls {
         self.receiver.recv().await
     }
 
-    pub async fn shutdown(mut self) {
+    pub fn shutdown(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
 
 impl Drop for RuntimeControls {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Join the reader before TerminalStateGuard restores the TTY. This
+        // guarantees no detached reader can consume shell input after dotlink
+        // returns on an error/unwind path.
+        self.stop_and_join();
     }
 }
 

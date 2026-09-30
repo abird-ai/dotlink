@@ -250,6 +250,6 @@ Do not intentionally log:
 - API keys;
 - secrets.
 
-`--silent` hides TOOL logs.
+`--quiet` hides TOOL logs.
 
-`--silent -vv` retains REQ logs while hiding TOOL logs.
+`--quiet -vv` retains REQ logs while hiding TOOL logs.
