@@ -4,16 +4,16 @@ Connect **your ChatGPT dot**, **your ChatGPT Web and Spaces** to files and tools
 
 A single lightweight binary with an MCP server, OpenAI tunnel transport, permission engine, profiles, activity logging, and a full Bubblewrap sandbox on Linux — no UI, no third-party relay, guided setup.
 
-- Let **your ChatGPT web** and **your dot** work directly on **your computer** through controlled, fine-grained access: read and edit files, run Git, build, test, execute scripts, and use only the tools you explicitly expose.
-- Use local data without the upload/download loop: analyze files, build reports or slide decks, and work with artifacts directly from your machine.
+- **Let your ChatGPT Web and your dot work directly on your computer through controlled, fine-grained access**: read and edit files, run Git, build, test, execute scripts, and use only the tools you explicitly expose.
+- **Use local data without the upload/download loop**: analyze files, build reports or slide decks, and work with artifacts directly from your machine.
 - **Keep project context connected**: reason and document in ChatGPT/Spaces, then continue against the same live repository and toolchain, then talk to dot about it.
-- Use ChatGPT as a practical fallback when Codex usage is unavailable or exhausted: reconnect to the same project state and keep going.
+- **Use ChatGPT as a practical fallback when Codex usage is unavailable or exhausted**: reconnect to the same project state and keep going.
 
 When your machine is offline, keep planning against context already in ChatGPT; reconnect later and let ChatGPT re-read the live project before continuing.
 
 For ChatGPT, dotlink opens an outbound **OpenAI Secure MCP Tunnel directly from your machine to OpenAI**. Your MCP server stays local: no public inbound port, no third-party relay.
 
-It also supports Claude.ai and other remote MCP clients over HTTP/ngrok, plus local MCP clients over stdio or loopback HTTP. Every transport uses the same local permission policy.
+**Supports Claude.ai and other remote MCP clients** over HTTP/ngrok, plus local MCP clients over stdio or loopback HTTP. Every transport uses the same local permission policy.
 
 Security is local and opt-in: the launch directory is read-only by default; write, shell, network, extra paths, caches, and public HTTP are separate grants. Linux shell execution is Bubblewrap-sandboxed by default.
 
