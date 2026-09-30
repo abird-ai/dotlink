@@ -1,16 +1,17 @@
 # abird-link
 
-**Connect ChatGPT, Claude.ai on the web to the files and tools on your computer — securely, from a single binary.**
+**Connect ChatGPT Web — including Spaces and dots — to the files and tools on your computer, securely from a single binary.**
 
-abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memory when enabled, and supported Codex/Work workflows — permission-scoped access to your local computer** through MCP. It brings many of the local development abilities you might normally use Codex for into your regular ChatGPT experience, where they can work alongside the broader conversation context and memories ChatGPT has available to you.
+abird-link turns your local project into a **live working context for ChatGPT**. Keep briefs, design decisions, research, handoffs, and other durable project knowledge in **Spaces**; use ChatGPT to reason and design with that context; let a **dot** carry ongoing work forward where available; then reconnect to the same live repository and toolchain to continue implementation.
+
+Your local project becomes the shared source of truth across **ChatGPT, Codex, Spaces, and dots**: the same Git history, plans, files, generated artifacts, and tools can carry work from one surface to another without pretending their private model state or memory is literally shared.
 
 - **Let ChatGPT Web build, test, and run tools on your machine securely** — read and edit code, run Git, builds, tests, scripts, compilers, package managers, and other tools you explicitly expose.
+- **Move between thinking and implementation without losing the project** — plan or document in ChatGPT and Spaces, then reconnect to the live repo and keep building from the current state.
 - **Work with local data and files without the upload/download loop** — let ChatGPT read data directly from your machine for analysis, reports, documents, or slide decks instead of repeatedly copy-pasting or moving files in and out of chat.
-- **Use ChatGPT as a practical fallback when you are out of Codex usage** — if you are in a pinch, connect ChatGPT Web to the same repository and toolchain and let it continue the work from your local project state.
+- **Use ChatGPT as a practical fallback when Codex usage is unavailable or exhausted** — in a pinch, connect ChatGPT Web to the same repository and toolchain and let it continue from the project state already on your machine.
 
-That context also gives you continuity when the machine or tunnel is temporarily offline: you can keep discussing architecture, planning changes, or designing against project context already present in ChatGPT, then reconnect later and have ChatGPT re-read the live repository, verify what changed, and continue from the current state.
-
-Your local project can also act as a shared source of truth between **ChatGPT and Codex**. Both can work against the same repository, Git history, plans, handoff files, generated artifacts, and local tooling, so work started in one can be picked up and reconciled by the other through the machine itself — without pretending their private model context or memory is literally the same.
+That context also gives you continuity when the machine or tunnel is temporarily offline: keep discussing architecture, planning changes, or designing against project context already present in ChatGPT, then reconnect later and have ChatGPT re-read the live repository, verify what changed, and continue.
 
 For ChatGPT, `abird-link` opens an outbound **OpenAI Secure MCP Tunnel directly from your machine to OpenAI**. Your MCP server stays local: no public inbound port, no ngrok, and no third-party relay in the ChatGPT path. One binary provides the MCP server, tunnel transport, permission engine, profiles, activity logging, and — on Linux — a Bubblewrap shell sandbox.
 
