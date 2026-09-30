@@ -328,6 +328,8 @@ DOTLINK_ORGANIZATION_ID
 DOTLINK_BASE_URL
 ```
 
+`DOTLINK_CONFIG` overrides only the JSONC path. Runtime keys always remain under dotlink's owned Abird XDG directory (`~/.config/abird/dotlink` or `$XDG_CONFIG_HOME/abird/dotlink`) so secrets never follow a project-local custom config.
+
 ## Transport runtime overrides
 
 Configured profile transports start automatically. Local runtime overrides are symmetric:

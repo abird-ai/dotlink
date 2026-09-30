@@ -16,7 +16,7 @@ git diff --check
 Final observed suite:
 
 ```text
-94 tests passed
+101 tests passed
 Clippy clean
 fmt clean
 diff check clean
@@ -74,6 +74,19 @@ Verified:
 - deny-read removes matching cache grants;
 - deny-write downgrades RW cache grants to RO;
 - real Bubblewrap cache reuse.
+
+## Fresh review hardening
+
+The 2026-09-30 clean-room review additionally validated/fixed:
+
+- active JSONC config and owned credential directory are protected from MCP/shell self-modification; existing write symlinks cannot bypass protected-path checks;
+- `DOTLINK_CONFIG` moves only JSONC; Runtime keys remain in the private Abird XDG directory and custom config parents are not chmod'd;
+- config/key writes use atomic replacement (including Windows replace-existing semantics), with key rollback on config-write failure and recoverable orphan-key deletion;
+- `--list-tools` uses the same canonical runtime policy as MCP, accurately representing write-only and deny-shadowed capabilities;
+- shell timeout is one absolute deadline across stdin, child execution, and output-drain completion; child error/timeout paths explicitly reap the direct process;
+- runtime/profile flags cannot be silently mixed with `dotlink profile` subcommands;
+- runtime transport modules keep human status off stdout, preserving mixed OpenAI+stdio protocol cleanliness;
+- stdio Ctrl+C handling is restored symmetrically on Unix and Windows.
 
 ## Transport validation
 

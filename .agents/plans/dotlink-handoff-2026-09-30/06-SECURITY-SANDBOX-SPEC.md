@@ -207,7 +207,7 @@ Do not try to enforce ordinary Rust path denies against an arbitrary unsandboxed
 
 Runtime API keys are stored separately from JSONC.
 
-All `runtime*.key` files in the config directory are protected paths.
+The active JSONC config and dotlink-owned credential directory are protected control-plane paths. `DOTLINK_CONFIG` may move JSONC elsewhere, but Runtime keys remain under the private Abird XDG directory.
 
 Known OpenAI/tunnel key environment variables are removed from child shell environment.
 

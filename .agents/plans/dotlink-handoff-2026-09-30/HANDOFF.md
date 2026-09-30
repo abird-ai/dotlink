@@ -362,7 +362,7 @@ JSONC supports:
 - BOM;
 - comment-like text in strings.
 
-Runtime key is never serialized into config.
+Runtime key is never serialized into config. `DOTLINK_CONFIG` may relocate JSONC, but credentials always stay under dotlink's owned Abird XDG directory.
 
 Current schema-v9 profile can persist:
 
@@ -697,7 +697,7 @@ git diff --check
 Latest observed full test pass:
 
 ```text
-94 tests
+101 tests
 ```
 
 The 2026-09-30 continuation pass also revalidated the current source with the intended Rust 1.98.1 toolchain:
@@ -709,7 +709,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-All 94 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
+All 101 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
 
 Live smokes have validated:
 

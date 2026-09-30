@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fresh correctness/security review: make Runtime-key writes atomic, keep credentials in dotlink's owned XDG directory even with `DOTLINK_CONFIG`, and protect active config/credentials from MCP and shell self-modification.
+- Make tool discovery use the canonical runtime policy, including write-only and deny-shadowed capability handling; existing write symlinks now resolve to their canonical target before protected-path checks.
+- Make shell timeout one absolute deadline across stdin, process execution, and output collection; explicitly reap failed/timed-out child processes.
+- Reject runtime flags mixed with `dotlink profile` commands instead of silently ignoring them, keep mixed stdio/OpenAI runtime status off stdout, and make stdio Ctrl+C handling symmetric on Unix/Windows.
+
 - Rename `-s/--silent` to `-q/--quiet`; default logging remains quiet, and `-q -vv` provides REQ-only diagnostics.
 - Keep stdio human/status/diagnostic output on stderr while stdout remains exclusively MCP protocol traffic; stdio is quiet by default unless verbosity is explicitly enabled.
 - Make manual TTY stdio robust to inherited broken terminal modes by temporarily enabling `Ctrl+C` interrupt signaling and restoring the exact original terminal state on exit.

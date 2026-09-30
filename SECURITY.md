@@ -112,7 +112,7 @@ The Runtime key is stored separately for each profile:
 ~/.config/abird/dotlink/runtime.work.key
 ~~~
 
-Canonical JSONC config files are config.jsonc or config.<profile>.jsonc. On Unix config/key files are mode 0600 and their directory is mode 0700.
+Canonical JSONC config files are config.jsonc or config.<profile>.jsonc. On Unix dotlink-owned config/key files are mode 0600 and the owned `~/.config/abird/dotlink` directory is mode 0700. `DOTLINK_CONFIG` may place JSONC elsewhere without chmod'ing its parent; Runtime keys still remain in the owned XDG directory.
 
 The Admin key used to create a tunnel is never persisted. A profile with OpenAI disabled does not require a runtime key.
 
@@ -138,7 +138,7 @@ The sandbox:
 - mounts effective read+write grants read-write;
 - does not expose purely write-only host grants;
 - masks read-denied paths and rebinds write-denied readable subtrees read-only;
-- masks the saved OpenAI runtime key when present;
+- masks dotlink control-plane state: the active JSONC config and the owned Runtime-key directory;
 - uses an empty temporary home, with only explicitly approved developer caches mounted back into package-manager-specific subdirectories;
 - mounts required system runtime paths read-only;
 - on NixOS, mounts the standard Nix store/profile symlink graph read-only (/nix/store, /run/current-system, /etc/profiles, /nix/var/nix/profiles, and ~/.nix-profile when present) without mounting the whole home directory;
@@ -202,7 +202,7 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - tunnel concurrency is bounded;
 - shell stdout/stderr are drained continuously with bounded retained output;
 - text/binary reads and writes are bounded;
-- shell calls have a timeout;
+- shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants);
 - HTTP and transport lifecycles share cancellation;
 - recovery teardown waits at most 5 seconds before aborting unresponsive peer transport tasks;
 - ngrok forwarding terminates with the HTTP transport/process lifecycle.

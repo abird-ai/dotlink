@@ -31,7 +31,8 @@ use crate::{
 #[command(
     name = "dotlink",
     version,
-    about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP"
+    about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP",
+    args_conflicts_with_subcommands = true
 )]
 struct Args {
     /// Manage persisted profiles.
@@ -433,32 +434,6 @@ impl Policy {
             allow_network,
         })
     }
-
-    fn has_read(&self) -> bool {
-        capability_available(
-            &self.read_roots,
-            &self.deny_read_roots,
-            self.unrestricted_fs,
-        )
-    }
-
-    fn has_write(&self) -> bool {
-        capability_available(
-            &self.write_roots,
-            &self.deny_write_roots,
-            self.unrestricted_fs,
-        )
-    }
-
-    fn has_read_write(&self) -> bool {
-        read_write_capability_available(
-            &self.read_roots,
-            &self.write_roots,
-            &self.deny_read_roots,
-            &self.deny_write_roots,
-            self.unrestricted_fs,
-        )
-    }
 }
 
 fn root_fully_denied(root: &Path, denies: &[PathBuf]) -> bool {
@@ -470,34 +445,6 @@ fn capability_available(grants: &[PathBuf], denies: &[PathBuf], unrestricted: bo
         return true;
     }
     grants.iter().any(|root| !root_fully_denied(root, denies))
-}
-
-fn read_write_capability_available(
-    reads: &[PathBuf],
-    writes: &[PathBuf],
-    deny_reads: &[PathBuf],
-    deny_writes: &[PathBuf],
-    unrestricted: bool,
-) -> bool {
-    if unrestricted
-        && !root_fully_denied(Path::new("/"), deny_reads)
-        && !root_fully_denied(Path::new("/"), deny_writes)
-    {
-        return true;
-    }
-
-    reads.iter().any(|read| {
-        writes.iter().any(|write| {
-            let overlap = if read.starts_with(write) {
-                read.as_path()
-            } else if write.starts_with(read) {
-                write.as_path()
-            } else {
-                return false;
-            };
-            !root_fully_denied(overlap, deny_reads) && !root_fully_denied(overlap, deny_writes)
-        })
-    })
 }
 
 fn base_or_path(path: &PathBuf, base_dir: &Path) -> PathBuf {
@@ -664,11 +611,6 @@ async fn run_runtime(
 
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
 
-    if args.list_tools {
-        print_tools(&policy);
-        return Ok(RuntimeOutcome::Exit);
-    }
-
     if args.print_id {
         let tunnel_id = setup
             .config
@@ -725,10 +667,6 @@ async fn run_runtime(
         }),
     };
 
-    if active_transports.is_empty() {
-        bail!("no MCP transport is active; enable one in setup or add --stdio/--http for this run");
-    }
-
     let mut cache_mounts = Vec::new();
     let mut shell_env = BTreeMap::new();
     if policy.allow_shell && policy.sandbox_shell {
@@ -770,6 +708,15 @@ async fn run_runtime(
         protected_paths: setup.protected_paths.clone(),
     })
     .await?;
+
+    if args.list_tools {
+        print_tools(&machine);
+        return Ok(RuntimeOutcome::Exit);
+    }
+
+    if active_transports.is_empty() {
+        bail!("no MCP transport is active; enable one in setup or add --stdio/--http for this run");
+    }
 
     let cancellation = CancellationToken::new();
     let _stdio_interrupt = StdioInterruptGuard::start(active_transports.stdio);
@@ -995,25 +942,11 @@ fn print_banner(
     eprintln!();
 }
 
-fn print_tools(policy: &Policy) {
-    let tools = LocalMachine::tool_router_for_policy(
-        policy.has_read(),
-        policy.has_write(),
-        policy.has_read_write(),
-        policy.allow_shell,
-    )
-    .list_all();
-
+fn print_tools(machine: &LocalMachine) {
     println!("abird dotlink tools");
     println!("────────────────────────────────────────────────────────");
-    for tool in tools {
-        let title = tool
-            .title
-            .as_deref()
-            .or_else(|| tool.annotations.as_ref().and_then(|a| a.title.as_deref()))
-            .or(tool.description.as_deref())
-            .unwrap_or("");
-        println!("• {:<16} {}", tool.name, title);
+    for (name, title) in machine.visible_tool_descriptions() {
+        println!("• {name:<16} {title}");
     }
 }
 
@@ -1430,6 +1363,16 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn profile_commands_reject_runtime_flags_but_allow_global_color() {
+        assert!(Args::try_parse_from(["dotlink", "--allow-shell", "profile", "list"]).is_err());
+        assert!(Args::try_parse_from(["dotlink", "-p", "work", "profile", "list"]).is_err());
+        assert!(Args::try_parse_from(["dotlink", "--setup", "profile", "list"]).is_err());
+
+        let args = Args::try_parse_from(["dotlink", "profile", "list", "--color=never"]).unwrap();
+        assert_eq!(args.color, ColorMode::Never);
     }
 
     #[test]

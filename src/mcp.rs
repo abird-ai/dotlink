@@ -547,7 +547,7 @@ impl AccessPolicy {
                     .await
                     .with_context(|| format!("existing path cannot be safely resolved: {input}"))?;
                 self.check(&canonical, need)?;
-                return Ok(target);
+                return Ok(canonical);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -908,6 +908,23 @@ impl LocalMachine {
         )
     }
 
+    pub fn visible_tool_descriptions(&self) -> Vec<(String, String)> {
+        self.policy_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                let title = tool
+                    .title
+                    .as_deref()
+                    .or_else(|| tool.annotations.as_ref().and_then(|a| a.title.as_deref()))
+                    .or(tool.description.as_deref())
+                    .unwrap_or("")
+                    .to_owned();
+                (tool.name.to_string(), title)
+            })
+            .collect()
+    }
+
     fn ensure_not_protected(&self, path: &Path) -> Result<()> {
         for protected in &self.config.protected_paths {
             if path == protected || path.starts_with(protected) {
@@ -1118,12 +1135,31 @@ impl LocalMachine {
             }
         };
 
-        let (stdout_bytes, stdout_truncated) = match stdout_task.await {
+        let mut stdout_task = stdout_task;
+        let mut stderr_task = stderr_task;
+        let collected = timeout_at(deadline, async {
+            let stdout = (&mut stdout_task).await;
+            let stderr = (&mut stderr_task).await;
+            (stdout, stderr)
+        })
+        .await;
+        let (stdout_result, stderr_result) = match collected {
+            Ok(results) => results,
+            Err(_) => {
+                stdout_task.abort();
+                stderr_task.abort();
+                return Ok(tool_error(format!(
+                    "collecting command output timed out after {timeout_secs} seconds"
+                )));
+            }
+        };
+
+        let (stdout_bytes, stdout_truncated) = match stdout_result {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => return Ok(tool_error(format!("failed reading stdout: {error}"))),
             Err(error) => return Ok(tool_error(format!("stdout reader task failed: {error}"))),
         };
-        let (stderr_bytes, stderr_truncated) = match stderr_task.await {
+        let (stderr_bytes, stderr_truncated) = match stderr_result {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => return Ok(tool_error(format!("failed reading stderr: {error}"))),
             Err(error) => return Ok(tool_error(format!("stderr reader task failed: {error}"))),
@@ -2037,6 +2073,50 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protected_write_target_cannot_be_reached_through_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let secret = root.join("config.jsonc");
+        let link = root.join("config-link");
+        std::fs::write(&secret, b"secret").unwrap();
+        symlink(&secret, &link).unwrap();
+
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            log: LogConfig::default(),
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: vec![secret],
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            machine
+                .resolve_for_create("config-link", AccessNeed::Write)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn default_tool_policy_is_read_only() {
         let names: Vec<_> = LocalMachine::tool_router_for_policy(true, false, false, false)
@@ -2502,6 +2582,68 @@ mod tests {
                 .as_std()
                 .get_args()
                 .any(|arg| arg == OsStr::new("--unshare-net"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_includes_output_collection_from_descendants() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = LocalMachine {
+            config: RuntimeConfig {
+                access: AccessPolicy::from_spec(AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                })
+                .unwrap(),
+                cache_mounts: Vec::new(),
+                shell_env: Vec::new(),
+                log: LogConfig::default(),
+                allow_shell: true,
+                sandbox_shell: false,
+                allow_network: true,
+                shell_program: Some(bash),
+                bwrap_program: None,
+                max_shell_timeout_secs: 2,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                protected_paths: Vec::new(),
+            },
+        };
+
+        let started = Instant::now();
+        let result = machine
+            .execute_shell(
+                ShellArgs {
+                    // The background process inherits the captured pipes after
+                    // Bash exits, so output collection must share the same
+                    // absolute deadline as the command itself.
+                    command: "sleep 2 & printf done".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(1),
+                    max_output_bytes: Some(4096),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(1800));
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(
+            serialized.contains("collecting command output timed out after 1 seconds"),
+            "unexpected shell result: {serialized}"
         );
     }
 

@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
-    net::{IpAddr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -1472,6 +1472,9 @@ fn atomic_write_private(path: &Path, contents: &[u8], harden_parent: bool) -> Re
 }
 
 fn save_config(config: &AppConfig, profile: Option<&str>) -> Result<()> {
+    // Runtime credentials always live in dotlink's owned XDG namespace, even
+    // when DOTLINK_CONFIG points at a project-local JSONC file.
+    ensure_dotlink_config_dir()?;
     let path = config_path(profile)?;
     let config_bytes = serialize_jsonc(config)?.into_bytes();
     let existing_key = try_read_saved_runtime_key(profile)?;
@@ -1661,74 +1664,59 @@ fn profiled_path(base: &Path, profile: Option<&str>) -> Result<PathBuf> {
     Ok(parent.join(filename))
 }
 
+fn dotlink_config_dir() -> Result<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        Ok(PathBuf::from(xdg).join("abird/dotlink"))
+    } else {
+        Ok(home_dir()?.join(".config/abird/dotlink"))
+    }
+}
+
+fn ensure_dotlink_config_dir() -> Result<PathBuf> {
+    let dir = dotlink_config_dir()?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    set_private_dir_permissions(&dir)?;
+    Ok(dir)
+}
+
 fn config_parent_is_dotlink_owned() -> bool {
     env::var_os("DOTLINK_CONFIG").is_none()
 }
 
 fn config_path(profile: Option<&str>) -> Result<PathBuf> {
-    let base = if let Some(path) = env::var_os("DOTLINK_CONFIG") {
-        PathBuf::from(path)
-    } else if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("abird/dotlink/config.jsonc")
-    } else {
-        home_dir()?.join(".config/abird/dotlink/config.jsonc")
+    let base = match env::var_os("DOTLINK_CONFIG") {
+        Some(path) => PathBuf::from(path),
+        None => dotlink_config_dir()?.join("config.jsonc"),
     };
     profiled_path(&base, profile)
 }
 
 fn credential_path(profile: Option<&str>) -> Result<PathBuf> {
-    let config = config_path(profile)?;
-    let parent = config
-        .parent()
-        .ok_or_else(|| anyhow!("credential path has no parent"))?;
+    let parent = dotlink_config_dir()?;
     Ok(match profile {
         Some(profile) => parent.join(format!("runtime.{profile}.key")),
         None => parent.join("runtime.key"),
     })
 }
 
-fn runtime_key_paths(parent: &Path) -> Result<Vec<PathBuf>> {
-    let mut protected = Vec::new();
-    if !parent.exists() {
-        return Ok(protected);
-    }
-
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "runtime.key" || (name.starts_with("runtime.") && name.ends_with(".key")) {
-            protected.push(entry.path());
-        }
-    }
-    protected.sort();
-    Ok(protected)
-}
-
 fn control_plane_paths(
     config: PathBuf,
-    current_key: PathBuf,
-    protect_parent: bool,
+    credential_dir: PathBuf,
+    protect_config_parent: bool,
 ) -> Result<Vec<PathBuf>> {
-    let parent = config
+    let config_parent = config
         .parent()
         .ok_or_else(|| anyhow!("configuration path has no parent"))?
         .to_path_buf();
 
-    // Standard dotlink config lives in a dedicated control-plane directory.
-    // Protecting that directory also covers every profile and atomic temp file.
-    // Custom DOTLINK_CONFIG paths stay file-scoped so an ordinary project
-    // directory is never hidden just because it contains the selected config.
-    let mut protected = if protect_parent {
-        vec![parent.clone()]
+    // Standard config lives entirely inside dotlink's private directory. A
+    // custom DOTLINK_CONFIG is protected file-by-file, while all Runtime keys
+    // remain under the owned XDG directory and can be protected as one unit.
+    let mut protected = if protect_config_parent {
+        vec![config_parent]
     } else {
-        vec![config]
+        vec![config, credential_dir]
     };
-    protected.extend(runtime_key_paths(&parent)?);
-
-    // Protect the selected key path even if it does not exist yet, so a local
-    // tool cannot pre-create credential material for a later profile change.
-    protected.push(current_key);
     protected.sort();
     protected.dedup();
     Ok(protected)
@@ -1737,7 +1725,7 @@ fn control_plane_paths(
 fn protected_paths_for_config(_config: &AppConfig, profile: Option<&str>) -> Result<Vec<PathBuf>> {
     control_plane_paths(
         config_path(profile)?,
-        credential_path(profile)?,
+        dotlink_config_dir()?,
         config_parent_is_dotlink_owned(),
     )
 }
@@ -2000,17 +1988,6 @@ fn try_read_saved_runtime_key(profile: Option<&str>) -> Result<Option<String>> {
     Ok(Some(key))
 }
 
-fn read_saved_runtime_key(profile: Option<&str>) -> Result<String> {
-    try_read_saved_runtime_key(profile)?.ok_or_else(|| {
-        anyhow!(
-            "saved runtime API key is missing or empty; run 'dotlink --setup{}' to repair credentials",
-            profile
-                .map(|name| format!(" --profile {name}"))
-                .unwrap_or_default()
-        )
-    })
-}
-
 fn validate_profile(profile: Option<&str>) -> Result<()> {
     let Some(profile) = profile else {
         return Ok(());
@@ -2121,10 +2098,12 @@ fn validate_control_plane_base_url(value: &str) -> Result<()> {
 
     let https = url.scheme() == "https" && url.host_str().is_some();
     let loopback_http = url.scheme() == "http"
-        && url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-        });
+        && match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip == Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => ip == Ipv6Addr::LOCALHOST,
+            None => false,
+        };
     if !https && !loopback_http {
         bail!("control-plane base URL must use HTTPS (loopback HTTP is allowed for testing)");
     }
@@ -2271,34 +2250,17 @@ mod tests {
     }
 
     #[test]
-    fn all_profile_runtime_keys_are_protected() {
+    fn control_plane_paths_protect_owned_dir_or_custom_file_plus_credentials() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("runtime.key"), b"default").unwrap();
-        std::fs::write(temp.path().join("runtime.work.key"), b"work").unwrap();
-        std::fs::write(temp.path().join("runtime.personal.key"), b"personal").unwrap();
-        std::fs::write(temp.path().join("runtime.txt"), b"not-a-key").unwrap();
+        let owned = temp.path().join("abird/dotlink");
+        let standard_config = owned.join("config.jsonc");
+        let custom_config = temp.path().join("project/config.jsonc");
 
-        let paths = runtime_key_paths(temp.path()).unwrap();
-        assert_eq!(paths.len(), 3);
-        assert!(paths.contains(&temp.path().join("runtime.key")));
-        assert!(paths.contains(&temp.path().join("runtime.work.key")));
-        assert!(paths.contains(&temp.path().join("runtime.personal.key")));
-    }
+        let standard = control_plane_paths(standard_config, owned.clone(), true).unwrap();
+        assert_eq!(standard.as_slice(), std::slice::from_ref(&owned));
 
-    #[test]
-    fn control_plane_paths_include_active_config_all_keys_and_missing_selected_key() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = temp.path().join("config.work.jsonc");
-        let selected_key = temp.path().join("runtime.work.key");
-        std::fs::write(&config, b"{}").unwrap();
-        std::fs::write(temp.path().join("runtime.key"), b"default").unwrap();
-        std::fs::write(temp.path().join("runtime.other.key"), b"other").unwrap();
-
-        let paths = control_plane_paths(config.clone(), selected_key.clone(), false).unwrap();
-        assert!(paths.contains(&config));
-        assert!(paths.contains(&selected_key));
-        assert!(paths.contains(&temp.path().join("runtime.key")));
-        assert!(paths.contains(&temp.path().join("runtime.other.key")));
+        let custom = control_plane_paths(custom_config.clone(), owned.clone(), false).unwrap();
+        assert_eq!(custom, [owned, custom_config]);
     }
 
     #[cfg(unix)]

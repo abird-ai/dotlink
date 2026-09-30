@@ -154,8 +154,12 @@ mod tests {
             ("http", include_str!("http.rs")),
             ("stdio", include_str!("stdio.rs")),
         ] {
+            let writes_stdout = source.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("println!(") || line.starts_with("print!(")
+            });
             assert!(
-                !source.contains("println!("),
+                !writes_stdout,
                 "{name} transport must keep stdout protocol-clean"
             );
         }

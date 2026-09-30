@@ -11,7 +11,7 @@ Current profile schema: **v9**. Older profile schemas are rejected; rerun setup 
 ~/.config/abird/dotlink/runtime.<profile>.key
 ```
 
-Profiles are JSONC only: comments and trailing commas are allowed. OpenAI runtime keys are stored separately and never serialized into the profile.
+Profiles are JSONC only: comments and trailing commas are allowed. OpenAI runtime keys are stored separately and never serialized into the profile. `DOTLINK_CONFIG` overrides only the JSONC location; Runtime keys always stay under the owned `~/.config/abird/dotlink` / `$XDG_CONFIG_HOME/abird/dotlink` directory.
 
 ## Setup flow
 

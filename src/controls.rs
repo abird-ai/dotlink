@@ -124,6 +124,25 @@ impl TerminalStateGuard {
         self.apply_termios(&current)
     }
 
+    #[cfg(windows)]
+    fn ensure_ctrl_c_signal(&self) -> io::Result<()> {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_PROCESSED_INPUT, GetConsoleMode, SetConsoleMode,
+        };
+
+        let mut mode = 0_u32;
+        // SAFETY: input_handle is the live console handle captured at construction.
+        if unsafe { GetConsoleMode(self.input_handle, &mut mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        mode |= ENABLE_PROCESSED_INPUT;
+        // SAFETY: input_handle is valid and mode is a console input-mode bitset.
+        if unsafe { SetConsoleMode(self.input_handle, mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn current_termios(&self) -> io::Result<libc::termios> {
         let mut current = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -191,7 +210,7 @@ impl StdioInterruptGuard {
 
         let terminal = TerminalStateGuard::capture().ok()?;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         terminal.ensure_ctrl_c_signal().ok()?;
 
         Some(Self {

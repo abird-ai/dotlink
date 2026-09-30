@@ -308,6 +308,8 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 ~/.config/abird/dotlink/runtime.work.key
 ~~~
 
+`DOTLINK_CONFIG` may move the JSONC file, but Runtime keys always stay in dotlink's private XDG directory above. The active config and credential directory are control-plane state and are not exposed through dotlink's MCP/filesystem/shell surface.
+
 When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
 
 ### Automatic tunnel recovery
