@@ -2,7 +2,11 @@
 
 **Connect ChatGPT, Claude.ai on the web to the files and tools on your computer — securely, from a single binary.**
 
-abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memory when enabled, and supported Codex/Work workflows — permission-scoped access to your local computer** through MCP. It brings many of the local development abilities you might normally use Codex for — reading and editing code, running Git, builds, tests, scripts, compilers, package managers, and other local tools — into your regular ChatGPT experience, where they can work alongside the broader conversation context and memories ChatGPT has available to you.
+abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memory when enabled, and supported Codex/Work workflows — permission-scoped access to your local computer** through MCP. It brings many of the local development abilities you might normally use Codex for into your regular ChatGPT experience, where they can work alongside the broader conversation context and memories ChatGPT has available to you.
+
+- **Let ChatGPT Web build, test, and run tools on your machine securely** — read and edit code, run Git, builds, tests, scripts, compilers, package managers, and other tools you explicitly expose.
+- **Work with local data and files without the upload/download loop** — let ChatGPT read data directly from your machine for analysis, reports, documents, or slide decks instead of repeatedly copy-pasting or moving files in and out of chat.
+- **Use ChatGPT as a practical fallback when you are out of Codex usage** — if you are in a pinch, connect ChatGPT Web to the same repository and toolchain and let it continue the work from your local project state.
 
 That context also gives you continuity when the machine or tunnel is temporarily offline: you can keep discussing architecture, planning changes, or designing against project context already present in ChatGPT, then reconnect later and have ChatGPT re-read the live repository, verify what changed, and continue from the current state.
 
