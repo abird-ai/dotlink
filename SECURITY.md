@@ -1,6 +1,6 @@
 # Security model
 
-abird-link is least-privilege by default.
+dotlink is least-privilege by default.
 
 Without write or shell flags, the visible tools are:
 
@@ -53,7 +53,7 @@ Supported cache families currently include Cargo registry/git, npm, pnpm, Yarn, 
 
 Cache grants are **shell-only**. They do not add the host cache path to the MCP filesystem allow-list, so `read`, `write`, `ls`, and related MCP tools cannot use cache sharing to inspect the user's home directory.
 
-abird-link maps approved host caches into the sandbox's private home at the package manager's expected location. Only the cache directory itself is mounted; adjacent credential/config files such as `~/.cargo/credentials.toml`, `~/.cargo/config.toml`, or `~/.npmrc` are not included.
+dotlink maps approved host caches into the sandbox's private home at the package manager's expected location. Only the cache directory itself is mounted; adjacent credential/config files such as `~/.cargo/credentials.toml`, `~/.cargo/config.toml`, or `~/.npmrc` are not included.
 
 Read-only sharing protects host cache integrity but cannot populate cache misses. Read+write sharing provides the normal package-manager experience and lets successful downloads/builds be reused later, but sandboxed code can also modify those shared host cache contents. Choose RW only when that tradeoff is acceptable.
 
@@ -99,7 +99,7 @@ Anyone who can reach an unprotected public endpoint may be able to exercise thos
 
 Use ngrok access controls when appropriate and grant only the minimum abird filesystem/shell permissions required.
 
-The ngrok SDK credential is read from NGROK_AUTHTOKEN. It authenticates abird-link to ngrok; it is not, by itself, authentication for MCP callers.
+The ngrok SDK credential is read from NGROK_AUTHTOKEN. It authenticates dotlink to ngrok; it is not, by itself, authentication for MCP callers.
 
 ## OpenAI credentials
 
@@ -108,8 +108,8 @@ OpenAI credentials exist only when the OpenAI transport is enabled.
 The Runtime key is stored separately for each profile:
 
 ~~~text
-~/.config/abird-link/runtime.key
-~/.config/abird-link/runtime.work.key
+~/.config/abird/dotlink/runtime.key
+~/.config/abird/dotlink/runtime.work.key
 ~~~
 
 Canonical JSONC config files are config.jsonc or config.<profile>.jsonc. On Unix config/key files are mode 0600 and their directory is mode 0700.
@@ -120,7 +120,7 @@ Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are rem
 
 ## Automatic transport recovery
 
-Transient OpenAI tunnel failures can trigger an automatic full runtime restart after 10 consecutive failed polls. Recovery does not grant new authority: abird-link reloads the same selected profile and reapplies the same CLI permission/deny flags before reconstructing `LocalMachine`, cache mounts, MCP state, and transports.
+Transient OpenAI tunnel failures can trigger an automatic full runtime restart after 10 consecutive failed polls. Recovery does not grant new authority: dotlink reloads the same selected profile and reapplies the same CLI permission/deny flags before reconstructing `LocalMachine`, cache mounts, MCP state, and transports.
 
 All peer transports are cancelled during recovery. They receive up to 5 seconds to stop cleanly before remaining tasks are force-aborted. Repeated unhealthy runtimes use bounded restart backoff, while fatal authentication/tunnel errors remain fatal.
 
@@ -146,7 +146,7 @@ The sandbox:
 - isolates PID, IPC, and UTS namespaces;
 - unshares the network namespace by default.
 
-The Nix daemon endpoint namespace is deliberately hidden by default when shell network is denied. abird-link masks the daemon endpoint roots (/nix/var/nix/daemon-socket and /run/nix-daemon) rather than assuming a particular socket filename or filesystem type. This prevents layout changes from accidentally exposing daemon-mediated builds or fetches outside the shell's direct filesystem/network isolation.
+The Nix daemon endpoint namespace is deliberately hidden by default when shell network is denied. dotlink masks the daemon endpoint roots (/nix/var/nix/daemon-socket and /run/nix-daemon) rather than assuming a particular socket filename or filesystem type. This prevents layout changes from accidentally exposing daemon-mediated builds or fetches outside the shell's direct filesystem/network isolation.
 
 Enable shell network access with:
 
@@ -154,7 +154,7 @@ Enable shell network access with:
 --allow-network
 ~~~
 
-The shell network namespace is separate from the main abird-link process. OpenAI and ngrok can use outbound networking even while the shell itself has no network.
+The shell network namespace is separate from the main dotlink process. OpenAI and ngrok can use outbound networking even while the shell itself has no network.
 
 ## Full unsandboxed host mode
 
@@ -175,7 +175,7 @@ Rust filesystem tools still enforce allow/deny policy on Windows and macOS.
 
 Bubblewrap is Linux-only. Native Windows/macOS shell execution therefore requires `--allow-all --no-sandbox`.
 
-For Windows, WSL2 is the recommended secure shell workflow: run abird-link inside WSL2 and use the normal Linux Bubblewrap sandbox instead of enabling unrestricted native PowerShell.
+For Windows, WSL2 is the recommended secure shell workflow: run dotlink inside WSL2 and use the normal Linux Bubblewrap sandbox instead of enabling unrestricted native PowerShell.
 
 ## Binary data
 
@@ -189,7 +189,7 @@ patch_binary also caps total file size processed in memory.
 
 At `-v`, TOOL logs show safe metadata such as paths, directories, flags, status, latency, and timestamps. Content/data fields are summarized by size instead of printing file contents or binary payloads.
 
-Verbose mode adds request-level transport/protocol metadata. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the abird-link request logger.
+Verbose mode adds request-level transport/protocol metadata. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the dotlink request logger.
 
 `--silent` suppresses TOOL activity. With `-vv`, it leaves REQ diagnostics visible while hiding TOOL lines.
 
@@ -208,31 +208,31 @@ Verbose mode adds request-level transport/protocol metadata. HTTP logs method/pa
 Read-only local MCP:
 
 ~~~bash
-abird-link --stdio
+dotlink --stdio
 ~~~
 
 Writable local project:
 
 ~~~bash
-abird-link --stdio --allow-write
+dotlink --stdio --allow-write
 ~~~
 
 Sandboxed build/test shell without shell network:
 
 ~~~bash
-abird-link --stdio --allow-write --allow-shell
+dotlink --stdio --allow-write --allow-shell
 ~~~
 
 Local HTTP:
 
 ~~~bash
-abird-link --http
+dotlink --http
 ~~~
 
 Public HTTP through ngrok:
 
 ~~~bash
-abird-link --http --ngrok
+dotlink --http --ngrok
 ~~~
 
 Use --allow-all --no-sandbox only when unrestricted host access is explicitly intended.

@@ -1,8 +1,8 @@
-# abird-link handoff — START HERE
+# dotlink handoff — START HERE
 
 Date: 2026-09-30
 
-This directory is the canonical handoff bundle for the completed 2026-09-30 `abird-link` development pass.
+This directory is the canonical handoff bundle for the completed 2026-09-30 `dotlink` development pass.
 
 ## First instruction
 
@@ -55,10 +55,10 @@ When documents disagree, use this priority:
 ## Repository identity
 
 ```text
-product / binary / MCP server: abird-link
+product / binary / MCP server: dotlink
 crate version: 0.5.0
 config schema version in source: 9
 branch: main
 ```
 
-Canonical upstream: `https://github.com/abird-ai/abird-link` (Git remote `origin`).
+Canonical upstream: `https://github.com/abird-ai/dotlink` (Git remote `origin`).

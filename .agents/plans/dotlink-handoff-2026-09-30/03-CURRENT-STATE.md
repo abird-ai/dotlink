@@ -17,17 +17,17 @@ Key continuation commits:
 ```text
 7b93e92 Add Crane cross builds and release installers
 b76f8e6 Expand profiles, sandbox caches, and logging
-5b8bbdd Rename to abird-link and add profiles and deny policy
+5b8bbdd Rename to dotlink and add profiles and deny policy
 ```
 
 The final documentation/handoff commit follows `7b93e92`; use `git log --oneline --decorate -12` for the exact current HEAD.
 
-Canonical upstream / `origin`: `https://github.com/abird-ai/abird-link`.
+Canonical upstream / `origin`: `https://github.com/abird-ai/dotlink`.
 
 ## Package/toolchain
 
 ```text
-crate name: abird-link
+crate name: dotlink
 crate version: 0.5.0
 edition: 2024
 rust toolchain: 1.98.1
@@ -45,15 +45,15 @@ JSONC
 Default:
 
 ```text
-~/.config/abird-link/config.jsonc
-~/.config/abird-link/runtime.key
+~/.config/abird/dotlink/config.jsonc
+~/.config/abird/dotlink/runtime.key
 ```
 
 Named profile `work`:
 
 ```text
-~/.config/abird-link/config.work.jsonc
-~/.config/abird-link/runtime.work.key
+~/.config/abird/dotlink/config.work.jsonc
+~/.config/abird/dotlink/runtime.work.key
 ```
 
 Legacy `.json` profiles remain readable.
@@ -229,7 +229,7 @@ Native outputs:
 
 ```text
 deps
-abird-link
+dotlink
 checks: package/tests/clippy/fmt
 devShell
 formatter
@@ -254,10 +254,10 @@ dist-windows-x86_64
 Stable assets:
 
 ```text
-abird-link-linux-x86_64
-abird-link-linux-x86_64.sha256
-abird-link-windows-x86_64.exe
-abird-link-windows-x86_64.exe.sha256
+dotlink-linux-x86_64
+dotlink-linux-x86_64.sha256
+dotlink-windows-x86_64.exe
+dotlink-windows-x86_64.exe.sha256
 ```
 
 Validated on 2026-09-30:
@@ -273,7 +273,7 @@ Validated on 2026-09-30:
 - Linux artifact is ELF64 x86_64, has no interpreter, `ldd` reports statically linked, checksum verifies, and `--version` runs.
 - Windows-GNU dependency/package/dist builds succeed.
 - Windows artifact is PE32+ x86_64 / Windows CUI and imports only Windows system DLLs; checksum verifies.
-- Windows executable runs under Wine and prints `abird-link 0.5.0`.
+- Windows executable runs under Wine and prints `dotlink 0.5.0`.
 - `scripts/build-release-artifacts.sh` succeeds end-to-end and produces the four expected release files.
 - `install.sh` succeeds against the real Linux release fixture and installs a byte-identical runnable binary.
 - `install.ps1` parses under PowerShell 7.6.6 and its checksum/copy/install flow succeeds against the real Windows release fixture.
@@ -283,4 +283,4 @@ Validated on 2026-09-30:
 - The currently running ChatGPT connector may still be an older process until it is restarted and the developer connection/tool schema is refreshed.
 - Public HTTP/ngrok still has no built-in application-layer caller authentication; ephemeral paths are not authentication.
 - Bubblewrap is Linux-only. Native Windows/macOS shell uses the explicitly unsandboxed full-host path.
-- Canonical upstream is `https://github.com/abird-ai/abird-link`; installers default there while retaining repository/base-URL overrides for forks and mirrors.
+- Canonical upstream is `https://github.com/abird-ai/dotlink`; installers default there while retaining repository/base-URL overrides for forks and mirrors.

@@ -18,8 +18,8 @@ linux_out="$("${nix_cmd[@]}" build .#dist-linux-x86_64 --no-link --print-out-pat
 echo "Building Windows distribution artifact..."
 windows_out="$("${nix_cmd[@]}" build .#dist-windows-x86_64 --no-link --print-out-paths)"
 
-cp "$linux_out"/abird-link-linux-x86_64* "$out_dir/"
-cp "$windows_out"/abird-link-windows-x86_64.exe* "$out_dir/"
+cp "$linux_out"/dotlink-linux-x86_64* "$out_dir/"
+cp "$windows_out"/dotlink-windows-x86_64.exe* "$out_dir/"
 
 printf '\nRelease artifacts:\n'
 ls -lh "$out_dir"

@@ -106,7 +106,7 @@ enum AccessNeed {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListArgs {
-    /// Directory path. Relative paths resolve from the directory where abird-link was launched; absolute paths are allowed only when permitted.
+    /// Directory path. Relative paths resolve from the directory where dotlink was launched; absolute paths are allowed only when permitted.
     #[serde(default = "dot")]
     path: String,
 
@@ -121,7 +121,7 @@ struct ListArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReadArgs {
-    /// UTF-8 text file path. Relative paths resolve from the directory where abird-link was launched.
+    /// UTF-8 text file path. Relative paths resolve from the directory where dotlink was launched.
     path: String,
 
     /// First 1-based line to return. Defaults to 1.
@@ -135,7 +135,7 @@ struct ReadArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WriteArgs {
-    /// File path. Relative paths resolve from the directory where abird-link was launched.
+    /// File path. Relative paths resolve from the directory where dotlink was launched.
     path: String,
 
     /// UTF-8 content. Missing parent directories are created automatically.
@@ -232,7 +232,7 @@ struct ShellArgs {
     /// Command string to execute.
     command: String,
 
-    /// Working directory. Relative paths resolve from the directory where abird-link was launched.
+    /// Working directory. Relative paths resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]
     dir: String,
 
@@ -850,7 +850,7 @@ impl LocalMachine {
         for protected in &self.config.protected_paths {
             if path == protected || path.starts_with(protected) {
                 bail!(
-                    "path is protected by abird-link and cannot be accessed through filesystem tools"
+                    "path is protected by dotlink and cannot be accessed through filesystem tools"
                 );
             }
         }
@@ -983,7 +983,7 @@ impl LocalMachine {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env_remove("ABIRD_LINK_API_KEY")
+            .env_remove("DOTLINK_API_KEY")
             .env_remove("CONTROL_PLANE_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("OPENAI_ADMIN_KEY")
@@ -1756,7 +1756,7 @@ impl LocalMachine {
 
 #[rmcp::tool_handler(
     router = self.policy_tool_router(),
-    name = "abird-link",
+    name = "dotlink",
     instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
 )]
 impl rmcp::ServerHandler for LocalMachine {
@@ -2416,15 +2416,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bubblewrap_cache_runtime_smoke_when_requested() {
-        if std::env::var_os("ABIRD_TEST_BWRAP").is_none() {
+        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
             return;
         }
 
         let Some(bwrap) = resolve_executable("bwrap") else {
-            panic!("ABIRD_TEST_BWRAP requested but bwrap is not installed");
+            panic!("DOTLINK_TEST_BWRAP requested but bwrap is not installed");
         };
         let Some(bash) = resolve_executable("bash") else {
-            panic!("ABIRD_TEST_BWRAP requested but bash is not installed");
+            panic!("DOTLINK_TEST_BWRAP requested but bash is not installed");
         };
 
         let project = tempfile::tempdir().unwrap();
@@ -2508,15 +2508,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bubblewrap_runtime_smoke_when_requested() {
-        if std::env::var_os("ABIRD_TEST_BWRAP").is_none() {
+        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
             return;
         }
 
         let Some(bwrap) = resolve_executable("bwrap") else {
-            panic!("ABIRD_TEST_BWRAP requested but bwrap is not installed");
+            panic!("DOTLINK_TEST_BWRAP requested but bwrap is not installed");
         };
         let Some(bash) = resolve_executable("bash") else {
-            panic!("ABIRD_TEST_BWRAP requested but bash is not installed");
+            panic!("DOTLINK_TEST_BWRAP requested but bash is not installed");
         };
 
         let temp = tempfile::tempdir().unwrap();

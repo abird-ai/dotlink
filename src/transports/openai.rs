@@ -349,7 +349,7 @@ impl TunnelClient {
             bail!("tunnel id and runtime API key are required");
         }
         let http = Client::builder()
-            .user_agent(format!("abird-link/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("dotlink/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(25))
             .build()?;
@@ -402,7 +402,7 @@ impl TunnelClient {
                             if should_restart_runtime_after_poll_failures(failures) {
                                 warn!(
                                     attempt = failures,
-                                    "tunnel poll failure threshold reached; restarting abird-link runtime"
+                                    "tunnel poll failure threshold reached; restarting dotlink runtime"
                                 );
                                 debug!(%error, "OpenAI tunnel poll failure triggering runtime restart");
                                 reconnect_reason = Some(error);
@@ -504,9 +504,11 @@ impl TunnelClient {
         match status {
             StatusCode::NOT_FOUND if in_activation_grace => Err(PollFailure::NotReady(error)),
             StatusCode::FORBIDDEN if in_activation_grace => Err(PollFailure::NotReady(error)),
-            StatusCode::NOT_FOUND => Err(PollFailure::Fatal(error.context(
-                "the Tunnel ID was not found; run `abird-link --setup` to reconfigure it",
-            ))),
+            StatusCode::NOT_FOUND => {
+                Err(PollFailure::Fatal(error.context(
+                    "the Tunnel ID was not found; run `dotlink --setup` to reconfigure it",
+                )))
+            }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(PollFailure::Fatal(
                 error.context("check the Runtime API key and its Tunnels Read + Use permissions"),
             )),
@@ -640,7 +642,7 @@ impl TunnelClient {
                 self.post_terminal(&command, response, deadline).await?;
             }
             "session_termination" => {
-                // abird-link advertises a stateless main channel, so there is no local
+                // dotlink advertises a stateless main channel, so there is no local
                 // MCP session to close. Acknowledge termination exactly as required by
                 // the tunnel protocol.
                 let response = TunnelResponse {
@@ -760,7 +762,7 @@ impl TunnelClient {
     fn common_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let mut request = request
             .bearer_auth(self.api_key.as_ref())
-            .header("X-Tunnel-Client-Name", "abird-link")
+            .header("X-Tunnel-Client-Name", "dotlink")
             .header("X-Tunnel-Client-Version", env!("CARGO_PKG_VERSION"))
             .header(
                 "X-Tunnel-Client-Wire-Protocol-Version",

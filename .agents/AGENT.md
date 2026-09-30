@@ -1,4 +1,4 @@
-# abird-link agent guide
+# dotlink agent guide
 
 Use this as the first agent-facing entrypoint for the repository.
 
@@ -9,7 +9,7 @@ Use this as the first agent-facing entrypoint for the repository.
 3. `SECURITY.md` for authority and sandbox invariants.
 4. `.agents/docs/configuration.md` for schema-v9 profiles and CLI precedence.
 5. `.agents/docs/release-install.md` for release/install details.
-6. `.agents/plans/abird-link-handoff-2026-09-30/00-START-HERE.md` only when historical implementation context is needed.
+6. `.agents/plans/dotlink-handoff-2026-09-30/00-START-HERE.md` only when historical implementation context is needed.
 
 ## Current invariants
 
@@ -30,6 +30,6 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-For sandbox-affecting work, also run `ABIRD_TEST_BWRAP=1 cargo test --locked --all-features`. For release/build changes, run the Nix flake checks and relevant dist outputs.
+For sandbox-affecting work, also run `DOTLINK_TEST_BWRAP=1 cargo test --locked --all-features`. For release/build changes, run the Nix flake checks and relevant dist outputs.
 
 Do not weaken permissions, sandboxing, credential masking, or transport isolation to make a test pass.

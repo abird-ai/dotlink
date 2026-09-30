@@ -1,19 +1,19 @@
 # Release and installation reference
 
-Canonical upstream: `https://github.com/abird-ai/abird-link`.
+Canonical upstream: `https://github.com/abird-ai/dotlink`.
 
 ## Installer behavior
 
 Linux x86_64:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/abird-ai/abird-link/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/abird-ai/dotlink/main/install.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/abird-ai/abird-link/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
 ```
 
 The installers verify SHA-256 sidecars before replacement. Unix replacement is atomic.
@@ -21,10 +21,10 @@ The installers verify SHA-256 sidecars before replacement. Unix replacement is a
 Supported overrides:
 
 ```text
-ABIRD_LINK_VERSION
-ABIRD_LINK_REPO
-ABIRD_LINK_RELEASE_BASE_URL
-ABIRD_LINK_INSTALL_DIR
+DOTLINK_VERSION
+DOTLINK_REPO
+DOTLINK_RELEASE_BASE_URL
+DOTLINK_INSTALL_DIR
 ```
 
 Default Unix install path: `~/.local/bin`.
@@ -32,10 +32,10 @@ Default Unix install path: `~/.local/bin`.
 ## Stable release assets
 
 ```text
-abird-link-linux-x86_64
-abird-link-linux-x86_64.sha256
-abird-link-windows-x86_64.exe
-abird-link-windows-x86_64.exe.sha256
+dotlink-linux-x86_64
+dotlink-linux-x86_64.sha256
+dotlink-windows-x86_64.exe
+dotlink-windows-x86_64.exe.sha256
 ```
 
 ## Nix / Crane outputs

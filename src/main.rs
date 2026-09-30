@@ -23,7 +23,7 @@ use crate::{
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "abird-link",
+    name = "dotlink",
     version,
     about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP"
 )]
@@ -394,9 +394,9 @@ async fn main() -> Result<()> {
 
     let log = LogConfig::new(args.verbose, args.silent, args.color);
     let default_filter = if args.verbose >= 2 {
-        "abird_link=debug"
+        "dotlink=debug"
     } else {
-        "abird_link=warn"
+        "dotlink=warn"
     };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -422,18 +422,18 @@ async fn main() -> Result<()> {
                 tracing::warn!(
                     restart = runtime_restarts,
                     delay_secs = delay.as_secs(),
-                    "OpenAI transport remained unhealthy; restarting abird-link runtime"
+                    "OpenAI transport remained unhealthy; restarting dotlink runtime"
                 );
                 tracing::debug!(%error, "runtime restart reason");
                 eprintln!(
-                    "\nOpenAI tunnel unhealthy — restarting abird-link runtime in {}s…",
+                    "\nOpenAI tunnel unhealthy — restarting dotlink runtime in {}s…",
                     delay.as_secs()
                 );
 
                 tokio::select! {
                     signal = tokio::signal::ctrl_c() => {
                         signal?;
-                        eprintln!("\nabird-link stopped.");
+                        eprintln!("\ndotlink stopped.");
                         return Ok(());
                     }
                     _ = tokio::time::sleep(delay) => {}
@@ -574,7 +574,7 @@ async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<
         signal = tokio::signal::ctrl_c() => {
             signal?;
             cancellation.cancel();
-            eprintln!("\nabird-link stopped.");
+            eprintln!("\ndotlink stopped.");
         }
     }
 
@@ -645,7 +645,10 @@ fn print_banner(
     eprintln!();
     eprintln!(
         "{}",
-        log.style("1;36", format!("abird-link {}", env!("CARGO_PKG_VERSION")))
+        log.style(
+            "1;36",
+            format!("abird dotlink {}", env!("CARGO_PKG_VERSION"))
+        )
     );
     eprintln!(
         "{}",
@@ -717,7 +720,7 @@ fn print_tools(policy: &Policy) {
     let tools =
         LocalMachine::tool_router_for_policy(policy.has_write(), policy.allow_shell).list_all();
 
-    println!("abird-link tools");
+    println!("abird dotlink tools");
     println!("────────────────────────────────────────────────────────");
     for tool in tools {
         let title = tool
@@ -765,7 +768,7 @@ mod tests {
 
     #[test]
     fn default_is_read_only_launch_directory() {
-        let (_, policy) = parse(&["abird-link"], no_defaults());
+        let (_, policy) = parse(&["dotlink"], no_defaults());
         assert_eq!(policy.base_dir, PathBuf::from("/workspace"));
         assert_eq!(policy.read_roots, [PathBuf::from("/workspace")]);
         assert!(policy.write_roots.is_empty());
@@ -774,8 +777,8 @@ mod tests {
 
     #[test]
     fn no_default_allow_removes_implicit_launch_read() {
-        let args = Args::try_parse_from(["abird-link", "--no-default-allow", "--allow-read=/ref"])
-            .unwrap();
+        let args =
+            Args::try_parse_from(["dotlink", "--no-default-allow", "--allow-read=/ref"]).unwrap();
         let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap();
         assert_eq!(policy.base_dir, PathBuf::from("/workspace"));
         assert_eq!(policy.read_roots, [PathBuf::from("/ref")]);
@@ -783,14 +786,14 @@ mod tests {
 
     #[test]
     fn no_filesystem_or_shell_capability_is_rejected() {
-        let args = Args::try_parse_from(["abird-link", "--no-default-allow"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--no-default-allow"]).unwrap();
         assert!(Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).is_err());
     }
 
     #[test]
     fn shell_requires_a_readable_directory() {
         let args =
-            Args::try_parse_from(["abird-link", "--no-default-allow", "--allow-shell"]).unwrap();
+            Args::try_parse_from(["dotlink", "--no-default-allow", "--allow-shell"]).unwrap();
         let error =
             Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap_err();
         assert!(
@@ -800,7 +803,7 @@ mod tests {
         );
 
         let args = Args::try_parse_from([
-            "abird-link",
+            "dotlink",
             "--no-default-allow",
             "--allow-read=/project",
             "--allow-shell",
@@ -819,7 +822,7 @@ mod tests {
             allow_network: true,
             ..PermissionConfig::default()
         };
-        let (_, policy) = parse(&["abird-link", "--deny-network"], defaults);
+        let (_, policy) = parse(&["dotlink", "--deny-network"], defaults);
         assert!(policy.allow_shell);
         assert!(policy.sandbox_shell);
         assert!(!policy.allow_network);
@@ -827,14 +830,14 @@ mod tests {
 
     #[test]
     fn allow_network_requires_shell_permission() {
-        let args = Args::try_parse_from(["abird-link", "--allow-network"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--allow-network"]).unwrap();
         assert!(Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).is_err());
     }
 
     #[test]
     fn bare_allow_write_and_allow_rw_mean_rw_launch_directory() {
         for flag in ["--allow-write", "--allow-rw"] {
-            let (_, policy) = parse(&["abird-link", flag], no_defaults());
+            let (_, policy) = parse(&["dotlink", flag], no_defaults());
             assert!(policy.read_roots.contains(&PathBuf::from("/workspace")));
             assert!(policy.write_roots.contains(&PathBuf::from("/workspace")));
         }
@@ -842,7 +845,7 @@ mod tests {
 
     #[test]
     fn allow_rw_root_naturally_means_unrestricted_filesystem() {
-        let (_, policy) = parse(&["abird-link", "--allow-rw=/"], no_defaults());
+        let (_, policy) = parse(&["dotlink", "--allow-rw=/"], no_defaults());
         assert!(policy.unrestricted_fs);
         assert!(policy.read_roots.contains(&PathBuf::from("/")));
         assert!(policy.write_roots.contains(&PathBuf::from("/")));
@@ -859,7 +862,7 @@ mod tests {
         };
         let (_, policy) = parse(
             &[
-                "abird-link",
+                "dotlink",
                 "--allow-rw=/both",
                 "--deny-read=/read-secret",
                 "--deny-write=/write-secret",
@@ -895,23 +898,20 @@ mod tests {
             allow_shell: true,
             ..PermissionConfig::default()
         };
-        let (_, policy) = parse(&["abird-link", "--deny-shell"], defaults);
+        let (_, policy) = parse(&["dotlink", "--deny-shell"], defaults);
         assert!(!policy.allow_shell);
     }
 
     #[test]
     fn allow_all_and_no_sandbox_require_each_other() {
-        assert!(Args::try_parse_from(["abird-link", "--allow-all"]).is_err());
-        assert!(Args::try_parse_from(["abird-link", "--no-sandbox"]).is_err());
-        assert!(Args::try_parse_from(["abird-link", "--allow-all", "--no-sandbox"]).is_ok());
+        assert!(Args::try_parse_from(["dotlink", "--allow-all"]).is_err());
+        assert!(Args::try_parse_from(["dotlink", "--no-sandbox"]).is_err());
+        assert!(Args::try_parse_from(["dotlink", "--allow-all", "--no-sandbox"]).is_ok());
     }
 
     #[test]
     fn allow_all_no_sandbox_is_full_authority() {
-        let (_, policy) = parse(
-            &["abird-link", "--allow-all", "--no-sandbox"],
-            no_defaults(),
-        );
+        let (_, policy) = parse(&["dotlink", "--allow-all", "--no-sandbox"], no_defaults());
         assert!(policy.unrestricted_fs);
         assert!(policy.allow_shell);
         assert!(!policy.sandbox_shell);
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn allow_all_rejects_deny_rules() {
         let args = Args::try_parse_from([
-            "abird-link",
+            "dotlink",
             "--allow-all",
             "--no-sandbox",
             "--deny-rw=/secret",
@@ -932,7 +932,7 @@ mod tests {
 
     #[test]
     fn profile_local_transports_start_without_cli_flags() {
-        let args = Args::try_parse_from(["abird-link"]).unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
         let defaults = TransportConfig {
             openai: false,
             stdio: true,
@@ -953,12 +953,12 @@ mod tests {
             ..TransportConfig::default()
         };
 
-        let args = Args::try_parse_from(["abird-link", "--no-stdio", "--no-http"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--no-stdio", "--no-http"]).unwrap();
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(!effective.stdio);
         assert!(!effective.http);
 
-        let args = Args::try_parse_from(["abird-link", "--stdio", "--http"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--stdio", "--http"]).unwrap();
         let effective = resolve_local_transports(
             &args,
             &TransportConfig {
@@ -973,31 +973,30 @@ mod tests {
 
     #[test]
     fn profile_and_setup_can_be_combined() {
-        let args = Args::try_parse_from(["abird-link", "--setup", "-p", "work"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--setup", "-p", "work"]).unwrap();
         assert!(args.setup);
         assert_eq!(args.profile.as_deref(), Some("work"));
 
-        let args = Args::try_parse_from(["abird-link", "-S", "-p", "work"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "-S", "-p", "work"]).unwrap();
         assert!(args.setup);
         assert_eq!(args.profile.as_deref(), Some("work"));
     }
 
     #[test]
     fn logging_flags_have_distinct_cli_meanings() {
-        let silent = Args::try_parse_from(["abird-link", "-s"]).unwrap();
+        let silent = Args::try_parse_from(["dotlink", "-s"]).unwrap();
         assert!(silent.silent);
         assert_eq!(silent.verbose, 0);
         assert!(!silent.setup);
 
-        let verbose = Args::try_parse_from(["abird-link", "-v"]).unwrap();
+        let verbose = Args::try_parse_from(["dotlink", "-v"]).unwrap();
         assert_eq!(verbose.verbose, 1);
         assert!(!verbose.silent);
 
-        let developer = Args::try_parse_from(["abird-link", "-vv"]).unwrap();
+        let developer = Args::try_parse_from(["dotlink", "-vv"]).unwrap();
         assert_eq!(developer.verbose, 2);
 
-        let both =
-            Args::try_parse_from(["abird-link", "--silent", "-vv", "--color=never"]).unwrap();
+        let both = Args::try_parse_from(["dotlink", "--silent", "-vv", "--color=never"]).unwrap();
         assert!(both.silent);
         assert_eq!(both.verbose, 2);
         assert_eq!(both.color, ColorMode::Never);
@@ -1005,7 +1004,7 @@ mod tests {
 
     #[test]
     fn setup_uses_uppercase_s_short_flag() {
-        let args = Args::try_parse_from(["abird-link", "-S"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "-S"]).unwrap();
         assert!(args.setup);
         assert!(!args.silent);
     }
@@ -1018,12 +1017,9 @@ mod tests {
             ngrok: true,
             ..TransportConfig::default()
         };
-        let args = Args::try_parse_from([
-            "abird-link",
-            "--http-ephemeral-url",
-            "--ngrok-ephemeral-url",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["dotlink", "--http-ephemeral-url", "--ngrok-ephemeral-url"])
+                .unwrap();
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(effective.http);
         assert!(effective.ngrok);
@@ -1038,9 +1034,9 @@ mod tests {
             ..TransportConfig::default()
         };
         for argv in [
-            vec!["abird-link", "--ngrok"],
-            vec!["abird-link", "--ephemeral-url"],
-            vec!["abird-link", "--http-bind=127.0.0.1:4000"],
+            vec!["dotlink", "--ngrok"],
+            vec!["dotlink", "--ephemeral-url"],
+            vec!["dotlink", "--http-bind=127.0.0.1:4000"],
         ] {
             let args = Args::try_parse_from(argv).unwrap();
             assert!(resolve_local_transports(&args, &defaults).is_err());
@@ -1058,17 +1054,14 @@ mod tests {
             ..TransportConfig::default()
         };
 
-        let args = Args::try_parse_from([
-            "abird-link",
-            "--ephemeral-url",
-            "--http-ephemeral-url=false",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["dotlink", "--ephemeral-url", "--http-ephemeral-url=false"])
+                .unwrap();
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(!effective.http_ephemeral_url);
         assert!(effective.ngrok_ephemeral_url);
 
-        let args = Args::try_parse_from(["abird-link", "--ngrok-ephemeral-url=false"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--ngrok-ephemeral-url=false"]).unwrap();
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(effective.http_ephemeral_url);
         assert!(!effective.ngrok_ephemeral_url);
@@ -1083,7 +1076,7 @@ mod tests {
             ngrok_ephemeral_url: true,
             ..TransportConfig::default()
         };
-        let args = Args::try_parse_from(["abird-link", "--no-ngrok"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--no-ngrok"]).unwrap();
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(effective.http);
         assert!(!effective.ngrok);
@@ -1097,13 +1090,13 @@ mod tests {
             ngrok: false,
             ..TransportConfig::default()
         };
-        let args = Args::try_parse_from(["abird-link", "--ngrok-ephemeral-url"]).unwrap();
+        let args = Args::try_parse_from(["dotlink", "--ngrok-ephemeral-url"]).unwrap();
         assert!(resolve_local_transports(&args, &defaults).is_err());
     }
 
     #[test]
     fn setup_is_not_mixed_with_protocol_stdio_or_http() {
-        assert!(Args::try_parse_from(["abird-link", "--setup", "--stdio"]).is_err());
-        assert!(Args::try_parse_from(["abird-link", "--setup", "--http"]).is_err());
+        assert!(Args::try_parse_from(["dotlink", "--setup", "--stdio"]).is_err());
+        assert!(Args::try_parse_from(["dotlink", "--setup", "--http"]).is_err());
     }
 }

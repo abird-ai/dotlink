@@ -21,7 +21,7 @@ Allows:
 --allow-rw[=<DIR>]
 ```
 
-Bare forms target the directory where abird-link was launched.
+Bare forms target the directory where dotlink was launched.
 
 Ergonomic behavior:
 
@@ -90,27 +90,27 @@ Do not proliferate old `*-dangerous` variants unless a new design explicitly rep
 Default config:
 
 ```text
-~/.config/abird-link/config.jsonc
+~/.config/abird/dotlink/config.jsonc
 ```
 
 Named:
 
 ```text
-~/.config/abird-link/config.<profile>.jsonc
+~/.config/abird/dotlink/config.<profile>.jsonc
 ```
 
 Use:
 
 ```bash
-abird-link -p work
-abird-link --profile work
+dotlink -p work
+dotlink --profile work
 ```
 
 Setup:
 
 ```bash
-abird-link -S -p work
-abird-link --setup --profile work
+dotlink -S -p work
+dotlink --setup --profile work
 ```
 
 `-s` is reserved for silent logging.
@@ -129,8 +129,6 @@ Must not strip comment markers inside strings such as URLs.
 Canonical save header currently indicates JSONC/comment support.
 
 Legacy `.json` profile files remain readable.
-
-If `ABIRD_LINK_CONFIG` explicitly points to `.json`, preserve valid plain JSON behavior for that path.
 
 ## Schema
 
@@ -194,7 +192,7 @@ Runtime API key is never serialized into config.
 
 ## Schema policy
 
-Schema v9 is the only supported profile schema. Older configs must be recreated with `abird-link --setup`.
+Schema v9 is the only supported profile schema. Older configs must be recreated with `dotlink --setup`.
 
 ## Onboarding flow
 
@@ -299,17 +297,17 @@ read_write
 Canonical:
 
 ```text
-ABIRD_LINK_*
+DOTLINK_*
 ```
 
 Examples:
 
 ```text
-ABIRD_LINK_CONFIG
-ABIRD_LINK_ID
-ABIRD_LINK_API_KEY
-ABIRD_LINK_ORGANIZATION_ID
-ABIRD_LINK_BASE_URL
+DOTLINK_CONFIG
+DOTLINK_ID
+DOTLINK_API_KEY
+DOTLINK_ORGANIZATION_ID
+DOTLINK_BASE_URL
 ```
 
 ## Transport runtime overrides

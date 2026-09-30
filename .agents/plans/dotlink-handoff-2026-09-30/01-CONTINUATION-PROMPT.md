@@ -4,7 +4,7 @@ Paste this to the next coding agent:
 
 ---
 
-You are continuing the `abird-link` Rust project from its committed 2026-09-30 implementation state.
+You are continuing the `dotlink` Rust project from its committed 2026-09-30 implementation state.
 
 First inspect the live repository:
 
@@ -19,19 +19,19 @@ Do not reset, clean, checkout over, or discard unexpected working-tree changes.
 
 Then read, in order:
 
-1. `.agents/plans/abird-link-handoff-2026-09-30/00-START-HERE.md`
-2. `.agents/plans/abird-link-handoff-2026-09-30/HANDOFF.md`
-3. `.agents/plans/abird-link-handoff-2026-09-30/02-CONTEXT-AND-HISTORY.md`
-4. `.agents/plans/abird-link-handoff-2026-09-30/03-CURRENT-STATE.md`
-5. `.agents/plans/abird-link-handoff-2026-09-30/04-PRODUCT-AND-ARCHITECTURE-SPEC.md`
-6. `.agents/plans/abird-link-handoff-2026-09-30/05-CLI-CONFIG-ONBOARDING-SPEC.md`
-7. `.agents/plans/abird-link-handoff-2026-09-30/06-SECURITY-SANDBOX-SPEC.md`
-8. `.agents/plans/abird-link-handoff-2026-09-30/07-MCP-TOOLS-TRANSPORTS-LOGGING.md`
-9. `.agents/plans/abird-link-handoff-2026-09-30/08-BUILD-RELEASE-INSTALL-SPEC.md`
-10. `.agents/plans/abird-link-handoff-2026-09-30/09-DECISION-LOG.md`
-11. `.agents/plans/abird-link-handoff-2026-09-30/10-VALIDATION-KNOWN-ISSUES.md`
-12. `.agents/plans/abird-link-handoff-2026-09-30/11-NEXT-WORK-ROADMAP.md`
-13. `.agents/plans/abird-link-handoff-2026-09-30/12-FILE-MAP.md`
+1. `.agents/plans/dotlink-handoff-2026-09-30/00-START-HERE.md`
+2. `.agents/plans/dotlink-handoff-2026-09-30/HANDOFF.md`
+3. `.agents/plans/dotlink-handoff-2026-09-30/02-CONTEXT-AND-HISTORY.md`
+4. `.agents/plans/dotlink-handoff-2026-09-30/03-CURRENT-STATE.md`
+5. `.agents/plans/dotlink-handoff-2026-09-30/04-PRODUCT-AND-ARCHITECTURE-SPEC.md`
+6. `.agents/plans/dotlink-handoff-2026-09-30/05-CLI-CONFIG-ONBOARDING-SPEC.md`
+7. `.agents/plans/dotlink-handoff-2026-09-30/06-SECURITY-SANDBOX-SPEC.md`
+8. `.agents/plans/dotlink-handoff-2026-09-30/07-MCP-TOOLS-TRANSPORTS-LOGGING.md`
+9. `.agents/plans/dotlink-handoff-2026-09-30/08-BUILD-RELEASE-INSTALL-SPEC.md`
+10. `.agents/plans/dotlink-handoff-2026-09-30/09-DECISION-LOG.md`
+11. `.agents/plans/dotlink-handoff-2026-09-30/10-VALIDATION-KNOWN-ISSUES.md`
+12. `.agents/plans/dotlink-handoff-2026-09-30/11-NEXT-WORK-ROADMAP.md`
+13. `.agents/plans/dotlink-handoff-2026-09-30/12-FILE-MAP.md`
 
 Read current source before modifying:
 
@@ -51,7 +51,7 @@ CHANGELOG.md
 
 Important current product intent:
 
-- `abird-link` securely connects ChatGPT, Claude.ai, and other MCP clients to local files/tools.
+- `dotlink` securely connects ChatGPT, Claude.ai, and other MCP clients to local files/tools.
 - Least privilege by default.
 - Pi-like text tools plus explicit binary tools.
 - Linux shell is Bubblewrap-sandboxed by default.
@@ -71,7 +71,7 @@ b76f8e6 Expand profiles, sandbox caches, and logging
 7b93e92 Add Crane cross builds and release installers
 ```
 
-The main remaining operational task is to restart the live `abird-link` process used by ChatGPT and refresh the developer connection/tool schema if the client must be proven against the final binary. Future product candidates are listed in `11-NEXT-WORK-ROADMAP.md`.
+The main remaining operational task is to restart the live `dotlink` process used by ChatGPT and refresh the developer connection/tool schema if the client must be proven against the final binary. Future product candidates are listed in `11-NEXT-WORK-ROADMAP.md`.
 
 Before committing future work, run the strongest relevant validation in `10-VALIDATION-KNOWN-ISSUES.md`.
 

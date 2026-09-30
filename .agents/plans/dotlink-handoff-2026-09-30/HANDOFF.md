@@ -1,8 +1,8 @@
-# abird-link comprehensive agent handoff
+# dotlink comprehensive agent handoff
 
 Date: 2026-09-30
 
-This is the single-file comprehensive handoff for the current `abird-link` project. Supporting detailed specs live beside this file in `.agents/plans/abird-link-handoff-2026-09-30/`.
+This is the single-file comprehensive handoff for the current `dotlink` project. Supporting detailed specs live beside this file in `.agents/plans/dotlink-handoff-2026-09-30/`.
 
 ## 0. First instruction: preserve the working tree
 
@@ -11,7 +11,7 @@ This is the single-file comprehensive handoff for the current `abird-link` proje
 Last committed baseline:
 
 ```text
-5b8bbdd Rename to abird-link and add profiles and deny policy
+5b8bbdd Rename to dotlink and add profiles and deny policy
 ```
 
 The current working tree contains a large newer development phase that is intentionally uncommitted. It is the project state to continue from, not junk.
@@ -29,7 +29,7 @@ Then read current source and docs.
 
 ## 1. What the product is
 
-`abird-link` is a single Rust binary that connects ChatGPT, Claude.ai, local MCP clients, and other MCP-capable AI tools to local files and optional shell execution under an explicit local permission policy.
+`dotlink` is a single Rust binary that connects ChatGPT, Claude.ai, local MCP clients, and other MCP-capable AI tools to local files and optional shell execution under an explicit local permission policy.
 
 Primary README sell:
 
@@ -40,7 +40,7 @@ The system is not merely a tunnel client anymore. It is a local permission/secur
 Canonical name:
 
 ```text
-abird-link
+dotlink
 ```
 
 Old historical name:
@@ -107,7 +107,7 @@ No transport gets extra filesystem/shell authority implicitly.
 Current package:
 
 ```text
-name: abird-link
+name: dotlink
 version: 0.5.0
 edition: 2024
 rust: 1.98.1
@@ -128,7 +128,7 @@ main
 Canonical upstream / `origin`:
 
 ```text
-https://github.com/abird-ai/abird-link
+https://github.com/abird-ai/dotlink
 ```
 
 The large JSONC/profile, cache, logging, Bubblewrap/Nix hardening, Crane/release and documentation phases that originally motivated this handoff have been reviewed and committed. Always inspect live `git status` / `git log` for any newer work.
@@ -216,7 +216,7 @@ Write-only directories are valid destinations.
 --allow-rw[=<DIR>]
 ```
 
-Bare forms use the directory where abird-link was launched.
+Bare forms use the directory where dotlink was launched.
 
 Ergonomic rule:
 
@@ -324,7 +324,7 @@ Profile `allow_network` requires shell.
 Full unsandboxed authority is deliberately paired:
 
 ```bash
-abird-link --allow-all --no-sandbox
+dotlink --allow-all --no-sandbox
 ```
 
 `--allow-rw=/` by itself is filesystem-wide RW under the normal sandbox model, not equivalent to no sandbox.
@@ -334,22 +334,22 @@ abird-link --allow-all --no-sandbox
 Default:
 
 ```text
-~/.config/abird-link/config.jsonc
-~/.config/abird-link/runtime.key
+~/.config/abird/dotlink/config.jsonc
+~/.config/abird/dotlink/runtime.key
 ```
 
 Named:
 
 ```text
-~/.config/abird-link/config.work.jsonc
-~/.config/abird-link/runtime.work.key
+~/.config/abird/dotlink/config.work.jsonc
+~/.config/abird/dotlink/runtime.work.key
 ```
 
 Use:
 
 ```bash
-abird-link -p work
-abird-link -S -p work
+dotlink -p work
+dotlink -S -p work
 ```
 
 `-s` is silent; setup shorthand is uppercase `-S`.
@@ -543,7 +543,7 @@ http://127.0.0.1:3000/mcp
 HTTP publication enhancer, not separate MCP transport.
 
 ```bash
-abird-link --http --ngrok
+dotlink --http --ngrok
 ```
 
 Remote client receives normal Streamable HTTP MCP endpoint.
@@ -574,15 +574,15 @@ Ephemeral path is not authentication.
 Documented current flow:
 
 ```text
-abird-link --setup
+dotlink --setup
 choose openai
-run abird-link
+run dotlink
 ChatGPT Settings → Security and login → Developer mode
 Plugins → +
 Connection: Tunnel
 select/paste tunnel ID
 review tools
-select Abird Link in chat
+select abird dotlink in chat
 ```
 
 Detailed ChatGPT connection flow: `docs/CHATGPT_PLUGIN.md`.
@@ -594,7 +594,7 @@ Claude.ai remote service needs public HTTPS MCP.
 Recommended:
 
 ```bash
-abird-link --http --ngrok --ngrok-ephemeral-url
+dotlink --http --ngrok --ngrok-ephemeral-url
 ```
 
 Register printed URL as custom connector.
@@ -661,10 +661,10 @@ dist-windows-x86_64
 Release files:
 
 ```text
-abird-link-linux-x86_64
-abird-link-linux-x86_64.sha256
-abird-link-windows-x86_64.exe
-abird-link-windows-x86_64.exe.sha256
+dotlink-linux-x86_64
+dotlink-linux-x86_64.sha256
+dotlink-windows-x86_64.exe
+dotlink-windows-x86_64.exe.sha256
 ```
 
 Installers:
@@ -675,7 +675,7 @@ install.ps1
 scripts/build-release-artifacts.sh
 ```
 
-Canonical upstream is `https://github.com/abird-ai/abird-link`; installers default there while retaining repository/base-URL overrides.
+Canonical upstream is `https://github.com/abird-ai/dotlink`; installers default there while retaining repository/base-URL overrides.
 
 ## 17. Validation status
 
@@ -703,7 +703,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-All 80 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `ABIRD_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
+All 80 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
 
 Live smokes have validated:
 
@@ -730,9 +730,9 @@ Crane/release validation completed on 2026-09-30:
 - full x86_64-linux `nix flake check` passes in the isolated writable Nix store;
 - native Crane dependency/package/test/Clippy/fmt outputs build successfully;
 - Linux-musl dependency/package/dist outputs build successfully;
-- Linux release artifact is ELF64 x86_64 with no interpreter or dynamic `NEEDED` entries, its checksum verifies, and `--version` runs as `abird-link 0.5.0`;
+- Linux release artifact is ELF64 x86_64 with no interpreter or dynamic `NEEDED` entries, its checksum verifies, and `--version` runs as `dotlink 0.5.0`;
 - Windows-GNU dependency/package/dist outputs build successfully;
-- Windows release artifact is a valid x86_64 PE executable, its checksum verifies, and it runs under Wine printing `abird-link 0.5.0`;
+- Windows release artifact is a valid x86_64 PE executable, its checksum verifies, and it runs under Wine printing `dotlink 0.5.0`;
 - `install.sh` installs the real Linux release fixture and verifies SHA-256;
 - `install.ps1` parses/runs under PowerShell and its fixture test verifies the installed Windows binary hash;
 - `install.sh` and `scripts/build-release-artifacts.sh` are executable and pass shell syntax validation;

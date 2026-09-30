@@ -4,7 +4,7 @@ This file records decisions that should not be casually reversed without underst
 
 ## Product name
 
-**Decision:** `abird-link` is canonical.
+**Decision:** `dotlink` is canonical.
 
 Old name `abird-tunnel` is historical only.
 
@@ -50,7 +50,7 @@ hex
 
 ## Default authority
 
-**Decision:** the directory where abird-link is launched is the internal relative-path base and is read-only by default. `--no-default-allow` removes the implicit read grant.
+**Decision:** the directory where dotlink is launched is the internal relative-path base and is read-only by default. `--no-default-allow` removes the implicit read grant.
 
 Schema v9 is a clean break; older profile schemas are not accepted.
 
@@ -128,7 +128,7 @@ Rationale: different projects/trust contexts should be easy to switch.
 
 **Decision:** canonical config format is JSONC, not JSONL.
 
-Support comments/trailing commas and legacy JSON fallback.
+Support comments and trailing commas in strict schema-v9 JSONC profiles.
 
 Rationale: hand-editable structured config.
 
@@ -218,6 +218,6 @@ Rationale: satisfies Debian use while increasing portability.
 
 ## Installer repository owner
 
-**Decision:** the canonical upstream is `https://github.com/abird-ai/abird-link`.
+**Decision:** the canonical upstream is `https://github.com/abird-ai/dotlink`.
 
-Installers default to `abird-ai/abird-link`, while `ABIRD_LINK_REPO` and a custom release base remain supported for forks, mirrors and alternate hosting.
+Installers default to `abird-ai/dotlink`, while `DOTLINK_REPO` and a custom release base remain supported for forks, mirrors and alternate hosting.

@@ -13,7 +13,7 @@ The code/build is final, but the currently connected ChatGPT MCP process may sti
 When convenient:
 
 1. rebuild/install the final binary if the connector launch path does not already point at it;
-2. restart `abird-link`;
+2. restart `dotlink`;
 3. refresh the ChatGPT developer connection/tool schema;
 4. confirm `tools/list` matches the selected policy;
 5. smoke one read call and, when permitted, one shell call;
@@ -26,7 +26,7 @@ This is a live-process refresh, not an implementation gap.
 Canonical upstream / `origin`:
 
 ```text
-https://github.com/abird-ai/abird-link
+https://github.com/abird-ai/dotlink
 ```
 
 Installers default to this repository. Future release work should choose the tag/release convention and publish the validated stable assets there; repository/base-URL overrides remain available for forks and mirrors.
@@ -87,8 +87,8 @@ Add application-layer authentication for public HTTP/ngrok rather than relying o
 Possible alternative/addition to sharing host caches:
 
 ```text
-$XDG_CACHE_HOME/abird-link/profiles/<profile>/cargo
-$XDG_CACHE_HOME/abird-link/profiles/<profile>/npm
+$XDG_CACHE_HOME/abird/dotlink/profiles/<profile>/cargo
+$XDG_CACHE_HOME/abird/dotlink/profiles/<profile>/npm
 ...
 ```
 
@@ -139,4 +139,4 @@ The current typed profile/onboarding model may already be sufficient.
 - do not reuse `-s` for setup;
 - do not silently enable network because a package manager misses a dependency;
 - do not weaken path canonicalization or deny precedence to make a test pass;
-- keep the canonical upstream as `https://github.com/abird-ai/abird-link`.
+- keep the canonical upstream as `https://github.com/abird-ai/dotlink`.

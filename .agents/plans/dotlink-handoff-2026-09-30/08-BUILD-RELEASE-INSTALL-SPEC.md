@@ -33,7 +33,7 @@ Native conceptual outputs:
 
 ```text
 .#deps
-.#abird-link
+.#dotlink
 default package
 checks
 devShell
@@ -70,8 +70,8 @@ dist-linux-x86_64
 Stable asset names:
 
 ```text
-abird-link-linux-x86_64
-abird-link-linux-x86_64.sha256
+dotlink-linux-x86_64
+dotlink-linux-x86_64.sha256
 ```
 
 ### Windows x86_64
@@ -99,8 +99,8 @@ dist-windows-x86_64
 Stable assets:
 
 ```text
-abird-link-windows-x86_64.exe
-abird-link-windows-x86_64.exe.sha256
+dotlink-windows-x86_64.exe
+dotlink-windows-x86_64.exe.sha256
 ```
 
 ## Release helper
@@ -139,10 +139,10 @@ Current intended behavior:
 Environment knobs:
 
 ```text
-ABIRD_LINK_VERSION
-ABIRD_LINK_REPO
-ABIRD_LINK_RELEASE_BASE_URL
-ABIRD_LINK_INSTALL_DIR
+DOTLINK_VERSION
+DOTLINK_REPO
+DOTLINK_RELEASE_BASE_URL
+DOTLINK_INSTALL_DIR
 ```
 
 ### Windows
@@ -158,10 +158,10 @@ Downloads Windows x86_64 asset and verifies SHA-256.
 Canonical repository:
 
 ```text
-https://github.com/abird-ai/abird-link
+https://github.com/abird-ai/dotlink
 ```
 
-The installers default to `abird-ai/abird-link`. `ABIRD_LINK_REPO` and `ABIRD_LINK_RELEASE_BASE_URL` remain supported for forks, mirrors, local fixtures and alternate release hosting.
+The installers default to `abird-ai/dotlink`. `DOTLINK_REPO` and `DOTLINK_RELEASE_BASE_URL` remain supported for forks, mirrors, local fixtures and alternate release hosting.
 
 ## Validation status
 
@@ -173,8 +173,8 @@ Completed in the 2026-09-30 continuation pass:
 - removed x86_64-darwin from the flake system matrix because nixpkgs 26.11 dropped support; Intel macOS is a Cargo-from-source path for now;
 - full x86_64-linux `nix flake check` completed successfully in the isolated writable Nix store;
 - `.#deps`, Linux-musl deps/package/dist, and Windows-GNU deps/package/dist all build successfully;
-- Linux release output is ELF64 x86_64 with no dynamic interpreter/dependency entries, checksum verifies, and the executable reports `abird-link 0.5.0`;
-- Windows release output is PE x86_64, checksum verifies, and Wine execution reports `abird-link 0.5.0`;
+- Linux release output is ELF64 x86_64 with no dynamic interpreter/dependency entries, checksum verifies, and the executable reports `dotlink 0.5.0`;
+- Windows release output is PE x86_64, checksum verifies, and Wine execution reports `dotlink 0.5.0`;
 - `install.sh` passes both mock and real Linux release fixture installation/checksum tests;
 - `install.ps1` parses/runs under PowerShell and passes its real Windows release fixture hash/install test;
 - `install.sh` and `scripts/build-release-artifacts.sh` are mode 0755 and pass `bash -n`;
@@ -184,7 +184,7 @@ No release-build implementation gap remains. A native Windows CI/runtime smoke i
 
 ## Why full Nix validation is separate
 
-The normal `abird-link` Bubblewrap sandbox deliberately:
+The normal `dotlink` Bubblewrap sandbox deliberately:
 
 - makes Nix store read-only;
 - hides host Nix daemon when shell network is denied.

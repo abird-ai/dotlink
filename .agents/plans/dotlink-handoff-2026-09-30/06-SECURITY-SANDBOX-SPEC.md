@@ -4,7 +4,7 @@
 
 The AI/MCP client is not trusted with arbitrary host authority.
 
-The local user explicitly selects capabilities; `abird-link` enforces them locally regardless of prompt content.
+The local user explicitly selects capabilities; `dotlink` enforces them locally regardless of prompt content.
 
 ## Filesystem policy
 
@@ -198,7 +198,7 @@ Profile sandbox network permission must not silently authorize the full unsandbo
 Deliberately paired:
 
 ```bash
-abird-link --allow-all --no-sandbox
+dotlink --allow-all --no-sandbox
 ```
 
 Do not try to enforce ordinary Rust path denies against an arbitrary unsandboxed subprocess; guard/reject incompatible combinations.

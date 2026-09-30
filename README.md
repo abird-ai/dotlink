@@ -1,19 +1,19 @@
-# abird-link
+# abird dotlink
 
-**Connect ChatGPT Web — including Spaces and dots — to the files and tools on your computer, securely with a single command.**
+Connect **your ChatGPT dot**, **your ChatGPT Web and Spaces** to files and tools on **your computer** — securely with a single command.
 
 A single lightweight binary with an MCP server, OpenAI tunnel transport, permission engine, profiles, activity logging, and a full Bubblewrap sandbox on Linux — no UI, no third-party relay, guided setup.
 
-- **Let ChatGPT Web — and your dot — work directly on your computer**: read and edit files, run Git, build, test, execute scripts, and use the tools you explicitly expose.
-- **Keep project context connected**: reason and document in ChatGPT/Spaces, then continue against the same live repository and toolchain.
-- **Use local data without the upload/download loop**: analyze files, build reports or slide decks, and work with artifacts directly from your machine.
-- **Use ChatGPT as a practical fallback when Codex usage is unavailable or exhausted**: reconnect to the same project state and keep going.
+- Let **your ChatGPT web** and **your dot** work directly on **your computer** through controlled, fine-grained access: read and edit files, run Git, build, test, execute scripts, and use only the tools you explicitly expose.
+- Use local data without the upload/download loop: analyze files, build reports or slide decks, and work with artifacts directly from your machine.
+- **Keep project context connected**: reason and document in ChatGPT/Spaces, then continue against the same live repository and toolchain, then talk to dot about it.
+- Use ChatGPT as a practical fallback when Codex usage is unavailable or exhausted: reconnect to the same project state and keep going.
 
-When the machine is offline, keep planning against context already in ChatGPT; reconnect later and let ChatGPT re-read the live project before continuing.
+When your machine is offline, keep planning against context already in ChatGPT; reconnect later and let ChatGPT re-read the live project before continuing.
 
-For ChatGPT, abird-link opens an outbound **OpenAI Secure MCP Tunnel directly from your machine to OpenAI**. Your MCP server stays local: no public inbound port, no third-party relay.
+For ChatGPT, dotlink opens an outbound **OpenAI Secure MCP Tunnel directly from your machine to OpenAI**. Your MCP server stays local: no public inbound port, no third-party relay.
 
-It also supports **Claude.ai and other remote MCP clients** over HTTP/ngrok, plus **local MCP clients** over stdio or loopback HTTP. Every transport uses the same local permission policy.
+It also supports Claude.ai and other remote MCP clients over HTTP/ngrok, plus local MCP clients over stdio or loopback HTTP. Every transport uses the same local permission policy.
 
 Security is local and opt-in: the launch directory is read-only by default; write, shell, network, extra paths, caches, and public HTTP are separate grants. Linux shell execution is Bubblewrap-sandboxed by default.
 
@@ -24,13 +24,13 @@ Security is local and opt-in: the launch directory is read-only by default; writ
 Linux x86_64:
 
 ~~~bash
-curl -fsSL https://raw.githubusercontent.com/abird-ai/abird-link/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/abird-ai/dotlink/main/install.sh | sh
 ~~~
 
 Windows PowerShell:
 
 ~~~powershell
-irm https://raw.githubusercontent.com/abird-ai/abird-link/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
 ~~~
 
 Or build with Nix/Cargo; see **Build** below.
@@ -38,17 +38,17 @@ Or build with Nix/Cargo; see **Build** below.
 ### Setup
 
 ~~~bash
-abird-link --setup
+dotlink --setup
 cd ~/src/my-project
-abird-link
+dotlink
 ~~~
 
 The launch directory is readable by default. Add capabilities only when needed:
 
 ~~~bash
-abird-link --allow-rw
-abird-link --allow-rw --allow-shell
-abird-link --allow-rw --allow-shell --allow-network
+dotlink --allow-rw
+dotlink --allow-rw --allow-shell
+dotlink --allow-rw --allow-shell --allow-network
 ~~~
 
 ### What it looks like
@@ -56,9 +56,9 @@ abird-link --allow-rw --allow-shell --allow-network
 Default runs are quiet. Add `-v` to see tool activity:
 
 ~~~text
-$ abird-link -v -p aw
+$ dotlink -v -p aw
 
-abird-link 0.5.0
+abird dotlink 0.5.0
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
@@ -79,12 +79,12 @@ Ctrl-C to stop.
 
 `-v` shows TOOL activity. `-vv` also shows transport/request REQ diagnostics. File contents, binary payloads, API keys, and raw request bodies are not intentionally logged.
 
-## Connect abird-link to ChatGPT
+## Connect dotlink to ChatGPT
 
-1. Run `abird-link --setup` and select **OpenAI Tunnel**.
-2. Start abird-link from the project directory and keep it running.
-3. In ChatGPT, enable **Developer mode**, add a **Tunnel** connection, and select/paste the `tunnel_...` ID printed by abird-link.
-4. Enable **Abird Link** from the chat tools menu and ask normally.
+1. Run `dotlink --setup` and select **OpenAI Tunnel**.
+2. Start dotlink from the project directory and keep it running.
+3. In ChatGPT, enable **Developer mode**, add a **Tunnel** connection, and select/paste the `tunnel_...` ID printed by dotlink.
+4. Enable **abird dotlink** from the chat tools menu and ask normally.
 
 The discovered tool surface follows local permissions:
 
@@ -94,15 +94,15 @@ write        + write, edit, write_binary, patch_binary
 shell        + bash (Unix) / powershell (Windows)
 ~~~
 
-After changing tool schemas or permissions, restart abird-link and refresh the ChatGPT connection.
+After changing tool schemas or permissions, restart dotlink and refresh the ChatGPT connection.
 
-If the tunnel is not found, verify that abird-link is connected, Developer mode is enabled, the tunnel belongs to the current workspace, and the Runtime API key has **Tunnels Read + Use**.
+If the tunnel is not found, verify that dotlink is connected, Developer mode is enabled, the tunnel belongs to the current workspace, and the Runtime API key has **Tunnels Read + Use**.
 
 Detailed ChatGPT connection steps: `docs/CHATGPT_PLUGIN.md`.
 
-## Connect abird-link to Claude.ai
+## Connect dotlink to Claude.ai
 
-Claude.ai custom connectors use **remote MCP**: Claude connects from Anthropic's cloud, not from your local machine. That means `http://127.0.0.1:3000/mcp` will not work directly with claude.ai; expose abird-link through a public HTTPS endpoint such as ngrok.
+Claude.ai custom connectors use **remote MCP**: Claude connects from Anthropic's cloud, not from your local machine. That means `http://127.0.0.1:3000/mcp` will not work directly with claude.ai; expose dotlink through a public HTTPS endpoint such as ngrok.
 
 ### 1. Start a public Streamable HTTP MCP endpoint
 
@@ -110,17 +110,17 @@ Set your ngrok token, then run:
 
 ~~~bash
 export NGROK_AUTHTOKEN='...'
-abird-link --http --ngrok --ngrok-ephemeral-url
+dotlink --http --ngrok --ngrok-ephemeral-url
 ~~~
 
 Add whatever local permissions you actually want Claude to have, for example:
 
 ~~~bash
-abird-link --http --ngrok --ngrok-ephemeral-url \
+dotlink --http --ngrok --ngrok-ephemeral-url \
   --allow-rw --allow-shell
 ~~~
 
-abird-link prints a URL similar to:
+dotlink prints a URL similar to:
 
 ~~~text
 ✓ ngrok MCP: https://example.ngrok.app/mcp/<ephemeral-token>
@@ -133,29 +133,29 @@ For individual Claude plans:
 1. Open **Customize → Connectors**.
 2. Select **+**.
 3. Choose **Add custom connector**.
-4. Give it a name such as **Abird Link**.
-5. Paste the ngrok MCP URL printed by abird-link.
+4. Give it a name such as **abird dotlink**.
+5. Paste the ngrok MCP URL printed by dotlink.
 6. Add the connector.
 
 For Team/Enterprise organizations, an owner may need to register the custom connector under the organization's connector settings first; members can then connect and enable it.
 
 ### 3. Enable it in a conversation
 
-In Claude, use the **+** menu in the chat composer, open **Connectors**, and enable **Abird Link** for that conversation. Claude can then call the tools exposed by the running abird-link process.
+In Claude, use the **+** menu in the chat composer, open **Connectors**, and enable **abird dotlink** for that conversation. Claude can then call the tools exposed by the running dotlink process.
 
-> **Security:** abird-link's HTTP/ngrok transport does not currently add application-layer authentication. Treat the public URL as sensitive. An ephemeral path makes accidental discovery much harder, but it is not authentication. Use ngrok access controls where appropriate and grant only the minimum local permissions needed.
+> **Security:** dotlink's HTTP/ngrok transport does not currently add application-layer authentication. Treat the public URL as sensitive. An ephemeral path makes accidental discovery much harder, but it is not authentication. Use ngrok access controls where appropriate and grant only the minimum local permissions needed.
 
 ## Connect other remote MCP clients through ngrok
 
 Any MCP client that supports remote **Streamable HTTP** can use the same public endpoint:
 
 ~~~bash
-abird-link --http --ngrok --ngrok-ephemeral-url
+dotlink --http --ngrok --ngrok-ephemeral-url
 ~~~
 
-Then give the client the printed HTTPS MCP URL. The remote client receives exactly the tool surface and permissions exposed by that abird-link process.
+Then give the client the printed HTTPS MCP URL. The remote client receives exactly the tool surface and permissions exposed by that dotlink process.
 
-## Use abird-link as a local sandboxed MCP server
+## Use dotlink as a local sandboxed MCP server
 
 For local MCP clients, no public tunnel is required.
 
@@ -164,7 +164,7 @@ For local MCP clients, no public tunnel is required.
 Use stdio when the client launches MCP servers as child processes:
 
 ~~~bash
-abird-link --stdio --allow-rw --allow-shell
+dotlink --stdio --allow-rw --allow-shell
 ~~~
 
 Typical MCP client configuration:
@@ -172,8 +172,8 @@ Typical MCP client configuration:
 ~~~json
 {
   "mcpServers": {
-    "abird-link": {
-      "command": "abird-link",
+    "dotlink": {
+      "command": "dotlink",
       "args": ["--stdio", "--allow-rw", "--allow-shell"]
     }
   }
@@ -187,7 +187,7 @@ On Linux the shell is still Bubblewrap-sandboxed.
 For local clients that support Streamable HTTP:
 
 ~~~bash
-abird-link --http --allow-rw --allow-shell
+dotlink --http --allow-rw --allow-shell
 ~~~
 
 Connect to:
@@ -243,10 +243,10 @@ With `--allow-shell`, Bash runs inside Bubblewrap by default. Read grants mount 
 
 ### Full unsandboxed access
 
-Unsandboxed shell execution inherently has the OS user's filesystem and network authority, so abird-link exposes one explicit full-host escape hatch rather than several partial "dangerous" flags:
+Unsandboxed shell execution inherently has the OS user's filesystem and network authority, so dotlink exposes one explicit full-host escape hatch rather than several partial "dangerous" flags:
 
 ~~~bash
-abird-link --allow-all --no-sandbox
+dotlink --allow-all --no-sandbox
 ~~~
 
 The two flags require each other. This grants:
@@ -261,7 +261,7 @@ sandbox      disabled
 For unrestricted filesystem access **without** removing the Linux sandbox, use the ordinary path model instead:
 
 ~~~bash
-abird-link --allow-rw=/
+dotlink --allow-rw=/
 ~~~
 
 Then add `--allow-shell` and/or `--allow-network` separately if needed. On Linux, those capabilities remain Bubblewrap-sandboxed unless `--allow-all --no-sandbox` is explicitly selected.
@@ -281,8 +281,8 @@ The Admin key is never persisted.
 The Runtime key is stored separately from JSONC config and follows the selected profile:
 
 ~~~text
-~/.config/abird-link/runtime.key
-~/.config/abird-link/runtime.work.key
+~/.config/abird/dotlink/runtime.key
+~/.config/abird/dotlink/runtime.work.key
 ~~~
 
 When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
@@ -291,7 +291,7 @@ When OpenAI transport is disabled for a profile, that profile does not require a
 
 Transient OpenAI poll failures retry with backoff. Normal warnings stay concise; full transport diagnostics are available with `-vv`.
 
-After **10 consecutive transient poll failures**, abird-link stops retrying the same runtime state. It cancels all active transports, gives them up to 5 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
+After **10 consecutive transient poll failures**, dotlink stops retrying the same runtime state. It cancels all active transports, gives them up to 5 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
 
 If a freshly restarted runtime keeps failing, restarts back off from 1 second up to a 30-second cap. Once a runtime has connected successfully, that restart backoff resets. Fatal control-plane errors such as an invalid Tunnel ID or invalid Runtime API key still fail immediately rather than entering a restart loop.
 
@@ -334,7 +334,7 @@ Color is automatic on interactive stderr. Override with `--color=always`, `--col
 ## CLI summary
 
 ~~~text
-abird-link -S, --setup          interactive setup for selected profile
+dotlink -S, --setup          interactive setup for selected profile
 -p, --profile <NAME>            use config.<NAME>.jsonc
 
 --stdio                         add stdio MCP for this run
@@ -403,23 +403,23 @@ Cross-build outputs, stable filenames, installer overrides, and platform release
 
 ## macOS and Windows
 
-The filesystem MCP tools (`read`, `write`, `edit`, `ls`, binary tools) still enforce abird-link's allow/deny policy on macOS and Windows.
+The filesystem MCP tools (`read`, `write`, `edit`, `ls`, binary tools) still enforce dotlink's allow/deny policy on macOS and Windows.
 
-The shell is different: Bubblewrap is Linux-specific, so native macOS and Windows do not currently have an equivalent abird-link shell sandbox. To enable shell execution natively on those platforms, use the explicit full-host mode:
+The shell is different: Bubblewrap is Linux-specific, so native macOS and Windows do not currently have an equivalent dotlink shell sandbox. To enable shell execution natively on those platforms, use the explicit full-host mode:
 
 ~~~bash
-abird-link --allow-all --no-sandbox
+dotlink --allow-all --no-sandbox
 ~~~
 
-That intentionally removes abird-link's shell isolation and gives the child shell the OS user's filesystem/network authority. Use it only when that is what you want.
+That intentionally removes dotlink's shell isolation and gives the child shell the OS user's filesystem/network authority. Use it only when that is what you want.
 
 ### Windows recommendation: WSL2
 
-For Windows development, the recommended secure shell workflow is to run abird-link **inside WSL2** and use the normal Linux Bubblewrap sandbox there:
+For Windows development, the recommended secure shell workflow is to run dotlink **inside WSL2** and use the normal Linux Bubblewrap sandbox there:
 
 ~~~bash
 # inside WSL2
-abird-link --allow-rw --allow-shell
+dotlink --allow-rw --allow-shell
 ~~~
 
 That preserves the same Linux permission/mount/network model described above instead of exposing an unrestricted native PowerShell shell.

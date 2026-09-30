@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Rebrand the project as **abird dotlink** for human-facing branding and `dotlink` for the crate, executable, MCP identity, config/env namespace, Nix outputs, installers, and release assets.
+- Move dotlink-owned XDG paths under the shared Abird namespace: `~/.config/abird/dotlink` / `$XDG_CONFIG_HOME/abird/dotlink`, with future private XDG cache/state/data paths under `abird/dotlink` as well.
+- Set the canonical upstream to `https://github.com/abird-ai/dotlink` and update installer defaults/release URLs accordingly.
+- Refocus the README around ChatGPT dots, Spaces, local project continuity, local data access, and controlled direct access to the user's computer.
+
 - Bump config schema to v9: the launch directory is the internal relative-path base and is read-allowed by default unless `default_allow=false` or `--no-default-allow` is used.
 - Make persisted stdio and HTTP transports start automatically, matching persisted OpenAI behavior; `--stdio` / `--http` add one-run transports and `--no-stdio` / `--no-http` suppress profile transports.
 - Persist HTTP ephemeral-path, ngrok, and ngrok-ephemeral behavior in profiles; add `--no-ngrok` as a one-run override.
@@ -12,12 +17,11 @@
 - Bound peer-transport shutdown to 5 seconds before force-aborting remaining tasks so recovery cannot hang indefinitely.
 - Add bounded runtime restart backoff (1s up to 30s) and reset it after a successfully connected runtime later becomes unhealthy.
 - Keep normal poll retry warnings concise while retaining full transport error details under verbose DEBUG logging.
-- Set `https://github.com/abird-ai/abird-link` as the canonical upstream in package metadata, Nix metadata, installers, and documentation; installers still support repository/base-URL overrides.
 - Harden installers with explicit HOME handling, checksum-format validation/manual hash comparison, and atomic Unix binary replacement.
 - Make the release helper enable `nix-command` and `flakes` explicitly instead of depending on global Nix configuration.
 
 - Refocus the README's front-page story on giving normal ChatGPT web workflows permission-scoped access to local files and tools through OpenAI Secure MCP Tunnel, with MCP server + policy engine + Linux Bubblewrap sandbox in one binary.
-- Add a representative startup/tool-activity transcript and document opt-in TOOL activity logging without exposing file contents or raw payload bodies without intentionally logging file contents or raw payload bodies.
+- Add a representative startup/tool-activity transcript and document opt-in TOOL activity logging without exposing file contents, raw payload bodies, or secrets.
 
 - Add developer-cache autodiscovery during onboarding for Cargo, npm, pnpm, Yarn, pip, uv, Go, Maven, Gradle, sccache, and ccache.
 - Persist typed cache grants with none/read-only/read+write choices and mount approved caches only into the sandboxed shell's private home.
@@ -32,7 +36,6 @@
 - Keep flake-native macOS support on aarch64-darwin; stop advertising x86_64-darwin now that nixpkgs 26.11 has dropped it, with Intel macOS documented as a Cargo-from-source path.
 - Harden Bubblewrap Nix-daemon isolation by masking the daemon endpoint roots (/nix/var/nix/daemon-socket and /run/nix-daemon) instead of assuming a specific socket leaf/type; centralize type-aware path masking for directories and non-directories.
 
-- Rename the package, binary, MCP server identity, Nix outputs, config directory, and environment prefix to abird-link.
 - Use JSONC profiles: config.jsonc for default and config.<profile>.jsonc for named profiles, with comments and trailing commas.
 - Add -p/--profile and allow -S/--setup -p <name> to create or reconfigure named profiles through the same onboarding flow.
 - Persist allow_read/allow_write/allow_rw and deny_read/deny_write/deny_rw path arrays, with CLI permissions merged on top.
@@ -80,7 +83,7 @@
 ## 0.2.0
 
 - The filesystem workspace defaults to the process launch directory.
-- Added ChatGPT tunnel-registration and Plugin Creator instructions.
+- Added ChatGPT tunnel-registration instructions.
 
 ## 0.1.0
 

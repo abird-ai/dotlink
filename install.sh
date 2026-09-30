@@ -6,28 +6,28 @@ say() {
 }
 
 die() {
-  printf 'abird-link installer: %s\n' "$*" >&2
+  printf 'dotlink installer: %s\n' "$*" >&2
   exit 1
 }
 
-VERSION="${ABIRD_LINK_VERSION:-latest}"
-REPO="${ABIRD_LINK_REPO:-abird-ai/abird-link}"
-BASE_URL="${ABIRD_LINK_RELEASE_BASE_URL:-}"
+VERSION="${DOTLINK_VERSION:-latest}"
+REPO="${DOTLINK_REPO:-abird-ai/dotlink}"
+BASE_URL="${DOTLINK_RELEASE_BASE_URL:-}"
 
-if [ -n "${ABIRD_LINK_INSTALL_DIR:-}" ]; then
-  INSTALL_DIR="$ABIRD_LINK_INSTALL_DIR"
+if [ -n "${DOTLINK_INSTALL_DIR:-}" ]; then
+  INSTALL_DIR="$DOTLINK_INSTALL_DIR"
 elif [ -n "${HOME:-}" ]; then
   INSTALL_DIR="$HOME/.local/bin"
 else
-  die "HOME is not set; set ABIRD_LINK_INSTALL_DIR explicitly"
+  die "HOME is not set; set DOTLINK_INSTALL_DIR explicitly"
 fi
 
 case "$(uname -s 2>/dev/null || printf unknown)" in
   Linux)
     case "$(uname -m 2>/dev/null || printf unknown)" in
       x86_64|amd64)
-        ASSET="abird-link-linux-x86_64"
-        BINARY="abird-link"
+        ASSET="dotlink-linux-x86_64"
+        BINARY="dotlink"
         ;;
       *)
         die "unsupported Linux architecture: $(uname -m). Currently published: x86_64."
@@ -37,8 +37,8 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
   MINGW*|MSYS*|CYGWIN*)
     case "$(uname -m 2>/dev/null || printf unknown)" in
       x86_64|amd64)
-        ASSET="abird-link-windows-x86_64.exe"
-        BINARY="abird-link.exe"
+        ASSET="dotlink-windows-x86_64.exe"
+        BINARY="dotlink.exe"
         ;;
       *)
         die "unsupported Windows architecture: $(uname -m). Currently published: x86_64."
@@ -68,7 +68,7 @@ fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
 TMPDIR_ROOT="${TMPDIR:-/tmp}"
-WORKDIR="$(mktemp -d "${TMPDIR_ROOT%/}/abird-link-install.XXXXXX")"
+WORKDIR="$(mktemp -d "${TMPDIR_ROOT%/}/dotlink-install.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT HUP INT TERM
 
 say "Downloading ${ASSET}..."
@@ -98,11 +98,11 @@ chmod 0755 "$DEST_TMP"
 mv -f "$DEST_TMP" "$INSTALL_DIR/$BINARY"
 DEST_TMP=""
 
-say "Installed abird-link to $INSTALL_DIR/$BINARY"
+say "Installed dotlink to $INSTALL_DIR/$BINARY"
 
 case ":${PATH:-}:" in
   *":$INSTALL_DIR:"*) ;;
   *)
-    say "Add $INSTALL_DIR to PATH to run 'abird-link' directly."
+    say "Add $INSTALL_DIR to PATH to run 'dotlink' directly."
     ;;
 esac

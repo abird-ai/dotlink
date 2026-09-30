@@ -183,7 +183,7 @@ Cross-release helper.
 Directory:
 
 ```text
-.agents/plans/abird-link-handoff-2026-09-30/
+.agents/plans/dotlink-handoff-2026-09-30/
 ```
 
 Canonical starting file:

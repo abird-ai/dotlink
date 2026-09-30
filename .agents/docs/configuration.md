@@ -5,10 +5,10 @@ Current profile schema: **v9**. Older profile schemas are rejected; rerun setup 
 ## Files
 
 ```text
-~/.config/abird-link/config.jsonc
-~/.config/abird-link/config.<profile>.jsonc
-~/.config/abird-link/runtime.key
-~/.config/abird-link/runtime.<profile>.key
+~/.config/abird/dotlink/config.jsonc
+~/.config/abird/dotlink/config.<profile>.jsonc
+~/.config/abird/dotlink/runtime.key
+~/.config/abird/dotlink/runtime.<profile>.key
 ```
 
 Profiles are JSONC only: comments and trailing commas are allowed. OpenAI runtime keys are stored separately and never serialized into the profile.

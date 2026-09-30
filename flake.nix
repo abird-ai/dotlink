@@ -1,5 +1,5 @@
 {
-  description = "abird-link — permission-scoped local MCP bridge";
+  description = "dotlink — permission-scoped local MCP bridge";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -57,7 +57,7 @@
 
           commonArgs = {
             inherit src version;
-            pname = "abird-link";
+            pname = "dotlink";
             strictDeps = true;
             cargoExtraArgs = "--locked --all-features";
           };
@@ -77,7 +77,7 @@
               ];
 
               postInstall = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-                wrapProgram $out/bin/abird-link \
+                wrapProgram $out/bin/dotlink \
                   --prefix PATH : ${
                     lib.makeBinPath [
                       pkgs.bash
@@ -88,9 +88,9 @@
 
               meta = {
                 description = "Permission-scoped local MCP bridge";
-                homepage = "https://github.com/abird-ai/abird-link";
+                homepage = "https://github.com/abird-ai/dotlink";
                 license = lib.licenses.mit;
-                mainProgram = "abird-link";
+                mainProgram = "dotlink";
               };
             }
           );
@@ -146,7 +146,7 @@
 
           commonArgs = {
             inherit src version;
-            pname = "abird-link";
+            pname = "dotlink";
             strictDeps = true;
             doCheck = false;
             cargoExtraArgs = "--locked --all-features";
@@ -165,7 +165,7 @@
               doCheck = false;
               meta = {
                 description = "Permission-scoped local MCP bridge";
-                homepage = "https://github.com/abird-ai/abird-link";
+                homepage = "https://github.com/abird-ai/dotlink";
                 license = pkgs.lib.licenses.mit;
               };
             }
@@ -213,7 +213,7 @@
         in
         {
           default = native.package;
-          abird-link = native.package;
+          dotlink = native.package;
 
           # Exposed intentionally so CI/cache infrastructure can build/cache
           # the dependency layer independently from the application source.
@@ -245,14 +245,14 @@
 
             linuxDist = mkDist pkgs {
               package = linux.package;
-              sourceName = "abird-link";
-              assetName = "abird-link-linux-x86_64";
+              sourceName = "dotlink";
+              assetName = "dotlink-linux-x86_64";
             };
 
             windowsDist = mkDist pkgs {
               package = windows.package;
-              sourceName = "abird-link.exe";
-              assetName = "abird-link-windows-x86_64.exe";
+              sourceName = "dotlink.exe";
+              assetName = "dotlink-windows-x86_64.exe";
             };
           in
           {
@@ -275,10 +275,10 @@
         {
           default = {
             type = "app";
-            program = "${native.package}/bin/abird-link";
+            program = "${native.package}/bin/dotlink";
             meta = {
               description = "Permission-scoped local MCP bridge";
-              homepage = "https://github.com/abird-ai/abird-link";
+              homepage = "https://github.com/abird-ai/dotlink";
               license = native.pkgs.lib.licenses.mit;
             };
           };

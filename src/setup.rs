@@ -70,7 +70,7 @@ impl TransportConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PermissionConfig {
-    /// Read the directory where abird-link is launched unless disabled.
+    /// Read the directory where dotlink is launched unless disabled.
     #[serde(default = "default_true")]
     pub default_allow: bool,
 
@@ -370,7 +370,7 @@ pub async fn load_or_setup(
             .map(|name| format!(" --profile {name}"))
             .unwrap_or_default();
         bail!(
-            "abird-link needs first-run setup, but stdin is not interactive. Run 'abird-link --setup{profile_hint}' in a terminal first"
+            "dotlink needs first-run setup, but stdin is not interactive. Run 'dotlink --setup{profile_hint}' in a terminal first"
         );
     }
 
@@ -378,8 +378,8 @@ pub async fn load_or_setup(
 }
 
 fn config_from_env() -> Result<Option<AppConfig>> {
-    let tunnel_id = env_first(&["ABIRD_LINK_ID", "CONTROL_PLANE_TUNNEL_ID"]);
-    let runtime_api_key = env_first(&["ABIRD_LINK_API_KEY", "CONTROL_PLANE_API_KEY"]);
+    let tunnel_id = env_first(&["DOTLINK_ID", "CONTROL_PLANE_TUNNEL_ID"]);
+    let runtime_api_key = env_first(&["DOTLINK_API_KEY", "CONTROL_PLANE_API_KEY"]);
 
     let (Some(tunnel_id), Some(runtime_api_key)) = (tunnel_id, runtime_api_key) else {
         return Ok(None);
@@ -393,7 +393,7 @@ fn config_from_env() -> Result<Option<AppConfig>> {
         tunnel_id: Some(tunnel_id),
         runtime_api_key,
         organization_id: env_first(&[
-            "ABIRD_LINK_ORGANIZATION_ID",
+            "DOTLINK_ORGANIZATION_ID",
             "CONTROL_PLANE_ORGANIZATION_ID",
             "OPENAI_ORGANIZATION",
         ]),
@@ -409,11 +409,11 @@ fn config_from_env() -> Result<Option<AppConfig>> {
 }
 
 fn apply_nonsecret_env_overrides(config: &mut AppConfig) -> Result<()> {
-    if let Some(base_url) = env_first(&["ABIRD_LINK_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
+    if let Some(base_url) = env_first(&["DOTLINK_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
         config.base_url = base_url;
     }
     if let Some(value) = env_first(&[
-        "ABIRD_LINK_ORGANIZATION_ID",
+        "DOTLINK_ORGANIZATION_ID",
         "CONTROL_PLANE_ORGANIZATION_ID",
         "OPENAI_ORGANIZATION",
     ]) {
@@ -687,7 +687,7 @@ fn setup_style(color: bool, code: &str, text: impl AsRef<str>) -> String {
 
 async fn interactive_setup(profile: Option<&str>, color: bool) -> Result<SetupResult> {
     println!();
-    println!("{}", setup_style(color, "1;36", "abird-link setup"));
+    println!("{}", setup_style(color, "1;36", "abird dotlink setup"));
     println!(
         "{}",
         setup_style(
@@ -1083,8 +1083,8 @@ async fn create_tunnel(
         .unwrap_or_else(|| "local-machine".to_owned());
 
     let mut body = serde_json::json!({
-        "name": format!("abird-link · {host}"),
-        "description": "Permission-scoped local MCP access via abird-link"
+        "name": format!("abird dotlink · {host}"),
+        "description": "Permission-scoped local MCP access via abird dotlink"
     });
     if !workspace_id.is_empty() {
         body["workspace_ids"] = serde_json::json!([workspace_id]);
@@ -1094,7 +1094,7 @@ async fn create_tunnel(
     }
 
     let client = reqwest::Client::builder()
-        .user_agent(format!("abird-link/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("dotlink/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
     let url = format!("{}/v1/tunnels", base_url.trim_end_matches('/'));
     let response = client
@@ -1181,7 +1181,7 @@ fn parse_jsonc<T: DeserializeOwned>(text: &str) -> Result<T> {
 fn serialize_jsonc<T: Serialize>(value: &T) -> Result<String> {
     let body = serde_json::to_string_pretty(value)?;
     Ok(format!(
-        "// abird-link configuration (JSONC)\n// Comments and trailing commas are allowed.\n{body}\n"
+        "// dotlink configuration (JSONC)\n// Comments and trailing commas are allowed.\n{body}\n"
     ))
 }
 
@@ -1328,12 +1328,12 @@ fn profiled_path(base: &Path, profile: Option<&str>) -> Result<PathBuf> {
 }
 
 fn config_path(profile: Option<&str>) -> Result<PathBuf> {
-    let base = if let Some(path) = env::var_os("ABIRD_LINK_CONFIG") {
+    let base = if let Some(path) = env::var_os("DOTLINK_CONFIG") {
         PathBuf::from(path)
     } else if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("abird-link/config.jsonc")
+        PathBuf::from(xdg).join("abird/dotlink/config.jsonc")
     } else {
-        home_dir()?.join(".config/abird-link/config.jsonc")
+        home_dir()?.join(".config/abird/dotlink/config.jsonc")
     };
     profiled_path(&base, profile)
 }
@@ -1420,7 +1420,7 @@ fn read_saved_runtime_key(profile: Option<&str>) -> Result<String> {
     let path = credential_path(profile)?;
     let key = fs::read_to_string(&path).with_context(|| {
         format!(
-            "failed to read {}; run 'abird-link --setup{}' to repair credentials",
+            "failed to read {}; run 'dotlink --setup{}' to repair credentials",
             path.display(),
             profile
                 .map(|name| format!(" --profile {name}"))
@@ -1429,7 +1429,7 @@ fn read_saved_runtime_key(profile: Option<&str>) -> Result<String> {
     })?;
     let key = key.trim().to_owned();
     if key.is_empty() {
-        bail!("saved runtime API key is empty; rerun abird-link setup");
+        bail!("saved runtime API key is empty; rerun dotlink setup");
     }
     Ok(key)
 }
@@ -1459,7 +1459,7 @@ fn home_dir() -> Result<PathBuf> {
 fn validate_config(config: &AppConfig) -> Result<()> {
     if config.version != config_version() {
         bail!(
-            "unsupported config version {}; expected {}. Rerun abird-link --setup for this profile",
+            "unsupported config version {}; expected {}. Rerun dotlink --setup for this profile",
             config.version,
             config_version()
         );
@@ -1737,14 +1737,14 @@ mod tests {
 
     #[test]
     fn profile_paths_are_predictable() {
-        let base = Path::new("/tmp/abird-link/config.jsonc");
+        let base = Path::new("/tmp/dotlink/config.jsonc");
         assert_eq!(
             profiled_path(base, None).unwrap(),
-            PathBuf::from("/tmp/abird-link/config.jsonc")
+            PathBuf::from("/tmp/dotlink/config.jsonc")
         );
         assert_eq!(
             profiled_path(base, Some("work")).unwrap(),
-            PathBuf::from("/tmp/abird-link/config.work.jsonc")
+            PathBuf::from("/tmp/dotlink/config.work.jsonc")
         );
         assert!(profiled_path(base, Some("../bad")).is_err());
     }
@@ -1790,7 +1790,7 @@ mod tests {
     #[test]
     fn runtime_key_is_never_serialized_into_jsonc() {
         let serialized = serialize_jsonc(&example_config()).unwrap();
-        assert!(serialized.starts_with("// abird-link configuration (JSONC)"));
+        assert!(serialized.starts_with("// dotlink configuration (JSONC)"));
         assert!(!serialized.contains("secret-runtime-key"));
         assert!(!serialized.contains("runtime_api_key"));
     }

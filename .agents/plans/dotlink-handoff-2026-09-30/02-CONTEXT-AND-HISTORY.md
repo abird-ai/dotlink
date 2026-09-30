@@ -19,7 +19,7 @@ run one binary
 
 The first name was `abird-tunnel`.
 
-## Why it became `abird-link`
+## Why it became `dotlink`
 
 The product evolved beyond a single OpenAI tunnel:
 
@@ -31,7 +31,7 @@ The product evolved beyond a single OpenAI tunnel:
 - Claude.ai remote connector;
 - Claude Desktop/Code/local MCP clients.
 
-The generic link/bridge concept was broader than “tunnel,” so product/package/binary/config/docs were renamed to `abird-link`.
+The generic link/bridge concept was broader than “tunnel,” so product/package/binary/config/docs were renamed to `dotlink`.
 
 ## Major design evolution
 
@@ -105,7 +105,7 @@ patch_binary
 
 ### Phase 8 — profiles and config
 
-- rename to `abird-link`;
+- rename to `dotlink`;
 - `-p/--profile`;
 - JSONC config;
 - per-profile runtime key;
@@ -218,7 +218,7 @@ Decision:
 Current last committed baseline:
 
 ```text
-5b8bbdd Rename to abird-link and add profiles and deny policy
+5b8bbdd Rename to dotlink and add profiles and deny policy
 ```
 
 Everything after that in the working tree reflects the later phases above.

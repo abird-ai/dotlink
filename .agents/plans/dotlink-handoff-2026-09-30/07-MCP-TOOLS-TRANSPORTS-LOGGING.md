@@ -193,7 +193,7 @@ not bodies.
 ngrok is an HTTP publication option, not a fourth MCP transport.
 
 ```bash
-abird-link --http --ngrok
+dotlink --http --ngrok
 ```
 
 Uses Rust ngrok SDK.
@@ -279,7 +279,7 @@ Claude.ai remote connector requires public HTTPS MCP, not localhost.
 Recommended:
 
 ```bash
-abird-link --http --ngrok --ngrok-ephemeral-url
+dotlink --http --ngrok --ngrok-ephemeral-url
 ```
 
 ## Runtime transport override

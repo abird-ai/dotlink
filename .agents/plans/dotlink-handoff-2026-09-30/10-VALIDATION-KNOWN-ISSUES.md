@@ -25,7 +25,7 @@ current binary rebuilt successfully
 
 ## Bubblewrap validation
 
-The opt-in real runtime smokes passed with `ABIRD_TEST_BWRAP=1`, including:
+The opt-in real runtime smokes passed with `DOTLINK_TEST_BWRAP=1`, including:
 
 - project RW when granted;
 - host home hidden;
@@ -106,7 +106,6 @@ Tests cover:
 - BOM;
 - unterminated block-comment rejection;
 - runtime key omitted from serialization;
-- legacy JSON fallback;
 - named profile paths;
 - schema-v9 default_allow + persistent allow/deny arrays;
 - shell/network defaults;
@@ -150,7 +149,7 @@ Verified:
 - no program interpreter;
 - `ldd` reports `statically linked`;
 - SHA-256 sidecar verifies;
-- binary runs locally and prints `abird-link 0.5.0`.
+- binary runs locally and prints `dotlink 0.5.0`.
 
 ### Windows release artifact
 
@@ -161,17 +160,17 @@ Verified:
 - SHA-256 sidecar verifies;
 - imports only Windows system DLLs;
 - no libgcc/libstdc++/libwinpthread/libssp runtime sidecar imports;
-- runs under Wine and prints `abird-link 0.5.0`.
+- runs under Wine and prints `dotlink 0.5.0`.
 
 ## Release/install validation — complete
 
 `scripts/build-release-artifacts.sh` was run end-to-end against the validated isolated Nix build context and produced exactly:
 
 ```text
-abird-link-linux-x86_64
-abird-link-linux-x86_64.sha256
-abird-link-windows-x86_64.exe
-abird-link-windows-x86_64.exe.sha256
+dotlink-linux-x86_64
+dotlink-linux-x86_64.sha256
+dotlink-windows-x86_64.exe
+dotlink-windows-x86_64.exe.sha256
 ```
 
 Both checksums verify.
@@ -180,7 +179,7 @@ Both checksums verify.
 
 - executable mode verified;
 - `sh -n` and ShellCheck pass;
-- canonical default URLs resolve to `abird-ai/abird-link`;
+- canonical default URLs resolve to `abird-ai/dotlink`;
 - repository/base-URL overrides remain functional;
 - missing `HOME` fails safely unless an install directory is explicit;
 - malformed checksum sidecars are rejected before installation;
@@ -192,10 +191,10 @@ Both checksums verify.
 `install.ps1`:
 
 - parsed/executed with PowerShell 7.6.6;
-- canonical default URLs resolve to `abird-ai/abird-link`;
+- canonical default URLs resolve to `abird-ai/dotlink`;
 - tested with `Invoke-WebRequest` mocked to the real Windows release fixture;
 - checksum format and value verification passed;
-- output `abird-link.exe` hash matches the release fixture.
+- output `dotlink.exe` hash matches the release fixture.
 
 `scripts/build-release-artifacts.sh` also passes ShellCheck and now enables `nix-command` + `flakes` explicitly, so it does not depend on those experimental features being globally configured.
 
@@ -216,15 +215,15 @@ Documentation/handoff follows those commits.
 
 ### Running connector freshness
 
-The ChatGPT connector process can outlive a binary rebuild. After changing tool/schema/sandbox metadata, restart `abird-link` and refresh the ChatGPT developer connection before using live tool behavior as final evidence.
+The ChatGPT connector process can outlive a binary rebuild. After changing tool/schema/sandbox metadata, restart `dotlink` and refresh the ChatGPT developer connection before using live tool behavior as final evidence.
 
 ### Repository upstream
 
-Canonical upstream / `origin` is `https://github.com/abird-ai/abird-link`. Release installers default to `abird-ai/abird-link` while retaining explicit repository/base-URL overrides.
+Canonical upstream / `origin` is `https://github.com/abird-ai/dotlink`. Release installers default to `abird-ai/dotlink` while retaining explicit repository/base-URL overrides.
 
 ### Public HTTP authentication
 
-abird-link HTTP/ngrok currently has no built-in application-layer caller authentication.
+dotlink HTTP/ngrok currently has no built-in application-layer caller authentication.
 
 Ephemeral paths are not authentication.
 

@@ -2,7 +2,7 @@
 
 ## Core split
 
-abird-link is one Tokio process with a transport-neutral MCP core.
+dotlink is one Tokio process with a transport-neutral MCP core.
 
 ~~~text
                      setup/config
@@ -39,7 +39,7 @@ No transport owns filesystem policy.
 
 ## Profiles and persisted defaults
 
-The default config is ~/.config/abird-link/config.jsonc. Named profiles use config.<profile>.jsonc and are selected with -p/--profile. Setup can target the same profile with -S/--setup -p <name>. Schema v9 JSONC supports line/block comments and trailing commas.
+The default config is ~/.config/abird/dotlink/config.jsonc. Named profiles use config.<profile>.jsonc and are selected with -p/--profile. Setup can target the same profile with -S/--setup -p <name>. Schema v9 JSONC supports line/block comments and trailing commas.
 
 Each profile persists transport behavior plus the local permission model:
 
@@ -145,7 +145,7 @@ When --http --ngrok is selected:
 1. the local HTTP MCP listener is bound first;
 2. the ngrok Rust SDK opens a public HTTP endpoint;
 3. ngrok forwards that endpoint to the local HTTP listener;
-4. abird-link prints the public URL with /mcp appended.
+4. dotlink prints the public URL with /mcp appended.
 
 The public URL speaks ordinary MCP Streamable HTTP. Clients connect directly to it.
 
@@ -201,7 +201,7 @@ Rules:
 - deny-shell and deny-network override profile defaults and runtime allows;
 - unrestricted filesystem access is represented naturally by read+write grant `/`.
 
-The base directory is where abird-link was launched. It is readable by default unless the profile sets `default_allow=false` or the run uses `--no-default-allow`.
+The base directory is where dotlink was launched. It is readable by default unless the profile sets `default_allow=false` or the run uses `--no-default-allow`.
 
 Bare --allow-write and --allow-rw add rw permission to the launch/base directory. Bare deny-read/deny-write/deny-rw target that same directory symmetrically.
 
@@ -281,14 +281,14 @@ Sandboxed shell starts with an unshared network namespace.
 
 This policy applies only to the shell child.
 
-The main abird-link process may still need outbound network access for:
+The main dotlink process may still need outbound network access for:
 
 - OpenAI Secure MCP Tunnel;
 - ngrok SDK ingress.
 
 ## Unsandboxed shell
 
-An unsandboxed shell cannot be constrained by Rust path checks, so abird-link exposes a single explicit full-host mode:
+An unsandboxed shell cannot be constrained by Rust path checks, so dotlink exposes a single explicit full-host mode:
 
 ~~~text
 --allow-all
@@ -322,7 +322,7 @@ Native outputs expose:
 
 ~~~text
 deps
-abird-link
+dotlink
 ~~~
 
 On x86_64-linux, release CI can additionally build:
@@ -339,7 +339,7 @@ dist-windows-x86_64
 
 The Linux release target is x86_64-unknown-linux-musl with static CRT linking, intended to run on Debian and other x86_64 Linux distributions without a Nix runtime. The Windows target is x86_64-pc-windows-gnu.
 
-Dist outputs use stable filenames plus SHA-256 sidecars so a release workflow can upload the same names on every tagged release. install.sh and install.ps1 consume those assets. The canonical upstream repository is `https://github.com/abird-ai/abird-link`; installers default to that repository while still allowing `ABIRD_LINK_REPO` or a custom release base URL for forks and mirrors.
+Dist outputs use stable filenames plus SHA-256 sidecars so a release workflow can upload the same names on every tagged release. install.sh and install.ps1 consume those assets. The canonical upstream repository is `https://github.com/abird-ai/dotlink`; installers default to that repository while still allowing `DOTLINK_REPO` or a custom release base URL for forks and mirrors.
 
 ## Binary MCP content
 

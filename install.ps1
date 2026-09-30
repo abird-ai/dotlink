@@ -1,20 +1,20 @@
 param(
-    [string]$Version = $(if ($env:ABIRD_LINK_VERSION) { $env:ABIRD_LINK_VERSION } else { "latest" }),
-    [string]$InstallDir = $env:ABIRD_LINK_INSTALL_DIR
+    [string]$Version = $(if ($env:DOTLINK_VERSION) { $env:DOTLINK_VERSION } else { "latest" }),
+    [string]$InstallDir = $env:DOTLINK_INSTALL_DIR
 )
 
 $ErrorActionPreference = "Stop"
 
 if (-not $InstallDir) {
     if (-not $HOME) {
-        throw "HOME is not set; pass -InstallDir or set ABIRD_LINK_INSTALL_DIR."
+        throw "HOME is not set; pass -InstallDir or set DOTLINK_INSTALL_DIR."
     }
     $InstallDir = Join-Path $HOME ".local\bin"
 }
 
-$Repo = if ($env:ABIRD_LINK_REPO) { $env:ABIRD_LINK_REPO } else { "abird-ai/abird-link" }
-$BaseUrl = $env:ABIRD_LINK_RELEASE_BASE_URL
-$Asset = "abird-link-windows-x86_64.exe"
+$Repo = if ($env:DOTLINK_REPO) { $env:DOTLINK_REPO } else { "abird-ai/dotlink" }
+$BaseUrl = $env:DOTLINK_RELEASE_BASE_URL
+$Asset = "dotlink-windows-x86_64.exe"
 
 if (-not $BaseUrl) {
     if ($Version -eq "latest") {
@@ -25,7 +25,7 @@ if (-not $BaseUrl) {
     }
 }
 
-$WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("abird-link-install-" + [guid]::NewGuid().ToString("N"))
+$WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("dotlink-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $WorkDir | Out-Null
 
 try {
@@ -47,12 +47,12 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    $Destination = Join-Path $InstallDir "abird-link.exe"
+    $Destination = Join-Path $InstallDir "dotlink.exe"
     Copy-Item -Force $BinaryPath $Destination
 
-    Write-Host "Installed abird-link to $Destination"
+    Write-Host "Installed dotlink to $Destination"
     if (-not (($env:PATH -split ';') -contains $InstallDir)) {
-        Write-Host "Add $InstallDir to PATH to run 'abird-link' directly."
+        Write-Host "Add $InstallDir to PATH to run 'dotlink' directly."
     }
 }
 finally {

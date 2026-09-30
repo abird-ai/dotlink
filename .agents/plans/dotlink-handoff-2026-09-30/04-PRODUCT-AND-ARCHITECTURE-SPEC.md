@@ -2,7 +2,7 @@
 
 ## Product promise
 
-`abird-link` is a single Rust binary that securely bridges AI/MCP clients to local files and optional command execution.
+`dotlink` is a single Rust binary that securely bridges AI/MCP clients to local files and optional command execution.
 
 Primary headline:
 
@@ -24,25 +24,25 @@ Simple read-only use:
 
 ```bash
 cd ~/src/project
-abird-link
+dotlink
 ```
 
 RW project:
 
 ```bash
-abird-link --allow-rw
+dotlink --allow-rw
 ```
 
 Sandboxed shell:
 
 ```bash
-abird-link --allow-rw --allow-shell
+dotlink --allow-rw --allow-shell
 ```
 
 Sandboxed shell with network:
 
 ```bash
-abird-link --allow-rw --allow-shell --allow-network
+dotlink --allow-rw --allow-shell --allow-network
 ```
 
 ## Product principles
@@ -94,7 +94,7 @@ patch_binary
 
 ### Transport is not authority
 
-Transport determines how the client reaches `abird-link`; it does not grant local capabilities.
+Transport determines how the client reaches `dotlink`; it does not grant local capabilities.
 
 OpenAI Tunnel, stdio and HTTP/ngrok must all terminate at one policy engine.
 
@@ -175,18 +175,17 @@ Do not create separate implicit trust levels by transport.
 Current documented flow:
 
 ```text
-abird-link --setup
+dotlink --setup
 → select openai
 → create/select Secure MCP Tunnel
-→ run abird-link
+→ run dotlink
 → ChatGPT Settings → Security and login → Developer mode
 → Plugins → + → Tunnel
 → select/paste tunnel ID
 → review discovered tools
-→ select Abird Link in chat
+→ select abird dotlink in chat
 ```
 
-Optional private packaged plugin can use the developer connection and be invoked from Work via `@Abird Link`.
 
 ## Claude.ai workflow
 
@@ -195,7 +194,7 @@ Claude.ai cloud cannot reach localhost directly.
 Use:
 
 ```bash
-abird-link --http --ngrok --ngrok-ephemeral-url
+dotlink --http --ngrok --ngrok-ephemeral-url
 ```
 
 Then register the printed HTTPS Streamable HTTP MCP URL as a custom connector.
@@ -205,13 +204,13 @@ Then register the printed HTTPS Streamable HTTP MCP URL as a custom connector.
 stdio:
 
 ```bash
-abird-link --stdio
+dotlink --stdio
 ```
 
 Loopback HTTP:
 
 ```bash
-abird-link --http
+dotlink --http
 ```
 
 ## Public URL principle
@@ -225,13 +224,13 @@ Do not describe it as equivalent to auth.
 The deliberately loud full authority path is:
 
 ```bash
-abird-link --allow-all --no-sandbox
+dotlink --allow-all --no-sandbox
 ```
 
 This is conceptually distinct from:
 
 ```bash
-abird-link --allow-rw=/ --allow-shell
+dotlink --allow-rw=/ --allow-shell
 ```
 
 which still uses the normal Linux sandbox model.
