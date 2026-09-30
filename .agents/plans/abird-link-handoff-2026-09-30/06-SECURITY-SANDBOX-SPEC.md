@@ -228,7 +228,7 @@ Treat public URL as sensitive or add external access controls.
 Normal TOOL logs include safe metadata only:
 
 - tool name;
-- path/cwd;
+- path / shell working-directory metadata;
 - flags;
 - command preview;
 - content/data sizes instead of body;
@@ -252,4 +252,4 @@ Do not intentionally log:
 
 `--silent` hides TOOL logs.
 
-`--silent --verbose` retains REQ logs while hiding TOOL logs.
+`--silent -vv` retains REQ logs while hiding TOOL logs.

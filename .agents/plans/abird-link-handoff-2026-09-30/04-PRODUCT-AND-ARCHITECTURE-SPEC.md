@@ -52,8 +52,8 @@ abird-link --allow-rw --allow-shell --allow-network
 Default posture:
 
 ```text
-cwd read access          ON
-cwd write access         OFF
+launch-directory read    ON
+launch-directory write   OFF
 extra filesystem paths   OFF
 shell                    OFF
 shell network            OFF
@@ -106,7 +106,7 @@ Onboarding should explain:
 - what AI can write;
 - whether shell is enabled;
 - whether shell has network;
-- whether the profile pins a cwd;
+- whether default read access to the launch directory is enabled;
 - which existing package caches are shared;
 - whether OpenAI credentials/tunnel setup is needed.
 
@@ -161,7 +161,7 @@ canonical policy        Bubblewrap Linux
 One process may expose multiple transports simultaneously, but they share:
 
 - effective profile;
-- cwd;
+- launch-directory/base path;
 - allow/deny roots;
 - cache grants;
 - shell policy;

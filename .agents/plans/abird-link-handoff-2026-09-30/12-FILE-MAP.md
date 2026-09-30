@@ -8,7 +8,7 @@ Owns:
 
 - clap CLI;
 - profile selection;
-- effective cwd/policy merge;
+- effective launch-directory/base policy merge and one-run transport overrides;
 - transport activation;
 - cache-grant runtime assembly;
 - logging CLI configuration;
@@ -20,17 +20,16 @@ Owns:
 
 Owns:
 
-- JSONC config schema/parser/serializer;
+- strict schema-v9 JSONC parser/serializer;
 - named profile paths;
-- legacy JSON fallback;
 - runtime key persistence;
 - interactive onboarding;
 - OpenAI tunnel setup/creation;
-- persistent cwd/path allow/deny arrays;
+- schema-v9 default_allow + persistent path allow/deny arrays;
 - persistent shell/network defaults;
 - developer cache discovery;
 - typed cache grants;
-- config validation and migration compatibility.
+- strict schema-v9 config validation.
 
 ### `src/mcp.rs`
 
@@ -47,7 +46,7 @@ Owns:
 - Nix daemon masking;
 - shell cache mounts;
 - child env sanitization;
-- central normal TOOL activity logging;
+- central optional TOOL activity logging;
 - security/runtime regression tests.
 
 ### `src/logging.rs`
@@ -125,11 +124,25 @@ Large `Unreleased` section describes uncommitted phase.
 
 ### `docs/CHATGPT_PLUGIN.md`
 
-ChatGPT developer connection/plugin workflow.
+ChatGPT developer tunnel connection workflow.
 
-### `prompts/PLUGIN_CREATOR.md`
+## Agent-facing repository docs
 
-Ready-to-paste private Plugin Creator prompt.
+### `.agents/AGENT.md`
+
+First entrypoint for agents: invariants, reading order, and validation rules.
+
+### `.agents/docs/configuration.md`
+
+Schema-v9 config/setup/cache reference.
+
+### `.agents/docs/release-install.md`
+
+Installer, release artifact, Nix/Crane, and platform reference.
+
+### `.agents/skills/README.md`
+
+Repository-local skill conventions.
 
 ## Build/release
 

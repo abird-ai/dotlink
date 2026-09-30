@@ -57,7 +57,7 @@ When documents disagree, use this priority:
 ```text
 product / binary / MCP server: abird-link
 crate version: 0.5.0
-config schema version in source: 8
+config schema version in source: 9
 branch: main
 ```
 

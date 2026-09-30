@@ -16,7 +16,7 @@ git diff --check
 Final observed suite:
 
 ```text
-77 tests passed
+80 tests passed
 Clippy clean
 fmt clean
 diff check clean
@@ -43,10 +43,10 @@ The opt-in real runtime smokes passed with `ABIRD_TEST_BWRAP=1`, including:
 Verified behavior:
 
 ```text
-default             TOOL start + completion, no REQ
---silent            no TOOL
---verbose           TOOL + REQ
---silent --verbose  REQ only
+default             no TOOL / REQ
+-v                  TOOL
+-vv                 TOOL + REQ
+--silent -vv         REQ only
 ```
 
 Also verified:
@@ -82,6 +82,10 @@ Verified historically and during the implementation phase:
 - repeated runtime restart backoff is capped at 30 seconds and resets after a successfully connected runtime;
 - stdio initialize;
 - HTTP initialize;
+- profile-only HTTP starts without repeating `--http`;
+- profile-only stdio starts without repeating `--stdio`;
+- a profile with no configured transport fails normally but can start with one-run `--stdio` / `--http`;
+- `--no-stdio` / `--no-http` suppress persisted local transports and `--no-ngrok` suppresses persisted ngrok;
 - clean stdio EOF does not kill active peer transports;
 - explicit runtime `--stdio` / `--http` override persisted false;
 - stable and ephemeral HTTP routing;
@@ -104,10 +108,9 @@ Tests cover:
 - runtime key omitted from serialization;
 - legacy JSON fallback;
 - named profile paths;
-- persistent cwd/allow/deny arrays;
+- schema-v9 default_allow + persistent allow/deny arrays;
 - shell/network defaults;
-- legacy boolean `allow_rw` migration;
-- deny-shell/deny-network precedence.
+- - deny-shell/deny-network precedence.
 
 ## Dependency advisory review
 

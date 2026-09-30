@@ -33,7 +33,7 @@ const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AccessSpec {
-    pub cwd: PathBuf,
+    pub base_dir: PathBuf,
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
     pub deny_read_roots: Vec<PathBuf>,
@@ -66,7 +66,7 @@ pub struct SandboxCacheMount {
 
 #[derive(Clone, Debug)]
 struct AccessPolicy {
-    cwd: PathBuf,
+    base_dir: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     deny_read_roots: Vec<PathBuf>,
@@ -106,7 +106,7 @@ enum AccessNeed {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListArgs {
-    /// Directory path. Relative paths resolve from --cwd; absolute paths are allowed only when permitted.
+    /// Directory path. Relative paths resolve from the directory where abird-link was launched; absolute paths are allowed only when permitted.
     #[serde(default = "dot")]
     path: String,
 
@@ -121,7 +121,7 @@ struct ListArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReadArgs {
-    /// UTF-8 text file path. Relative paths resolve from --cwd.
+    /// UTF-8 text file path. Relative paths resolve from the directory where abird-link was launched.
     path: String,
 
     /// First 1-based line to return. Defaults to 1.
@@ -135,7 +135,7 @@ struct ReadArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WriteArgs {
-    /// File path. Relative paths resolve from --cwd.
+    /// File path. Relative paths resolve from the directory where abird-link was launched.
     path: String,
 
     /// UTF-8 content. Missing parent directories are created automatically.
@@ -232,9 +232,9 @@ struct ShellArgs {
     /// Command string to execute.
     command: String,
 
-    /// Working directory. Relative paths resolve from --cwd.
+    /// Working directory. Relative paths resolve from the directory where abird-link was launched.
     #[serde(default = "dot")]
-    cwd: String,
+    dir: String,
 
     /// Optional stdin text passed to the process.
     #[serde(default)]
@@ -381,11 +381,11 @@ fn sandbox_runtime_mounts() -> Vec<PathBuf> {
     paths
 }
 
-async fn canonicalize_grant(cwd: &Path, path: &Path) -> Result<PathBuf> {
+async fn canonicalize_grant(base_dir: &Path, path: &Path) -> Result<PathBuf> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        cwd.join(path)
+        base_dir.join(path)
     };
     let canonical = fs::canonicalize(&joined)
         .await
@@ -396,11 +396,11 @@ async fn canonicalize_grant(cwd: &Path, path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-async fn canonicalize_deny(cwd: &Path, path: &Path) -> Result<PathBuf> {
+async fn canonicalize_deny(base_dir: &Path, path: &Path) -> Result<PathBuf> {
     let target = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        cwd.join(path)
+        base_dir.join(path)
     };
 
     if let Ok(canonical) = fs::canonicalize(&target).await {
@@ -446,7 +446,7 @@ fn decode_binary(data: &str, encoding: BinaryEncoding, max_bytes: usize) -> Resu
 
 impl AccessPolicy {
     fn from_spec(spec: AccessSpec) -> Result<Self> {
-        if !spec.cwd.is_absolute()
+        if !spec.base_dir.is_absolute()
             || spec.read_roots.iter().any(|path| !path.is_absolute())
             || spec.write_roots.iter().any(|path| !path.is_absolute())
             || spec.deny_read_roots.iter().any(|path| !path.is_absolute())
@@ -456,7 +456,7 @@ impl AccessPolicy {
         }
 
         Ok(Self {
-            cwd: spec.cwd,
+            base_dir: spec.base_dir,
             read_roots: spec.read_roots,
             write_roots: spec.write_roots,
             deny_read_roots: spec.deny_read_roots,
@@ -473,7 +473,7 @@ impl AccessPolicy {
         if path.is_absolute() {
             Ok(path.to_path_buf())
         } else {
-            Ok(self.cwd.join(path))
+            Ok(self.base_dir.join(path))
         }
     }
 
@@ -578,7 +578,7 @@ impl AccessPolicy {
     }
 
     fn relative_display(&self, path: &Path) -> String {
-        path.strip_prefix(&self.cwd)
+        path.strip_prefix(&self.base_dir)
             .map(|relative| {
                 let value = relative.to_string_lossy().to_string();
                 if value.is_empty() {
@@ -624,32 +624,40 @@ impl AccessPolicy {
 
 impl LocalMachine {
     pub async fn new(args: MachineConfig) -> Result<Self> {
-        let cwd = fs::canonicalize(&args.access.cwd)
+        let base_dir = fs::canonicalize(&args.access.base_dir)
             .await
-            .with_context(|| format!("cwd does not exist: {}", args.access.cwd.display()))?;
-        if !fs::metadata(&cwd).await?.is_dir() {
-            bail!("cwd is not a directory: {}", cwd.display());
+            .with_context(|| {
+                format!(
+                    "launch/base directory does not exist: {}",
+                    args.access.base_dir.display()
+                )
+            })?;
+        if !fs::metadata(&base_dir).await?.is_dir() {
+            bail!(
+                "launch/base directory is not a directory: {}",
+                base_dir.display()
+            );
         }
 
         let mut read_roots = Vec::with_capacity(args.access.read_roots.len());
         for path in &args.access.read_roots {
-            read_roots.push(canonicalize_grant(&cwd, path).await?);
+            read_roots.push(canonicalize_grant(&base_dir, path).await?);
         }
         let mut write_roots = Vec::with_capacity(args.access.write_roots.len());
         for path in &args.access.write_roots {
-            write_roots.push(canonicalize_grant(&cwd, path).await?);
+            write_roots.push(canonicalize_grant(&base_dir, path).await?);
         }
         let mut deny_read_roots = Vec::with_capacity(args.access.deny_read_roots.len());
         for path in &args.access.deny_read_roots {
-            deny_read_roots.push(canonicalize_deny(&cwd, path).await?);
+            deny_read_roots.push(canonicalize_deny(&base_dir, path).await?);
         }
         let mut deny_write_roots = Vec::with_capacity(args.access.deny_write_roots.len());
         for path in &args.access.deny_write_roots {
-            deny_write_roots.push(canonicalize_deny(&cwd, path).await?);
+            deny_write_roots.push(canonicalize_deny(&base_dir, path).await?);
         }
 
         let access = AccessPolicy::from_spec(AccessSpec {
-            cwd,
+            base_dir,
             read_roots,
             write_roots,
             deny_read_roots,
@@ -777,10 +785,6 @@ impl LocalMachine {
 
     pub fn log(&self) -> &LogConfig {
         &self.config.log
-    }
-
-    pub fn cwd(&self) -> &Path {
-        &self.config.access.cwd
     }
 
     pub fn shell_enabled(&self) -> bool {
@@ -940,16 +944,16 @@ impl LocalMachine {
             )));
         }
 
-        let cwd = match self.resolve_existing(&args.cwd, AccessNeed::Read).await {
+        let working_dir = match self.resolve_existing(&args.dir, AccessNeed::Read).await {
             Ok(path) => path,
             Err(error) => return Ok(tool_error(error)),
         };
-        if !fs::metadata(&cwd)
+        if !fs::metadata(&working_dir)
             .await
             .map(|m| m.is_dir())
             .unwrap_or(false)
         {
-            return Ok(tool_error("cwd is not a directory"));
+            return Ok(tool_error("dir is not a directory"));
         }
 
         let timeout_secs = args
@@ -963,12 +967,13 @@ impl LocalMachine {
 
         #[cfg(target_os = "linux")]
         let mut command = if self.config.sandbox_shell && !powershell {
-            self.bubblewrap_command(shell_program, &cwd, &args.command)
+            self.bubblewrap_command(shell_program, &working_dir, &args.command)
         } else {
-            direct_shell_command(shell_program, powershell, &cwd, &args.command)
+            direct_shell_command(shell_program, powershell, &working_dir, &args.command)
         };
         #[cfg(not(target_os = "linux"))]
-        let mut command = direct_shell_command(shell_program, powershell, &cwd, &args.command);
+        let mut command =
+            direct_shell_command(shell_program, powershell, &working_dir, &args.command);
 
         command
             .stdin(if args.stdin.is_some() {
@@ -1059,7 +1064,7 @@ impl LocalMachine {
             serde_json::json!({
                 "exit_code": status.code(),
                 "success": status.success(),
-                "cwd": self.config.access.relative_display(&cwd),
+                "dir": self.config.access.relative_display(&working_dir),
                 "sandboxed": self.config.sandbox_shell,
                 "network": self.config.allow_network,
                 "stdout": String::from_utf8_lossy(&stdout_bytes),
@@ -1072,7 +1077,7 @@ impl LocalMachine {
     }
 
     #[cfg(target_os = "linux")]
-    fn bubblewrap_command(&self, shell: &Path, cwd: &Path, script: &str) -> Command {
+    fn bubblewrap_command(&self, shell: &Path, working_dir: &Path, script: &str) -> Command {
         let bwrap = self
             .config
             .bwrap_program
@@ -1191,7 +1196,7 @@ impl LocalMachine {
 
         command
             .arg("--chdir")
-            .arg(cwd)
+            .arg(working_dir)
             .arg("--clearenv")
             .arg("--setenv")
             .arg("HOME")
@@ -1273,7 +1278,12 @@ fn prepare_mount_target_dirs(command: &mut Command, path: &Path) {
     }
 }
 
-fn direct_shell_command(shell: &Path, powershell: bool, cwd: &Path, script: &str) -> Command {
+fn direct_shell_command(
+    shell: &Path,
+    powershell: bool,
+    working_dir: &Path,
+    script: &str,
+) -> Command {
     let mut command = Command::new(shell);
     if powershell {
         command
@@ -1289,7 +1299,7 @@ fn direct_shell_command(shell: &Path, powershell: bool, cwd: &Path, script: &str
             .arg("-lc")
             .arg(script);
     }
-    command.current_dir(cwd);
+    command.current_dir(working_dir);
     command
 }
 
@@ -1301,7 +1311,7 @@ fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Valu
     let mut parts = Vec::new();
     for key in [
         "path",
-        "cwd",
+        "dir",
         "command",
         "format",
         "encoding",
@@ -1781,7 +1791,7 @@ mod tests {
 
     fn access(root: &Path) -> AccessPolicy {
         AccessPolicy::from_spec(AccessSpec {
-            cwd: root.to_path_buf(),
+            base_dir: root.to_path_buf(),
             read_roots: vec![root.to_path_buf()],
             write_roots: Vec::new(),
             deny_read_roots: Vec::new(),
@@ -1808,7 +1818,7 @@ mod tests {
         std::fs::create_dir(&child).unwrap();
 
         let policy = AccessPolicy::from_spec(AccessSpec {
-            cwd: root.clone(),
+            base_dir: root.clone(),
             read_roots: vec![root],
             write_roots: vec![child.clone()],
             deny_read_roots: Vec::new(),
@@ -1829,7 +1839,7 @@ mod tests {
         std::fs::create_dir(&denied).unwrap();
 
         let policy = AccessPolicy::from_spec(AccessSpec {
-            cwd: root.clone(),
+            base_dir: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![root],
             deny_read_roots: vec![denied.clone()],
@@ -1852,7 +1862,7 @@ mod tests {
         std::fs::create_dir(&write_denied).unwrap();
 
         let policy = AccessPolicy::from_spec(AccessSpec {
-            cwd: root.clone(),
+            base_dir: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![root],
             deny_read_roots: vec![read_denied.clone()],
@@ -1896,7 +1906,7 @@ mod tests {
 
         let root = allowed.path().canonicalize().unwrap();
         let policy = AccessPolicy::from_spec(AccessSpec {
-            cwd: root.clone(),
+            base_dir: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![root],
             deny_read_roots: Vec::new(),
@@ -1928,7 +1938,7 @@ mod tests {
 
         let machine = LocalMachine::new(MachineConfig {
             access: AccessSpec {
-                cwd: root.clone(),
+                base_dir: root.clone(),
                 read_roots: vec![root],
                 write_roots: Vec::new(),
                 deny_read_roots: Vec::new(),
@@ -2100,7 +2110,7 @@ mod tests {
         std::fs::create_dir(&denied).unwrap();
 
         let access = AccessPolicy::from_spec(AccessSpec {
-            cwd: root.clone(),
+            base_dir: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![writable.clone()],
             deny_read_roots: vec![denied.clone()],
@@ -2124,7 +2134,7 @@ mod tests {
         std::fs::create_dir(&denied).unwrap();
 
         let access = AccessPolicy::from_spec(AccessSpec {
-            cwd: root.clone(),
+            base_dir: root.clone(),
             read_roots: vec![root.clone()],
             write_roots: vec![root.clone()],
             deny_read_roots: Vec::new(),
@@ -2150,7 +2160,7 @@ mod tests {
 
         let machine = LocalMachine::new(MachineConfig {
             access: AccessSpec {
-                cwd: root.clone(),
+                base_dir: root.clone(),
                 read_roots: vec![root],
                 write_roots: Vec::new(),
                 deny_read_roots: vec![denied_read.clone()],
@@ -2203,7 +2213,7 @@ mod tests {
 
         let machine = LocalMachine::new(MachineConfig {
             access: AccessSpec {
-                cwd: root.clone(),
+                base_dir: root.clone(),
                 read_roots: vec![root],
                 write_roots: Vec::new(),
                 deny_read_roots: Vec::new(),
@@ -2253,7 +2263,7 @@ mod tests {
         let machine = LocalMachine {
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
-                    cwd: root.clone(),
+                    base_dir: root.clone(),
                     read_roots: vec![root.clone()],
                     write_roots: Vec::new(),
                     deny_read_roots: Vec::new(),
@@ -2321,7 +2331,7 @@ mod tests {
         let machine = LocalMachine {
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
-                    cwd: root.clone(),
+                    base_dir: root.clone(),
                     read_roots: vec![root.clone()],
                     write_roots: Vec::new(),
                     deny_read_roots: vec![denied.clone()],
@@ -2428,7 +2438,7 @@ mod tests {
 
         let machine = LocalMachine::new(MachineConfig {
             access: AccessSpec {
-                cwd: root.clone(),
+                base_dir: root.clone(),
                 read_roots: vec![root],
                 write_roots: Vec::new(),
                 deny_read_roots: Vec::new(),
@@ -2476,7 +2486,7 @@ mod tests {
                         "touch \"$CARGO_HOME/git/works\""
                     )
                     .to_owned(),
-                    cwd: ".".to_owned(),
+                    dir: ".".to_owned(),
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
@@ -2521,7 +2531,7 @@ mod tests {
         let machine = LocalMachine {
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
-                    cwd: root.clone(),
+                    base_dir: root.clone(),
                     read_roots: vec![root.clone()],
                     write_roots: vec![writable.clone()],
                     deny_read_roots: vec![denied.clone()],
@@ -2557,7 +2567,7 @@ mod tests {
                         "test ! -e /etc/resolv.conf"
                     )
                     .to_owned(),
-                    cwd: ".".to_owned(),
+                    dir: ".".to_owned(),
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),

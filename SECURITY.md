@@ -10,11 +10,11 @@ read
 read_binary
 ~~~
 
-and cwd is the only implicit readable directory.
+and the launch directory is the only implicit readable directory. `--no-default-allow` removes even that grant.
 
 ## Profiles and permission precedence
 
-Profiles may persist cwd, allow_read/allow_write/allow_rw path arrays, deny_read/deny_write/deny_rw path arrays, allow_shell, and allow_network. Named profiles use config.<profile>.jsonc; the default uses config.jsonc. JSONC supports comments/trailing commas, while legacy .json profiles remain readable.
+Profiles persist `default_allow`, path grants/denies, shell/network policy, and transport/HTTP/ngrok defaults. Named profiles use config.<profile>.jsonc; the default uses config.jsonc. Schema v9 JSONC is the only supported profile format.
 
 Runtime allow rules are additive. Denies always take precedence over profile defaults, ordinary allows, and developer-cache grants.
 
@@ -26,7 +26,7 @@ Filesystem controls are symmetric:
 --allow-rw[=DIR]      --deny-rw[=DIR]
 ~~~
 
-Bare forms target cwd. Bare --allow-write retains its historical behavior and means rw-cwd. Legacy --deny=PATH is equivalent to denying both read and write.
+Bare forms target the launch directory. Bare --allow-write means read+write on that directory. Legacy --deny=PATH is equivalent to denying both read and write.
 
 Capability controls are also symmetric:
 
@@ -187,11 +187,11 @@ patch_binary also caps total file size processed in memory.
 
 ## Logging privacy
 
-Normal activity logs show tool names, safe argument metadata such as paths/cwd/flags, completion status, latency, and timestamps. They intentionally summarize content/data fields by size instead of printing file contents or binary payloads.
+At `-v`, TOOL logs show safe metadata such as paths, directories, flags, status, latency, and timestamps. Content/data fields are summarized by size instead of printing file contents or binary payloads.
 
 Verbose mode adds request-level transport/protocol metadata. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the abird-link request logger.
 
-`--silent` suppresses normal TOOL activity lines. `--silent --verbose` retains developer REQ logs while hiding TOOL lines.
+`--silent` suppresses TOOL activity. With `-vv`, it leaves REQ diagnostics visible while hiding TOOL lines.
 
 ## Resource limits
 

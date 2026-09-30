@@ -39,12 +39,12 @@ No transport owns filesystem policy.
 
 ## Profiles and persisted defaults
 
-The default config is ~/.config/abird-link/config.jsonc. Named profiles use config.<profile>.jsonc and are selected with -p/--profile. Setup can target the same profile with -S/--setup -p <name>. JSONC supports line/block comments and trailing commas; legacy .json profiles remain readable as a compatibility fallback.
+The default config is ~/.config/abird-link/config.jsonc. Named profiles use config.<profile>.jsonc and are selected with -p/--profile. Setup can target the same profile with -S/--setup -p <name>. Schema v9 JSONC supports line/block comments and trailing commas.
 
-Each profile persists transport support plus the full local permission model:
+Each profile persists transport behavior plus the local permission model:
 
 ~~~text
-permissions.cwd
+permissions.default_allow
 permissions.allow_read[]
 permissions.allow_write[]
 permissions.allow_rw[]
@@ -53,32 +53,29 @@ permissions.deny_write[]
 permissions.deny_rw[]
 permissions.allow_shell
 permissions.allow_network
+
+transports.openai
+transports.stdio
+transports.http
+transports.http_bind
+transports.http_ephemeral_url
+transports.ngrok
+transports.ngrok_ephemeral_url
 ~~~
 
-Relative permission paths resolve from the effective cwd. CLI paths merge on top of the profile, while --cwd overrides permissions.cwd for one run. `allow_rw: ["."]` means rw on cwd; `allow_rw: ["/"]` is unrestricted filesystem read+write.
+The process launch directory is the internal relative-path base. It is readable by default when `permissions.default_allow=true`; `--no-default-allow` removes that implicit grant for one run. Relative profile/CLI paths resolve from the launch directory. `allow_rw: ["."]` means rw on the launch directory; `allow_rw: ["/"]` is unrestricted filesystem read+write.
 
 allow_shell enables the normal platform shell. allow_network controls network access for the normal sandboxed shell path. On Linux Bubblewrap still applies unless --allow-all --no-sandbox is explicitly selected.
 
-Setup also persists three independent transport booleans:
+Every transport enabled in the selected profile starts automatically. Runtime flags add or suppress local transports for one run:
 
 ~~~text
-openai
-stdio
-http
+--stdio / --no-stdio
+--http  / --no-http
+--ngrok / --no-ngrok
 ~~~
 
-OpenAI starts automatically when configured.
-
-stdio and HTTP are opt-in at runtime:
-
-~~~text
---stdio
---http
-~~~
-
-Persisted transport booleans are defaults/preferences, not hard runtime gates. Explicit --stdio and --http flags add those transports for the current run even when persisted setup has them disabled.
-
---ngrok modifies the HTTP transport; it is not a fourth MCP transport.
+`--ngrok` modifies the HTTP transport; it is not a fourth MCP transport. HTTP bind and ephemeral-path flags override persisted HTTP/ngrok settings without requiring `--http` again when HTTP is already enabled in the profile.
 
 A profile may configure no transport at all; explicit --stdio/--http can still activate local transports for a run.
 
@@ -185,7 +182,7 @@ Fatal control-plane failures, such as invalid credentials or a missing tunnel ou
 The access policy contains:
 
 ~~~text
-cwd
+base_dir                  # internal relative-path base
 read_roots[]
 write_roots[]
 deny_read_roots[]
@@ -204,9 +201,9 @@ Rules:
 - deny-shell and deny-network override profile defaults and runtime allows;
 - unrestricted filesystem access is represented naturally by read+write grant `/`.
 
-The effective cwd is readable by default. A profile may also add write-cwd, shell, network, and typed developer-cache defaults.
+The base directory is where abird-link was launched. It is readable by default unless the profile sets `default_allow=false` or the run uses `--no-default-allow`.
 
-Bare --allow-write and --allow-rw add rw permission to cwd. Bare deny-read/deny-write/deny-rw target cwd symmetrically.
+Bare --allow-write and --allow-rw add rw permission to the launch/base directory. Bare deny-read/deny-write/deny-rw target that same directory symmetrically.
 
 Existing paths are canonicalized before checks. Create targets canonicalize their nearest existing ancestor before the final path is checked.
 
@@ -315,7 +312,7 @@ Logging has two layers:
 - normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP all produce the same timestamped TOOL start/completion lines;
 - verbose developer logging records incoming request metadata at the transport boundary without dumping request bodies.
 
-`-s/--silent` suppresses TOOL activity. `-v/--verbose` adds REQ logging. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is an interactive terminal.
+Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. `-s/--silent` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
 
 ## Build and release architecture
 

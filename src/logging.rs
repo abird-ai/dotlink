@@ -16,21 +16,21 @@ pub enum ColorMode {
 
 #[derive(Clone, Debug, Default)]
 pub struct LogConfig {
-    silent_activity: bool,
+    activity: bool,
     developer: bool,
     color: bool,
 }
 
 impl LogConfig {
-    pub fn new(silent_activity: bool, developer: bool, color_mode: ColorMode) -> Self {
+    pub fn new(verbose: u8, silent_activity: bool, color_mode: ColorMode) -> Self {
         let color = match color_mode {
             ColorMode::Auto => io::stderr().is_terminal(),
             ColorMode::Always => true,
             ColorMode::Never => false,
         };
         Self {
-            silent_activity,
-            developer,
+            activity: verbose >= 1 && !silent_activity,
+            developer: verbose >= 2,
             color,
         }
     }
@@ -39,12 +39,16 @@ impl LogConfig {
         self.color
     }
 
+    pub fn activity_enabled(&self) -> bool {
+        self.activity
+    }
+
     pub fn developer_enabled(&self) -> bool {
         self.developer
     }
 
     pub fn activity_start(&self, tool: &str, detail: impl AsRef<str>) -> Option<Instant> {
-        if self.silent_activity {
+        if !self.activity {
             return None;
         }
         let detail = detail.as_ref();
@@ -144,7 +148,26 @@ mod tests {
 
     #[test]
     fn color_mode_is_explicit_when_requested() {
-        assert!(LogConfig::new(false, false, ColorMode::Always).color_enabled());
-        assert!(!LogConfig::new(false, false, ColorMode::Never).color_enabled());
+        assert!(LogConfig::new(0, false, ColorMode::Always).color_enabled());
+        assert!(!LogConfig::new(0, false, ColorMode::Never).color_enabled());
+    }
+
+    #[test]
+    fn verbosity_levels_map_to_tool_and_request_logging() {
+        let quiet = LogConfig::new(0, false, ColorMode::Never);
+        assert!(!quiet.activity_enabled());
+        assert!(!quiet.developer_enabled());
+
+        let tools = LogConfig::new(1, false, ColorMode::Never);
+        assert!(tools.activity_enabled());
+        assert!(!tools.developer_enabled());
+
+        let developer = LogConfig::new(2, false, ColorMode::Never);
+        assert!(developer.activity_enabled());
+        assert!(developer.developer_enabled());
+
+        let silent_developer = LogConfig::new(2, true, ColorMode::Never);
+        assert!(!silent_developer.activity_enabled());
+        assert!(silent_developer.developer_enabled());
     }
 }

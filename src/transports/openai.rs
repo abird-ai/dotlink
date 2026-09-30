@@ -889,7 +889,7 @@ fn summarize_tool_arguments(arguments: &Value) -> String {
     let mut parts = Vec::new();
     for key in [
         "path",
-        "cwd",
+        "dir",
         "command",
         "mode",
         "recursive",
@@ -1000,11 +1000,11 @@ mod tests {
         use crate::mcp::{AccessSpec, MachineConfig};
 
         let temp = tempfile::tempdir().unwrap();
-        let cwd = temp.path().to_path_buf();
+        let base_dir = temp.path().to_path_buf();
         let machine = LocalMachine::new(MachineConfig {
             access: AccessSpec {
-                cwd: cwd.clone(),
-                read_roots: vec![cwd],
+                base_dir: base_dir.clone(),
+                read_roots: vec![base_dir],
                 write_roots: Vec::new(),
                 deny_read_roots: Vec::new(),
                 deny_write_roots: Vec::new(),

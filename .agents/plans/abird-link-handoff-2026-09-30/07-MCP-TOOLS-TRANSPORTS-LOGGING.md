@@ -233,45 +233,18 @@ Ctrl-C cancels root cancellation token.
 
 ## Logging model
 
-### Default activity
+### Verbosity
 
-Centralized around the MCP tool router:
-
-```text
-[01:06:47.410] TOOL read → path=README.md limit=1
-[01:06:47.411] TOOL read ← ok 1ms
-```
-
-All transports share this format.
-
-### Silent
+Activity logging is quiet by default.
 
 ```text
--s
---silent
+default    no TOOL / REQ
+-v         TOOL
+-vv        TOOL + REQ
+-s -vv     REQ only
 ```
 
-Suppress TOOL start/completion lines.
-
-### Verbose/developer
-
-```text
--v
---verbose
-```
-
-Adds REQ metadata while retaining normal TOOL activity unless silent is also set.
-
-Examples:
-
-```text
-REQ stdio → initialize
-REQ stdio → tools/call
-REQ http → POST /mcp
-REQ http ← POST /mcp 200 1ms
-```
-
-`--silent --verbose` means REQ-only.
+TOOL lines are centralized around the MCP tool router, so all transports share the same format. REQ diagnostics stay at transport boundaries and include safe metadata only.
 
 ### Color
 
@@ -297,18 +270,7 @@ ChatGPT Settings
 → select/paste tunnel ID
 ```
 
-Optional personal plugin:
-
-```text
-docs/CHATGPT_PLUGIN.md
-prompts/PLUGIN_CREATOR.md
-```
-
-Work-mode explicit invocation:
-
-```text
-@Abird Link ...
-```
+Detailed ChatGPT tunnel setup: `docs/CHATGPT_PLUGIN.md`.
 
 ## Claude.ai
 

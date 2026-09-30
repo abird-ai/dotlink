@@ -1,5 +1,7 @@
 # Context and project history
 
+> Historical note: this file intentionally records earlier designs, including an earlier configurable project-base model. Schema v9 supersedes that model: the launch directory is now the internal base, `default_allow` controls its implicit read grant, and older schemas are unsupported.
+
 ## Original problem
 
 The project started as a clean Rust binary that would let ChatGPT connect to a user's local machine through OpenAI Secure MCP Tunnel, exposing local filesystem access and optionally Bash.
@@ -42,7 +44,7 @@ The generic link/bridge concept was broader than “tunnel,” so product/packag
 
 ### Phase 2 — workspace boundary
 
-- `--cwd`;
+- a removed project-base flag;
 - filesystem tool path checks;
 - prevent escaping selected workspace;
 - beginner-friendly setup.
@@ -107,7 +109,7 @@ patch_binary
 - `-p/--profile`;
 - JSONC config;
 - per-profile runtime key;
-- persistent cwd/path rules;
+- earlier persistent base/path rules;
 - persistent shell/network defaults;
 - symmetric deny model.
 
@@ -132,7 +134,7 @@ Original `-v` was user-facing concise tool logging.
 
 Decision changed:
 
-- normal TOOL activity should be default;
+- TOOL activity is available on demand with `-v`;
 - `-s` should suppress it;
 - `-v` should mean developer request/protocol logging;
 - setup short flag moves to `-S`;

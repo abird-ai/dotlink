@@ -31,7 +31,7 @@ crate name: abird-link
 crate version: 0.5.0
 edition: 2024
 rust toolchain: 1.98.1
-config schema: 8
+config schema: 9
 ```
 
 ## Config
@@ -58,10 +58,10 @@ Named profile `work`:
 
 Legacy `.json` profiles remain readable.
 
-Persistent permission state supports:
+Persistent profile state supports:
 
 ```text
-cwd
+default_allow
 allow_read[]
 allow_write[]
 allow_rw[]
@@ -71,8 +71,15 @@ deny_rw[]
 allow_shell
 allow_network
 typed developer caches
-transport defaults
+
+openai / stdio / http
+http_bind
+http_ephemeral_url
+ngrok
+ngrok_ephemeral_url
 ```
+
+The process launch directory is the internal relative-path base and is readable by default. `--no-default-allow` removes that implicit read grant for one run. Schema v9 is strict; older profile schemas are rejected.
 
 Older boolean `allow_rw: true` remains compatible and maps to `["."]`.
 
@@ -81,16 +88,19 @@ Older boolean `allow_rw: true` remains compatible and maps to `["."]`.
 ```text
 -S, --setup
 -p, --profile <NAME>
---cwd <DIR>
 
 --stdio
+--no-stdio
 --http
+--no-http
 --http-bind <ADDR>
 --ngrok
+--no-ngrok
 --ephemeral-url
 --http-ephemeral-url[=<BOOL>]
 --ngrok-ephemeral-url[=<BOOL>]
 
+--no-default-allow
 --allow-read[=<DIR>]
 --allow-write[=<DIR>]
 --allow-rw[=<DIR>]
@@ -117,9 +127,11 @@ Important:
 
 - `-s` means silent.
 - setup shorthand is uppercase `-S`.
-- explicit `--stdio` / `--http` activate those transports even if profile defaults are false.
-- bare `--allow-rw` means RW cwd.
-- bare `--allow-write` retains historical RW-cwd behavior; explicit `--allow-write=/path` is write-only.
+- every transport enabled in the selected profile starts automatically.
+- explicit `--stdio` / `--http` add those transports for one run; `--no-stdio` / `--no-http` suppress profile defaults.
+- `--no-ngrok` suppresses profile ngrok while keeping effective HTTP.
+- bare `--allow-rw` means RW on the launch directory.
+- bare `--allow-write` means RW on the launch directory; explicit `--allow-write=/path` is write-only.
 - `--allow-rw=/` is unrestricted filesystem RW inside the sandbox model; it does not disable Bubblewrap.
 - paired `--allow-all --no-sandbox` is the full-host unsandboxed escape hatch.
 - no dangerous-suffixed authority flags remain.
@@ -171,17 +183,14 @@ http://127.0.0.1:3000/mcp
 
 ## Logging model
 
-Default:
-
 ```text
-[HH:MM:SS.mmm] TOOL read → path=README.md limit=1
-[HH:MM:SS.mmm] TOOL read ← ok 1ms
+default    no TOOL / REQ
+-v         TOOL activity
+-vv        TOOL + REQ developer diagnostics
+-s -vv     REQ only
 ```
 
-- `-s/--silent`: hides TOOL activity.
-- `-v/--verbose`: adds REQ-level developer logs.
-- `--silent --verbose`: REQ-only.
-- `--color=auto|always|never`: controls ANSI.
+`--color=auto|always|never` controls ANSI rendering.
 
 ## Developer cache model
 
@@ -254,7 +263,7 @@ abird-link-windows-x86_64.exe.sha256
 Validated on 2026-09-30:
 
 - `flake.lock` locks Crane v0.24.0 and rust-overlay.
-- Rust fmt/test/Clippy passes; 77/77 tests after automatic tunnel recovery and restart-backoff coverage.
+- Rust fmt/test/Clippy passes; 80/80 tests after automatic tunnel recovery and restart-backoff coverage.
 - real Bubblewrap runtime and cache-mount smokes pass.
 - full x86_64-linux `nix flake check` passes using an isolated writable Nix store without exposing the host daemon.
 - `nix flake check --all-systems --no-build` evaluates x86_64 Linux, aarch64 Linux and aarch64 Darwin.

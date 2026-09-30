@@ -30,6 +30,12 @@ pub struct TransportConfig {
     pub http: bool,
     #[serde(default = "default_http_bind")]
     pub http_bind: String,
+    #[serde(default)]
+    pub http_ephemeral_url: bool,
+    #[serde(default)]
+    pub ngrok: bool,
+    #[serde(default)]
+    pub ngrok_ephemeral_url: bool,
 }
 
 impl Default for TransportConfig {
@@ -39,6 +45,9 @@ impl Default for TransportConfig {
             stdio: false,
             http: false,
             http_bind: default_http_bind(),
+            http_ephemeral_url: false,
+            ngrok: false,
+            ngrok_ephemeral_url: false,
         }
     }
 }
@@ -59,36 +68,33 @@ impl TransportConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PermissionConfig {
-    /// Persistent default working directory. Relative paths resolve from the launch cwd.
-    #[serde(default)]
-    pub cwd: Option<PathBuf>,
+    /// Read the directory where abird-link is launched unless disabled.
+    #[serde(default = "default_true")]
+    pub default_allow: bool,
 
-    /// Additional readable directories. Relative paths resolve from the effective cwd.
+    /// Additional readable directories. Relative paths resolve from the launch directory.
     #[serde(default)]
     pub allow_read: Vec<PathBuf>,
 
-    /// Additional writable directories. Relative paths resolve from the effective cwd.
+    /// Additional writable directories. Relative paths resolve from the launch directory.
     #[serde(default)]
     pub allow_write: Vec<PathBuf>,
 
-    /// Additional read+write directories. Relative paths resolve from the effective cwd.
-    ///
-    /// Compatibility: v7 and older configs used a boolean allow_rw where true
-    /// meant rw on cwd.
-    #[serde(default, deserialize_with = "deserialize_path_list_or_bool")]
+    /// Additional read+write directories. Relative paths resolve from the launch directory.
+    #[serde(default)]
     pub allow_rw: Vec<PathBuf>,
 
-    /// Paths denied for reads. Relative paths resolve from the effective cwd.
+    /// Paths denied for reads. Relative paths resolve from the launch directory.
     #[serde(default)]
     pub deny_read: Vec<PathBuf>,
 
-    /// Paths denied for writes. Relative paths resolve from the effective cwd.
+    /// Paths denied for writes. Relative paths resolve from the launch directory.
     #[serde(default)]
     pub deny_write: Vec<PathBuf>,
 
-    /// Paths denied for both reads and writes. Relative paths resolve from the effective cwd.
+    /// Paths denied for both reads and writes. Relative paths resolve from the launch directory.
     #[serde(default)]
     pub deny_rw: Vec<PathBuf>,
 
@@ -101,21 +107,19 @@ pub struct PermissionConfig {
     pub allow_network: bool,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum PathListOrBool {
-    Paths(Vec<PathBuf>),
-    Bool(bool),
-}
-
-fn deserialize_path_list_or_bool<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match PathListOrBool::deserialize(deserializer)? {
-        PathListOrBool::Paths(paths) => Ok(paths),
-        PathListOrBool::Bool(true) => Ok(vec![PathBuf::from(".")]),
-        PathListOrBool::Bool(false) => Ok(Vec::new()),
+impl Default for PermissionConfig {
+    fn default() -> Self {
+        Self {
+            default_allow: true,
+            allow_read: Vec::new(),
+            allow_write: Vec::new(),
+            allow_rw: Vec::new(),
+            deny_read: Vec::new(),
+            deny_write: Vec::new(),
+            deny_rw: Vec::new(),
+            allow_shell: false,
+            allow_network: false,
+        }
     }
 }
 
@@ -250,7 +254,6 @@ struct DiscoveredCache {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    #[serde(default = "config_version")]
     pub version: u32,
 
     #[serde(default)]
@@ -293,7 +296,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    8
+    9
 }
 
 fn default_true() -> bool {
@@ -320,7 +323,11 @@ fn default_file_bytes() -> usize {
     DEFAULT_MAX_FILE_BYTES
 }
 
-pub async fn load_or_setup(force_setup: bool, profile: Option<&str>) -> Result<SetupResult> {
+pub async fn load_or_setup(
+    force_setup: bool,
+    profile: Option<&str>,
+    color: bool,
+) -> Result<SetupResult> {
     validate_profile(profile)?;
 
     if !force_setup {
@@ -336,26 +343,12 @@ pub async fn load_or_setup(force_setup: bool, profile: Option<&str>) -> Result<S
         }
 
         let path = config_path(profile)?;
-        let legacy_path = legacy_json_config_path(profile)?;
-        let source_path = if path.exists() {
-            Some(path.clone())
-        } else if legacy_path.exists() {
-            Some(legacy_path)
-        } else {
-            None
-        };
 
-        if let Some(source_path) = source_path {
-            let text = fs::read_to_string(&source_path)
-                .with_context(|| format!("failed to read {}", source_path.display()))?;
-            let mut config: AppConfig =
-                if source_path.extension().and_then(|value| value.to_str()) == Some("jsonc") {
-                    parse_jsonc(&text)
-                        .with_context(|| format!("failed to parse {}", source_path.display()))?
-                } else {
-                    serde_json::from_str(&text)
-                        .with_context(|| format!("failed to parse {}", source_path.display()))?
-                };
+        if path.exists() {
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let mut config: AppConfig = parse_jsonc(&text)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
 
             if config.transports.openai {
                 config.runtime_api_key = read_saved_runtime_key(profile)?;
@@ -381,7 +374,7 @@ pub async fn load_or_setup(force_setup: bool, profile: Option<&str>) -> Result<S
         );
     }
 
-    interactive_setup(profile).await
+    interactive_setup(profile, color).await
 }
 
 fn config_from_env() -> Result<Option<AppConfig>> {
@@ -604,12 +597,17 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
         .collect()
 }
 
-fn prompt_cache_mode(cache: &DiscoveredCache) -> Result<Option<CacheMode>> {
+fn prompt_cache_mode(cache: &DiscoveredCache, color: bool) -> Result<Option<CacheMode>> {
     loop {
         let input = prompt_line(&format!(
-            "   {:<18} {}\n      Access [n]one / [r]ead-only / read+[w]rite [n]: ",
+            "   {:<18} {}\n      {} ",
             cache.kind.label(),
-            cache.path.display()
+            cache.path.display(),
+            setup_style(
+                color,
+                "33",
+                "Access [n]one / [r]ead-only / read+[w]rite [n]:"
+            )
         ))?;
 
         match input.trim().to_ascii_lowercase().as_str() {
@@ -623,14 +621,17 @@ fn prompt_cache_mode(cache: &DiscoveredCache) -> Result<Option<CacheMode>> {
     }
 }
 
-async fn setup_developer_caches(allow_shell: bool) -> Result<Vec<CacheGrant>> {
+async fn setup_developer_caches(allow_shell: bool, color: bool) -> Result<Vec<CacheGrant>> {
     if !allow_shell || !cfg!(target_os = "linux") {
         return Ok(Vec::new());
     }
 
     println!();
-    println!("3. Discover developer caches");
-    println!("   Scanning known package/build cache locations…");
+    println!("{}", setup_style(color, "1", "3. Developer caches"));
+    println!(
+        "   {}",
+        setup_style(color, "2", "Scanning known package/build cache locations…")
+    );
 
     let discovered = discover_developer_caches().await;
     if discovered.is_empty() {
@@ -653,13 +654,19 @@ async fn setup_developer_caches(allow_shell: bool) -> Result<Vec<CacheGrant>> {
         "   • read+write is fastest, but allows sandboxed builds to modify the shared host cache."
     );
 
-    if !prompt_yes_no("   Configure access to discovered caches? [y/N]: ", false)? {
+    if !prompt_yes_no(
+        &format!(
+            "   {} ",
+            setup_style(color, "33", "Configure access to discovered caches? [y/N]:")
+        ),
+        false,
+    )? {
         return Ok(Vec::new());
     }
 
     let mut grants = Vec::new();
     for cache in discovered {
-        if let Some(mode) = prompt_cache_mode(&cache)? {
+        if let Some(mode) = prompt_cache_mode(&cache, color)? {
             grants.push(CacheGrant {
                 kind: cache.kind,
                 path: cache.path,
@@ -670,57 +677,159 @@ async fn setup_developer_caches(allow_shell: bool) -> Result<Vec<CacheGrant>> {
     Ok(grants)
 }
 
-async fn interactive_setup(profile: Option<&str>) -> Result<SetupResult> {
+fn setup_style(color: bool, code: &str, text: impl AsRef<str>) -> String {
+    if color {
+        format!("[{code}m{}[0m", text.as_ref())
+    } else {
+        text.as_ref().to_owned()
+    }
+}
+
+async fn interactive_setup(profile: Option<&str>, color: bool) -> Result<SetupResult> {
     println!();
-    println!("abird-link setup");
-    println!("────────────────────────────────────────────────────────");
+    println!("{}", setup_style(color, "1;36", "abird-link setup"));
+    println!(
+        "{}",
+        setup_style(
+            color,
+            "2",
+            "────────────────────────────────────────────────────────"
+        )
+    );
     if let Some(profile) = profile {
-        println!("Profile: {profile}");
+        println!(
+            "{} {}",
+            setup_style(color, "1", "Profile:"),
+            setup_style(color, "36", profile)
+        );
         println!();
     }
 
-    println!("1. Choose MCP transports");
-    println!("   • openai — OpenAI Secure MCP Tunnel; starts automatically");
-    println!("   • stdio  — local stdio MCP server; can also be added with --stdio");
-    println!("   • http   — local HTTP MCP server; can also be added with --http");
-    println!("   • Enter comma-separated names, 'all', or 'none'.");
-    let selection = prompt_line("   Enabled [openai]: ")?;
-    let transports = parse_transport_selection(&selection)?;
+    println!("{}", setup_style(color, "1", "1. MCP transports"));
+    println!(
+        "   {}  OpenAI Tunnel   {}",
+        setup_style(color, "1;36", "1"),
+        setup_style(color, "2", "Recommended for ChatGPT")
+    );
+    println!(
+        "   {}  stdio           {}",
+        setup_style(color, "1;36", "2"),
+        setup_style(
+            color,
+            "2",
+            "Local MCP clients (Claude Desktop, Codex, etc.)"
+        )
+    );
+    println!(
+        "   {}  HTTP            {}",
+        setup_style(color, "1;36", "3"),
+        setup_style(color, "2", "Claude.ai and other web MCP clients")
+    );
+    let selection = prompt_line(&format!(
+        "   {} ",
+        setup_style(color, "1;33", "Select [1] (comma-separated; all / none):")
+    ))?;
+    let mut transports = parse_transport_selection(&selection)?;
 
-    println!();
-    println!("2. Choose default local permissions");
-    println!("   • cwd is always readable unless a deny rule overrides it.");
-    let setup_cwd = env::current_dir().context("failed to determine setup cwd")?;
-    let persist_cwd = prompt_yes_no(
-        &format!("   Pin this profile to {}? [y/N]: ", setup_cwd.display()),
-        false,
-    )?;
-    let allow_rw_cwd = prompt_yes_no("   Allow read+write cwd by default? [y/N]: ", false)?;
-    let allow_shell = prompt_yes_no("   Allow shell by default? [y/N]: ", false)?;
-    let allow_network = if allow_shell {
-        println!("   • Linux shell remains Bubblewrap-sandboxed.");
-        prompt_yes_no("   Allow shell network access by default? [y/N]: ", false)?
+    if transports.http {
+        println!();
+        println!("   {}", setup_style(color, "1", "HTTP options"));
+        transports.http_ephemeral_url = prompt_yes_no(
+            &format!(
+                "   {} ",
+                setup_style(color, "33", "Use an ephemeral local MCP URL? [y/N]:")
+            ),
+            false,
+        )?;
+        transports.ngrok = prompt_yes_no(
+            &format!(
+                "   {} ",
+                setup_style(color, "33", "Publish a public ngrok HTTPS endpoint? [y/N]:")
+            ),
+            false,
+        )?;
+        if transports.ngrok {
+            transports.ngrok_ephemeral_url = prompt_yes_no(
+                &format!(
+                    "   {} ",
+                    setup_style(color, "33", "Use an ephemeral ngrok MCP URL? [y/N]:")
+                ),
+                false,
+            )?;
+        }
+    }
+
+    let no_transports = transports.enabled_names().is_empty();
+    let (permissions, caches) = if no_transports {
+        (PermissionConfig::default(), Vec::new())
     } else {
-        false
+        println!();
+        println!("{}", setup_style(color, "1", "2. Local access"));
+        let setup_dir = env::current_dir().context("failed to determine setup directory")?;
+        let default_allow = prompt_yes_no(
+            &format!(
+                "   {} {} ",
+                setup_style(color, "33", "Allow read access to:"),
+                setup_style(color, "36", format!("{} [Y/n]:", setup_dir.display()))
+            ),
+            true,
+        )?;
+        let allow_rw_base = if default_allow {
+            prompt_yes_no(
+                &format!(
+                    "   {} ",
+                    setup_style(color, "33", "Allow write access too? [y/N]:")
+                ),
+                false,
+            )?
+        } else {
+            false
+        };
+        let allow_shell = prompt_yes_no(
+            &format!(
+                "   {} ",
+                setup_style(color, "33", "Allow shell access? [y/N]:")
+            ),
+            false,
+        )?;
+        let allow_network = if allow_shell {
+            if cfg!(target_os = "linux") {
+                println!(
+                    "   {}",
+                    setup_style(color, "2", "Linux shell runs inside Bubblewrap.")
+                );
+            }
+            prompt_yes_no(
+                &format!(
+                    "   {} ",
+                    setup_style(color, "33", "Allow shell network access? [y/N]:")
+                ),
+                false,
+            )?
+        } else {
+            false
+        };
+
+        let permissions = PermissionConfig {
+            default_allow,
+            allow_read: Vec::new(),
+            allow_write: Vec::new(),
+            allow_rw: allow_rw_base
+                .then(|| PathBuf::from("."))
+                .into_iter()
+                .collect(),
+            deny_read: Vec::new(),
+            deny_write: Vec::new(),
+            deny_rw: Vec::new(),
+            allow_shell,
+            allow_network,
+        };
+        let caches = setup_developer_caches(allow_shell, color).await?;
+        (permissions, caches)
     };
-    let permissions = PermissionConfig {
-        cwd: persist_cwd.then_some(setup_cwd),
-        allow_read: Vec::new(),
-        allow_write: Vec::new(),
-        allow_rw: allow_rw_cwd
-            .then(|| PathBuf::from("."))
-            .into_iter()
-            .collect(),
-        deny_read: Vec::new(),
-        deny_write: Vec::new(),
-        deny_rw: Vec::new(),
-        allow_shell,
-        allow_network,
-    };
-    let caches = setup_developer_caches(allow_shell).await?;
 
     let (tunnel_id, runtime_api_key, organization_id, new_tunnel) = if transports.openai {
-        setup_openai().await?
+        setup_openai(color).await?
     } else {
         (None, String::new(), None, false)
     };
@@ -744,40 +853,45 @@ async fn interactive_setup(profile: Option<&str>) -> Result<SetupResult> {
     save_config(&config, profile)?;
 
     println!();
-    println!("✓ Setup complete");
+    println!("{}", setup_style(color, "1;32", "✓ Setup complete"));
     println!("  • Config: {}", config_path(profile)?.display());
     let enabled = config.transports.enabled_names();
     println!(
-        "  • Configured transports: {}",
+        "  • Transports: {}",
         if enabled.is_empty() {
             "none".to_owned()
         } else {
             enabled.join(", ")
         }
     );
+
+    let mut permission_summary = Vec::new();
+    if config.permissions.default_allow {
+        permission_summary.push("read launch directory");
+    }
+    if config
+        .permissions
+        .allow_rw
+        .iter()
+        .any(|path| path == Path::new("."))
+    {
+        permission_summary.push("write launch directory");
+    }
+    if config.permissions.allow_shell {
+        permission_summary.push("shell");
+    }
+    if config.permissions.allow_network {
+        permission_summary.push("shell network");
+    }
     println!(
-        "  • Default permissions: read cwd{}{}{}",
-        if config
-            .permissions
-            .allow_rw
-            .iter()
-            .any(|path| path == Path::new("."))
-        {
-            " + write cwd"
+        "  • Local access: {}",
+        if permission_summary.is_empty() {
+            "none".to_owned()
         } else {
-            ""
-        },
-        if config.permissions.allow_shell {
-            " + shell"
-        } else {
-            ""
-        },
-        if config.permissions.allow_network {
-            " + network"
-        } else {
-            ""
-        },
+            permission_summary.join(" + ")
+        }
     );
+
     if !config.caches.is_empty() {
         println!("  • Shared developer caches:");
         for cache in &config.caches {
@@ -799,8 +913,28 @@ async fn interactive_setup(profile: Option<&str>) -> Result<SetupResult> {
     }
     if config.transports.http {
         println!(
-            "  • HTTP default: http://{}/mcp",
-            config.transports.http_bind
+            "  • HTTP: http://{}{}",
+            config.transports.http_bind,
+            if config.transports.http_ephemeral_url {
+                "/mcp/<ephemeral>"
+            } else {
+                "/mcp"
+            }
+        );
+        if config.transports.ngrok {
+            println!(
+                "  • ngrok: public HTTPS{}",
+                if config.transports.ngrok_ephemeral_url {
+                    " + ephemeral MCP path"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    if enabled.is_empty() {
+        println!(
+            "  • No transport will start by default; use --stdio or --http for a one-run transport."
         );
     }
 
@@ -822,7 +956,7 @@ fn parse_transport_selection(input: &str) -> Result<TransportConfig> {
         openai: false,
         stdio: false,
         http: false,
-        http_bind: default_http_bind(),
+        ..TransportConfig::default()
     };
 
     for token in input.split([',', ' ', ';']) {
@@ -831,30 +965,35 @@ fn parse_transport_selection(input: &str) -> Result<TransportConfig> {
             continue;
         }
         match token.as_str() {
-            "all" => {
+            "a" | "all" => {
                 config.openai = true;
                 config.stdio = true;
                 config.http = true;
             }
-            "none" => {
+            "n" | "none" => {
                 config.openai = false;
                 config.stdio = false;
                 config.http = false;
             }
-            "openai" | "tunnel" => config.openai = true,
-            "stdio" => config.stdio = true,
-            "http" => config.http = true,
-            other => bail!("unknown transport {other:?}; choose openai, stdio, http, all, or none"),
+            "1" | "openai" | "tunnel" => config.openai = true,
+            "2" | "stdio" => config.stdio = true,
+            "3" | "http" => config.http = true,
+            other => {
+                bail!("unknown transport {other:?}; choose 1/openai, 2/stdio, 3/http, all, or none")
+            }
         }
     }
 
     Ok(config)
 }
 
-async fn setup_openai() -> Result<(Option<String>, String, Option<String>, bool)> {
+async fn setup_openai(color: bool) -> Result<(Option<String>, String, Option<String>, bool)> {
     println!();
-    println!("Configure OpenAI Secure MCP Tunnel");
-    println!("   Create a Runtime API key");
+    println!(
+        "{}",
+        setup_style(color, "1", "Configure OpenAI Secure MCP Tunnel")
+    );
+    println!("   {}", setup_style(color, "1", "Create a Runtime API key"));
     println!("   • Permissions: Tunnels Read + Use");
     println!("   • https://platform.openai.com/settings/organization/api-keys");
     let runtime_api_key = Zeroizing::new(prompt_secret("   Paste key: ")?);
@@ -863,13 +1002,16 @@ async fn setup_openai() -> Result<(Option<String>, String, Option<String>, bool)
     }
 
     println!();
-    println!("   Choose a tunnel");
+    println!("   {}", setup_style(color, "1", "Choose a tunnel"));
     println!("   • Paste an existing Tunnel ID, or press Enter to create one.");
     let existing_id = prompt_line("   Tunnel ID [create new]: ")?;
 
     let (tunnel_id, new_tunnel, runtime_organization_id) = if existing_id.trim().is_empty() {
         println!();
-        println!("   Create a one-time Admin key");
+        println!(
+            "   {}",
+            setup_style(color, "1", "Create a one-time Admin key")
+        );
         println!("   • Permission: Tunnels Manage");
         println!("   • Used once and never saved; you can delete it after setup.");
         println!("   • https://platform.openai.com/settings/organization/admin-keys");
@@ -879,7 +1021,7 @@ async fn setup_openai() -> Result<(Option<String>, String, Option<String>, bool)
         }
 
         println!();
-        println!("   Choose tunnel scope");
+        println!("   {}", setup_style(color, "1", "Choose tunnel scope"));
         println!("   • Workspace ID:    https://chatgpt.com/admin");
         println!("     Select your ChatGPT workspace → Settings, then copy Workspace ID.");
         println!("   • Organization ID: https://platform.openai.com/settings/organization/general");
@@ -1196,15 +1338,6 @@ fn config_path(profile: Option<&str>) -> Result<PathBuf> {
     profiled_path(&base, profile)
 }
 
-fn legacy_json_config_path(profile: Option<&str>) -> Result<PathBuf> {
-    let path = config_path(profile)?;
-    match path.extension().and_then(|value| value.to_str()) {
-        Some("json") => Ok(path),
-        Some("jsonc") => Ok(path.with_extension("json")),
-        _ => Ok(PathBuf::from(format!("{}.json", path.display()))),
-    }
-}
-
 fn credential_path(profile: Option<&str>) -> Result<PathBuf> {
     let config = config_path(profile)?;
     let parent = config
@@ -1324,8 +1457,22 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn validate_config(config: &AppConfig) -> Result<()> {
+    if config.version != config_version() {
+        bail!(
+            "unsupported config version {}; expected {}. Rerun abird-link --setup for this profile",
+            config.version,
+            config_version()
+        );
+    }
+
     if config.permissions.allow_network && !config.permissions.allow_shell {
         bail!("permissions.allow_network requires permissions.allow_shell");
+    }
+    if config.transports.ngrok && !config.transports.http {
+        bail!("transports.ngrok requires transports.http");
+    }
+    if config.transports.ngrok_ephemeral_url && !config.transports.ngrok {
+        bail!("transports.ngrok_ephemeral_url requires transports.ngrok");
     }
 
     let mut cache_kinds = std::collections::BTreeSet::new();
@@ -1486,6 +1633,14 @@ mod tests {
         assert!(!transports.openai);
         assert!(transports.stdio);
         assert!(transports.http);
+
+        let numbered = parse_transport_selection("2,3").unwrap();
+        assert!(!numbered.openai);
+        assert!(numbered.stdio);
+        assert!(numbered.http);
+
+        let all = parse_transport_selection("all").unwrap();
+        assert!(all.openai && all.stdio && all.http);
 
         let none = parse_transport_selection("none").unwrap();
         assert!(!none.openai && !none.stdio && !none.http);
@@ -1651,34 +1806,47 @@ mod tests {
     }
 
     #[test]
-    fn legacy_boolean_allow_rw_migrates_to_cwd_path() {
-        let parsed: AppConfig = parse_jsonc(
-            r#"{
-                "version": 7,
-                "transports": {
-                    "openai": false,
-                    "stdio": true,
-                    "http": false,
-                    "http_bind": "127.0.0.1:3000"
-                },
-                "permissions": {
-                    "allow_rw": true,
-                    "allow_shell": false,
-                    "allow_network": false
-                },
-                "base_url": "https://api.openai.com"
-            }"#,
-        )
-        .unwrap();
+    fn only_schema_v9_is_accepted() {
+        let mut config = example_config();
+        config.version = 8;
+        let error = validate_config(&config).unwrap_err();
+        assert!(error.to_string().contains("unsupported config version 8"));
 
-        assert_eq!(parsed.permissions.allow_rw, [PathBuf::from(".")]);
+        let missing =
+            parse_jsonc::<AppConfig>(r#"{ "transports": { "openai": false }, "permissions": {} }"#);
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn http_profile_options_round_trip() {
+        let mut config = example_config();
+        config.transports = TransportConfig {
+            openai: false,
+            stdio: false,
+            http: true,
+            http_bind: "127.0.0.1:4321".to_owned(),
+            http_ephemeral_url: true,
+            ngrok: true,
+            ngrok_ephemeral_url: true,
+        };
+        config.tunnel_id = None;
+        config.runtime_api_key.clear();
+
+        let serialized = serialize_jsonc(&config).unwrap();
+        let parsed: AppConfig = parse_jsonc(&serialized).unwrap();
+        assert!(parsed.transports.http);
+        assert_eq!(parsed.transports.http_bind, "127.0.0.1:4321");
+        assert!(parsed.transports.http_ephemeral_url);
+        assert!(parsed.transports.ngrok);
+        assert!(parsed.transports.ngrok_ephemeral_url);
+        validate_config(&parsed).unwrap();
     }
 
     #[test]
     fn permissions_round_trip_in_jsonc() {
         let mut config = example_config();
         config.permissions = PermissionConfig {
-            cwd: Some(PathBuf::from("/workspace")),
+            default_allow: false,
             allow_read: vec![PathBuf::from("/reference")],
             allow_write: vec![PathBuf::from("generated")],
             allow_rw: vec![PathBuf::from(".")],
@@ -1691,7 +1859,7 @@ mod tests {
 
         let serialized = serialize_jsonc(&config).unwrap();
         let parsed: AppConfig = parse_jsonc(&serialized).unwrap();
-        assert_eq!(parsed.permissions.cwd, Some(PathBuf::from("/workspace")));
+        assert!(!parsed.permissions.default_allow);
         assert_eq!(parsed.permissions.allow_read, [PathBuf::from("/reference")]);
         assert_eq!(parsed.permissions.allow_write, [PathBuf::from("generated")]);
         assert_eq!(parsed.permissions.allow_rw, [PathBuf::from(".")]);

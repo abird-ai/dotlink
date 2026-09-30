@@ -17,7 +17,7 @@ When convenient:
 3. refresh the ChatGPT developer connection/tool schema;
 4. confirm `tools/list` matches the selected policy;
 5. smoke one read call and, when permitted, one shell call;
-6. verify normal TOOL logging and optional `-v` REQ logging.
+6. verify quiet default logging, `-v` TOOL activity, and `-vv` REQ diagnostics.
 
 This is a live-process refresh, not an implementation gap.
 
@@ -38,7 +38,7 @@ Installers default to this repository. Future release work should choose the tag
 Complete:
 
 - JSONC profiles;
-- persistent cwd + allow/deny arrays;
+- schema-v9 default launch-directory read + persistent allow/deny arrays;
 - shell/network defaults;
 - profile-specific runtime secrets;
 - developer cache discovery/sharing;
@@ -135,8 +135,8 @@ The current typed profile/onboarding model may already be sufficient.
 - do not describe ephemeral URLs as authentication;
 - do not restore `fs_*` tool names;
 - do not overload text read/write with binary encodings;
-- do not make `-v` normal tool logging;
+- do not enable TOOL logging by default;
 - do not reuse `-s` for setup;
 - do not silently enable network because a package manager misses a dependency;
 - do not weaken path canonicalization or deny precedence to make a test pass;
-- do not invent a GitHub owner while no remote is configured.
+- keep the canonical upstream as `https://github.com/abird-ai/abird-link`.

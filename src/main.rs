@@ -10,14 +10,14 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     logging::{ColorMode, LogConfig},
     mcp::{AccessSpec, LocalMachine, MachineConfig, SandboxCacheMount},
-    setup::{PermissionConfig, load_or_setup},
+    setup::{PermissionConfig, TransportConfig, load_or_setup},
     transports::ActiveTransports,
 };
 
@@ -29,35 +29,57 @@ use crate::{
 )]
 struct Args {
     /// Run interactive setup for the selected profile.
-    #[arg(short = 'S', long, conflicts_with_all = ["stdio", "http", "ngrok"])]
+    #[arg(
+        short = 'S',
+        long,
+        conflicts_with_all = [
+            "stdio",
+            "no_stdio",
+            "http",
+            "no_http",
+            "ngrok",
+            "no_ngrok",
+            "ephemeral_url",
+            "http_ephemeral_url",
+            "ngrok_ephemeral_url"
+        ]
+    )]
     setup: bool,
 
     /// Select a named config profile (config.<profile>.jsonc).
     #[arg(short = 'p', long, value_name = "NAME")]
     profile: Option<String>,
 
-    /// Default working directory. Defaults to the directory where abird-link is launched.
-    #[arg(long, value_name = "DIR")]
-    cwd: Option<PathBuf>,
-
-    /// Start the stdio MCP server for this run.
-    #[arg(long)]
+    /// Add the stdio MCP server for this run.
+    #[arg(long, conflicts_with = "no_stdio")]
     stdio: bool,
 
-    /// Start the HTTP MCP server for this run.
-    #[arg(long)]
+    /// Disable stdio even if enabled in the selected profile.
+    #[arg(long, conflicts_with = "stdio")]
+    no_stdio: bool,
+
+    /// Add the HTTP MCP server for this run.
+    #[arg(long, conflicts_with = "no_http")]
     http: bool,
 
+    /// Disable HTTP (and ngrok) even if enabled in the selected profile.
+    #[arg(long, conflicts_with = "http")]
+    no_http: bool,
+
     /// Override the configured HTTP listen address for this run.
-    #[arg(long, value_name = "ADDR", requires = "http")]
+    #[arg(long, value_name = "ADDR")]
     http_bind: Option<SocketAddr>,
 
-    /// Publish the HTTP MCP server through ngrok. Requires --http and NGROK_AUTHTOKEN.
-    #[arg(long, requires = "http")]
+    /// Publish the effective HTTP MCP server through ngrok for this run.
+    #[arg(long, conflicts_with = "no_ngrok")]
     ngrok: bool,
 
+    /// Disable ngrok even if enabled in the selected profile.
+    #[arg(long, conflicts_with = "ngrok")]
+    no_ngrok: bool,
+
     /// Use fresh hard-to-guess URL paths for both local HTTP and ngrok.
-    #[arg(long, requires = "http")]
+    #[arg(long)]
     ephemeral_url: bool,
 
     /// Override local HTTP ephemeral-path behavior. Bare flag means true.
@@ -67,7 +89,6 @@ struct Args {
         num_args = 0..=1,
         default_missing_value = "true",
         require_equals = true,
-        requires = "http",
         alias = "http-emphemeral-url"
     )]
     http_ephemeral_url: Option<bool>,
@@ -79,12 +100,11 @@ struct Args {
         num_args = 0..=1,
         default_missing_value = "true",
         require_equals = true,
-        requires = "ngrok",
         alias = "ngrok-emphemeral-url"
     )]
     ngrok_ephemeral_url: Option<bool>,
 
-    /// Add readable access. Bare --allow-read means cwd.
+    /// Add readable access. Bare --allow-read means the launch directory.
     #[arg(
         long,
         value_name = "DIR",
@@ -94,7 +114,7 @@ struct Args {
     )]
     allow_read: Vec<PathBuf>,
 
-    /// Add writable access. Bare --allow-write means read+write cwd.
+    /// Add writable access. Bare --allow-write means read+write on the launch directory.
     #[arg(
         long,
         value_name = "DIR",
@@ -104,7 +124,7 @@ struct Args {
     )]
     allow_write: Vec<PathBuf>,
 
-    /// Add read+write access. Bare --allow-rw means cwd.
+    /// Add read+write access. Bare --allow-rw means the launch directory.
     #[arg(
         long,
         value_name = "DIR",
@@ -114,7 +134,11 @@ struct Args {
     )]
     allow_rw: Vec<PathBuf>,
 
-    /// Deny reads. Bare --deny-read means cwd. Denies override allows.
+    /// Do not implicitly grant read access to the launch directory for this run.
+    #[arg(long)]
+    no_default_allow: bool,
+
+    /// Deny reads. Bare --deny-read means the launch directory. Denies override allows.
     #[arg(
         long,
         value_name = "DIR",
@@ -124,7 +148,7 @@ struct Args {
     )]
     deny_read: Vec<PathBuf>,
 
-    /// Deny writes. Bare --deny-write means cwd. Denies override allows.
+    /// Deny writes. Bare --deny-write means the launch directory. Denies override allows.
     #[arg(
         long,
         value_name = "DIR",
@@ -134,7 +158,7 @@ struct Args {
     )]
     deny_write: Vec<PathBuf>,
 
-    /// Deny both reads and writes. Bare --deny-rw means cwd.
+    /// Deny both reads and writes. Bare --deny-rw means the launch directory.
     #[arg(
         long,
         value_name = "DIR",
@@ -176,13 +200,13 @@ struct Args {
     #[arg(long)]
     print_id: bool,
 
-    /// Hide normal tool-attempt activity logging.
+    /// Suppress TOOL activity even when verbosity enables it.
     #[arg(short = 's', long)]
     silent: bool,
 
-    /// Enable developer request logging in addition to normal tool activity.
-    #[arg(short = 'v', long)]
-    verbose: bool,
+    /// Increase logging verbosity: -v shows TOOL activity; -vv also shows REQ diagnostics.
+    #[arg(short = 'v', long, action = ArgAction::Count)]
+    verbose: u8,
 
     /// Control ANSI colors in human-facing stderr output.
     #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
@@ -195,7 +219,7 @@ struct Args {
 
 #[derive(Debug, Clone)]
 struct Policy {
-    cwd: PathBuf,
+    base_dir: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     deny_read_roots: Vec<PathBuf>,
@@ -207,18 +231,8 @@ struct Policy {
 }
 
 impl Policy {
-    fn from_args(args: &Args, launch_cwd: PathBuf, defaults: &PermissionConfig) -> Result<Self> {
-        let configured_cwd = args
-            .cwd
-            .as_ref()
-            .or(defaults.cwd.as_ref())
-            .cloned()
-            .unwrap_or_else(|| launch_cwd.clone());
-        let cwd = if configured_cwd.is_absolute() {
-            configured_cwd
-        } else {
-            launch_cwd.join(configured_cwd)
-        };
+    fn from_args(args: &Args, launch_dir: PathBuf, defaults: &PermissionConfig) -> Result<Self> {
+        let base_dir = launch_dir;
 
         let has_filesystem_denies = !defaults.deny_read.is_empty()
             || !defaults.deny_write.is_empty()
@@ -235,30 +249,34 @@ impl Policy {
             bail!("--allow-all cannot be combined with --deny-shell or --deny-network");
         }
 
-        let mut read_roots = vec![cwd.clone()];
+        let mut read_roots = Vec::new();
         let mut write_roots = Vec::new();
 
+        if defaults.default_allow && !args.no_default_allow {
+            read_roots.push(base_dir.clone());
+        }
+
         for path in defaults.allow_read.iter().chain(defaults.allow_rw.iter()) {
-            read_roots.push(cwd_or_path(path, &cwd));
+            read_roots.push(base_or_path(path, &base_dir));
         }
         for path in defaults.allow_write.iter().chain(defaults.allow_rw.iter()) {
-            write_roots.push(cwd_or_path(path, &cwd));
+            write_roots.push(base_or_path(path, &base_dir));
         }
 
         for path in &args.allow_read {
-            read_roots.push(cwd_or_path(path, &cwd));
+            read_roots.push(base_or_path(path, &base_dir));
         }
         for path in &args.allow_write {
             if path == &PathBuf::from(".") {
-                // Historical ergonomic behavior: bare --allow-write means rw cwd.
-                read_roots.push(cwd.clone());
-                write_roots.push(cwd.clone());
+                // Bare --allow-write remains ergonomic shorthand for rw on the launch/base directory.
+                read_roots.push(base_dir.clone());
+                write_roots.push(base_dir.clone());
             } else {
-                write_roots.push(cwd_or_path(path, &cwd));
+                write_roots.push(base_or_path(path, &base_dir));
             }
         }
         for path in &args.allow_rw {
-            let path = cwd_or_path(path, &cwd);
+            let path = base_or_path(path, &base_dir);
             read_roots.push(path.clone());
             write_roots.push(path);
         }
@@ -272,20 +290,20 @@ impl Policy {
         let mut deny_write_roots = Vec::new();
 
         for path in defaults.deny_read.iter().chain(defaults.deny_rw.iter()) {
-            deny_read_roots.push(cwd_or_path(path, &cwd));
+            deny_read_roots.push(base_or_path(path, &base_dir));
         }
         for path in defaults.deny_write.iter().chain(defaults.deny_rw.iter()) {
-            deny_write_roots.push(cwd_or_path(path, &cwd));
+            deny_write_roots.push(base_or_path(path, &base_dir));
         }
 
         for path in &args.deny_read {
-            deny_read_roots.push(cwd_or_path(path, &cwd));
+            deny_read_roots.push(base_or_path(path, &base_dir));
         }
         for path in &args.deny_write {
-            deny_write_roots.push(cwd_or_path(path, &cwd));
+            deny_write_roots.push(base_or_path(path, &base_dir));
         }
         for path in args.deny_rw.iter().chain(args.deny.iter()) {
-            let path = cwd_or_path(path, &cwd);
+            let path = base_or_path(path, &base_dir);
             deny_read_roots.push(path.clone());
             deny_write_roots.push(path);
         }
@@ -318,8 +336,19 @@ impl Policy {
             true
         };
 
+        if allow_shell && read_roots.is_empty() {
+            bail!(
+                "shell access requires at least one readable directory; omit --no-default-allow or add --allow-read/--allow-rw"
+            );
+        }
+        if read_roots.is_empty() && write_roots.is_empty() && !allow_shell {
+            bail!(
+                "no local capability is enabled; allow a path (or omit --no-default-allow) or enable shell access"
+            );
+        }
+
         Ok(Self {
-            cwd,
+            base_dir,
             read_roots,
             write_roots,
             deny_read_roots,
@@ -336,11 +365,11 @@ impl Policy {
     }
 }
 
-fn cwd_or_path(path: &PathBuf, cwd: &std::path::Path) -> PathBuf {
+fn base_or_path(path: &PathBuf, base_dir: &Path) -> PathBuf {
     if path.is_absolute() {
         path.clone()
     } else {
-        cwd.join(path)
+        base_dir.join(path)
     }
 }
 
@@ -361,10 +390,10 @@ fn runtime_restart_delay(attempt: u32) -> std::time::Duration {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let launch_cwd = std::env::current_dir()?;
+    let launch_dir = std::env::current_dir()?;
 
-    let log = LogConfig::new(args.silent, args.verbose, args.color);
-    let default_filter = if args.verbose {
+    let log = LogConfig::new(args.verbose, args.silent, args.color);
+    let default_filter = if args.verbose >= 2 {
         "abird_link=debug"
     } else {
         "abird_link=warn"
@@ -379,7 +408,7 @@ async fn main() -> Result<()> {
 
     let mut runtime_restarts = 0_u32;
     loop {
-        match run_runtime(&args, &launch_cwd, &log).await {
+        match run_runtime(&args, &launch_dir, &log).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let Some(restart) = transports::runtime_restart_request(&error) else {
@@ -414,14 +443,14 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_runtime(args: &Args, launch_cwd: &Path, log: &LogConfig) -> Result<()> {
-    let setup = load_or_setup(args.setup, args.profile.as_deref()).await?;
+async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<()> {
+    let setup = load_or_setup(args.setup, args.profile.as_deref(), log.color_enabled()).await?;
 
     if args.setup {
         return Ok(());
     }
 
-    let policy = Policy::from_args(args, launch_cwd.to_path_buf(), &setup.config.permissions)?;
+    let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
 
     if args.list_tools {
         print_tools(&policy);
@@ -438,7 +467,9 @@ async fn run_runtime(args: &Args, launch_cwd: &Path, log: &LogConfig) -> Result<
         return Ok(());
     }
 
-    let http_bind = if args.http {
+    let local_transports = resolve_local_transports(args, &setup.config.transports)?;
+
+    let http_bind = if local_transports.http {
         Some(match args.http_bind {
             Some(bind) => bind,
             None => setup
@@ -470,24 +501,20 @@ async fn run_runtime(args: &Args, launch_cwd: &Path, log: &LogConfig) -> Result<
         None
     };
 
-    let (http_ephemeral_url, ngrok_ephemeral_url) = ephemeral_url_policy(args);
-
     let active_transports = ActiveTransports {
         openai,
-        stdio: args.stdio,
+        stdio: local_transports.stdio,
         http: http_bind.map(|bind| transports::http::Config {
             bind,
-            ngrok: args.ngrok,
-            http_ephemeral_url,
-            ngrok_ephemeral_url,
+            ngrok: local_transports.ngrok,
+            http_ephemeral_url: local_transports.http_ephemeral_url,
+            ngrok_ephemeral_url: local_transports.ngrok_ephemeral_url,
             log: log.clone(),
         }),
     };
 
     if active_transports.is_empty() {
-        bail!(
-            "no MCP transport is active; enable OpenAI in setup or start a local transport with --stdio and/or --http"
-        );
+        bail!("no MCP transport is active; enable one in setup or add --stdio/--http for this run");
     }
 
     let mut cache_mounts = Vec::new();
@@ -511,7 +538,7 @@ async fn run_runtime(args: &Args, launch_cwd: &Path, log: &LogConfig) -> Result<
 
     let machine = LocalMachine::new(MachineConfig {
         access: AccessSpec {
-            cwd: policy.cwd.clone(),
+            base_dir: policy.base_dir.clone(),
             read_roots: policy.read_roots.clone(),
             write_roots: policy.write_roots.clone(),
             deny_read_roots: policy.deny_read_roots.clone(),
@@ -554,11 +581,58 @@ async fn run_runtime(args: &Args, launch_cwd: &Path, log: &LogConfig) -> Result<
     Ok(())
 }
 
-fn ephemeral_url_policy(args: &Args) -> (bool, bool) {
-    (
-        args.http_ephemeral_url.unwrap_or(args.ephemeral_url),
-        args.ngrok_ephemeral_url.unwrap_or(args.ephemeral_url),
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EffectiveLocalTransports {
+    stdio: bool,
+    http: bool,
+    ngrok: bool,
+    http_ephemeral_url: bool,
+    ngrok_ephemeral_url: bool,
+}
+
+fn resolve_local_transports(
+    args: &Args,
+    defaults: &TransportConfig,
+) -> Result<EffectiveLocalTransports> {
+    let stdio = (defaults.stdio || args.stdio) && !args.no_stdio;
+    let http = (defaults.http || args.http) && !args.no_http;
+
+    let http_options_requested = args.http_bind.is_some()
+        || args.ngrok
+        || args.no_ngrok
+        || args.ephemeral_url
+        || args.http_ephemeral_url.is_some()
+        || args.ngrok_ephemeral_url.is_some();
+    if !http && http_options_requested {
+        bail!(
+            "HTTP options were requested, but HTTP is disabled; enable it in the profile or add --http"
+        );
+    }
+
+    let ngrok = http && (defaults.ngrok || args.ngrok) && !args.no_ngrok;
+    if args.ngrok_ephemeral_url.is_some() && !ngrok {
+        bail!("--ngrok-ephemeral-url requires ngrok to be enabled in the profile or with --ngrok");
+    }
+
+    let (http_ephemeral_url, ngrok_ephemeral_url) = ephemeral_url_policy(args, defaults);
+
+    Ok(EffectiveLocalTransports {
+        stdio,
+        http,
+        ngrok,
+        http_ephemeral_url,
+        ngrok_ephemeral_url,
+    })
+}
+
+fn ephemeral_url_policy(args: &Args, defaults: &TransportConfig) -> (bool, bool) {
+    let http = args
+        .http_ephemeral_url
+        .unwrap_or(args.ephemeral_url || defaults.http_ephemeral_url);
+    let ngrok = args
+        .ngrok_ephemeral_url
+        .unwrap_or(args.ephemeral_url || defaults.ngrok_ephemeral_url);
+    (http, ngrok)
 }
 
 fn print_banner(
@@ -599,7 +673,6 @@ fn print_banner(
             }
         }
     }
-    eprintln!("• Cwd        {}", machine.cwd().display());
     let access_summary = if allow_all {
         format!("{} (allow-all requested)", machine.access_summary())
     } else {
@@ -625,12 +698,13 @@ fn print_banner(
         );
     }
     if log.developer_enabled() {
-        eprintln!("• Logging    verbose");
+        eprintln!("• Logging    TOOL + REQ");
+    } else if log.activity_enabled() {
+        eprintln!("• Logging    TOOL");
     }
-    eprintln!("• Status     {}", log.style("33", "starting…"));
     eprintln!();
     if transports.openai.is_some() {
-        eprintln!("OpenAI Secure MCP Tunnel active.");
+        eprintln!("OpenAI Secure MCP Tunnel connecting…");
     }
     if transports.stdio {
         eprintln!("stdio MCP server active; stdout is reserved for MCP.");
@@ -690,71 +764,51 @@ mod tests {
     }
 
     #[test]
-    fn default_is_read_only_cwd() {
+    fn default_is_read_only_launch_directory() {
         let (_, policy) = parse(&["abird-link"], no_defaults());
+        assert_eq!(policy.base_dir, PathBuf::from("/workspace"));
         assert_eq!(policy.read_roots, [PathBuf::from("/workspace")]);
         assert!(policy.write_roots.is_empty());
         assert!(!policy.allow_shell);
     }
 
     #[test]
-    fn config_defaults_can_persist_cwd_paths_shell_and_network() {
-        let defaults = PermissionConfig {
-            cwd: Some(PathBuf::from("/project")),
-            allow_read: vec![PathBuf::from("/reference")],
-            allow_write: vec![PathBuf::from("generated")],
-            allow_rw: vec![PathBuf::from(".")],
-            deny_read: vec![PathBuf::from("private")],
-            deny_write: vec![PathBuf::from("locked")],
-            deny_rw: vec![PathBuf::from("secret")],
-            allow_shell: true,
-            allow_network: true,
-        };
-        let (_, policy) = parse(&["abird-link"], defaults);
-
-        assert_eq!(policy.cwd, PathBuf::from("/project"));
-        assert!(policy.read_roots.contains(&PathBuf::from("/project")));
-        assert!(policy.read_roots.contains(&PathBuf::from("/reference")));
-        assert!(policy.write_roots.contains(&PathBuf::from("/project")));
-        assert!(
-            policy
-                .write_roots
-                .contains(&PathBuf::from("/project/generated"))
-        );
-        assert!(
-            policy
-                .deny_read_roots
-                .contains(&PathBuf::from("/project/private"))
-        );
-        assert!(
-            policy
-                .deny_write_roots
-                .contains(&PathBuf::from("/project/locked"))
-        );
-        assert!(
-            policy
-                .deny_read_roots
-                .contains(&PathBuf::from("/project/secret"))
-        );
-        assert!(
-            policy
-                .deny_write_roots
-                .contains(&PathBuf::from("/project/secret"))
-        );
-        assert!(policy.allow_shell);
-        if cfg!(target_os = "linux") {
-            assert!(policy.allow_network);
-        }
+    fn no_default_allow_removes_implicit_launch_read() {
+        let args = Args::try_parse_from(["abird-link", "--no-default-allow", "--allow-read=/ref"])
+            .unwrap();
+        let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap();
+        assert_eq!(policy.base_dir, PathBuf::from("/workspace"));
+        assert_eq!(policy.read_roots, [PathBuf::from("/ref")]);
     }
 
     #[test]
-    fn cli_cwd_overrides_profile_cwd() {
-        let defaults = PermissionConfig {
-            cwd: Some(PathBuf::from("/profile")),
-            ..PermissionConfig::default()
-        };
-        let (_, policy) = parse(&["abird-link", "--cwd=/cli"], defaults);
-        assert_eq!(policy.cwd, PathBuf::from("/cli"));
+    fn no_filesystem_or_shell_capability_is_rejected() {
+        let args = Args::try_parse_from(["abird-link", "--no-default-allow"]).unwrap();
+        assert!(Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).is_err());
+    }
+
+    #[test]
+    fn shell_requires_a_readable_directory() {
+        let args =
+            Args::try_parse_from(["abird-link", "--no-default-allow", "--allow-shell"]).unwrap();
+        let error =
+            Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shell access requires at least one readable directory")
+        );
+
+        let args = Args::try_parse_from([
+            "abird-link",
+            "--no-default-allow",
+            "--allow-read=/project",
+            "--allow-shell",
+        ])
+        .unwrap();
+        let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap();
+        assert!(policy.allow_shell);
+        assert_eq!(policy.read_roots, [PathBuf::from("/project")]);
     }
 
     #[cfg(target_os = "linux")]
@@ -778,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_allow_write_and_allow_rw_mean_rw_cwd() {
+    fn bare_allow_write_and_allow_rw_mean_rw_launch_directory() {
         for flag in ["--allow-write", "--allow-rw"] {
             let (_, policy) = parse(&["abird-link", flag], no_defaults());
             assert!(policy.read_roots.contains(&PathBuf::from("/workspace")));
@@ -877,10 +931,44 @@ mod tests {
     }
 
     #[test]
-    fn explicit_local_transport_flags_parse_as_runtime_overrides() {
+    fn profile_local_transports_start_without_cli_flags() {
+        let args = Args::try_parse_from(["abird-link"]).unwrap();
+        let defaults = TransportConfig {
+            openai: false,
+            stdio: true,
+            http: true,
+            ..TransportConfig::default()
+        };
+        let effective = resolve_local_transports(&args, &defaults).unwrap();
+        assert!(effective.stdio);
+        assert!(effective.http);
+    }
+
+    #[test]
+    fn cli_can_add_or_remove_profile_local_transports() {
+        let defaults = TransportConfig {
+            openai: false,
+            stdio: true,
+            http: true,
+            ..TransportConfig::default()
+        };
+
+        let args = Args::try_parse_from(["abird-link", "--no-stdio", "--no-http"]).unwrap();
+        let effective = resolve_local_transports(&args, &defaults).unwrap();
+        assert!(!effective.stdio);
+        assert!(!effective.http);
+
         let args = Args::try_parse_from(["abird-link", "--stdio", "--http"]).unwrap();
-        assert!(args.stdio);
-        assert!(args.http);
+        let effective = resolve_local_transports(
+            &args,
+            &TransportConfig {
+                openai: false,
+                ..TransportConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(effective.stdio);
+        assert!(effective.http);
     }
 
     #[test]
@@ -898,17 +986,20 @@ mod tests {
     fn logging_flags_have_distinct_cli_meanings() {
         let silent = Args::try_parse_from(["abird-link", "-s"]).unwrap();
         assert!(silent.silent);
-        assert!(!silent.verbose);
+        assert_eq!(silent.verbose, 0);
         assert!(!silent.setup);
 
         let verbose = Args::try_parse_from(["abird-link", "-v"]).unwrap();
-        assert!(verbose.verbose);
+        assert_eq!(verbose.verbose, 1);
         assert!(!verbose.silent);
 
+        let developer = Args::try_parse_from(["abird-link", "-vv"]).unwrap();
+        assert_eq!(developer.verbose, 2);
+
         let both =
-            Args::try_parse_from(["abird-link", "--silent", "--verbose", "--color=never"]).unwrap();
+            Args::try_parse_from(["abird-link", "--silent", "-vv", "--color=never"]).unwrap();
         assert!(both.silent);
-        assert!(both.verbose);
+        assert_eq!(both.verbose, 2);
         assert_eq!(both.color, ColorMode::Never);
     }
 
@@ -920,72 +1011,94 @@ mod tests {
     }
 
     #[test]
-    fn ngrok_requires_http() {
-        assert!(Args::try_parse_from(["abird-link", "--ngrok"]).is_err());
-        let args = Args::try_parse_from(["abird-link", "--http", "--ngrok"]).unwrap();
-        assert!(args.http);
-        assert!(args.ngrok);
-    }
-
-    #[test]
-    fn ephemeral_url_requires_http() {
-        assert!(Args::try_parse_from(["abird-link", "--ephemeral-url"]).is_err());
-        let args = Args::try_parse_from(["abird-link", "--http", "--ephemeral-url"]).unwrap();
-        assert!(args.http);
-        assert!(args.ephemeral_url);
-    }
-
-    #[test]
-    fn transport_ephemeral_overrides_parse_independently() {
+    fn profile_http_accepts_http_overrides_without_repeating_http_flag() {
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            ..TransportConfig::default()
+        };
         let args = Args::try_parse_from([
             "abird-link",
-            "--http",
-            "--ngrok",
-            "--ephemeral-url",
-            "--http-ephemeral-url=false",
+            "--http-ephemeral-url",
             "--ngrok-ephemeral-url",
         ])
         .unwrap();
-        assert_eq!(ephemeral_url_policy(&args), (false, true));
+        let effective = resolve_local_transports(&args, &defaults).unwrap();
+        assert!(effective.http);
+        assert!(effective.ngrok);
+        assert!(effective.http_ephemeral_url);
+        assert!(effective.ngrok_ephemeral_url);
     }
 
     #[test]
-    fn global_ephemeral_url_can_be_overridden_per_transport() {
+    fn http_specific_flags_require_effective_http() {
+        let defaults = TransportConfig {
+            openai: false,
+            ..TransportConfig::default()
+        };
+        for argv in [
+            vec!["abird-link", "--ngrok"],
+            vec!["abird-link", "--ephemeral-url"],
+            vec!["abird-link", "--http-bind=127.0.0.1:4000"],
+        ] {
+            let args = Args::try_parse_from(argv).unwrap();
+            assert!(resolve_local_transports(&args, &defaults).is_err());
+        }
+    }
+
+    #[test]
+    fn transport_ephemeral_overrides_profile_and_global_defaults() {
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            http_ephemeral_url: true,
+            ngrok_ephemeral_url: false,
+            ..TransportConfig::default()
+        };
+
         let args = Args::try_parse_from([
             "abird-link",
-            "--http",
-            "--ngrok",
             "--ephemeral-url",
             "--http-ephemeral-url=false",
         ])
         .unwrap();
-        assert_eq!(ephemeral_url_policy(&args), (false, true));
+        let effective = resolve_local_transports(&args, &defaults).unwrap();
+        assert!(!effective.http_ephemeral_url);
+        assert!(effective.ngrok_ephemeral_url);
 
-        let args = Args::try_parse_from([
-            "abird-link",
-            "--http",
-            "--ngrok",
-            "--ephemeral-url",
-            "--ngrok-ephemeral-url=false",
-        ])
-        .unwrap();
-        assert_eq!(ephemeral_url_policy(&args), (true, false));
+        let args = Args::try_parse_from(["abird-link", "--ngrok-ephemeral-url=false"]).unwrap();
+        let effective = resolve_local_transports(&args, &defaults).unwrap();
+        assert!(effective.http_ephemeral_url);
+        assert!(!effective.ngrok_ephemeral_url);
     }
 
     #[test]
-    fn individual_ephemeral_flags_are_independent() {
-        let args = Args::try_parse_from(["abird-link", "--http", "--http-ephemeral-url"]).unwrap();
-        assert_eq!(ephemeral_url_policy(&args), (true, false));
-
-        let args =
-            Args::try_parse_from(["abird-link", "--http", "--ngrok", "--ngrok-ephemeral-url"])
-                .unwrap();
-        assert_eq!(ephemeral_url_policy(&args), (false, true));
+    fn no_ngrok_disables_profile_ngrok_without_disabling_http() {
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            ngrok_ephemeral_url: true,
+            ..TransportConfig::default()
+        };
+        let args = Args::try_parse_from(["abird-link", "--no-ngrok"]).unwrap();
+        let effective = resolve_local_transports(&args, &defaults).unwrap();
+        assert!(effective.http);
+        assert!(!effective.ngrok);
     }
 
     #[test]
-    fn ngrok_ephemeral_override_requires_ngrok() {
-        assert!(Args::try_parse_from(["abird-link", "--http", "--ngrok-ephemeral-url"]).is_err());
+    fn ngrok_ephemeral_override_requires_effective_ngrok() {
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: false,
+            ..TransportConfig::default()
+        };
+        let args = Args::try_parse_from(["abird-link", "--ngrok-ephemeral-url"]).unwrap();
+        assert!(resolve_local_transports(&args, &defaults).is_err());
     }
 
     #[test]

@@ -21,13 +21,15 @@ Allows:
 --allow-rw[=<DIR>]
 ```
 
-Bare forms target cwd.
+Bare forms target the directory where abird-link was launched.
 
-Historical ergonomic behavior:
+Ergonomic behavior:
 
 ```text
-bare --allow-write == read+write cwd
+bare --allow-write == read+write launch directory
 ```
+
+The launch directory is also the internal relative-path base. It is read-allowed by default unless the profile sets `default_allow=false` or the run uses `--no-default-allow`.
 
 Explicit write-only remains:
 
@@ -135,24 +137,27 @@ If `ABIRD_LINK_CONFIG` explicitly points to `.json`, preserve valid plain JSON b
 Current source schema version:
 
 ```text
-8
+9
 ```
 
 Conceptual current config:
 
 ```jsonc
 {
-  "version": 8,
+  "version": 9,
 
   "transports": {
     "openai": true,
     "stdio": false,
     "http": false,
     "http_bind": "127.0.0.1:3000",
+    "http_ephemeral_url": false,
+    "ngrok": false,
+    "ngrok_ephemeral_url": false,
   },
 
   "permissions": {
-    "cwd": "/optional/project",
+    "default_allow": true,
 
     "allow_read": [],
     "allow_write": [],
@@ -187,48 +192,48 @@ Conceptual current config:
 
 Runtime API key is never serialized into config.
 
-## Permission compatibility
+## Schema policy
 
-Older profile representation:
-
-```json
-"allow_rw": true
-```
-
-is accepted and maps logically to:
-
-```json
-"allow_rw": ["."]
-```
+Schema v9 is the only supported profile schema. Older configs must be recreated with `abird-link --setup`.
 
 ## Onboarding flow
 
 ### Step 1 — transports
 
-Prompt supports:
+The compact numbered selector accepts numbers or names:
 
 ```text
-openai
-stdio
-http
+1  openai
+2  stdio
+3  http
 all
 none
+```
+
+OpenAI is presented as the recommended ChatGPT path; stdio is described for local MCP clients; HTTP is described for Claude.ai and other web MCP clients.
+
+When HTTP is selected, setup conditionally asks:
+
+```text
+Use an ephemeral local MCP URL?
+Publish a public ngrok HTTPS endpoint?
+Use an ephemeral ngrok MCP URL?     only when ngrok=yes
 ```
 
 If OpenAI is not selected, skip all OpenAI credential/tunnel questions.
 
 ### Step 2 — local defaults
 
-Current intended questions:
+Current questions:
 
 ```text
-Pin this profile to current project?
-Allow read+write cwd by default?
-Allow shell by default?
-Allow shell network access by default?    only when shell=yes
+Allow read access to: <launch directory>?
+Allow write access too?             only when read=yes
+Allow shell access?
+Allow shell network access?         only when shell=yes
 ```
 
-Network defaults to no.
+Read defaults to yes; write, shell, and network default to no.
 
 ### Step 3 — developer caches
 
@@ -309,11 +314,15 @@ ABIRD_LINK_BASE_URL
 
 ## Transport runtime overrides
 
-Explicit:
+Configured profile transports start automatically. Local runtime overrides are symmetric:
 
 ```text
---stdio
---http
+--stdio      add stdio for this run
+--no-stdio   suppress profile stdio
+--http       add HTTP for this run
+--no-http    suppress profile HTTP and ngrok
+--ngrok      add ngrok to effective HTTP
+--no-ngrok   suppress profile ngrok
 ```
 
-must activate those transports for that run even if persisted transport booleans are false.
+HTTP bind and ephemeral-path flags override persisted HTTP/ngrok behavior without requiring `--http` again when HTTP is already active from the profile.

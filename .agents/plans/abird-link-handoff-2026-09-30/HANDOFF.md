@@ -58,8 +58,8 @@ Do not reintroduce the old name in product/API/config paths.
 Default posture:
 
 ```text
-cwd read access          ON
-cwd write access         OFF
+launch-directory read    ON
+launch-directory write   OFF
 extra paths              OFF
 shell                    OFF
 shell network            OFF
@@ -216,13 +216,15 @@ Write-only directories are valid destinations.
 --allow-rw[=<DIR>]
 ```
 
-Bare forms use cwd.
+Bare forms use the directory where abird-link was launched.
 
-Special historical rule:
+Ergonomic rule:
 
 ```text
-bare --allow-write == rw cwd
+bare --allow-write == rw launch directory
 ```
+
+The launch directory is the internal relative-path base and is readable by default. `--no-default-allow` removes that implicit read for one run.
 
 Explicit `--allow-write=/path` remains write-only.
 
@@ -364,9 +366,9 @@ Legacy `.json` is readable.
 
 Runtime key is never serialized into config.
 
-Current profile can persist:
+Current schema-v9 profile can persist:
 
-- cwd;
+- default_allow;
 - allow_read;
 - allow_write;
 - allow_rw;
@@ -376,35 +378,41 @@ Current profile can persist:
 - allow_shell;
 - allow_network;
 - typed caches;
-- transport defaults.
+- OpenAI/stdio/HTTP transport defaults;
+- HTTP bind + local ephemeral-path behavior;
+- ngrok + ngrok ephemeral-path behavior.
 
-Compatibility: older boolean `allow_rw: true` maps to `allow_rw: ["."]`.
+Schema v9 is strict; older profile schemas must be recreated with setup.
 
 ## 9. Onboarding
 
 ### Transport step
 
-Choices:
+Compact numbered choices:
 
 ```text
-openai
-stdio
-http
+1  OpenAI Tunnel   Recommended for ChatGPT
+2  stdio           Local MCP clients
+3  HTTP            Claude.ai / web MCP clients
 all
 none
 ```
+
+When HTTP is selected, setup asks about local ephemeral paths, optional public ngrok, and (when ngrok is enabled) an ephemeral ngrok MCP path.
+
+Every configured transport starts automatically. Runtime `--stdio` / `--http` add local transports, while `--no-stdio` / `--no-http` suppress profile defaults and `--no-ngrok` suppresses profile ngrok.
 
 If OpenAI is not chosen, skip OpenAI configuration entirely.
 
 ### Local permission step
 
-Current intended questions:
+Current questions:
 
 ```text
-Pin this profile to current project?
-Allow rw cwd by default?
-Allow shell by default?
-Allow shell network by default?   only if shell=yes
+Allow read access to: <launch directory>?  default yes
+Allow write access too?                    only when read=yes
+Allow shell access?
+Allow shell network access?                only if shell=yes
 ```
 
 ### Developer cache autodiscovery
@@ -577,12 +585,7 @@ review tools
 select Abird Link in chat
 ```
 
-Optional private plugin creator material:
-
-```text
-docs/CHATGPT_PLUGIN.md
-prompts/PLUGIN_CREATOR.md
-```
+Detailed ChatGPT connection flow: `docs/CHATGPT_PLUGIN.md`.
 
 ## 14. Claude.ai user flow
 
@@ -598,7 +601,7 @@ Register printed URL as custom connector.
 
 ## 15. Logging
 
-Normal activity is default:
+Activity logging is quiet by default; use `-v` for TOOL and `-vv` for TOOL + REQ:
 
 ```text
 [01:06:47.410] TOOL read → path=README.md limit=1
@@ -607,9 +610,9 @@ Normal activity is default:
 
 `-s/--silent` suppresses TOOL activity.
 
-`-v/--verbose` adds developer REQ logs.
+`-v` enables TOOL logs; `-vv` adds developer REQ logs.
 
-`--silent --verbose` means REQ-only.
+`--silent -vv` means REQ-only.
 
 `--color=auto|always|never` controls ANSI; auto checks interactive stderr.
 
@@ -688,7 +691,7 @@ git diff --check
 Latest observed full test pass:
 
 ```text
-77 tests
+80 tests
 ```
 
 The 2026-09-30 continuation pass also revalidated the current source with the intended Rust 1.98.1 toolchain:
@@ -700,7 +703,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-All 77 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `ABIRD_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
+All 80 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `ABIRD_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
 
 Live smokes have validated:
 
@@ -741,8 +744,8 @@ The implementation/release phase is complete. Remaining work is operational rath
 
 1. restart the live connector so ChatGPT is definitely using the final committed binary;
 2. refresh the ChatGPT developer connection/tool schema and smoke the final tool surface/logging;
-3. configure the intended Git remote/release destination;
-4. publish/push only when explicitly desired;
+3. push the finalized validated commit to the configured `origin` when desired;
+4. publish release assets/tags when desired;
 5. optionally add CI, including a native Windows runner for future regression coverage.
 
 ## 19. What not to do
@@ -754,7 +757,7 @@ The implementation/release phase is complete. Remaining work is operational rath
 - do not call ephemeral URL authentication;
 - do not restore `fs_*` naming;
 - do not overload text read/write with binary modes;
-- do not make `-v` normal activity logging again;
+- do not enable TOOL activity by default; keep it opt-in with `-v`;
 - do not reuse `-s` for setup;
 - do not silently enable network because a package manager wants a dependency;
 - do not weaken path canonicalization/deny precedence just to get a build passing;

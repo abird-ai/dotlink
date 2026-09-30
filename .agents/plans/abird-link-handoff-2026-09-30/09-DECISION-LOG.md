@@ -50,9 +50,11 @@ hex
 
 ## Default authority
 
-**Decision:** cwd read-only by default.
+**Decision:** the directory where abird-link is launched is the internal relative-path base and is read-only by default. `--no-default-allow` removes the implicit read grant.
 
-Rationale: least privilege.
+Schema v9 is a clean break; older profile schemas are not accepted.
+
+Rationale: keep the safe ergonomic default while collapsing filesystem authority into one allow/deny vocabulary.
 
 ## Dynamic tool routing
 
@@ -132,9 +134,11 @@ Rationale: hand-editable structured config.
 
 ## Runtime transport flags
 
-**Decision:** explicit `--stdio` and `--http` activate for the current run even if persisted transport defaults are false.
+**Decision:** every transport enabled in the selected profile starts automatically. Explicit `--stdio` / `--http` add local transports for one run; `--no-stdio` / `--no-http` suppress profile local transports; `--no-ngrok` suppresses profile ngrok while preserving HTTP.
 
-Rationale: explicit runtime CLI request is authoritative.
+HTTP bind/ephemeral/ngrok settings are persisted profile defaults and may be overridden for one run.
+
+Rationale: profiles should be complete runnable configurations, while CLI remains a clean one-run override layer.
 
 ## OpenAI onboarding
 
@@ -170,11 +174,11 @@ Rationale: loud deliberate acknowledgement; avoid proliferating intermediate `*-
 
 ## Logging
 
-**Decision:** normal TOOL activity is default user-facing behavior.
+**Decision:** activity logging is quiet by default; `-v` enables TOOL activity and `-vv` adds REQ diagnostics.
 
 `-s/--silent` hides TOOL activity.
 
-`-v/--verbose` is developer REQ logging.
+`-v` enables TOOL logging; `-vv` adds developer REQ logging.
 
 `-S/--setup` is setup.
 
