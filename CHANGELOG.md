@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add automatic OpenAI tunnel recovery: after 10 consecutive transient poll failures, tear down the active runtime and reconstruct profile, policy, MCP state, and transports automatically.
+- Bound peer-transport shutdown to 5 seconds before force-aborting remaining tasks so recovery cannot hang indefinitely.
+- Add bounded runtime restart backoff (1s up to 30s) and reset it after a successfully connected runtime later becomes unhealthy.
+- Keep normal poll retry warnings concise while retaining full transport error details under verbose DEBUG logging.
+- Set `https://github.com/abird-ai/abird-link` as the canonical upstream in package metadata, Nix metadata, installers, and documentation; installers still support repository/base-URL overrides.
+- Harden installers with explicit HOME handling, checksum-format validation/manual hash comparison, and atomic Unix binary replacement.
+- Make the release helper enable `nix-command` and `flakes` explicitly instead of depending on global Nix configuration.
+
 - Refocus the README's front-page story on giving normal ChatGPT web workflows permission-scoped access to local files and tools through OpenAI Secure MCP Tunnel, with MCP server + policy engine + Linux Bubblewrap sandbox in one binary.
 - Add a representative startup/tool-activity transcript and document that normal TOOL attempts/completions are logged locally by default without intentionally logging file contents or raw payload bodies.
 

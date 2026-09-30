@@ -1,6 +1,6 @@
 # abird-link
 
-**Connect ChatGPT on the web to the files and tools on your computer — securely, from one local binary.**
+**Connect ChatGPT, Claude.ai on the web to the files and tools on your computer — securely, from a single binary.**
 
 abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memory when enabled, and supported Codex/Work workflows — permission-scoped access to your local computer** through MCP. It brings many of the local development abilities you might normally use Codex for — reading and editing code, running Git, builds, tests, scripts, compilers, package managers, and other local tools — into your regular ChatGPT experience, where they can work alongside the broader conversation context and memories ChatGPT has available to you.
 
@@ -966,6 +966,14 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 
 When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
 
+### Automatic tunnel recovery
+
+Transient OpenAI poll failures retry with backoff. Normal logging keeps attempts concise; the full transport error is available with `-v/--verbose`.
+
+After **10 consecutive transient poll failures**, abird-link stops retrying the same runtime state. It cancels all active transports, gives them up to 5 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
+
+If a freshly restarted runtime keeps failing, restarts back off from 1 second up to a 30-second cap. Once a runtime has connected successfully, that restart backoff resets. Fatal control-plane errors such as an invalid Tunnel ID or invalid Runtime API key still fail immediately rather than entering a restart loop.
+
 Useful locations:
 
 - Runtime API keys: https://platform.openai.com/settings/organization/api-keys
@@ -1134,17 +1142,19 @@ These outputs are deliberately separate so CI can build/cache the dependency der
 
 The repository includes install.sh for curl/sh installs and install.ps1 for native PowerShell installs.
 
-This checkout does not currently have a Git remote configured, so the installer does not guess a GitHub owner. Once a release repository exists, provide it explicitly:
+The upstream repository is **https://github.com/abird-ai/abird-link**. Install the latest Linux x86_64 release with:
 
 ~~~bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/abird-link/main/install.sh   | ABIRD_LINK_REPO=OWNER/abird-link sh
+curl -fsSL https://raw.githubusercontent.com/abird-ai/abird-link/main/install.sh | sh
 ~~~
 
 By default it installs the latest GitHub release into ~/.local/bin. Pin a release with:
 
 ~~~bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/abird-link/main/install.sh   | ABIRD_LINK_REPO=OWNER/abird-link ABIRD_LINK_VERSION=0.5.0 sh
+curl -fsSL https://raw.githubusercontent.com/abird-ai/abird-link/main/install.sh | ABIRD_LINK_VERSION=0.5.0 sh
 ~~~
+
+`ABIRD_LINK_REPO` remains available as an override for forks or mirrors.
 
 A non-GitHub release/CDN can be used instead:
 
@@ -1155,8 +1165,7 @@ curl -fsSL https://example.com/install.sh   | ABIRD_LINK_RELEASE_BASE_URL=https:
 Windows PowerShell uses the same release assets and checksum verification:
 
 ~~~powershell
-$env:ABIRD_LINK_REPO = "OWNER/abird-link"
-irm https://raw.githubusercontent.com/OWNER/abird-link/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/abird-ai/abird-link/main/install.ps1 | iex
 ~~~
 
 The installers verify the matching SHA-256 sidecar before replacing the executable.

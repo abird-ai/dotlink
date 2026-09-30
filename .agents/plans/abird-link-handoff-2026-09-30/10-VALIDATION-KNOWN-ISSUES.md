@@ -16,7 +16,7 @@ git diff --check
 Final observed suite:
 
 ```text
-70 tests passed
+77 tests passed
 Clippy clean
 fmt clean
 diff check clean
@@ -76,6 +76,10 @@ Verified:
 Verified historically and during the implementation phase:
 
 - OpenAI transport integration path;
+- unreachable local OpenAI test endpoint reaches 10 consecutive transient poll failures and emits the typed full-runtime restart signal;
+- restart marker survives multi-transport anyhow context wrapping;
+- peer transport teardown is cancellation-first with a 5-second force-abort bound;
+- repeated runtime restart backoff is capped at 30 seconds and resets after a successfully connected runtime;
 - stdio initialize;
 - HTTP initialize;
 - clean stdio EOF does not kill active peer transports;
@@ -104,6 +108,18 @@ Tests cover:
 - shell/network defaults;
 - legacy boolean `allow_rw` migration;
 - deny-shell/deny-network precedence.
+
+## Dependency advisory review
+
+`cargo-audit 0.22.2` scanned the locked dependency graph against the current RustSec advisory database:
+
+- no known vulnerabilities were found;
+- two transitive maintenance warnings remain:
+  - `generational-arena 0.2.9` via `ngrok 0.19.0 -> awaitdrop`;
+  - `rustls-pemfile 2.2.0` via `ngrok 0.19.0`.
+- `ngrok 0.19.0` is the current published ngrok SDK, so there is no supported newer ngrok release to upgrade to for those warnings at this time.
+
+These are unmaintained-crate warnings, not RustSec vulnerability findings.
 
 ## Nix/Crane validation — complete
 
@@ -160,18 +176,25 @@ Both checksums verify.
 `install.sh`:
 
 - executable mode verified;
-- `bash -n` passes;
+- `sh -n` and ShellCheck pass;
+- canonical default URLs resolve to `abird-ai/abird-link`;
+- repository/base-URL overrides remain functional;
+- missing `HOME` fails safely unless an install directory is explicit;
+- malformed checksum sidecars are rejected before installation;
 - ran against the real Linux release fixture;
-- SHA-256 verification passed;
-- installed binary is byte-identical;
-- installed binary runs.
+- SHA-256 verification passed using explicit hash comparison;
+- install replacement is staged in the destination directory and renamed atomically;
+- installed binary is byte-identical and runs.
 
 `install.ps1`:
 
-- parsed with PowerShell 7.6.6;
+- parsed/executed with PowerShell 7.6.6;
+- canonical default URLs resolve to `abird-ai/abird-link`;
 - tested with `Invoke-WebRequest` mocked to the real Windows release fixture;
-- checksum verification passed;
+- checksum format and value verification passed;
 - output `abird-link.exe` hash matches the release fixture.
+
+`scripts/build-release-artifacts.sh` also passes ShellCheck and now enables `nix-command` + `flakes` explicitly, so it does not depend on those experimental features being globally configured.
 
 A native Windows host test is still useful future CI coverage, but there is no known packaging failure after PE inspection + Wine execution + PowerShell installer logic validation.
 
@@ -192,9 +215,9 @@ Documentation/handoff follows those commits.
 
 The ChatGPT connector process can outlive a binary rebuild. After changing tool/schema/sandbox metadata, restart `abird-link` and refresh the ChatGPT developer connection before using live tool behavior as final evidence.
 
-### No repository remote
+### Repository upstream
 
-No Git remote is configured. Nothing is pushed automatically, and release installers intentionally do not invent a repository owner.
+Canonical upstream / `origin` is `https://github.com/abird-ai/abird-link`. Release installers default to `abird-ai/abird-link` while retaining explicit repository/base-URL overrides.
 
 ### Public HTTP authentication
 

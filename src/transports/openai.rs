@@ -24,6 +24,7 @@ use crate::{logging::LogConfig, mcp::LocalMachine};
 const POLL_LIMIT: u8 = 25;
 const POLL_TIMEOUT_MS: u64 = 15_000;
 const MAX_IN_FLIGHT: usize = 8;
+const POLL_FAILURES_BEFORE_RUNTIME_RESTART: u32 = 10;
 const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
 const SERVER_INFO: &str =
     r#"{"version":2,"channels":[{"name":"main","stateless":true,"proc_affinity":true}]}"#;
@@ -72,7 +73,18 @@ pub async fn run(
         config.log,
         cancellation,
     )?;
-    tunnel.run(embedded).await
+
+    match tunnel.run(embedded).await? {
+        TunnelRunOutcome::Cancelled => Ok(()),
+        TunnelRunOutcome::RestartRuntime { error, had_success } => {
+            Err(anyhow::Error::new(super::RuntimeRestartRequested::new(
+                format!(
+                    "OpenAI tunnel hit {POLL_FAILURES_BEFORE_RUNTIME_RESTART} consecutive transient poll failures: {error:#}"
+                ),
+                had_success,
+            )))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -315,6 +327,14 @@ enum PollFailure {
     Fatal(anyhow::Error),
 }
 
+enum TunnelRunOutcome {
+    Cancelled,
+    RestartRuntime {
+        error: anyhow::Error,
+        had_success: bool,
+    },
+}
+
 impl TunnelClient {
     pub fn new(
         base_url: String,
@@ -347,11 +367,12 @@ impl TunnelClient {
         })
     }
 
-    pub async fn run(self, mcp: EmbeddedMcp) -> Result<()> {
+    async fn run(self, mcp: EmbeddedMcp) -> Result<TunnelRunOutcome> {
         let mut tasks = JoinSet::new();
         let mut failures = 0_u32;
         let mut not_ready_failures = 0_u32;
         let mut announced = false;
+        let mut reconnect_reason = None;
 
         loop {
             while let Some(result) = tasks.try_join_next() {
@@ -377,7 +398,19 @@ impl TunnelClient {
                         }
                         Err(PollFailure::Transient(error)) => {
                             failures = failures.saturating_add(1);
-                            warn!(%error, attempt = failures, "tunnel poll failed; retrying");
+
+                            if should_restart_runtime_after_poll_failures(failures) {
+                                warn!(
+                                    attempt = failures,
+                                    "tunnel poll failure threshold reached; restarting abird-link runtime"
+                                );
+                                debug!(%error, "OpenAI tunnel poll failure triggering runtime restart");
+                                reconnect_reason = Some(error);
+                                break;
+                            }
+
+                            warn!(attempt = failures, "tunnel poll failed; retrying");
+                            debug!(%error, attempt = failures, "OpenAI tunnel poll failure detail");
                             self.sleep_backoff(failures).await;
                             continue;
                         }
@@ -423,7 +456,15 @@ impl TunnelClient {
 
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        Ok(())
+
+        if let Some(error) = reconnect_reason {
+            Ok(TunnelRunOutcome::RestartRuntime {
+                error,
+                had_success: announced,
+            })
+        } else {
+            Ok(TunnelRunOutcome::Cancelled)
+        }
     }
 
     async fn poll_once(&self) -> std::result::Result<PolledBatch, PollFailure> {
@@ -734,7 +775,13 @@ impl TunnelClient {
     }
 
     async fn sleep_backoff(&self, attempt: u32) {
+        #[cfg(test)]
+        let _ = attempt;
+        #[cfg(test)]
+        let delay = Duration::from_millis(1);
+        #[cfg(not(test))]
         let delay = retry_delay(attempt);
+
         tokio::select! {
             _ = self.cancellation.cancelled() => {}
             _ = time::sleep(delay) => {}
@@ -916,6 +963,10 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + fastrand::u64(0..=250))
 }
 
+fn should_restart_runtime_after_poll_failures(failures: u32) -> bool {
+    failures >= POLL_FAILURES_BEFORE_RUNTIME_RESTART
+}
+
 async fn response_error_text(response: reqwest::Response) -> String {
     let text = response.text().await.unwrap_or_default();
     bounded(&text, MAX_CONTROL_PLANE_ERROR_BYTES)
@@ -935,6 +986,73 @@ fn bounded(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_failure_threshold_restarts_runtime_on_tenth_failure() {
+        assert!(!should_restart_runtime_after_poll_failures(0));
+        assert!(!should_restart_runtime_after_poll_failures(9));
+        assert!(should_restart_runtime_after_poll_failures(10));
+        assert!(should_restart_runtime_after_poll_failures(11));
+    }
+
+    #[tokio::test]
+    async fn repeated_transient_poll_failures_request_runtime_restart() {
+        use crate::mcp::{AccessSpec, MachineConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_path_buf();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                cwd: cwd.clone(),
+                read_roots: vec![cwd],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            log: LogConfig::default(),
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 1,
+            max_output_bytes: 1024,
+            max_read_bytes: 1024,
+            max_write_bytes: 1024,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = run(
+            machine,
+            Config {
+                base_url: format!("http://{addr}"),
+                tunnel_id: "tunnel_test".into(),
+                runtime_api_key: "test-key".into(),
+                organization_id: None,
+                new_tunnel: false,
+                log: LogConfig::default(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        let request = crate::transports::runtime_restart_request(&error)
+            .expect("transient failure threshold should request a restart");
+        assert!(!request.reset_backoff());
+        assert!(
+            error
+                .to_string()
+                .contains("10 consecutive transient poll failures")
+        );
+    }
 
     #[test]
     fn response_timeout_parser_accepts_contract_values() {

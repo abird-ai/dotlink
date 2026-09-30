@@ -214,6 +214,6 @@ Rationale: satisfies Debian use while increasing portability.
 
 ## Installer repository owner
 
-**Decision:** do not invent/hard-code owner while repo has no Git remote.
+**Decision:** the canonical upstream is `https://github.com/abird-ai/abird-link`.
 
-Use `ABIRD_LINK_REPO` or custom release base.
+Installers default to `abird-ai/abird-link`, while `ABIRD_LINK_REPO` and a custom release base remain supported for forks, mirrors and alternate hosting.

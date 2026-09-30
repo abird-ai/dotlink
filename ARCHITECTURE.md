@@ -170,6 +170,16 @@ optional organization ID
 
 When OpenAI is disabled, setup skips these fields and no runtime key is loaded.
 
+### Recovery lifecycle
+
+Transient tunnel poll failures are retried with per-poll backoff. At normal log level the retry message stays concise; the underlying request error and URL are DEBUG details available with `-v`.
+
+After 10 consecutive transient poll failures, the OpenAI transport emits a typed runtime-restart request instead of retrying the same client/runtime state indefinitely. The shared transport supervisor cancels every active transport and gives peer tasks up to 5 seconds to shut down cleanly before force-aborting anything still running.
+
+The top-level runtime then reloads the selected profile, reconstructs the permission policy, cache mounts, `LocalMachine`, embedded MCP service, and all configured transports. Repeated unhealthy runtimes restart with exponential backoff capped at 30 seconds. If a runtime had connected successfully before becoming unhealthy, the restart backoff resets to its initial 1-second delay.
+
+Fatal control-plane failures, such as invalid credentials or a missing tunnel outside activation grace, remain fatal and do not enter this recovery loop.
+
 ## Permission model
 
 The access policy contains:
@@ -332,7 +342,7 @@ dist-windows-x86_64
 
 The Linux release target is x86_64-unknown-linux-musl with static CRT linking, intended to run on Debian and other x86_64 Linux distributions without a Nix runtime. The Windows target is x86_64-pc-windows-gnu.
 
-Dist outputs use stable filenames plus SHA-256 sidecars so a release workflow can upload the same names on every tagged release. install.sh and install.ps1 consume those assets. The release repository/base URL remains configurable because the local Git repository does not yet have a remote configured.
+Dist outputs use stable filenames plus SHA-256 sidecars so a release workflow can upload the same names on every tagged release. install.sh and install.ps1 consume those assets. The canonical upstream repository is `https://github.com/abird-ai/abird-link`; installers default to that repository while still allowing `ABIRD_LINK_REPO` or a custom release base URL for forks and mirrors.
 
 ## Binary MCP content
 

@@ -85,6 +85,13 @@
                     ]
                   }
               '';
+
+              meta = {
+                description = "Permission-scoped local MCP bridge";
+                homepage = "https://github.com/abird-ai/abird-link";
+                license = lib.licenses.mit;
+                mainProgram = "abird-link";
+              };
             }
           );
 
@@ -137,18 +144,17 @@
           craneLib = mkCraneLib pkgs target;
           src = craneLib.cleanCargoSource ./.;
 
-          commonArgs =
-            {
-              inherit src version;
-              pname = "abird-link";
-              strictDeps = true;
-              doCheck = false;
-              cargoExtraArgs = "--locked --all-features";
-              CARGO_BUILD_TARGET = target;
-            }
-            // nixpkgs.lib.optionalAttrs (rustFlags != null) {
-              CARGO_BUILD_RUSTFLAGS = rustFlags;
-            };
+          commonArgs = {
+            inherit src version;
+            pname = "abird-link";
+            strictDeps = true;
+            doCheck = false;
+            cargoExtraArgs = "--locked --all-features";
+            CARGO_BUILD_TARGET = target;
+          }
+          // nixpkgs.lib.optionalAttrs (rustFlags != null) {
+            CARGO_BUILD_RUSTFLAGS = rustFlags;
+          };
 
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
@@ -157,6 +163,11 @@
             // {
               inherit cargoArtifacts;
               doCheck = false;
+              meta = {
+                description = "Permission-scoped local MCP bridge";
+                homepage = "https://github.com/abird-ai/abird-link";
+                license = pkgs.lib.licenses.mit;
+              };
             }
           );
         in
@@ -267,6 +278,8 @@
             program = "${native.package}/bin/abird-link";
             meta = {
               description = "Permission-scoped local MCP bridge";
+              homepage = "https://github.com/abird-ai/abird-link";
+              license = native.pkgs.lib.licenses.mit;
             };
           };
         }

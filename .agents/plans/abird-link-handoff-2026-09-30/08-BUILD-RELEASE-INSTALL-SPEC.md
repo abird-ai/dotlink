@@ -153,13 +153,15 @@ install.ps1
 
 Downloads Windows x86_64 asset and verifies SHA-256.
 
-## No remote configured
+## Canonical upstream
 
-Current checkout has no Git remote.
+Canonical repository:
 
-Therefore installers intentionally do **not** hard-code an invented GitHub owner.
+```text
+https://github.com/abird-ai/abird-link
+```
 
-README examples use placeholders/environment variables.
+The installers default to `abird-ai/abird-link`. `ABIRD_LINK_REPO` and `ABIRD_LINK_RELEASE_BASE_URL` remain supported for forks, mirrors, local fixtures and alternate release hosting.
 
 ## Validation status
 

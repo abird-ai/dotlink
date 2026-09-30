@@ -118,6 +118,14 @@ The Admin key used to create a tunnel is never persisted. A profile with OpenAI 
 
 Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are removed from child shell environments.
 
+## Automatic transport recovery
+
+Transient OpenAI tunnel failures can trigger an automatic full runtime restart after 10 consecutive failed polls. Recovery does not grant new authority: abird-link reloads the same selected profile and reapplies the same CLI permission/deny flags before reconstructing `LocalMachine`, cache mounts, MCP state, and transports.
+
+All peer transports are cancelled during recovery. They receive up to 5 seconds to stop cleanly before remaining tasks are force-aborted. Repeated unhealthy runtimes use bounded restart backoff, while fatal authentication/tunnel errors remain fatal.
+
+Recovery must never bypass path canonicalization, deny precedence, protected credential paths, Bubblewrap policy, or shell-network policy.
+
 ## Linux Bubblewrap shell
 
 --allow-shell enables Bash on Unix.
@@ -192,6 +200,7 @@ Verbose mode adds request-level transport/protocol metadata. HTTP logs method/pa
 - text/binary reads and writes are bounded;
 - shell calls have a timeout;
 - HTTP and transport lifecycles share cancellation;
+- recovery teardown waits at most 5 seconds before aborting unresponsive peer transport tasks;
 - ngrok forwarding terminates with the HTTP transport/process lifecycle.
 
 ## Recommended use

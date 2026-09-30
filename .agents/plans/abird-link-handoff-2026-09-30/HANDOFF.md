@@ -125,16 +125,13 @@ Branch:
 main
 ```
 
-No Git remote is configured.
+Canonical upstream / `origin`:
 
-Uncommitted working-tree work includes:
+```text
+https://github.com/abird-ai/abird-link
+```
 
-- JSONC/profile expansion;
-- cache autodiscovery/sharing;
-- logging redesign;
-- Bubblewrap/Nix daemon hardening;
-- Crane/cross-build/release/install;
-- extensive docs.
+The large JSONC/profile, cache, logging, Bubblewrap/Nix hardening, Crane/release and documentation phases that originally motivated this handoff have been reviewed and committed. Always inspect live `git status` / `git log` for any newer work.
 
 See `03-CURRENT-STATE.md` for exact paths.
 
@@ -502,6 +499,17 @@ OpenAI setup:
 - Admin key never saved;
 - Runtime key per profile.
 
+Automatic recovery:
+
+- transient poll failures retry with backoff;
+- after 10 consecutive transient failures, OpenAI requests a full runtime restart;
+- all active transports are cancelled and given up to 5 seconds to stop before remaining tasks are force-aborted;
+- profile/policy, `LocalMachine`, embedded MCP and transports are reconstructed;
+- repeated unhealthy runtimes back off from 1 second up to 30 seconds;
+- a runtime that had successfully connected resets the restart backoff;
+- fatal tunnel/auth failures remain fatal;
+- raw request/URL details are DEBUG-only under `-v`.
+
 ### stdio
 
 Local subprocess MCP.
@@ -664,7 +672,7 @@ install.ps1
 scripts/build-release-artifacts.sh
 ```
 
-No Git remote is configured, so do not invent/hard-code an owner.
+Canonical upstream is `https://github.com/abird-ai/abird-link`; installers default there while retaining repository/base-URL overrides.
 
 ## 17. Validation status
 
@@ -680,7 +688,7 @@ git diff --check
 Latest observed full test pass:
 
 ```text
-70 tests
+77 tests
 ```
 
 The 2026-09-30 continuation pass also revalidated the current source with the intended Rust 1.98.1 toolchain:
@@ -692,7 +700,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-All 70 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `ABIRD_TEST_BWRAP=1`.
+All 77 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `ABIRD_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
 
 Live smokes have validated:
 

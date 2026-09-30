@@ -126,6 +126,18 @@ Intended for private/developer ChatGPT connection.
 
 OpenAI-specific request logging in verbose mode uses the shared logging model.
 
+Automatic recovery:
+
+- transient poll failures retry with backoff;
+- retries 1–9 stay within the current runtime;
+- the 10th consecutive transient failure requests a full runtime restart;
+- the shared supervisor cancels every transport and allows up to 5 seconds for graceful shutdown before force-aborting remaining tasks;
+- the top-level runtime reloads the profile/policy, reconstructs `LocalMachine`, embedded MCP state and transports, then starts again;
+- repeated unhealthy runtimes back off from 1 second up to a 30-second cap;
+- a runtime that had successfully connected resets the restart backoff before a later recovery;
+- fatal Tunnel ID/auth/control-plane failures remain fatal;
+- normal WARN retry lines omit raw URL/error details; `-v` retains detailed DEBUG diagnostics.
+
 ### stdio
 
 File:

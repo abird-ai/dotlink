@@ -11,9 +11,16 @@ die() {
 }
 
 VERSION="${ABIRD_LINK_VERSION:-latest}"
-REPO="${ABIRD_LINK_REPO:-}"
+REPO="${ABIRD_LINK_REPO:-abird-ai/abird-link}"
 BASE_URL="${ABIRD_LINK_RELEASE_BASE_URL:-}"
-INSTALL_DIR="${ABIRD_LINK_INSTALL_DIR:-${HOME:-}/.local/bin}"
+
+if [ -n "${ABIRD_LINK_INSTALL_DIR:-}" ]; then
+  INSTALL_DIR="$ABIRD_LINK_INSTALL_DIR"
+elif [ -n "${HOME:-}" ]; then
+  INSTALL_DIR="$HOME/.local/bin"
+else
+  die "HOME is not set; set ABIRD_LINK_INSTALL_DIR explicitly"
+fi
 
 case "$(uname -s 2>/dev/null || printf unknown)" in
   Linux)
@@ -47,8 +54,6 @@ case "$(uname -s 2>/dev/null || printf unknown)" in
 esac
 
 if [ -z "$BASE_URL" ]; then
-  [ -n "$REPO" ] || die "set ABIRD_LINK_REPO=owner/repo or ABIRD_LINK_RELEASE_BASE_URL=https://... before running this installer"
-
   if [ "$VERSION" = "latest" ]; then
     BASE_URL="https://github.com/${REPO}/releases/latest/download"
   else
@@ -70,22 +75,28 @@ say "Downloading ${ASSET}..."
 curl -fsSL "${BASE_URL%/}/${ASSET}" -o "$WORKDIR/$ASSET"
 curl -fsSL "${BASE_URL%/}/${ASSET}.sha256" -o "$WORKDIR/$ASSET.sha256"
 
+expected="$(awk 'NR == 1 { print $1; exit }' "$WORKDIR/$ASSET.sha256" | tr 'A-F' 'a-f')"
+[ "${#expected}" -eq 64 ] || die "invalid SHA-256 sidecar"
+case "$expected" in
+  *[!0-9a-f]*) die "invalid SHA-256 sidecar" ;;
+esac
+
 if command -v sha256sum >/dev/null 2>&1; then
-  (
-    cd "$WORKDIR"
-    sha256sum -c "$ASSET.sha256"
-  ) >/dev/null
+  actual="$(sha256sum "$WORKDIR/$ASSET" | awk '{print $1}')"
 elif command -v shasum >/dev/null 2>&1; then
-  expected="$(awk '{print $1}' "$WORKDIR/$ASSET.sha256")"
   actual="$(shasum -a 256 "$WORKDIR/$ASSET" | awk '{print $1}')"
-  [ "$expected" = "$actual" ] || die "SHA-256 verification failed"
 else
   die "sha256sum or shasum is required for checksum verification"
 fi
+[ "$expected" = "$actual" ] || die "SHA-256 verification failed"
 
 mkdir -p "$INSTALL_DIR"
-cp "$WORKDIR/$ASSET" "$INSTALL_DIR/$BINARY"
-chmod 0755 "$INSTALL_DIR/$BINARY"
+DEST_TMP="$INSTALL_DIR/.$BINARY.tmp.$$"
+trap 'rm -rf "$WORKDIR"; [ -z "${DEST_TMP:-}" ] || rm -f "$DEST_TMP"' EXIT HUP INT TERM
+cp "$WORKDIR/$ASSET" "$DEST_TMP"
+chmod 0755 "$DEST_TMP"
+mv -f "$DEST_TMP" "$INSTALL_DIR/$BINARY"
+DEST_TMP=""
 
 say "Installed abird-link to $INSTALL_DIR/$BINARY"
 

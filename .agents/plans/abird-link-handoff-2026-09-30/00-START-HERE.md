@@ -61,4 +61,4 @@ config schema version in source: 8
 branch: main
 ```
 
-There is currently no configured Git remote in this checkout.
+Canonical upstream: `https://github.com/abird-ai/abird-link` (Git remote `origin`).

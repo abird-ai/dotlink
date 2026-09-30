@@ -21,16 +21,15 @@ When convenient:
 
 This is a live-process refresh, not an implementation gap.
 
-### 2. Configure a Git remote/release destination
+### 2. Upstream and releases
 
-This checkout currently has no remote.
+Canonical upstream / `origin`:
 
-Before publishing release assets:
+```text
+https://github.com/abird-ai/abird-link
+```
 
-- configure the intended repository remote;
-- choose release/tag convention;
-- set `ABIRD_LINK_REPO` or release base URL in installation examples/automation as appropriate;
-- push only when explicitly desired.
+Installers default to this repository. Future release work should choose the tag/release convention and publish the validated stable assets there; repository/base-URL overrides remain available for forks and mirrors.
 
 ## Completed implementation phases
 

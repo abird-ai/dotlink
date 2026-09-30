@@ -1,5 +1,16 @@
-/target
-/.direnv
+# Rust build output and local backup artifacts.
+/target/
+*.rs.bk
+/Cargo.toml.orig
+
+# Nix / direnv build links and local environments.
+/result
+/result-*
+/.direnv/
+
+# Local environment, logs, and generated release output.
 .env
+.env.*
+!.env.example
 *.log
-/dist
+/dist/

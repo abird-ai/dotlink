@@ -22,7 +22,7 @@ b76f8e6 Expand profiles, sandbox caches, and logging
 
 The final documentation/handoff commit follows `7b93e92`; use `git log --oneline --decorate -12` for the exact current HEAD.
 
-No Git remote is configured.
+Canonical upstream / `origin`: `https://github.com/abird-ai/abird-link`.
 
 ## Package/toolchain
 
@@ -254,7 +254,7 @@ abird-link-windows-x86_64.exe.sha256
 Validated on 2026-09-30:
 
 - `flake.lock` locks Crane v0.24.0 and rust-overlay.
-- Rust fmt/test/Clippy passes; 70/70 tests.
+- Rust fmt/test/Clippy passes; 77/77 tests after automatic tunnel recovery and restart-backoff coverage.
 - real Bubblewrap runtime and cache-mount smokes pass.
 - full x86_64-linux `nix flake check` passes using an isolated writable Nix store without exposing the host daemon.
 - `nix flake check --all-systems --no-build` evaluates x86_64 Linux, aarch64 Linux and aarch64 Darwin.
@@ -274,4 +274,4 @@ Validated on 2026-09-30:
 - The currently running ChatGPT connector may still be an older process until it is restarted and the developer connection/tool schema is refreshed.
 - Public HTTP/ngrok still has no built-in application-layer caller authentication; ephemeral paths are not authentication.
 - Bubblewrap is Linux-only. Native Windows/macOS shell uses the explicitly unsandboxed full-host path.
-- There is no configured Git remote, so nothing has been pushed and installers intentionally require repository/base-URL configuration.
+- Canonical upstream is `https://github.com/abird-ai/abird-link`; installers default there while retaining repository/base-URL overrides for forks and mirrors.

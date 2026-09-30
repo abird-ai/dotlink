@@ -344,6 +344,20 @@ fn cwd_or_path(path: &PathBuf, cwd: &std::path::Path) -> PathBuf {
     }
 }
 
+fn next_runtime_restart_attempt(current: u32, reset_backoff: bool) -> u32 {
+    if reset_backoff {
+        1
+    } else {
+        current.saturating_add(1)
+    }
+}
+
+fn runtime_restart_delay(attempt: u32) -> std::time::Duration {
+    let exponent = attempt.saturating_sub(1).min(5);
+    let seconds = (1_u64 << exponent).min(30);
+    std::time::Duration::from_secs(seconds)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -363,13 +377,51 @@ async fn main() -> Result<()> {
         .with_ansi(log.color_enabled())
         .init();
 
+    let mut runtime_restarts = 0_u32;
+    loop {
+        match run_runtime(&args, &launch_cwd, &log).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let Some(restart) = transports::runtime_restart_request(&error) else {
+                    return Err(error);
+                };
+
+                runtime_restarts =
+                    next_runtime_restart_attempt(runtime_restarts, restart.reset_backoff());
+                let delay = runtime_restart_delay(runtime_restarts);
+
+                tracing::warn!(
+                    restart = runtime_restarts,
+                    delay_secs = delay.as_secs(),
+                    "OpenAI transport remained unhealthy; restarting abird-link runtime"
+                );
+                tracing::debug!(%error, "runtime restart reason");
+                eprintln!(
+                    "\nOpenAI tunnel unhealthy — restarting abird-link runtime in {}s…",
+                    delay.as_secs()
+                );
+
+                tokio::select! {
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        eprintln!("\nabird-link stopped.");
+                        return Ok(());
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn run_runtime(args: &Args, launch_cwd: &Path, log: &LogConfig) -> Result<()> {
     let setup = load_or_setup(args.setup, args.profile.as_deref()).await?;
 
     if args.setup {
         return Ok(());
     }
 
-    let policy = Policy::from_args(&args, launch_cwd, &setup.config.permissions)?;
+    let policy = Policy::from_args(args, launch_cwd.to_path_buf(), &setup.config.permissions)?;
 
     if args.list_tools {
         print_tools(&policy);
@@ -418,7 +470,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let (http_ephemeral_url, ngrok_ephemeral_url) = ephemeral_url_policy(&args);
+    let (http_ephemeral_url, ngrok_ephemeral_url) = ephemeral_url_policy(args);
 
     let active_transports = ActiveTransports {
         openai,
@@ -486,7 +538,7 @@ async fn main() -> Result<()> {
         &active_transports,
         &machine,
         args.profile.as_deref(),
-        &log,
+        log,
         args.allow_all,
     );
 
@@ -616,6 +668,25 @@ mod tests {
 
     fn no_defaults() -> PermissionConfig {
         PermissionConfig::default()
+    }
+
+    #[test]
+    fn successful_runtime_resets_restart_backoff() {
+        assert_eq!(next_runtime_restart_attempt(0, false), 1);
+        assert_eq!(next_runtime_restart_attempt(1, false), 2);
+        assert_eq!(next_runtime_restart_attempt(5, true), 1);
+    }
+
+    #[test]
+    fn runtime_restart_backoff_is_bounded() {
+        assert_eq!(runtime_restart_delay(1), std::time::Duration::from_secs(1));
+        assert_eq!(runtime_restart_delay(2), std::time::Duration::from_secs(2));
+        assert_eq!(runtime_restart_delay(5), std::time::Duration::from_secs(16));
+        assert_eq!(runtime_restart_delay(6), std::time::Duration::from_secs(30));
+        assert_eq!(
+            runtime_restart_delay(100),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
