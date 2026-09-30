@@ -1,6 +1,303 @@
 # abird-link
 
-A small Rust MCP bridge for permission-scoped local files and optional local command execution.
+**Connect ChatGPT, Claude.ai, and other MCP-capable AI tools to your computer files and shell securely — from a single binary.**
+
+abird-link is an open-source local bridge that lets AI tools work directly with files and tools on your computer — without handing them unrestricted access to your machine.
+
+One `abird-link` binary can serve multiple kinds of clients at once:
+
+- **ChatGPT** through OpenAI Secure MCP Tunnel — no public inbound port required.
+- **Claude.ai and other remote AI/MCP clients** through Streamable HTTP, optionally published over an HTTPS ngrok tunnel.
+- **Local MCP clients** through stdio or loopback Streamable HTTP.
+
+All transports terminate at the same local permission engine and expose the same policy-controlled tool surface.
+
+Start read-only. Add write access, a sandboxed shell, or network access only when you want them. Save different permission sets as profiles for different projects and workflows.
+
+- **Work with local files** — inspect, edit, create, and patch text or binary files.
+- **Run local tools** — optionally let the assistant use Bash or PowerShell for builds, tests, Git, scripts, and developer tooling.
+- **Least privilege by default** — the working directory starts read-only unless you grant more.
+- **Explicit allow + deny controls** — independently control read, write, shell, and network access; deny rules always win.
+- **Sandboxed shell on Linux** — Bubblewrap limits filesystem and network access.
+- **Private ChatGPT connectivity** — OpenAI Secure MCP Tunnel connects your local machine without exposing a public inbound port.
+- **Reusable profiles** — keep separate configs for work, personal projects, or different levels of access.
+
+## 60-second quick start
+
+Run the guided setup once:
+
+~~~bash
+abird-link --setup
+~~~
+
+Then start abird-link from the directory you want the assistant to work with:
+
+~~~bash
+cd ~/src/my-project
+abird-link
+~~~
+
+By default, the project is exposed read-only.
+
+Give the assistant read/write access to the current project:
+
+~~~bash
+abird-link --allow-rw
+~~~
+
+Add a sandboxed shell for builds, tests, Git, and local tooling:
+
+~~~bash
+abird-link --allow-rw --allow-shell
+~~~
+
+Allow network access inside that sandbox too:
+
+~~~bash
+abird-link --allow-rw --allow-shell --allow-network
+~~~
+
+You decide what the assistant can access. abird-link enforces those permissions locally.
+
+## Connect abird-link to ChatGPT
+
+### 1. Configure the OpenAI tunnel
+
+Run:
+
+~~~bash
+abird-link --setup
+~~~
+
+Choose **openai** as a transport. Setup will guide you through creating or selecting an OpenAI Secure MCP Tunnel and choosing your default local permissions.
+
+Then run abird-link from the project you want ChatGPT to access:
+
+~~~bash
+cd ~/src/my-project
+abird-link
+~~~
+
+Keep this process running while you use ChatGPT.
+
+The startup output includes a tunnel ID such as:
+
+~~~text
+• Tunnel     tunnel_...
+✓ Connected — ready
+~~~
+
+### 2. Enable Developer mode in ChatGPT
+
+In ChatGPT:
+
+1. Open **Settings**.
+2. Select **Security and login**.
+3. Turn on **Developer mode**.
+
+Developer mode availability can depend on your account or workspace policy.
+
+### 3. Add the connection
+
+In ChatGPT:
+
+1. Open **ChatGPT Plugins**.
+2. Select the **+** button.
+3. Give the connection a name such as **Abird Link**.
+4. Add a short description such as **Secure access to files and tools on my computer**.
+5. Under **Connection**, choose **Tunnel**.
+6. Select the available tunnel, or paste the `tunnel_...` ID printed by abird-link.
+7. Create the connection.
+8. Review the tools and metadata ChatGPT discovers.
+
+The discovered tools reflect the permissions of the currently running abird-link process.
+
+A default read-only connection typically exposes:
+
+~~~text
+ls
+read
+read_binary
+~~~
+
+With write access, ChatGPT can also see tools such as:
+
+~~~text
+edit
+patch_binary
+write
+write_binary
+~~~
+
+With shell enabled, it additionally sees:
+
+~~~text
+bash         # Linux / Unix
+powershell   # Windows
+~~~
+
+### 4. Use it in a ChatGPT conversation
+
+Start a new conversation, open the **tools / More** menu from the prompt box, and select **Abird Link**.
+
+Then ask normally — you do not need to name individual MCP tools.
+
+For example:
+
+~~~text
+Inspect this project and explain its structure.
+~~~
+
+~~~text
+Read README.md and Cargo.toml and tell me how this project works.
+~~~
+
+With write access:
+
+~~~text
+Update the README to document the new profile system.
+~~~
+
+With shell access:
+
+~~~text
+Run the test suite and fix any failures you find.
+~~~
+
+~~~text
+Check git status, review the current diff, run the formatter, linter,
+and tests, then summarize anything that still needs attention.
+~~~
+
+### 5. Optional: call a packaged Abird Link plugin directly
+
+The developer connection above is enough to use abird-link as an MCP tool source.
+
+If you package that connection as a personal **Abird Link** plugin using the included Plugin Creator instructions, you can invoke it directly from a ChatGPT **Work** conversation:
+
+~~~text
+@Abird Link inspect this repository and tell me what changed.
+~~~
+
+or:
+
+~~~text
+@Abird Link run the tests and fix the failing ones.
+~~~
+
+Type `@` in the Work prompt box and select **Abird Link** to invoke it explicitly.
+
+### If ChatGPT cannot find the tunnel
+
+Check that:
+
+- abird-link is still running and connected;
+- you copied the correct `tunnel_...` ID;
+- Developer mode is enabled;
+- the tunnel is associated with the ChatGPT workspace you are currently using;
+- the Runtime API key has **Tunnels Read + Use** permission.
+
+After changing tool names, schemas, permissions, or metadata, restart abird-link and use **Refresh** on the developer connection in ChatGPT before retesting.
+
+## Connect abird-link to Claude.ai
+
+Claude.ai custom connectors use **remote MCP**: Claude connects from Anthropic's cloud, not from your local machine. That means `http://127.0.0.1:3000/mcp` will not work directly with claude.ai; expose abird-link through a public HTTPS endpoint such as ngrok.
+
+### 1. Start a public Streamable HTTP MCP endpoint
+
+Set your ngrok token, then run:
+
+~~~bash
+export NGROK_AUTHTOKEN='...'
+abird-link --http --ngrok --ngrok-ephemeral-url
+~~~
+
+Add whatever local permissions you actually want Claude to have, for example:
+
+~~~bash
+abird-link --http --ngrok --ngrok-ephemeral-url \
+  --allow-rw --allow-shell
+~~~
+
+abird-link prints a URL similar to:
+
+~~~text
+✓ ngrok MCP: https://example.ngrok.app/mcp/<ephemeral-token>
+~~~
+
+### 2. Add it to Claude.ai
+
+For individual Claude plans:
+
+1. Open **Customize → Connectors**.
+2. Select **+**.
+3. Choose **Add custom connector**.
+4. Give it a name such as **Abird Link**.
+5. Paste the ngrok MCP URL printed by abird-link.
+6. Add the connector.
+
+For Team/Enterprise organizations, an owner may need to register the custom connector under the organization's connector settings first; members can then connect and enable it.
+
+### 3. Enable it in a conversation
+
+In Claude, use the **+** menu in the chat composer, open **Connectors**, and enable **Abird Link** for that conversation. Claude can then call the tools exposed by the running abird-link process.
+
+> **Security:** abird-link's HTTP/ngrok transport does not currently add application-layer authentication. Treat the public URL as sensitive. An ephemeral path makes accidental discovery much harder, but it is not authentication. Use ngrok access controls where appropriate and grant only the minimum local permissions needed.
+
+## Connect other remote MCP clients through ngrok
+
+Any MCP client that supports remote **Streamable HTTP** can use the same public endpoint:
+
+~~~bash
+abird-link --http --ngrok --ngrok-ephemeral-url
+~~~
+
+Then give the client the printed HTTPS MCP URL. The remote client receives exactly the tool surface and permissions exposed by that abird-link process.
+
+## Use abird-link as a local sandboxed MCP server
+
+For local MCP clients, no public tunnel is required.
+
+### stdio
+
+Use stdio when the client launches MCP servers as child processes:
+
+~~~bash
+abird-link --stdio --allow-rw --allow-shell
+~~~
+
+Typical MCP client configuration:
+
+~~~json
+{
+  "mcpServers": {
+    "abird-link": {
+      "command": "abird-link",
+      "args": ["--stdio", "--allow-rw", "--allow-shell"]
+    }
+  }
+}
+~~~
+
+On Linux the shell is still Bubblewrap-sandboxed.
+
+### Local Streamable HTTP
+
+For local clients that support Streamable HTTP:
+
+~~~bash
+abird-link --http --allow-rw --allow-shell
+~~~
+
+Connect to:
+
+~~~text
+http://127.0.0.1:3000/mcp
+~~~
+
+This stays loopback-only unless you explicitly change `--http-bind`.
+
+## How it connects
 
 The same LocalMachine MCP server can be exposed through three independent transports:
 
@@ -17,7 +314,140 @@ The same LocalMachine MCP server can be exposed through three independent transp
                                                  public HTTPS /mcp
 ~~~
 
-The transports are modular: OpenAI, stdio, and HTTP can each be enabled or disabled in persisted setup. Profiles can also persist default rw-cwd and shell permissions.
+The transports are modular: OpenAI, stdio, and HTTP can each be enabled or disabled in persisted setup. Profiles can also persist cwd, allow/deny path rules, shell, network, and approved developer-cache access.
+
+## Technical architecture
+
+abird-link is one binary with one local policy core and multiple connection adapters. The transport you use changes **how an AI reaches abird-link**, not **what it is allowed to do**.
+
+~~~text
+                  ChatGPT
+                     |
+          OpenAI Secure MCP Tunnel
+                     |
+                     v
+Claude.ai / remote AI tools        Local MCP clients
+          |                         |            |
+     HTTPS / ngrok                stdio     loopback HTTP
+          |                         |            |
+          +------------+------------+------------+
+                       |
+                 transport adapters
+                       |
+                       v
+               +-------------------+
+               |   LocalMachine    |
+               | shared MCP server |
+               +-------------------+
+                       |
+              policy-aware tool router
+                       |
+          +------------+-------------+
+          |                          |
+   Rust filesystem tools         shell tool
+ read/write/edit/ls/binary      Bash / PowerShell
+          |                          |
+ canonical path policy          Linux: Bubblewrap
+          |                          |
+ allow + deny roots             mount + namespace
+          |                          |
+          +------------+-------------+
+                       |
+                  host machine
+~~~
+
+Every transport uses the same `LocalMachine` instance and therefore the same effective profile, cwd, allow/deny paths, cache grants, shell policy, and network policy. Running OpenAI Tunnel and HTTP at the same time does not create two different security domains.
+
+### Opt-in security model
+
+The default posture is intentionally small:
+
+~~~text
+cwd read access          ON
+cwd write access         OFF
+extra filesystem paths   OFF
+shell                    OFF
+shell network            OFF
+shared developer caches  OFF
+public HTTP ingress      OFF
+unsandboxed host mode    OFF
+~~~
+
+Capabilities are added independently:
+
+~~~text
+--allow-read=DIR
+--allow-write=DIR
+--allow-rw=DIR
+--allow-shell
+--allow-network
+~~~
+
+Profiles persist the same model in JSONC. CLI grants merge on top of profile grants; deny rules take precedence in the normal sandboxed model.
+
+`--allow-rw=/` is simply a root filesystem RW grant. It does **not** automatically enable shell, network, or disable Bubblewrap.
+
+The only full unsandboxed escape hatch is:
+
+~~~bash
+abird-link --allow-all --no-sandbox
+~~~
+
+That pair intentionally grants root filesystem RW, shell, and network with no shell sandbox. Deny rules are rejected in that mode because an arbitrary unsandboxed child process cannot be constrained by abird-link's Rust path checks.
+
+### Filesystem policy layer
+
+The Rust filesystem tools always go through the same canonical-path policy before touching the host filesystem.
+
+~~~text
+read / read_binary / ls       require read
+write / write_binary          require write
+edit / patch_binary           require read + write
+~~~
+
+Existing targets are canonicalized before policy checks, and create targets canonicalize their nearest existing ancestor. This prevents symlink traversal from escaping an allowed root.
+
+The visible MCP tool router is also permission-aware. A read-only process does not merely reject `write`; the write/edit/patch tools are omitted from the advertised MCP tool list. Shell is similarly absent until explicitly enabled.
+
+### Linux Bubblewrap shell sandbox
+
+On Linux, `--allow-shell` runs Bash inside Bubblewrap by default. The Rust filesystem policy determines what Bubblewrap mounts into the child:
+
+~~~text
+read-only grant       host path -> same path, RO
+read+write grant      host path -> same path, RW
+write-only grant      not exposed to shell
+deny-read             hidden/masked
+deny-write            readable subtree rebound RO
+~~~
+
+The sandbox also creates a constrained runtime environment:
+
+~~~text
+/proc                  fresh proc mount
+/dev                   Bubblewrap-managed minimal /dev
+/tmp                   private tmpfs
+HOME                   /tmp/home
+developer caches       only explicitly approved cache dirs
+/nix/store             RO on NixOS
+Nix profile/runtime    RO where required
+Nix daemon endpoint    hidden when shell network is denied
+~~~
+
+Bubblewrap also isolates PID, IPC, and UTS namespaces. The shell network namespace is unshared by default; `--allow-network` restores host network access for the shell child.
+
+Approved Cargo/npm/uv/etc. caches are mounted only into expected locations under the private sandbox home. They are **not** added to the MCP filesystem allow-list, so sharing `~/.cargo/registry` with a build does not let the AI call `read ~/.cargo/registry/...` through the normal MCP filesystem tools.
+
+### Transport security is separate from local authority
+
+A transport does not grant filesystem or shell permissions.
+
+- **OpenAI Secure MCP Tunnel** gives ChatGPT a private transport to the local server.
+- **stdio** is local child-process IPC.
+- **loopback HTTP** stays on the local machine by default.
+- **ngrok** makes the HTTP MCP endpoint remotely reachable and therefore increases exposure, but it still exposes only the tools permitted by the local policy.
+
+For public HTTP/ngrok, the URL should be treated as sensitive. Ephemeral MCP paths make accidental discovery harder but are not authentication; use external access controls when appropriate.
 
 ## Setup and profiles
 
@@ -31,7 +461,7 @@ Or create a named profile:
 
 ~~~bash
 abird-link --setup --profile work
-abird-link -s -p work
+abird-link -S -p work
 ~~~
 
 Use it later with:
@@ -53,8 +483,26 @@ Setup begins with:
 
 2. Choose default local permissions
    • cwd is always readable unless denied.
+   Pin this profile to /current/project? [y/N]:
    Allow read+write cwd by default? [y/N]:
    Allow shell by default? [y/N]:
+   Allow shell network access by default? [y/N]:   # asked only when shell=yes
+
+3. Discover developer caches
+   Scanning known package/build cache locations…
+
+   Found:
+   • Cargo registry     ~/.cargo/registry
+   • Cargo git          ~/.cargo/git
+   • npm                ~/.npm
+   • uv                 ~/.cache/uv
+
+   • Only cache directories are shared; adjacent credentials/config files are excluded.
+   • read+write is fastest, but allows sandboxed builds to modify the shared host cache.
+
+   Configure access to discovered caches? [y/N]:
+   Cargo registry ...
+      Access [n]one / [r]ead-only / read+[w]rite [n]:
 ~~~
 
 Examples:
@@ -71,15 +519,15 @@ none
 
 If OpenAI is not selected, every OpenAI credential/tunnel question is skipped and no OpenAI runtime key is required.
 
-Configuration is JSON:
+Configuration is JSONC (JSON with comments and trailing commas):
 
 ~~~text
-~/.config/abird-link/config.json
-~/.config/abird-link/config.work.json
-~/.config/abird-link/config.personal.json
+~/.config/abird-link/config.jsonc
+~/.config/abird-link/config.work.jsonc
+~/.config/abird-link/config.personal.jsonc
 ~~~
 
-The default profile uses config.json. --profile work uses config.work.json.
+The default profile uses config.jsonc. --profile work uses config.work.jsonc. Existing .json profile files remain readable as a legacy fallback; setup/save writes the canonical JSONC format.
 
 OpenAI runtime keys are kept separately per profile:
 
@@ -88,18 +536,67 @@ OpenAI runtime keys are kept separately per profile:
 ~/.config/abird-link/runtime.work.key
 ~~~
 
-A config can persist these safe defaults:
+A profile can persist the default cwd and the same allow/deny filesystem rules available on the CLI:
 
-~~~json
+~~~jsonc
+// Comments and trailing commas are allowed.
 {
   "permissions": {
-    "allow_rw": true,
-    "allow_shell": true
-  }
+    // Optional. If omitted, cwd is where abird-link is launched.
+    "cwd": "/home/me/src/project",
+
+    // Paths may be absolute or relative to the effective cwd.
+    "allow_read": [
+      "/home/me/reference",
+    ],
+    "allow_write": [
+      "generated",
+    ],
+    "allow_rw": [
+      ".",                  // rw on cwd
+      "/home/me/shared",
+    ],
+
+    "deny_read": [
+      "private-inputs",
+    ],
+    "deny_write": [
+      "locked-output",
+    ],
+    "deny_rw": [
+      ".secrets",
+    ],
+
+    "allow_shell": true,
+    "allow_network": false,
+  },
+
+  "caches": [
+    {
+      "kind": "cargo_registry",
+      "path": "/home/me/.cargo/registry",
+      "mode": "read_write"
+    },
+    {
+      "kind": "npm",
+      "path": "/home/me/.npm",
+      "mode": "read_only"
+    }
+  ]
 }
 ~~~
 
-allow_rw means rw on the launch cwd. allow_shell enables the normal platform shell; on Linux it remains Bubblewrap-sandboxed and network remains disabled unless separately allowed.
+The CLI merges additional grants/denies on top of the profile. `--cwd` overrides the profile's persistent `cwd` for that run. Relative permission paths resolve from the effective cwd.
+
+`allow_rw: ["."]` is the persistent equivalent of bare `--allow-rw`. `allow_rw: ["/"]` is unrestricted filesystem read+write, exactly like `--allow-rw=/`.
+
+Older v7 profiles that stored `"allow_rw": true` are still accepted and migrate logically to `"allow_rw": ["."]`.
+
+`allow_shell` enables the normal platform shell. `allow_network` controls network access for the normal sandboxed shell path; on Linux Bubblewrap remains enabled. A profile cannot set `allow_network=true` while `allow_shell=false`.
+
+Cache grants are shell-only. They do **not** expand the MCP read/write filesystem policy. On Linux, approved host caches are mounted into the private sandbox home at the package manager's expected location (for example host `~/.cargo/registry` → sandbox `/tmp/home/.cargo/registry`). Read-only grants can reuse existing packages without modification; read+write grants also let builds populate/update the shared host cache.
+
+Autodiscovery currently understands Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build caches, Maven, Gradle, sccache, and ccache. It uses environment variables and known existing cache locations, plus non-mutating local queries such as `npm config get cache`, `pip cache dir`, `uv cache dir`, and `go env`. Probes that may initialize a cache directory are deliberately avoided. It never grants the parent config/credential directory just because a cache lives nearby.
 
 ## Transport activation
 
@@ -273,12 +770,12 @@ The older --deny=PATH remains a synonym for denying both read and write.
 - --deny-read=DIR blocks reads while writes may still be allowed.
 - --deny-write=DIR blocks writes while reads may still be allowed.
 - --deny-rw=DIR blocks both.
-- --deny-shell hides the shell even if the profile or --allow-all-dangerous enabled it.
+- --deny-shell hides the shell even if the profile enabled it.
 - --deny-network keeps shell networking off.
 
-On Linux, filesystem or network denies force shell execution into Bubblewrap even if --no-sandbox or --allow-all-dangerous was also requested, because the sandbox is required to enforce those denies. On systems without an enforceable shell sandbox, shell + deny combinations are rejected.
+`--allow-rw=/` is simply a root read+write grant, so it provides unrestricted filesystem access without needing a separate "allow all rw" flag. It does **not** automatically enable shell, network, or disable the sandbox.
 
-Filesystem denies also constrain --allow-rw-all-dangerous and --allow-all-dangerous.
+`--allow-all --no-sandbox` is the explicit full-host escape hatch. It grants root filesystem RW, shell, and network with no Bubblewrap isolation. Because deny rules cannot constrain an arbitrary unsandboxed child process, `--allow-all` cannot be combined with deny rules.
 
 Relative MCP paths resolve from --cwd. Absolute paths work when granted. Existing paths and ancestors are canonicalized before Rust policy checks to prevent symlink escapes.
 
@@ -385,29 +882,30 @@ abird-link --allow-shell --allow-network
 
 This shell-network policy does not affect the main abird-link process. OpenAI Tunnel and ngrok use outbound networking from that main process.
 
-## Dangerous unsandboxed access
+## Full unsandboxed access
 
-Unsandboxed shell execution inherently has the OS user's filesystem and network authority.
-
-It therefore requires:
+Unsandboxed shell execution inherently has the OS user's filesystem and network authority, so abird-link exposes one explicit full-host escape hatch rather than several partial "dangerous" flags:
 
 ~~~bash
-abird-link \
-  --allow-shell \
-  --no-sandbox \
-  --allow-rw-all-dangerous \
-  --allow-network-dangereous
+abird-link --allow-all --no-sandbox
 ~~~
 
-The corrected alias --allow-network-dangerous is also accepted.
+The two flags require each other. This grants:
 
-The full escape hatch is:
+~~~text
+filesystem   read+write /
+shell        enabled
+network      enabled
+sandbox      disabled
+~~~
+
+For unrestricted filesystem access **without** removing the Linux sandbox, use the ordinary path model instead:
 
 ~~~bash
-abird-link --allow-all-dangerous
+abird-link --allow-rw=/
 ~~~
 
-That is a grant shortcut for unrestricted filesystem + unsandboxed shell + network. Explicit deny flags still win. On Linux, a filesystem/network deny automatically restores Bubblewrap so the deny can be enforced; --deny-shell disables shell entirely.
+Then add `--allow-shell` and/or `--allow-network` separately if needed. On Linux, those capabilities remain Bubblewrap-sandboxed unless `--allow-all --no-sandbox` is explicitly selected.
 
 ## OpenAI Secure MCP Tunnel
 
@@ -421,7 +919,7 @@ Setup asks for:
 
 The Admin key is never persisted.
 
-The Runtime key is stored separately from JSON config and follows the selected profile:
+The Runtime key is stored separately from JSONC config and follows the selected profile:
 
 ~~~text
 ~/.config/abird-link/runtime.key
@@ -437,11 +935,57 @@ Useful locations:
 - ChatGPT Workspace ID: https://chatgpt.com/admin
 - OpenAI Organization ID: https://platform.openai.com/settings/organization/general
 
+## Logging
+
+Normal runs show concise tool activity on stderr with local timestamps:
+
+~~~text
+[01:06:47.410] TOOL read       → path=README.md limit=1
+[01:06:47.411] TOOL read       ← ok  1ms
+~~~
+
+This activity stream is transport-independent: OpenAI Tunnel, stdio, and HTTP all produce the same tool lines.
+
+Suppress normal tool activity with:
+
+~~~bash
+abird-link --silent
+abird-link -s
+~~~
+
+Enable developer request logging with:
+
+~~~bash
+abird-link --verbose
+abird-link -v
+~~~
+
+Verbose mode keeps normal tool activity and additionally logs incoming transport/protocol requests. For example:
+
+~~~text
+[01:06:47.426] REQ  stdio      → initialize
+[01:06:47.427] REQ  stdio      → tools/call
+[01:06:47.427] TOOL read       → path=README.md limit=1
+[01:06:47.429] TOOL read       ← ok  1ms
+~~~
+
+HTTP verbose logs include method/path/status/latency. OpenAI Tunnel verbose logs include MCP request methods. Request bodies, file contents, binary payloads, and secrets are not dumped into developer logs.
+
+`--silent --verbose` is valid: it hides the user-focused TOOL activity lines while retaining developer REQ logs.
+
+Color is automatic by default: stderr is colored when attached to an interactive terminal and plain when redirected or piped. Override it with:
+
+~~~bash
+abird-link --color=always
+abird-link --color=never
+abird-link --color=auto
+~~~
+
 ## CLI summary
 
 ~~~text
-abird-link -s, --setup          interactive setup for selected profile
--p, --profile <NAME>            use config.<NAME>.json
+abird-link -S, --setup          interactive setup for selected profile
+-p, --profile <NAME>            use config.<NAME>.jsonc
 
 --stdio                         start stdio MCP for this run
 --http                          start HTTP MCP for this run
@@ -463,28 +1007,37 @@ abird-link -s, --setup          interactive setup for selected profile
 --deny=<PATH>                   legacy synonym for deny-rw
 --deny-shell                    deny shell; always wins
 --deny-network                  deny shell network; always wins
---deny-rw-all-dangerous         cancel unrestricted filesystem grant
 
 --allow-shell                   add platform shell
 --allow-network                 network inside Linux shell sandbox
---no-sandbox                    disable Bubblewrap when no deny requires it
-
---allow-rw-all-dangerous        unrestricted Rust filesystem grant
---allow-network-dangereous      acknowledge unsandboxed network
---allow-all-dangerous           unrestricted rw + shell + network grant shortcut
+--allow-rw=/                    unrestricted filesystem read+write
+--allow-all                     full host filesystem + shell + network; requires --no-sandbox
+--no-sandbox                    disable shell sandbox; requires --allow-all
 
 --list-tools                    show exposed tools
--v, --verbose                   concise request/tool logs
+-s, --silent                    hide normal tool activity logs
+-v, --verbose                   add developer request logging
+--color=<auto|always|never>     control ANSI colors (default: auto)
 --print-id                      print configured OpenAI Tunnel ID
 ~~~
 
 ## Build
+
+The Nix build uses Crane. Dependencies are built in a separate derivation with buildDepsOnly, then reused by the application package, tests, and Clippy. This keeps source-only changes from rebuilding the dependency graph.
+
+Native build:
 
 ~~~bash
 nix build
 nix run .
 nix flake check
 nix develop
+~~~
+
+The dependency layer is also exposed directly for cache-oriented CI jobs:
+
+~~~bash
+nix build .#deps
 ~~~
 
 Inside nix develop:
@@ -496,13 +1049,118 @@ cargo test --all-features
 cargo build --release --all-features
 ~~~
 
-The Linux Nix package includes Bubblewrap and Bash.
+The native Linux Nix package includes Bubblewrap and Bash.
+
+### Cross builds
+
+The x86_64-linux flake exposes cross-build outputs intended for release CI.
+
+Portable Linux x86_64:
+
+~~~bash
+nix build .#cross-linux-x86_64-deps
+nix build .#cross-linux-x86_64
+nix build .#dist-linux-x86_64
+~~~
+
+This target is x86_64-unknown-linux-musl with static CRT linking, so the resulting binary is suitable for Debian and other x86_64 Linux systems without requiring Nix or the host's glibc version.
+
+Windows x86_64:
+
+~~~bash
+nix build .#cross-windows-x86_64-deps
+nix build .#cross-windows-x86_64
+nix build .#dist-windows-x86_64
+~~~
+
+This target is x86_64-pc-windows-gnu using the MinGW/MSVCRT cross toolchain.
+
+The dist outputs use stable release filenames:
+
+~~~text
+abird-link-linux-x86_64
+abird-link-linux-x86_64.sha256
+abird-link-windows-x86_64.exe
+abird-link-windows-x86_64.exe.sha256
+~~~
+
+Build both release artifacts into ./dist:
+
+~~~bash
+./scripts/build-release-artifacts.sh
+~~~
+
+These outputs are deliberately separate so CI can build/cache the dependency derivations first, then build and upload the stable-named release assets.
+
+### Install script
+
+The repository includes install.sh for curl/sh installs and install.ps1 for native PowerShell installs.
+
+This checkout does not currently have a Git remote configured, so the installer does not guess a GitHub owner. Once a release repository exists, provide it explicitly:
+
+~~~bash
+curl -fsSL https://raw.githubusercontent.com/OWNER/abird-link/main/install.sh   | ABIRD_LINK_REPO=OWNER/abird-link sh
+~~~
+
+By default it installs the latest GitHub release into ~/.local/bin. Pin a release with:
+
+~~~bash
+curl -fsSL https://raw.githubusercontent.com/OWNER/abird-link/main/install.sh   | ABIRD_LINK_REPO=OWNER/abird-link ABIRD_LINK_VERSION=0.5.0 sh
+~~~
+
+A non-GitHub release/CDN can be used instead:
+
+~~~bash
+curl -fsSL https://example.com/install.sh   | ABIRD_LINK_RELEASE_BASE_URL=https://example.com/releases/v0.5.0 sh
+~~~
+
+Windows PowerShell uses the same release assets and checksum verification:
+
+~~~powershell
+$env:ABIRD_LINK_REPO = "OWNER/abird-link"
+irm https://raw.githubusercontent.com/OWNER/abird-link/main/install.ps1 | iex
+~~~
+
+The installers verify the matching SHA-256 sidecar before replacing the executable.
+
+
+## macOS and Windows
+
+The filesystem MCP tools (`read`, `write`, `edit`, `ls`, binary tools) still enforce abird-link's allow/deny policy on macOS and Windows.
+
+The shell is different: Bubblewrap is Linux-specific, so native macOS and Windows do not currently have an equivalent abird-link shell sandbox. To enable shell execution natively on those platforms, use the explicit full-host mode:
+
+~~~bash
+abird-link --allow-all --no-sandbox
+~~~
+
+That intentionally removes abird-link's shell isolation and gives the child shell the OS user's filesystem/network authority. Use it only when that is what you want.
+
+### Windows recommendation: WSL2
+
+For Windows development, the recommended secure shell workflow is to run abird-link **inside WSL2** and use the normal Linux Bubblewrap sandbox there:
+
+~~~bash
+# inside WSL2
+abird-link --allow-rw --allow-shell
+~~~
+
+That preserves the same Linux permission/mount/network model described above instead of exposing an unrestricted native PowerShell shell.
+
+Native Windows can still use the Rust filesystem tools with allow/deny enforcement without enabling PowerShell.
+
+### macOS
+
+macOS can use the Rust filesystem tools with the same allow/deny policy, plus stdio/HTTP/OpenAI transports. Because Bubblewrap is unavailable, shell execution requires `--allow-all --no-sandbox` until a macOS-native sandbox backend is added.
+
+The current nixpkgs unstable used by the flake supports Apple Silicon macOS but has dropped x86_64-darwin, so Intel macOS should build from source with Cargo for now rather than relying on `nix build`.
 
 ## Project layout
 
 ~~~text
 src/
   main.rs
+  logging.rs
   mcp.rs
   setup.rs
   transports/
@@ -510,9 +1168,15 @@ src/
     openai.rs
     stdio.rs
     http.rs
+
+scripts/
+  build-release-artifacts.sh
+
+install.sh
+install.ps1
 ~~~
 
-mcp.rs owns the permission-scoped tool implementation. Each transport is isolated in its own module.
+mcp.rs owns the permission-scoped tool implementation and Bubblewrap mapping. logging.rs owns the shared timestamp/color activity logger. setup.rs owns JSONC profiles, onboarding, and developer-cache discovery. Each transport is isolated in its own module around the same LocalMachine policy core.
 
 ## License
 

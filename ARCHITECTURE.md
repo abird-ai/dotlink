@@ -39,16 +39,25 @@ No transport owns filesystem policy.
 
 ## Profiles and persisted defaults
 
-The default config is ~/.config/abird-link/config.json. Named profiles use config.<profile>.json and are selected with -p/--profile. Setup can target the same profile with -s/--setup -p <name>.
+The default config is ~/.config/abird-link/config.jsonc. Named profiles use config.<profile>.jsonc and are selected with -p/--profile. Setup can target the same profile with -S/--setup -p <name>. JSONC supports line/block comments and trailing commas; legacy .json profiles remain readable as a compatibility fallback.
 
-Each profile persists transport support plus safe local defaults:
+Each profile persists transport support plus the full local permission model:
 
 ~~~text
-permissions.allow_rw
+permissions.cwd
+permissions.allow_read[]
+permissions.allow_write[]
+permissions.allow_rw[]
+permissions.deny_read[]
+permissions.deny_write[]
+permissions.deny_rw[]
 permissions.allow_shell
+permissions.allow_network
 ~~~
 
-allow_rw means rw on the launch cwd. allow_shell enables the normal platform shell; Linux still applies Bubblewrap and leaves network disabled by default.
+Relative permission paths resolve from the effective cwd. CLI paths merge on top of the profile, while --cwd overrides permissions.cwd for one run. `allow_rw: ["."]` means rw on cwd; `allow_rw: ["/"]` is unrestricted filesystem read+write.
+
+allow_shell enables the normal platform shell. allow_network controls network access for the normal sandboxed shell path. On Linux Bubblewrap still applies unless --allow-all --no-sandbox is explicitly selected.
 
 Setup also persists three independent transport booleans:
 
@@ -171,7 +180,7 @@ read_roots[]
 write_roots[]
 deny_read_roots[]
 deny_write_roots[]
-rw_all_dangerous
+unrestricted_fs
 ~~~
 
 Rules:
@@ -183,13 +192,15 @@ Rules:
 - deny-read, deny-write, and deny-rw are additive and take precedence over grants;
 - legacy --deny maps to both read and write deny sets;
 - deny-shell and deny-network override profile defaults and runtime allows;
-- deny-rw-all-dangerous cancels the unrestricted filesystem grant, including the filesystem portion of allow-all-dangerous.
+- unrestricted filesystem access is represented naturally by read+write grant `/`.
 
-The effective cwd is readable by default. A profile may also add write-cwd and shell defaults.
+The effective cwd is readable by default. A profile may also add write-cwd, shell, network, and typed developer-cache defaults.
 
 Bare --allow-write and --allow-rw add rw permission to cwd. Bare deny-read/deny-write/deny-rw target cwd symmetrically.
 
 Existing paths are canonicalized before checks. Create targets canonicalize their nearest existing ancestor before the final path is checked.
+
+Developer caches are modeled separately from filesystem grants. A cache record stores its tool family, host source path, and RO/RW mode. At runtime the source is canonicalized and mounted only into the shell sandbox, typically below `/tmp/home` at the tool's expected path. Cache mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical cache sources before mounting.
 
 ## Dynamic tool router
 
@@ -225,7 +236,7 @@ Only bash is exposed on Unix and only powershell on Windows.
 
 ## Linux Bubblewrap mapping
 
-On Linux, enabled shell runs inside Bubblewrap unless dangerous unsandboxed access was explicitly selected.
+On Linux, enabled shell runs inside Bubblewrap unless --allow-all --no-sandbox was explicitly selected.
 
 Effective filesystem grants become mounts:
 
@@ -239,7 +250,7 @@ Read-denied paths are masked after allow mounts. Write-denied paths inside other
 
 The saved OpenAI runtime credential is masked when present.
 
-Bubblewrap provides an empty temporary home and temporary directory.
+Bubblewrap provides an empty temporary home and temporary directory. Approved developer caches are then mounted selectively into that private home, for example host `~/.cargo/registry` -> sandbox `/tmp/home/.cargo/registry`; tool-specific cache environment variables are set when useful.
 
 On NixOS, the sandbox also preserves the standard Nix executable/profile graph read-only when those paths exist:
 
@@ -270,20 +281,58 @@ The main abird-link process may still need outbound network access for:
 
 ## Unsandboxed shell
 
-An unsandboxed shell cannot be constrained by Rust path checks.
-
-Therefore it requires explicit unrestricted filesystem and network acknowledgements:
+An unsandboxed shell cannot be constrained by Rust path checks, so abird-link exposes a single explicit full-host mode:
 
 ~~~text
---allow-shell
+--allow-all
 --no-sandbox
---allow-rw-all-dangerous
---allow-network-dangereous
 ~~~
 
---allow-all-dangerous is the full grant shorthand.
+The two flags require each other. This grants filesystem read+write `/`, shell, and network with no shell sandbox. Filesystem/network deny rules are rejected in this mode because they cannot constrain an arbitrary unsandboxed child process.
 
-Explicit denies still win. On Linux, a filesystem or network deny forces shell execution back into Bubblewrap even if --no-sandbox or --allow-all-dangerous was requested. On platforms without an enforceable shell sandbox, shell + filesystem/network deny combinations are rejected. deny-shell simply removes shell capability.
+For unrestricted filesystem access while keeping Linux Bubblewrap, use the normal path model instead:
+
+~~~text
+--allow-rw=/
+~~~
+
+Then add --allow-shell and/or --allow-network separately.
+
+## Logging model
+
+Logging has two layers:
+
+- normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP all produce the same timestamped TOOL start/completion lines;
+- verbose developer logging records incoming request metadata at the transport boundary without dumping request bodies.
+
+`-s/--silent` suppresses TOOL activity. `-v/--verbose` adds REQ logging. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is an interactive terminal.
+
+## Build and release architecture
+
+Nix builds use Crane. Each target has a separate dependency artifact derivation created with buildDepsOnly; final package/test/lint derivations import those Cargo artifacts instead of rebuilding dependencies after source-only changes.
+
+Native outputs expose:
+
+~~~text
+deps
+abird-link
+~~~
+
+On x86_64-linux, release CI can additionally build:
+
+~~~text
+cross-linux-x86_64-deps
+cross-linux-x86_64
+dist-linux-x86_64
+
+cross-windows-x86_64-deps
+cross-windows-x86_64
+dist-windows-x86_64
+~~~
+
+The Linux release target is x86_64-unknown-linux-musl with static CRT linking, intended to run on Debian and other x86_64 Linux distributions without a Nix runtime. The Windows target is x86_64-pc-windows-gnu.
+
+Dist outputs use stable filenames plus SHA-256 sidecars so a release workflow can upload the same names on every tagged release. install.sh and install.ps1 consume those assets. The release repository/base URL remains configurable because the local Git repository does not yet have a remote configured.
 
 ## Binary MCP content
 

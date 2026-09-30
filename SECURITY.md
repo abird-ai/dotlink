@@ -14,9 +14,9 @@ and cwd is the only implicit readable directory.
 
 ## Profiles and permission precedence
 
-Profiles may persist allow_rw (rw-cwd) and allow_shell defaults. Named profiles use config.<profile>.json; the default uses config.json.
+Profiles may persist cwd, allow_read/allow_write/allow_rw path arrays, deny_read/deny_write/deny_rw path arrays, allow_shell, and allow_network. Named profiles use config.<profile>.jsonc; the default uses config.jsonc. JSONC supports comments/trailing commas, while legacy .json profiles remain readable.
 
-Runtime allow rules are additive. Denies always take precedence over profile defaults, ordinary allows, and dangerous grant shortcuts.
+Runtime allow rules are additive. Denies always take precedence over profile defaults, ordinary allows, and developer-cache grants.
 
 Filesystem controls are symmetric:
 
@@ -31,10 +31,11 @@ Bare forms target cwd. Bare --allow-write retains its historical behavior and me
 Capability controls are also symmetric:
 
 ~~~text
---allow-shell             --deny-shell
---allow-network           --deny-network
---allow-rw-all-dangerous  --deny-rw-all-dangerous
+--allow-shell      --deny-shell
+--allow-network    --deny-network
 ~~~
+
+`--allow-rw=/` is unrestricted filesystem read+write; no separate all-rw flag exists.
 
 Rust file tools canonicalize existing targets and ancestors before policy checks so symlink traversal cannot escape a grant.
 
@@ -43,6 +44,20 @@ Tool requirements:
 - read, read_binary, ls require read;
 - write, write_binary require write;
 - edit, patch_binary require read+write.
+
+## Developer cache sharing
+
+When shell is enabled, onboarding can autodiscover existing package/build caches and ask whether each cache should be shared with the sandbox as none, read-only, or read+write.
+
+Supported cache families currently include Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build caches, Maven, Gradle, sccache, and ccache.
+
+Cache grants are **shell-only**. They do not add the host cache path to the MCP filesystem allow-list, so `read`, `write`, `ls`, and related MCP tools cannot use cache sharing to inspect the user's home directory.
+
+abird-link maps approved host caches into the sandbox's private home at the package manager's expected location. Only the cache directory itself is mounted; adjacent credential/config files such as `~/.cargo/credentials.toml`, `~/.cargo/config.toml`, or `~/.npmrc` are not included.
+
+Read-only sharing protects host cache integrity but cannot populate cache misses. Read+write sharing provides the normal package-manager experience and lets successful downloads/builds be reused later, but sandboxed code can also modify those shared host cache contents. Choose RW only when that tradeoff is acceptable.
+
+Filesystem deny rules remain authoritative: deny-read removes a matching cache mount and deny-write downgrades a matching RW cache to read-only.
 
 ## Transport security
 
@@ -97,7 +112,7 @@ The Runtime key is stored separately for each profile:
 ~/.config/abird-link/runtime.work.key
 ~~~
 
-JSON config files are config.json or config.<profile>.json. On Unix config/key files are mode 0600 and their directory is mode 0700.
+Canonical JSONC config files are config.jsonc or config.<profile>.jsonc. On Unix config/key files are mode 0600 and their directory is mode 0700.
 
 The Admin key used to create a tunnel is never persisted. A profile with OpenAI disabled does not require a runtime key.
 
@@ -116,14 +131,14 @@ The sandbox:
 - does not expose purely write-only host grants;
 - masks read-denied paths and rebinds write-denied readable subtrees read-only;
 - masks the saved OpenAI runtime key when present;
-- uses an empty temporary home;
+- uses an empty temporary home, with only explicitly approved developer caches mounted back into package-manager-specific subdirectories;
 - mounts required system runtime paths read-only;
 - on NixOS, mounts the standard Nix store/profile symlink graph read-only (/nix/store, /run/current-system, /etc/profiles, /nix/var/nix/profiles, and ~/.nix-profile when present) without mounting the whole home directory;
 - canonicalizes and filters PATH entries so only sandbox-visible tool directories remain;
 - isolates PID, IPC, and UTS namespaces;
 - unshares the network namespace by default.
 
-The Nix daemon socket is deliberately not exposed by default. Giving a sandboxed shell access to the host Nix daemon could bypass the intended filesystem/network isolation through daemon-mediated builds or fetches.
+The Nix daemon endpoint namespace is deliberately hidden by default when shell network is denied. abird-link masks the daemon endpoint roots (/nix/var/nix/daemon-socket and /run/nix-daemon) rather than assuming a particular socket filename or filesystem type. This prevents layout changes from accidentally exposing daemon-mediated builds or fetches outside the shell's direct filesystem/network isolation.
 
 Enable shell network access with:
 
@@ -133,36 +148,26 @@ Enable shell network access with:
 
 The shell network namespace is separate from the main abird-link process. OpenAI and ngrok can use outbound networking even while the shell itself has no network.
 
-## Dangerous unsandboxed shell
+## Full unsandboxed host mode
 
---no-sandbox does not grant shell access by itself.
-
-Unsandboxed execution requires:
+The only unsandboxed shell mode is:
 
 ~~~text
---allow-shell
+--allow-all
 --no-sandbox
---allow-rw-all-dangerous
---allow-network-dangereous
 ~~~
 
-The corrected alias --allow-network-dangerous is accepted.
+The flags require each other and grant root filesystem read+write, shell, and network with no Bubblewrap isolation. Deny rules are not accepted in this mode because an arbitrary unsandboxed child process cannot be constrained by Rust path checks.
 
-The full grant shortcut is:
+For unrestricted filesystem access while keeping Linux sandboxing, use `--allow-rw=/` and add shell/network capabilities separately.
 
-~~~text
---allow-all-dangerous
-~~~
+## Windows and macOS
 
-Explicit denies still win. On Linux, filesystem or network denies force the shell back into Bubblewrap so those denies remain enforceable even if --no-sandbox or --allow-all-dangerous was requested. deny-shell removes shell capability entirely. On platforms without an enforceable shell sandbox, shell + filesystem/network deny combinations are rejected.
+Rust filesystem tools still enforce allow/deny policy on Windows and macOS.
 
-## Windows
+Bubblewrap is Linux-only. Native Windows/macOS shell execution therefore requires `--allow-all --no-sandbox`.
 
-The Windows shell tool is powershell, preferring pwsh.exe and falling back to powershell.exe.
-
-Bubblewrap is Linux-only, so Windows shell execution follows the explicit unsandboxed-dangerous requirements.
-
-Rust filesystem tools still enforce allow/deny policy on Windows.
+For Windows, WSL2 is the recommended secure shell workflow: run abird-link inside WSL2 and use the normal Linux Bubblewrap sandbox instead of enabling unrestricted native PowerShell.
 
 ## Binary data
 
@@ -171,6 +176,14 @@ read_binary supports MCP typed media/blob content plus explicit base64 and hex.
 write_binary and patch_binary enforce write limits.
 
 patch_binary also caps total file size processed in memory.
+
+## Logging privacy
+
+Normal activity logs show tool names, safe argument metadata such as paths/cwd/flags, completion status, latency, and timestamps. They intentionally summarize content/data fields by size instead of printing file contents or binary payloads.
+
+Verbose mode adds request-level transport/protocol metadata. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the abird-link request logger.
+
+`--silent` suppresses normal TOOL activity lines. `--silent --verbose` retains developer REQ logs while hiding TOOL lines.
 
 ## Resource limits
 
@@ -213,4 +226,4 @@ Public HTTP through ngrok:
 abird-link --http --ngrok
 ~~~
 
-Use --allow-all-dangerous only when unrestricted host access is explicitly intended.
+Use --allow-all --no-sandbox only when unrestricted host access is explicitly intended.

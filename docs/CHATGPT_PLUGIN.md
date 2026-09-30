@@ -122,7 +122,7 @@ Do not provide Plugin Creator with:
 - local credentials;
 - public MCP URL.
 
-Filesystem/shell defaults may be persisted per profile, then refined or denied at launch. Use -p/--profile to select config.<profile>.json; explicit deny flags always win.
+Filesystem/shell/network defaults may be persisted per profile, then refined or denied at launch. Use -p/--profile to select config.<profile>.jsonc; explicit deny flags always win.
 
 ## Distribution
 

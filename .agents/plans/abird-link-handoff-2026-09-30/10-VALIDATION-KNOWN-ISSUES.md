@@ -1,0 +1,213 @@
+# Validation history and known issues
+
+Date: 2026-09-30
+
+## Rust validation
+
+The final implementation was validated with the intended Rust 1.98.1 toolchain:
+
+```bash
+cargo fmt --check
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+git diff --check
+```
+
+Final observed suite:
+
+```text
+70 tests passed
+Clippy clean
+fmt clean
+diff check clean
+current binary rebuilt successfully
+```
+
+## Bubblewrap validation
+
+The opt-in real runtime smokes passed with `ABIRD_TEST_BWRAP=1`, including:
+
+- project RW when granted;
+- host home hidden;
+- Nix profile/store tooling visible where intended;
+- network denied by default;
+- Nix daemon unavailable when denied;
+- runtime credentials hidden;
+- deny-read masking;
+- deny-write RO downgrade;
+- typed cache RO/RW mounts;
+- cache-specific environment mapping.
+
+## Logging validation
+
+Verified behavior:
+
+```text
+default             TOOL start + completion, no REQ
+--silent            no TOOL
+--verbose           TOOL + REQ
+--silent --verbose  REQ only
+```
+
+Also verified:
+
+- timestamps;
+- forced ANSI color;
+- HTTP method/path/status request logging;
+- stdio stdout remains protocol-only;
+- verbose summaries avoid raw bulk payload/file-content logging.
+
+## Cache validation
+
+Verified:
+
+- typed cache config serialization;
+- onboarding discovery for supported cache families;
+- none/RO/RW choices;
+- candidates must already exist;
+- discovery avoids creation-prone Yarn/pnpm probes;
+- cache grants do not expand MCP filesystem roots;
+- deny-read removes matching cache grants;
+- deny-write downgrades RW cache grants to RO;
+- real Bubblewrap cache reuse.
+
+## Transport validation
+
+Verified historically and during the implementation phase:
+
+- OpenAI transport integration path;
+- stdio initialize;
+- HTTP initialize;
+- clean stdio EOF does not kill active peer transports;
+- explicit runtime `--stdio` / `--http` override persisted false;
+- stable and ephemeral HTTP routing;
+- independent local/ngrok ephemeral path policy;
+- ngrok missing-token path is clear;
+- logging does not corrupt stdio MCP traffic.
+
+The final live ChatGPT/OpenAI process still needs a restart/connection refresh to guarantee the client is using the final committed binary/schema.
+
+## JSONC/profile validation
+
+Tests cover:
+
+- line comments;
+- block comments;
+- trailing commas;
+- comment markers inside strings;
+- BOM;
+- unterminated block-comment rejection;
+- runtime key omitted from serialization;
+- legacy JSON fallback;
+- named profile paths;
+- persistent cwd/allow/deny arrays;
+- shell/network defaults;
+- legacy boolean `allow_rw` migration;
+- deny-shell/deny-network precedence.
+
+## Nix/Crane validation — complete
+
+The release build was validated without exposing the host Nix daemon by using a writable isolated Nix store under ignored `target/`.
+
+Validated:
+
+- `flake.lock` contains Crane v0.24.0 and rust-overlay.
+- `nix flake show` evaluates.
+- `nix flake check --all-systems --no-build` passes for supported systems:
+  - x86_64-linux;
+  - aarch64-linux;
+  - aarch64-darwin.
+- full x86_64-linux `nix flake check` builds/passes package, tests, Clippy and fmt.
+- `.#deps` builds as a separate Crane dependency artifact.
+- `.#cross-linux-x86_64-deps`, `.#cross-linux-x86_64`, and `.#dist-linux-x86_64` build.
+- `.#cross-windows-x86_64-deps`, `.#cross-windows-x86_64`, and `.#dist-windows-x86_64` build.
+- the same cross/dist outputs were rebuilt from the actual Git-backed committed source after implementation commits.
+
+### Linux release artifact
+
+Verified:
+
+- ELF64 x86_64;
+- no program interpreter;
+- `ldd` reports `statically linked`;
+- SHA-256 sidecar verifies;
+- binary runs locally and prints `abird-link 0.5.0`.
+
+### Windows release artifact
+
+Verified:
+
+- PE32+ / `pei-x86-64`;
+- x86_64 Windows CUI subsystem;
+- SHA-256 sidecar verifies;
+- imports only Windows system DLLs;
+- no libgcc/libstdc++/libwinpthread/libssp runtime sidecar imports;
+- runs under Wine and prints `abird-link 0.5.0`.
+
+## Release/install validation — complete
+
+`scripts/build-release-artifacts.sh` was run end-to-end against the validated isolated Nix build context and produced exactly:
+
+```text
+abird-link-linux-x86_64
+abird-link-linux-x86_64.sha256
+abird-link-windows-x86_64.exe
+abird-link-windows-x86_64.exe.sha256
+```
+
+Both checksums verify.
+
+`install.sh`:
+
+- executable mode verified;
+- `bash -n` passes;
+- ran against the real Linux release fixture;
+- SHA-256 verification passed;
+- installed binary is byte-identical;
+- installed binary runs.
+
+`install.ps1`:
+
+- parsed with PowerShell 7.6.6;
+- tested with `Invoke-WebRequest` mocked to the real Windows release fixture;
+- checksum verification passed;
+- output `abird-link.exe` hash matches the release fixture.
+
+A native Windows host test is still useful future CI coverage, but there is no known packaging failure after PE inspection + Wine execution + PowerShell installer logic validation.
+
+## Commit structure
+
+Implementation was split into coherent compilable commits:
+
+```text
+b76f8e6 Expand profiles, sandbox caches, and logging
+7b93e92 Add Crane cross builds and release installers
+```
+
+Documentation/handoff follows those commits.
+
+## Current known limitations
+
+### Running connector freshness
+
+The ChatGPT connector process can outlive a binary rebuild. After changing tool/schema/sandbox metadata, restart `abird-link` and refresh the ChatGPT developer connection before using live tool behavior as final evidence.
+
+### No repository remote
+
+No Git remote is configured. Nothing is pushed automatically, and release installers intentionally do not invent a repository owner.
+
+### Public HTTP authentication
+
+abird-link HTTP/ngrok currently has no built-in application-layer caller authentication.
+
+Ephemeral paths are not authentication.
+
+### Platform sandboxing
+
+Bubblewrap is Linux-only.
+
+Windows/macOS filesystem MCP tools still use Rust allow/deny policy, but native shell execution cannot claim Linux Bubblewrap isolation. Windows users are advised to use WSL2 + Bubblewrap for the stronger shell boundary.
+
+### Intel macOS Nix
+
+Current nixpkgs unstable dropped `x86_64-darwin`; the flake intentionally does not advertise it. Intel macOS is documented as Cargo-from-source until a separate supported nixpkgs path/release artifact is introduced.

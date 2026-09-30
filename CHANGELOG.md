@@ -2,13 +2,29 @@
 
 ## Unreleased
 
+- Add developer-cache autodiscovery during onboarding for Cargo, npm, pnpm, Yarn, pip, uv, Go, Maven, Gradle, sccache, and ccache.
+- Persist typed cache grants with none/read-only/read+write choices and mount approved caches only into the sandboxed shell's private home.
+- Keep shared caches outside the MCP filesystem permission surface; filesystem deny rules still remove or downgrade matching cache grants.
+- Add tool-specific sandbox cache environment mapping and Bubblewrap RO/RW cache regression tests.
+
+- Refactor Nix builds to Crane with a separate buildDepsOnly dependency artifact layer reused by package, tests, and Clippy.
+- Add portable x86_64 Linux/musl and x86_64 Windows GNU cross-build outputs, with separate dependency-cache outputs for CI.
+- Add stable release-artifact outputs with SHA-256 sidecars and a scripts/build-release-artifacts.sh helper.
+- Add curl-able install.sh and PowerShell install.ps1 installers using stable release asset names.
+- Refresh `flake.lock` for Crane v0.24.0 and rust-overlay.
+- Keep flake-native macOS support on aarch64-darwin; stop advertising x86_64-darwin now that nixpkgs 26.11 has dropped it, with Intel macOS documented as a Cargo-from-source path.
+- Harden Bubblewrap Nix-daemon isolation by masking the daemon endpoint roots (/nix/var/nix/daemon-socket and /run/nix-daemon) instead of assuming a specific socket leaf/type; centralize type-aware path masking for directories and non-directories.
+
 - Rename the package, binary, MCP server identity, Nix outputs, config directory, and environment prefix to abird-link.
-- Replace TOML persistence with JSON: config.json for default and config.<profile>.json for named profiles.
-- Add -p/--profile and allow -s/--setup -p <name> to create or reconfigure named profiles through the same onboarding flow.
-- Persist safe per-profile permission defaults for rw-cwd and shell.
-- Add symmetric deny-read, deny-write, deny-rw, deny-shell, deny-network, and deny-rw-all-dangerous controls; denies override config defaults and allow flags.
+- Replace TOML persistence with JSONC: config.jsonc for default and config.<profile>.jsonc for named profiles, with comments/trailing commas and legacy .json read fallback.
+- Add -p/--profile and allow -S/--setup -p <name> to create or reconfigure named profiles through the same onboarding flow.
+- Expand profile permissions to persist cwd plus allow_read/allow_write/allow_rw and deny_read/deny_write/deny_rw path arrays, with CLI permissions merged on top.
+- Keep backward compatibility with v7 boolean allow_rw by mapping true to allow_rw: ["."].
+- Add setup-time optional cwd pinning plus persisted shell and sandboxed-network defaults.
+- Add symmetric deny-read, deny-write, deny-rw, deny-shell, and deny-network controls; denies override profile defaults and runtime grants.
 - Keep legacy --deny=PATH as a read+write deny synonym.
-- Force Bubblewrap on Linux when filesystem/network denies must constrain a shell, even if a dangerous no-sandbox grant was requested.
+- Make --allow-rw=/ naturally mean unrestricted filesystem RW; remove special all-rw authority flags.
+- Replace the intermediate dangerous-suffixed unsandboxed flags with a single paired --allow-all --no-sandbox full-host mode; deny rules are rejected in that mode.
 - Store OpenAI runtime keys separately per profile as runtime.key / runtime.<profile>.key.
 
 - Make explicit --stdio and --http runtime flags activate those transports even when persisted setup has them disabled.
@@ -34,12 +50,15 @@
 - Make bare --allow-write shorthand for read+write cwd.
 - Add Linux Bubblewrap shell sandboxing with network disabled by default.
 - Add --allow-network for sandboxed network access.
-- Add --allow-rw-all-dangerous, --allow-network-dangereous, and --allow-all-dangerous for explicit unsandboxed host authority.
+- Add explicit full-host authority through paired --allow-all --no-sandbox; ordinary --allow-rw=/ remains available for unrestricted filesystem RW inside the Linux sandbox.
 - Add Bash on Unix and PowerShell selection on Windows.
 - Simplify first-run setup into a compact beginner-friendly checklist.
 - Hide verbose tunnel INFO logs by default while keeping them available through RUST_LOG.
 - Add a complete Nix flake package, app, development shell, formatter, Bubblewrap runtime, and nix flake check checks.
-- Add -v / --verbose concise MCP request and tool-call logging.
+- Make timestamped tool-attempt/completion logging the normal user-facing activity stream across all transports.
+- Add -s/--silent to suppress normal tool activity, repurposing -s from setup; setup now uses -S.
+- Redefine -v/--verbose as developer request logging for OpenAI, stdio, and HTTP while retaining normal tool activity.
+- Add --color=auto|always|never with TTY-aware automatic ANSI color output.
 - Add --list-tools generated from the live policy-aware MCP router.
 - Add direct setup links for ChatGPT Workspace IDs and OpenAI Organization IDs.
 
