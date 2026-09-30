@@ -290,6 +290,30 @@ pub struct SetupResult {
     pub protected_paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum ProfileRuleKind {
+    Read,
+    Write,
+    Rw,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum ProfileBool {
+    Openai,
+    Stdio,
+    Http,
+    #[value(alias = "http-ephemeral-url")]
+    HttpEphemeral,
+    Ngrok,
+    #[value(alias = "ngrok-ephemeral-url")]
+    NgrokEphemeral,
+    DefaultAllow,
+    Shell,
+    Network,
+}
+
 #[derive(Debug, Deserialize)]
 struct TunnelRecord {
     id: String,
@@ -323,11 +347,49 @@ fn default_file_bytes() -> usize {
     DEFAULT_MAX_FILE_BYTES
 }
 
+fn default_app_config() -> AppConfig {
+    AppConfig {
+        version: config_version(),
+        transports: TransportConfig::default(),
+        permissions: PermissionConfig::default(),
+        caches: Vec::new(),
+        tunnel_id: None,
+        runtime_api_key: String::new(),
+        organization_id: None,
+        base_url: default_base_url(),
+        max_shell_timeout_secs: default_shell_timeout(),
+        max_output_bytes: default_output_bytes(),
+        max_read_bytes: default_file_bytes(),
+        max_write_bytes: default_file_bytes(),
+    }
+}
+
+fn read_profile_config(profile: Option<&str>) -> Result<Option<AppConfig>> {
+    let path = config_path(profile)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let config: AppConfig =
+        parse_jsonc(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+    validate_config_structure(&config)?;
+    Ok(Some(config))
+}
+
+fn load_profile_for_edit(profile: Option<&str>) -> Result<Option<AppConfig>> {
+    let Some(mut config) = read_profile_config(profile)? else {
+        return Ok(None);
+    };
+    config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
+    Ok(Some(config))
+}
+
 pub async fn load_or_setup(
     force_setup: bool,
     profile: Option<&str>,
     color: bool,
-) -> Result<SetupResult> {
+) -> Result<Option<SetupResult>> {
     validate_profile(profile)?;
 
     if !force_setup {
@@ -335,11 +397,11 @@ pub async fn load_or_setup(
             && let Some(config) = config_from_env()?
         {
             let protected_paths = protected_paths_for_config(&config, profile)?;
-            return Ok(SetupResult {
+            return Ok(Some(SetupResult {
                 config,
                 new_tunnel: false,
                 protected_paths,
-            });
+            }));
         }
 
         let path = config_path(profile)?;
@@ -357,11 +419,11 @@ pub async fn load_or_setup(
             apply_nonsecret_env_overrides(&mut config)?;
             validate_config(&config)?;
             let protected_paths = protected_paths_for_config(&config, profile)?;
-            return Ok(SetupResult {
+            return Ok(Some(SetupResult {
                 config,
                 new_tunnel: false,
                 protected_paths,
-            });
+            }));
         }
     }
 
@@ -374,7 +436,8 @@ pub async fn load_or_setup(
         );
     }
 
-    interactive_setup(profile, color).await
+    let existing = load_profile_for_edit(profile)?;
+    interactive_setup(profile, color, existing).await
 }
 
 fn config_from_env() -> Result<Option<AppConfig>> {
@@ -597,7 +660,20 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
         .collect()
 }
 
-fn prompt_cache_mode(cache: &DiscoveredCache, color: bool) -> Result<Option<CacheMode>> {
+fn yes_no_hint(default: bool) -> &'static str {
+    if default { "[Y/n]" } else { "[y/N]" }
+}
+
+fn prompt_cache_mode(
+    cache: &DiscoveredCache,
+    existing: Option<CacheMode>,
+    color: bool,
+) -> Result<Option<CacheMode>> {
+    let default_key = match existing {
+        Some(CacheMode::ReadOnly) => "r",
+        Some(CacheMode::ReadWrite) => "w",
+        None => "n",
+    };
     loop {
         let input = prompt_line(&format!(
             "   {:<18} {}\n      {} ",
@@ -606,12 +682,17 @@ fn prompt_cache_mode(cache: &DiscoveredCache, color: bool) -> Result<Option<Cach
             setup_style(
                 color,
                 "33",
-                "Access [n]one / [r]ead-only / read+[w]rite [n]:"
+                format!("Access [n]one / [r]ead-only / read+[w]rite [{default_key}]:")
             )
         ))?;
 
-        match input.trim().to_ascii_lowercase().as_str() {
-            "" | "n" | "none" | "no" => return Ok(None),
+        let value = if input.trim().is_empty() {
+            default_key
+        } else {
+            input.trim()
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "n" | "none" | "no" => return Ok(None),
             "r" | "ro" | "read" | "read-only" => return Ok(Some(CacheMode::ReadOnly)),
             "w" | "rw" | "write" | "read-write" | "read+write" => {
                 return Ok(Some(CacheMode::ReadWrite));
@@ -621,7 +702,11 @@ fn prompt_cache_mode(cache: &DiscoveredCache, color: bool) -> Result<Option<Cach
     }
 }
 
-async fn setup_developer_caches(allow_shell: bool, color: bool) -> Result<Vec<CacheGrant>> {
+async fn setup_developer_caches(
+    allow_shell: bool,
+    color: bool,
+    existing: &[CacheGrant],
+) -> Result<Vec<CacheGrant>> {
     if !allow_shell || !cfg!(target_os = "linux") {
         return Ok(Vec::new());
     }
@@ -633,19 +718,26 @@ async fn setup_developer_caches(allow_shell: bool, color: bool) -> Result<Vec<Ca
         setup_style(color, "2", "Scanning known package/build cache locations…")
     );
 
-    let discovered = discover_developer_caches().await;
-    if discovered.is_empty() {
+    let mut candidates = BTreeMap::<CacheKind, PathBuf>::new();
+    for cache in discover_developer_caches().await {
+        candidates.insert(cache.kind, cache.path);
+    }
+    for cache in existing {
+        candidates.insert(cache.kind, cache.path.clone());
+    }
+
+    if candidates.is_empty() {
         println!("   • No supported existing caches found.");
         return Ok(Vec::new());
     }
 
     println!(
         "   Found {} cache{}:",
-        discovered.len(),
-        if discovered.len() == 1 { "" } else { "s" }
+        candidates.len(),
+        if candidates.len() == 1 { "" } else { "s" }
     );
-    for cache in &discovered {
-        println!("   • {:<18} {}", cache.kind.label(), cache.path.display());
+    for (kind, path) in &candidates {
+        println!("   • {:<18} {}", kind.label(), path.display());
     }
     println!(
         "   • Only cache directories are shared; adjacent credentials/config files are excluded."
@@ -654,19 +746,32 @@ async fn setup_developer_caches(allow_shell: bool, color: bool) -> Result<Vec<Ca
         "   • read+write is fastest, but allows sandboxed builds to modify the shared host cache."
     );
 
+    let configure_default = !existing.is_empty();
     if !prompt_yes_no(
         &format!(
             "   {} ",
-            setup_style(color, "33", "Configure access to discovered caches? [y/N]:")
+            setup_style(
+                color,
+                "33",
+                format!(
+                    "Configure access to discovered caches? {}:",
+                    yes_no_hint(configure_default)
+                )
+            )
         ),
-        false,
+        configure_default,
     )? {
         return Ok(Vec::new());
     }
 
     let mut grants = Vec::new();
-    for cache in discovered {
-        if let Some(mode) = prompt_cache_mode(&cache, color)? {
+    for (kind, path) in candidates {
+        let cache = DiscoveredCache { kind, path };
+        let existing_mode = existing
+            .iter()
+            .find(|grant| grant.kind == cache.kind)
+            .map(|grant| grant.mode);
+        if let Some(mode) = prompt_cache_mode(&cache, existing_mode, color)? {
             grants.push(CacheGrant {
                 kind: cache.kind,
                 path: cache.path,
@@ -677,6 +782,39 @@ async fn setup_developer_caches(allow_shell: bool, color: bool) -> Result<Vec<Ca
     Ok(grants)
 }
 
+fn set_dot_rule(paths: &mut Vec<PathBuf>, enabled: bool) {
+    let dot = PathBuf::from(".");
+    paths.retain(|path| path != &dot);
+    if enabled {
+        paths.push(dot);
+    }
+}
+
+fn setup_cancelled(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "0" | "cancel" | "none" | "q" | "quit"
+    )
+}
+
+fn transport_selection_label(config: &TransportConfig) -> String {
+    let mut selected = Vec::new();
+    if config.openai {
+        selected.push("1");
+    }
+    if config.stdio {
+        selected.push("2");
+    }
+    if config.http {
+        selected.push("3");
+    }
+    if selected.is_empty() {
+        "1".to_owned()
+    } else {
+        selected.join(",")
+    }
+}
+
 fn setup_style(color: bool, code: &str, text: impl AsRef<str>) -> String {
     if color {
         format!("[{code}m{}[0m", text.as_ref())
@@ -685,7 +823,11 @@ fn setup_style(color: bool, code: &str, text: impl AsRef<str>) -> String {
     }
 }
 
-async fn interactive_setup(profile: Option<&str>, color: bool) -> Result<SetupResult> {
+async fn interactive_setup(
+    profile: Option<&str>,
+    color: bool,
+    existing: Option<AppConfig>,
+) -> Result<Option<SetupResult>> {
     println!();
     println!("{}", setup_style(color, "1;36", "abird dotlink setup"));
     println!(
@@ -704,6 +846,10 @@ async fn interactive_setup(profile: Option<&str>, color: bool) -> Result<SetupRe
         );
         println!();
     }
+
+    let mut config = existing.unwrap_or_else(default_app_config);
+    let previous = config.clone();
+    let current_transports = config.transports.clone();
 
     println!("{}", setup_style(color, "1", "1. MCP transports"));
     println!(
@@ -725,129 +871,202 @@ async fn interactive_setup(profile: Option<&str>, color: bool) -> Result<SetupRe
         setup_style(color, "1;36", "3"),
         setup_style(color, "2", "Claude.ai and other web MCP clients")
     );
+    println!("   {}  Cancel setup", setup_style(color, "1;36", "0"));
+
+    let selection_default = transport_selection_label(&current_transports);
     let selection = prompt_line(&format!(
         "   {} ",
-        setup_style(color, "1;33", "Select [1] (comma-separated; all / none):")
+        setup_style(
+            color,
+            "1;33",
+            format!("Select [{selection_default}] (comma-separated; all / cancel):")
+        )
     ))?;
-    let mut transports = parse_transport_selection(&selection)?;
+    if setup_cancelled(&selection) {
+        println!();
+        println!(
+            "{}",
+            setup_style(color, "2", "Setup cancelled. No changes saved.")
+        );
+        return Ok(None);
+    }
 
+    let selected = if selection.trim().is_empty() {
+        selection_default.as_str()
+    } else {
+        selection.as_str()
+    };
+    let mut transports = parse_transport_selection(selected)?;
+    if transports.enabled_names().is_empty() {
+        println!();
+        println!(
+            "{}",
+            setup_style(color, "2", "Setup cancelled. No changes saved.")
+        );
+        return Ok(None);
+    }
+
+    transports.http_bind = current_transports.http_bind.clone();
     if transports.http {
         println!();
         println!("   {}", setup_style(color, "1", "HTTP options"));
         transports.http_ephemeral_url = prompt_yes_no(
             &format!(
                 "   {} ",
-                setup_style(color, "33", "Use an ephemeral local MCP URL? [y/N]:")
+                setup_style(
+                    color,
+                    "33",
+                    format!(
+                        "Use an ephemeral local MCP URL? {}:",
+                        yes_no_hint(current_transports.http_ephemeral_url)
+                    )
+                )
             ),
-            false,
+            current_transports.http_ephemeral_url,
         )?;
         transports.ngrok = prompt_yes_no(
             &format!(
                 "   {} ",
-                setup_style(color, "33", "Publish a public ngrok HTTPS endpoint? [y/N]:")
+                setup_style(
+                    color,
+                    "33",
+                    format!(
+                        "Publish a public ngrok HTTPS endpoint? {}:",
+                        yes_no_hint(current_transports.ngrok)
+                    )
+                )
             ),
-            false,
+            current_transports.ngrok,
         )?;
         if transports.ngrok {
             transports.ngrok_ephemeral_url = prompt_yes_no(
                 &format!(
                     "   {} ",
-                    setup_style(color, "33", "Use an ephemeral ngrok MCP URL? [y/N]:")
+                    setup_style(
+                        color,
+                        "33",
+                        format!(
+                            "Use an ephemeral ngrok MCP URL? {}:",
+                            yes_no_hint(current_transports.ngrok_ephemeral_url)
+                        )
+                    )
                 ),
-                false,
+                current_transports.ngrok_ephemeral_url,
             )?;
+        } else {
+            transports.ngrok_ephemeral_url = false;
         }
+    } else {
+        transports.http_ephemeral_url = false;
+        transports.ngrok = false;
+        transports.ngrok_ephemeral_url = false;
     }
 
-    let no_transports = transports.enabled_names().is_empty();
-    let (permissions, caches) = if no_transports {
-        (PermissionConfig::default(), Vec::new())
-    } else {
-        println!();
-        println!("{}", setup_style(color, "1", "2. Local access"));
-        let setup_dir = env::current_dir().context("failed to determine setup directory")?;
-        let default_allow = prompt_yes_no(
-            &format!(
-                "   {} {} ",
-                setup_style(color, "33", "Allow read access to:"),
-                setup_style(color, "36", format!("{} [Y/n]:", setup_dir.display()))
-            ),
-            true,
-        )?;
-        let allow_rw_base = if default_allow {
-            prompt_yes_no(
-                &format!(
-                    "   {} ",
-                    setup_style(color, "33", "Allow write access too? [y/N]:")
-                ),
-                false,
-            )?
-        } else {
-            false
-        };
-        let allow_shell = prompt_yes_no(
+    println!();
+    println!("{}", setup_style(color, "1", "2. Local access"));
+    let setup_dir = env::current_dir().context("failed to determine setup directory")?;
+    let mut permissions = config.permissions.clone();
+    permissions.default_allow = prompt_yes_no(
+        &format!(
+            "   {} {} ",
+            setup_style(color, "33", "Allow read access to:"),
+            setup_style(
+                color,
+                "36",
+                format!(
+                    "{} {}:",
+                    setup_dir.display(),
+                    yes_no_hint(permissions.default_allow)
+                )
+            )
+        ),
+        permissions.default_allow,
+    )?;
+
+    let current_rw_base = permissions
+        .allow_rw
+        .iter()
+        .any(|path| path == Path::new("."));
+    let allow_rw_base = if permissions.default_allow {
+        prompt_yes_no(
             &format!(
                 "   {} ",
-                setup_style(color, "33", "Allow shell access? [y/N]:")
+                setup_style(
+                    color,
+                    "33",
+                    format!("Allow write access too? {}:", yes_no_hint(current_rw_base))
+                )
             ),
-            false,
-        )?;
-        let allow_network = if allow_shell {
-            if cfg!(target_os = "linux") {
-                println!(
-                    "   {}",
-                    setup_style(color, "2", "Linux shell runs inside Bubblewrap.")
-                );
-            }
-            prompt_yes_no(
-                &format!(
-                    "   {} ",
-                    setup_style(color, "33", "Allow shell network access? [y/N]:")
-                ),
-                false,
-            )?
-        } else {
-            false
-        };
+            current_rw_base,
+        )?
+    } else {
+        false
+    };
+    set_dot_rule(&mut permissions.allow_rw, allow_rw_base);
 
-        let permissions = PermissionConfig {
-            default_allow,
-            allow_read: Vec::new(),
-            allow_write: Vec::new(),
-            allow_rw: allow_rw_base
-                .then(|| PathBuf::from("."))
-                .into_iter()
-                .collect(),
-            deny_read: Vec::new(),
-            deny_write: Vec::new(),
-            deny_rw: Vec::new(),
-            allow_shell,
-            allow_network,
-        };
-        let caches = setup_developer_caches(allow_shell, color).await?;
-        (permissions, caches)
+    permissions.allow_shell = prompt_yes_no(
+        &format!(
+            "   {} ",
+            setup_style(
+                color,
+                "33",
+                format!(
+                    "Allow shell access? {}:",
+                    yes_no_hint(permissions.allow_shell)
+                )
+            )
+        ),
+        permissions.allow_shell,
+    )?;
+    permissions.allow_network = if permissions.allow_shell {
+        if cfg!(target_os = "linux") {
+            println!(
+                "   {}",
+                setup_style(color, "2", "Linux shell runs inside Bubblewrap.")
+            );
+        }
+        prompt_yes_no(
+            &format!(
+                "   {} ",
+                setup_style(
+                    color,
+                    "33",
+                    format!(
+                        "Allow shell network access? {}:",
+                        yes_no_hint(permissions.allow_network)
+                    )
+                )
+            ),
+            permissions.allow_network,
+        )?
+    } else {
+        false
+    };
+
+    let caches = if permissions.allow_shell {
+        setup_developer_caches(true, color, &config.caches).await?
+    } else {
+        config.caches.clone()
     };
 
     let (tunnel_id, runtime_api_key, organization_id, new_tunnel) = if transports.openai {
-        setup_openai(color).await?
+        setup_openai(color, Some(&previous)).await?
     } else {
-        (None, String::new(), None, false)
+        (
+            previous.tunnel_id.clone(),
+            previous.runtime_api_key.clone(),
+            previous.organization_id.clone(),
+            false,
+        )
     };
 
-    let config = AppConfig {
-        version: config_version(),
-        transports,
-        permissions,
-        caches,
-        tunnel_id,
-        runtime_api_key,
-        organization_id,
-        base_url: default_base_url(),
-        max_shell_timeout_secs: default_shell_timeout(),
-        max_output_bytes: default_output_bytes(),
-        max_read_bytes: default_file_bytes(),
-        max_write_bytes: default_file_bytes(),
-    };
+    config.version = config_version();
+    config.transports = transports;
+    config.permissions = permissions;
+    config.caches = caches;
+    config.tunnel_id = tunnel_id;
+    config.runtime_api_key = runtime_api_key;
+    config.organization_id = organization_id;
 
     validate_config(&config)?;
     save_config(&config, profile)?;
@@ -856,14 +1075,7 @@ async fn interactive_setup(profile: Option<&str>, color: bool) -> Result<SetupRe
     println!("{}", setup_style(color, "1;32", "✓ Setup complete"));
     println!("  • Config: {}", config_path(profile)?.display());
     let enabled = config.transports.enabled_names();
-    println!(
-        "  • Transports: {}",
-        if enabled.is_empty() {
-            "none".to_owned()
-        } else {
-            enabled.join(", ")
-        }
-    );
+    println!("  • Transports: {}", enabled.join(", "));
 
     let mut permission_summary = Vec::new();
     if config.permissions.default_allow {
@@ -932,18 +1144,13 @@ async fn interactive_setup(profile: Option<&str>, color: bool) -> Result<SetupRe
             );
         }
     }
-    if enabled.is_empty() {
-        println!(
-            "  • No transport will start by default; use --stdio or --http for a one-run transport."
-        );
-    }
 
     let protected_paths = protected_paths_for_config(&config, profile)?;
-    Ok(SetupResult {
+    Ok(Some(SetupResult {
         config,
         new_tunnel,
         protected_paths,
-    })
+    }))
 }
 
 fn parse_transport_selection(input: &str) -> Result<TransportConfig> {
@@ -987,26 +1194,48 @@ fn parse_transport_selection(input: &str) -> Result<TransportConfig> {
     Ok(config)
 }
 
-async fn setup_openai(color: bool) -> Result<(Option<String>, String, Option<String>, bool)> {
+async fn setup_openai(
+    color: bool,
+    existing: Option<&AppConfig>,
+) -> Result<(Option<String>, String, Option<String>, bool)> {
     println!();
     println!(
         "{}",
         setup_style(color, "1", "Configure OpenAI Secure MCP Tunnel")
     );
-    println!("   {}", setup_style(color, "1", "Create a Runtime API key"));
+    println!("   {}", setup_style(color, "1", "Runtime API key"));
     println!("   • Permissions: Tunnels Read + Use");
     println!("   • https://platform.openai.com/settings/organization/api-keys");
-    let runtime_api_key = Zeroizing::new(prompt_secret("   Paste key: ")?);
-    if runtime_api_key.trim().is_empty() {
-        bail!("runtime API key cannot be empty");
-    }
+
+    let existing_key = existing
+        .map(|config| config.runtime_api_key.trim())
+        .filter(|key| !key.is_empty());
+    let key_prompt = if existing_key.is_some() {
+        "   Runtime API key [existing key]: "
+    } else {
+        "   Paste key: "
+    };
+    let entered_key = Zeroizing::new(prompt_secret(key_prompt)?);
+    let runtime_api_key = if entered_key.trim().is_empty() {
+        existing_key
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("runtime API key cannot be empty"))?
+    } else {
+        entered_key.trim().to_owned()
+    };
 
     println!();
     println!("   {}", setup_style(color, "1", "Choose a tunnel"));
-    println!("   • Paste an existing Tunnel ID, or press Enter to create one.");
-    let existing_id = prompt_line("   Tunnel ID [create new]: ")?;
+    let existing_id = existing.and_then(|config| config.tunnel_id.as_deref());
+    let tunnel_prompt = match existing_id {
+        Some(id) => format!("   Tunnel ID [{id}] (type 'new' to create): "),
+        None => "   Tunnel ID [create new]: ".to_owned(),
+    };
+    let selected_id = prompt_line(&tunnel_prompt)?;
+    let create_new = selected_id.eq_ignore_ascii_case("new")
+        || (selected_id.trim().is_empty() && existing_id.is_none());
 
-    let (tunnel_id, new_tunnel, runtime_organization_id) = if existing_id.trim().is_empty() {
+    let (tunnel_id, new_tunnel, runtime_organization_id) = if create_new {
         println!();
         println!(
             "   {}",
@@ -1027,19 +1256,34 @@ async fn setup_openai(color: bool) -> Result<(Option<String>, String, Option<Str
         println!("   • Organization ID: https://platform.openai.com/settings/organization/general");
         println!("   • Paste a Workspace ID, or press Enter to use your Organization ID.");
         let workspace_id = prompt_line("   ChatGPT workspace ID [optional]: ")?;
-        let organization_id = if workspace_id.trim().is_empty() {
-            prompt_line("   OpenAI organization ID: ")?
+
+        let existing_org = existing.and_then(|config| config.organization_id.as_deref());
+        let organization_prompt = match existing_org {
+            Some(org) => format!("   OpenAI organization ID [{org}]: "),
+            None => "   OpenAI organization ID: ".to_owned(),
+        };
+        let organization_input = if workspace_id.trim().is_empty() {
+            prompt_line(&organization_prompt)?
         } else {
             String::new()
         };
-        if workspace_id.trim().is_empty() && organization_id.trim().is_empty() {
+        let organization_id =
+            if workspace_id.trim().is_empty() && organization_input.trim().is_empty() {
+                existing_org.unwrap_or_default().to_owned()
+            } else {
+                organization_input.trim().to_owned()
+            };
+        if workspace_id.trim().is_empty() && organization_id.is_empty() {
             bail!("a workspace ID or organization ID is required to create a tunnel");
         }
 
         print!("   Creating tunnel… ");
         io::stdout().flush()?;
+        let base_url = existing
+            .map(|config| config.base_url.as_str())
+            .unwrap_or(DEFAULT_BASE_URL);
         let tunnel_id = create_tunnel(
-            DEFAULT_BASE_URL,
+            base_url,
             &admin_key,
             workspace_id.trim(),
             organization_id.trim(),
@@ -1051,20 +1295,31 @@ async fn setup_openai(color: bool) -> Result<(Option<String>, String, Option<Str
         (
             tunnel_id,
             true,
-            if organization_id.trim().is_empty() {
+            if organization_id.is_empty() {
                 None
             } else {
-                Some(organization_id.trim().to_owned())
+                Some(organization_id)
             },
         )
     } else {
-        validate_tunnel_id(existing_id.trim())?;
-        (existing_id.trim().to_owned(), false, None)
+        let tunnel_id = if selected_id.trim().is_empty() {
+            existing_id
+                .ok_or_else(|| anyhow!("Tunnel ID is required"))?
+                .to_owned()
+        } else {
+            selected_id.trim().to_owned()
+        };
+        validate_tunnel_id(&tunnel_id)?;
+        (
+            tunnel_id,
+            false,
+            existing.and_then(|config| config.organization_id.clone()),
+        )
     };
 
     Ok((
         Some(tunnel_id),
-        runtime_api_key.as_str().to_owned(),
+        runtime_api_key,
         runtime_organization_id,
         new_tunnel,
     ))
@@ -1127,13 +1382,7 @@ fn save_config(config: &AppConfig, profile: Option<&str>) -> Result<()> {
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     set_private_dir_permissions(parent)?;
 
-    let text = if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        let mut text = serde_json::to_string_pretty(config)?;
-        text.push('\n');
-        text
-    } else {
-        serialize_jsonc(config)?
-    };
+    let text = serialize_jsonc(config)?;
     let temp = parent.join(format!(
         ".{}.tmp-{}",
         path.file_name()
@@ -1162,10 +1411,8 @@ fn save_config(config: &AppConfig, profile: Option<&str>) -> Result<()> {
     fs::rename(&temp, &path).with_context(|| format!("failed to replace {}", path.display()))?;
     set_private_file_permissions(&path)?;
 
-    if config.transports.openai {
+    if !config.runtime_api_key.trim().is_empty() {
         save_runtime_key(&config.runtime_api_key, profile)?;
-    } else {
-        remove_saved_runtime_key(profile)?;
     }
 
     Ok(())
@@ -1381,6 +1628,225 @@ fn protected_paths_for_config(_config: &AppConfig, profile: Option<&str>) -> Res
     Ok(protected)
 }
 
+fn profile_target(name: &str) -> Result<Option<&str>> {
+    if name.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+    validate_profile(Some(name))?;
+    Ok(Some(name))
+}
+
+fn require_profile(name: &str) -> Result<(Option<&str>, AppConfig)> {
+    let target = profile_target(name)?;
+    let config =
+        load_profile_for_edit(target)?.ok_or_else(|| anyhow!("profile {name:?} does not exist"))?;
+    Ok((target, config))
+}
+
+pub fn list_profiles() -> Result<Vec<String>> {
+    let base = config_path(None)?;
+    let parent = base
+        .parent()
+        .ok_or_else(|| anyhow!("configuration path has no parent"))?;
+    if !parent.exists() {
+        return Ok(Vec::new());
+    }
+
+    let base_name = base
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("configuration filename is invalid"))?;
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("configuration filename is invalid"))?;
+    let extension = base.extension().and_then(|value| value.to_str());
+
+    let mut profiles = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == base_name {
+            profiles.push("default".to_owned());
+            continue;
+        }
+
+        let candidate = match extension {
+            Some(extension) if !extension.is_empty() => {
+                let prefix = format!("{stem}.");
+                let suffix = format!(".{extension}");
+                name.strip_prefix(&prefix)
+                    .and_then(|value| value.strip_suffix(&suffix))
+            }
+            _ => name.strip_prefix(&format!("{base_name}.")),
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if candidate.is_empty() || candidate.eq_ignore_ascii_case("default") {
+            continue;
+        }
+        if validate_profile(Some(candidate)).is_ok() {
+            profiles.push(candidate.to_owned());
+        }
+    }
+    profiles.sort();
+    profiles.dedup();
+    Ok(profiles)
+}
+
+pub fn show_profile(name: &str) -> Result<String> {
+    let (target, config) = require_profile(name)?;
+    let path = config_path(target)?;
+    let has_key = try_read_saved_runtime_key(target)?.is_some();
+    let mut output = String::new();
+    output.push_str(&format!("// Profile: {name}\n"));
+    output.push_str(&format!("// Config: {}\n", path.display()));
+    if has_key {
+        output.push_str("// Runtime API key: [existing key]\n");
+    }
+    output.push_str(&serialize_jsonc(&config)?);
+    Ok(output)
+}
+
+pub async fn create_profile(name: &str, color: bool) -> Result<bool> {
+    let target = profile_target(name)?;
+    let path = config_path(target)?;
+    if path.exists() || credential_path(target)?.exists() {
+        bail!("profile {name:?} already exists");
+    }
+    if !io::stdin().is_terminal() {
+        bail!("profile creation is interactive; run it in a terminal");
+    }
+    Ok(interactive_setup(target, color, None).await?.is_some())
+}
+
+pub async fn edit_profile(name: &str, color: bool) -> Result<bool> {
+    let target = profile_target(name)?;
+    let existing =
+        load_profile_for_edit(target)?.ok_or_else(|| anyhow!("profile {name:?} does not exist"))?;
+    if !io::stdin().is_terminal() {
+        bail!("profile editing is interactive; run it in a terminal");
+    }
+    Ok(interactive_setup(target, color, Some(existing))
+        .await?
+        .is_some())
+}
+
+pub fn delete_profile(name: &str) -> Result<()> {
+    let target = profile_target(name)?;
+    let path = config_path(target)?;
+    if !path.exists() {
+        bail!("profile {name:?} does not exist");
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    remove_saved_runtime_key(target)?;
+    Ok(())
+}
+
+fn rule_paths_mut(config: &mut AppConfig, allow: bool, kind: ProfileRuleKind) -> &mut Vec<PathBuf> {
+    match (allow, kind) {
+        (true, ProfileRuleKind::Read) => &mut config.permissions.allow_read,
+        (true, ProfileRuleKind::Write) => &mut config.permissions.allow_write,
+        (true, ProfileRuleKind::Rw) => &mut config.permissions.allow_rw,
+        (false, ProfileRuleKind::Read) => &mut config.permissions.deny_read,
+        (false, ProfileRuleKind::Write) => &mut config.permissions.deny_write,
+        (false, ProfileRuleKind::Rw) => &mut config.permissions.deny_rw,
+    }
+}
+
+pub fn mutate_profile_rule(
+    name: &str,
+    allow: bool,
+    kind: ProfileRuleKind,
+    path: PathBuf,
+    remove: bool,
+) -> Result<()> {
+    let (target, mut config) = require_profile(name)?;
+    let paths = rule_paths_mut(&mut config, allow, kind);
+    if remove {
+        let before = paths.len();
+        paths.retain(|existing| existing != &path);
+        if paths.len() == before {
+            bail!("rule not found in profile {name:?}: {}", path.display());
+        }
+    } else if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+    validate_config(&config)?;
+    save_config(&config, target)
+}
+
+fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: bool) -> Result<()> {
+    match (setting, enabled) {
+        (ProfileBool::Openai, value) => config.transports.openai = value,
+        (ProfileBool::Stdio, value) => config.transports.stdio = value,
+        (ProfileBool::Http, true) => config.transports.http = true,
+        (ProfileBool::Http, false) => {
+            config.transports.http = false;
+            config.transports.http_ephemeral_url = false;
+            config.transports.ngrok = false;
+            config.transports.ngrok_ephemeral_url = false;
+        }
+        (ProfileBool::HttpEphemeral, true) => {
+            if !config.transports.http {
+                bail!("http-ephemeral requires http to be enabled");
+            }
+            config.transports.http_ephemeral_url = true;
+        }
+        (ProfileBool::HttpEphemeral, false) => config.transports.http_ephemeral_url = false,
+        (ProfileBool::Ngrok, true) => {
+            if !config.transports.http {
+                bail!("ngrok requires http to be enabled");
+            }
+            config.transports.ngrok = true;
+        }
+        (ProfileBool::Ngrok, false) => {
+            config.transports.ngrok = false;
+            config.transports.ngrok_ephemeral_url = false;
+        }
+        (ProfileBool::NgrokEphemeral, true) => {
+            if !config.transports.ngrok {
+                bail!("ngrok-ephemeral requires ngrok to be enabled");
+            }
+            config.transports.ngrok_ephemeral_url = true;
+        }
+        (ProfileBool::NgrokEphemeral, false) => config.transports.ngrok_ephemeral_url = false,
+        (ProfileBool::DefaultAllow, value) => config.permissions.default_allow = value,
+        (ProfileBool::Shell, true) => config.permissions.allow_shell = true,
+        (ProfileBool::Shell, false) => {
+            config.permissions.allow_shell = false;
+            config.permissions.allow_network = false;
+        }
+        (ProfileBool::Network, true) => {
+            if !config.permissions.allow_shell {
+                bail!("network requires shell to be enabled");
+            }
+            config.permissions.allow_network = true;
+        }
+        (ProfileBool::Network, false) => config.permissions.allow_network = false,
+    }
+    Ok(())
+}
+
+pub fn set_profile_bool(name: &str, setting: ProfileBool, enabled: bool) -> Result<()> {
+    let (target, mut config) = require_profile(name)?;
+    apply_profile_bool(&mut config, setting, enabled)?;
+    if config.transports.openai
+        && (config.tunnel_id.is_none() || config.runtime_api_key.trim().is_empty())
+    {
+        bail!(
+            "OpenAI is not fully configured for profile {name:?}; run `dotlink profile edit {name}` first"
+        );
+    }
+    validate_config(&config)?;
+    save_config(&config, target)
+}
+
 fn save_runtime_key(key: &str, profile: Option<&str>) -> Result<()> {
     let path = credential_path(profile)?;
     let parent = path
@@ -1416,28 +1882,40 @@ fn remove_saved_runtime_key(profile: Option<&str>) -> Result<()> {
     }
 }
 
-fn read_saved_runtime_key(profile: Option<&str>) -> Result<String> {
+fn try_read_saved_runtime_key(profile: Option<&str>) -> Result<Option<String>> {
     let path = credential_path(profile)?;
-    let key = fs::read_to_string(&path).with_context(|| {
-        format!(
-            "failed to read {}; run 'dotlink --setup{}' to repair credentials",
-            path.display(),
+    let key = match fs::read_to_string(&path) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let key = key.trim().to_owned();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(key))
+}
+
+fn read_saved_runtime_key(profile: Option<&str>) -> Result<String> {
+    try_read_saved_runtime_key(profile)?.ok_or_else(|| {
+        anyhow!(
+            "saved runtime API key is missing or empty; run 'dotlink --setup{}' to repair credentials",
             profile
                 .map(|name| format!(" --profile {name}"))
                 .unwrap_or_default()
         )
-    })?;
-    let key = key.trim().to_owned();
-    if key.is_empty() {
-        bail!("saved runtime API key is empty; rerun dotlink setup");
-    }
-    Ok(key)
+    })
 }
 
 fn validate_profile(profile: Option<&str>) -> Result<()> {
     let Some(profile) = profile else {
         return Ok(());
     };
+    if profile.eq_ignore_ascii_case("default") {
+        bail!("profile name 'default' is reserved for the unnamed default profile");
+    }
     if profile.is_empty()
         || profile.len() > 64
         || !profile
@@ -1456,7 +1934,7 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("could not determine the user's home directory"))
 }
 
-fn validate_config(config: &AppConfig) -> Result<()> {
+fn validate_config_structure(config: &AppConfig) -> Result<()> {
     if config.version != config_version() {
         bail!(
             "unsupported config version {}; expected {}. Rerun dotlink --setup for this profile",
@@ -1467,6 +1945,9 @@ fn validate_config(config: &AppConfig) -> Result<()> {
 
     if config.permissions.allow_network && !config.permissions.allow_shell {
         bail!("permissions.allow_network requires permissions.allow_shell");
+    }
+    if config.transports.http_ephemeral_url && !config.transports.http {
+        bail!("transports.http_ephemeral_url requires transports.http");
     }
     if config.transports.ngrok && !config.transports.http {
         bail!("transports.ngrok requires transports.http");
@@ -1500,23 +1981,27 @@ fn validate_config(config: &AppConfig) -> Result<()> {
             )
         })?;
 
-    if config.transports.openai {
-        let tunnel_id = config
-            .tunnel_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("OpenAI transport is enabled but tunnel_id is missing"))?;
+    if let Some(tunnel_id) = config.tunnel_id.as_deref() {
         validate_tunnel_id(tunnel_id)?;
+    }
+    if !(config.base_url.starts_with("https://") || config.base_url.starts_with("http://localhost"))
+    {
+        bail!("control-plane base URL must use HTTPS (localhost is allowed for testing)");
+    }
 
+    Ok(())
+}
+
+fn validate_config(config: &AppConfig) -> Result<()> {
+    validate_config_structure(config)?;
+    if config.transports.openai {
+        if config.tunnel_id.is_none() {
+            bail!("OpenAI transport is enabled but tunnel_id is missing");
+        }
         if config.runtime_api_key.trim().is_empty() {
             bail!("OpenAI transport is enabled but runtime API key is empty");
         }
-        if !(config.base_url.starts_with("https://")
-            || config.base_url.starts_with("http://localhost"))
-        {
-            bail!("control-plane base URL must use HTTPS (localhost is allowed for testing)");
-        }
     }
-
     Ok(())
 }
 
@@ -1868,6 +2353,111 @@ mod tests {
         assert_eq!(parsed.permissions.deny_rw, [PathBuf::from("secret")]);
         assert!(parsed.permissions.allow_shell);
         assert!(parsed.permissions.allow_network);
+    }
+
+    #[test]
+    fn setup_cancel_tokens_are_explicit() {
+        for value in ["0", "none", "cancel", "q", "quit", " CANCEL "] {
+            assert!(setup_cancelled(value), "{value:?} should cancel setup");
+        }
+        for value in ["", "1", "all", "stdio"] {
+            assert!(!setup_cancelled(value), "{value:?} should not cancel setup");
+        }
+    }
+
+    #[test]
+    fn profile_boolean_dependencies_and_cascades_are_safe() {
+        let mut config = example_config();
+        config.transports.openai = false;
+        config.runtime_api_key.clear();
+        config.tunnel_id = None;
+        config.transports.http = false;
+        config.transports.ngrok = false;
+        config.permissions.allow_shell = false;
+        config.permissions.allow_network = false;
+
+        assert!(apply_profile_bool(&mut config, ProfileBool::Ngrok, true).is_err());
+        assert!(apply_profile_bool(&mut config, ProfileBool::HttpEphemeral, true).is_err());
+        assert!(apply_profile_bool(&mut config, ProfileBool::Network, true).is_err());
+
+        apply_profile_bool(&mut config, ProfileBool::Http, true).unwrap();
+        apply_profile_bool(&mut config, ProfileBool::Ngrok, true).unwrap();
+        apply_profile_bool(&mut config, ProfileBool::NgrokEphemeral, true).unwrap();
+        apply_profile_bool(&mut config, ProfileBool::HttpEphemeral, true).unwrap();
+        assert!(config.transports.http);
+        assert!(config.transports.ngrok);
+        assert!(config.transports.ngrok_ephemeral_url);
+        assert!(config.transports.http_ephemeral_url);
+
+        apply_profile_bool(&mut config, ProfileBool::Http, false).unwrap();
+        assert!(!config.transports.http);
+        assert!(!config.transports.ngrok);
+        assert!(!config.transports.ngrok_ephemeral_url);
+        assert!(!config.transports.http_ephemeral_url);
+
+        apply_profile_bool(&mut config, ProfileBool::Shell, true).unwrap();
+        apply_profile_bool(&mut config, ProfileBool::Network, true).unwrap();
+        assert!(config.permissions.allow_network);
+        apply_profile_bool(&mut config, ProfileBool::Shell, false).unwrap();
+        assert!(!config.permissions.allow_shell);
+        assert!(!config.permissions.allow_network);
+    }
+
+    #[test]
+    fn default_profile_alias_is_reserved_for_profile_manager() {
+        assert_eq!(profile_target("default").unwrap(), None);
+        assert!(validate_profile(Some("default")).is_err());
+        assert_eq!(profile_target("work").unwrap(), Some("work"));
+    }
+
+    #[test]
+    fn rule_kind_selects_expected_permission_array() {
+        let mut config = example_config();
+        rule_paths_mut(&mut config, true, ProfileRuleKind::Read).push(PathBuf::from("/allow-read"));
+        rule_paths_mut(&mut config, true, ProfileRuleKind::Write)
+            .push(PathBuf::from("/allow-write"));
+        rule_paths_mut(&mut config, true, ProfileRuleKind::Rw).push(PathBuf::from("/allow-rw"));
+        rule_paths_mut(&mut config, false, ProfileRuleKind::Read).push(PathBuf::from("/deny-read"));
+        rule_paths_mut(&mut config, false, ProfileRuleKind::Write)
+            .push(PathBuf::from("/deny-write"));
+        rule_paths_mut(&mut config, false, ProfileRuleKind::Rw).push(PathBuf::from("/deny-rw"));
+
+        assert!(
+            config
+                .permissions
+                .allow_read
+                .contains(&PathBuf::from("/allow-read"))
+        );
+        assert!(
+            config
+                .permissions
+                .allow_write
+                .contains(&PathBuf::from("/allow-write"))
+        );
+        assert!(
+            config
+                .permissions
+                .allow_rw
+                .contains(&PathBuf::from("/allow-rw"))
+        );
+        assert!(
+            config
+                .permissions
+                .deny_read
+                .contains(&PathBuf::from("/deny-read"))
+        );
+        assert!(
+            config
+                .permissions
+                .deny_write
+                .contains(&PathBuf::from("/deny-write"))
+        );
+        assert!(
+            config
+                .permissions
+                .deny_rw
+                .contains(&PathBuf::from("/deny-rw"))
+        );
     }
 
     #[test]

@@ -10,14 +10,18 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     logging::{ColorMode, LogConfig},
     mcp::{AccessSpec, LocalMachine, MachineConfig, SandboxCacheMount},
-    setup::{PermissionConfig, TransportConfig, load_or_setup},
+    setup::{
+        PermissionConfig, ProfileBool, ProfileRuleKind, TransportConfig, create_profile,
+        delete_profile, edit_profile, list_profiles, load_or_setup, mutate_profile_rule,
+        set_profile_bool, show_profile,
+    },
     transports::ActiveTransports,
 };
 
@@ -28,6 +32,10 @@ use crate::{
     about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP"
 )]
 struct Args {
+    /// Manage persisted profiles.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Run interactive setup for the selected profile.
     #[arg(
         short = 'S',
@@ -209,12 +217,75 @@ struct Args {
     verbose: u8,
 
     /// Control ANSI colors in human-facing stderr output.
-    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto, global = true)]
     color: ColorMode,
 
     /// List the MCP tools exposed under the effective policy and exit.
     #[arg(long)]
     list_tools: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// List, create, edit, delete, or mutate profiles.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// List available profiles.
+    List,
+    /// Show a profile without exposing secret key material.
+    Show { name: String },
+    /// Create a new profile with the interactive setup editor.
+    Create { name: String },
+    /// Edit an existing profile using its current values as defaults.
+    Edit { name: String },
+    /// Delete a profile and its saved runtime key.
+    Delete { name: String },
+    /// Add an allow rule.
+    Allow {
+        name: String,
+        #[arg(value_enum)]
+        kind: ProfileRuleKind,
+        path: PathBuf,
+    },
+    /// Remove an allow rule.
+    RemoveAllow {
+        name: String,
+        #[arg(value_enum)]
+        kind: ProfileRuleKind,
+        path: PathBuf,
+    },
+    /// Add a deny rule.
+    Deny {
+        name: String,
+        #[arg(value_enum)]
+        kind: ProfileRuleKind,
+        path: PathBuf,
+    },
+    /// Remove a deny rule.
+    RemoveDeny {
+        name: String,
+        #[arg(value_enum)]
+        kind: ProfileRuleKind,
+        path: PathBuf,
+    },
+    /// Enable a persisted boolean setting.
+    Enable {
+        name: String,
+        #[arg(value_enum)]
+        setting: ProfileBool,
+    },
+    /// Disable a persisted boolean setting.
+    Disable {
+        name: String,
+        #[arg(value_enum)]
+        setting: ProfileBool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +477,11 @@ async fn main() -> Result<()> {
         .with_ansi(log.color_enabled())
         .init();
 
+    if let Some(command) = &args.command {
+        run_command(command, log.color_enabled()).await?;
+        return Ok(());
+    }
+
     let mut runtime_restarts = 0_u32;
     loop {
         match run_runtime(&args, &launch_dir, &log).await {
@@ -443,8 +519,69 @@ async fn main() -> Result<()> {
     }
 }
 
+async fn run_command(command: &Command, color: bool) -> Result<()> {
+    match command {
+        Command::Profile { command } => match command {
+            ProfileCommand::List => {
+                let profiles = list_profiles()?;
+                if profiles.is_empty() {
+                    println!("No profiles configured.");
+                } else {
+                    for profile in profiles {
+                        println!("{profile}");
+                    }
+                }
+            }
+            ProfileCommand::Show { name } => print!("{}", show_profile(name)?),
+            ProfileCommand::Create { name } => {
+                if create_profile(name, color).await? {
+                    println!("Profile {name:?} created.");
+                }
+            }
+            ProfileCommand::Edit { name } => {
+                if edit_profile(name, color).await? {
+                    println!("Profile {name:?} updated.");
+                }
+            }
+            ProfileCommand::Delete { name } => {
+                delete_profile(name)?;
+                println!("Profile {name:?} deleted.");
+            }
+            ProfileCommand::Allow { name, kind, path } => {
+                mutate_profile_rule(name, true, *kind, path.clone(), false)?;
+                println!("Profile {name:?} updated.");
+            }
+            ProfileCommand::RemoveAllow { name, kind, path } => {
+                mutate_profile_rule(name, true, *kind, path.clone(), true)?;
+                println!("Profile {name:?} updated.");
+            }
+            ProfileCommand::Deny { name, kind, path } => {
+                mutate_profile_rule(name, false, *kind, path.clone(), false)?;
+                println!("Profile {name:?} updated.");
+            }
+            ProfileCommand::RemoveDeny { name, kind, path } => {
+                mutate_profile_rule(name, false, *kind, path.clone(), true)?;
+                println!("Profile {name:?} updated.");
+            }
+            ProfileCommand::Enable { name, setting } => {
+                set_profile_bool(name, *setting, true)?;
+                println!("Profile {name:?} updated.");
+            }
+            ProfileCommand::Disable { name, setting } => {
+                set_profile_bool(name, *setting, false)?;
+                println!("Profile {name:?} updated.");
+            }
+        },
+    }
+    Ok(())
+}
+
 async fn run_runtime(args: &Args, launch_dir: &Path, log: &LogConfig) -> Result<()> {
-    let setup = load_or_setup(args.setup, args.profile.as_deref(), log.color_enabled()).await?;
+    let Some(setup) =
+        load_or_setup(args.setup, args.profile.as_deref(), log.color_enabled()).await?
+    else {
+        return Ok(());
+    };
 
     if args.setup {
         return Ok(());
@@ -1092,6 +1229,54 @@ mod tests {
         };
         let args = Args::try_parse_from(["dotlink", "--ngrok-ephemeral-url"]).unwrap();
         assert!(resolve_local_transports(&args, &defaults).is_err());
+    }
+
+    #[test]
+    fn profile_subcommands_parse_cleanly() {
+        let args = Args::try_parse_from(["dotlink", "profile", "list"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Profile {
+                command: ProfileCommand::List
+            })
+        ));
+
+        let args =
+            Args::try_parse_from(["dotlink", "profile", "allow", "work", "rw", "/shared"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Profile {
+                command: ProfileCommand::Allow {
+                    kind: ProfileRuleKind::Rw,
+                    ..
+                }
+            })
+        ));
+
+        let args =
+            Args::try_parse_from(["dotlink", "profile", "enable", "work", "http-ephemeral-url"])
+                .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Profile {
+                command: ProfileCommand::Enable {
+                    setting: ProfileBool::HttpEphemeral,
+                    ..
+                }
+            })
+        ));
+
+        let args =
+            Args::try_parse_from(["dotlink", "profile", "disable", "work", "network"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Profile {
+                command: ProfileCommand::Disable {
+                    setting: ProfileBool::Network,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

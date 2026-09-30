@@ -128,8 +128,6 @@ Must not strip comment markers inside strings such as URLs.
 
 Canonical save header currently indicates JSONC/comment support.
 
-Legacy `.json` profile files remain readable.
-
 ## Schema
 
 Current source schema version:
@@ -205,7 +203,7 @@ The compact numbered selector accepts numbers or names:
 2  stdio
 3  http
 all
-none
+0 / none / cancel   cancel setup without saving
 ```
 
 OpenAI is presented as the recommended ChatGPT path; stdio is described for local MCP clients; HTTP is described for Claude.ai and other web MCP clients.
@@ -231,7 +229,7 @@ Allow shell access?
 Allow shell network access?         only when shell=yes
 ```
 
-Read defaults to yes; write, shell, and network default to no.
+Read defaults to yes; write, shell, and network default to no for new profiles. Re-running setup uses existing values as defaults, preserves path rules not directly edited by the wizard, and masks stored Runtime API keys as `[existing key]`; blank keeps the saved key.
 
 ### Step 3 — developer caches
 
@@ -264,6 +262,26 @@ If OpenAI selected:
 - Workspace ID or Organization ID when creating tunnel;
 - Admin key used once and never persisted;
 - Runtime key stored separately per profile.
+
+## Profile manager
+
+Persistent profile administration is available without hand-editing JSONC:
+
+```text
+dotlink profile list
+dotlink profile show <name>
+dotlink profile create <name>
+dotlink profile edit <name>
+dotlink profile delete <name>
+dotlink profile allow <name> read|write|rw <path>
+dotlink profile remove-allow <name> read|write|rw <path>
+dotlink profile deny <name> read|write|rw <path>
+dotlink profile remove-deny <name> read|write|rw <path>
+dotlink profile enable <name> <setting>
+dotlink profile disable <name> <setting>
+```
+
+`default` is the manager alias for the unnamed default profile. Boolean settings are `openai`, `stdio`, `http`, `http-ephemeral`, `ngrok`, `ngrok-ephemeral`, `default-allow`, `shell`, and `network`. Parent dependencies are enforced; disabling a parent cascades dependent booleans off. Disabling OpenAI preserves tunnel/key data; deleting the profile removes the saved key.
 
 ## Cache kinds
 

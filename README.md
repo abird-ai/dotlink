@@ -43,6 +43,8 @@ cd ~/src/my-project
 dotlink
 ~~~
 
+Setup is transactional: choose `0`, `none`, or `cancel` to exit successfully without writing anything. Re-running `--setup` on an existing profile uses its current values as defaults; secret prompts show only `[existing key]`, and blank input keeps the stored key.
+
 The launch directory is readable by default. Add capabilities only when needed:
 
 ~~~bash
@@ -50,6 +52,27 @@ dotlink --allow-rw
 dotlink --allow-rw --allow-shell
 dotlink --allow-rw --allow-shell --allow-network
 ~~~
+
+### Manage profiles
+
+~~~bash
+dotlink profile list
+dotlink profile show work
+dotlink profile create work
+dotlink profile edit work
+dotlink profile delete work
+
+dotlink profile allow work rw /shared
+dotlink profile deny work read /secret
+dotlink profile remove-allow work rw /shared
+dotlink profile remove-deny work read /secret
+
+dotlink profile enable work shell
+dotlink profile enable work network
+dotlink profile disable work network
+~~~
+
+Use `default` as the profile name to manage the unnamed default profile. Persisted booleans can be toggled with `profile enable/disable`: `openai`, `stdio`, `http`, `http-ephemeral`, `ngrok`, `ngrok-ephemeral`, `default-allow`, `shell`, and `network`. Dependent settings are validated; disabling a parent safely disables its dependents.
 
 ### What it looks like
 
@@ -334,8 +357,9 @@ Color is automatic on interactive stderr. Override with `--color=always`, `--col
 ## CLI summary
 
 ~~~text
-dotlink -S, --setup          interactive setup for selected profile
+dotlink -S, --setup             interactive setup/editor for selected profile
 -p, --profile <NAME>            use config.<NAME>.jsonc
+dotlink profile <COMMAND>       list/create/edit/delete/mutate persisted profiles
 
 --stdio                         add stdio MCP for this run
 --no-stdio                      suppress profile stdio for this run

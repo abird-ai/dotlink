@@ -15,7 +15,7 @@ Profiles are JSONC only: comments and trailing commas are allowed. OpenAI runtim
 
 ## Setup flow
 
-Transport selection accepts `1`/`openai`, `2`/`stdio`, `3`/`http`, comma-separated combinations, `all`, or `none`.
+Transport selection accepts `1`/`openai`, `2`/`stdio`, `3`/`http`, comma-separated combinations, or `all`. `0`, `none`, `cancel`, `q`, and `quit` cancel setup successfully without saving.
 
 When HTTP is selected, setup can persist:
 
@@ -30,7 +30,7 @@ Local access setup asks whether to:
 - expose shell;
 - allow shell network access.
 
-On Linux, setup can also discover existing developer caches and grant none/read-only/read+write access per cache.
+On Linux, setup can also discover existing developer caches and grant none/read-only/read+write access per cache. Re-running setup uses current profile values as defaults, preserves rules not directly edited by the wizard, and shows stored secrets only as `[existing key]`; blank secret input keeps the current value.
 
 ## Schema
 
@@ -81,6 +81,42 @@ On Linux, setup can also discover existing developer caches and grant none/read-
 
 Relative paths resolve from the launch directory. `default_allow=true` adds read access to that directory; `--no-default-allow` suppresses it for one run.
 
+## Profile manager
+
+`default` is the reserved alias for the unnamed default profile.
+
+```bash
+dotlink profile list
+dotlink profile show <name>
+dotlink profile create <name>
+dotlink profile edit <name>
+dotlink profile delete <name>
+
+dotlink profile allow <name> read|write|rw <path>
+dotlink profile remove-allow <name> read|write|rw <path>
+dotlink profile deny <name> read|write|rw <path>
+dotlink profile remove-deny <name> read|write|rw <path>
+
+dotlink profile enable <name> <setting>
+dotlink profile disable <name> <setting>
+```
+
+Boolean settings are:
+
+```text
+openai
+stdio
+http
+http-ephemeral
+ngrok
+ngrok-ephemeral
+default-allow
+shell
+network
+```
+
+Enabling dependent settings requires their parent (`network` → `shell`, `ngrok` → `http`, `ngrok-ephemeral` → `ngrok`, `http-ephemeral` → `http`). Disabling `shell`, `ngrok`, or `http` also disables dependent booleans so the profile remains valid. Disabling OpenAI preserves its tunnel/key for later re-enable; deleting the profile removes its saved runtime key. `profile show` never prints key material and reports only `[existing key]` when one is stored.
+
 ## Transport precedence
 
 Every profile-enabled transport starts automatically.
@@ -97,7 +133,7 @@ Every profile-enabled transport starts automatically.
 --ngrok-ephemeral-url  override ngrok path behavior
 ```
 
-A profile may persist no transport. Normal startup then errors until `--stdio` or `--http` is supplied.
+Interactive setup never saves a zero-transport selection; that choice cancels setup. Direct `profile disable` commands can intentionally leave a profile with no transports, in which case normal startup requires a one-run `--stdio` or `--http`.
 
 ## Path and capability precedence
 

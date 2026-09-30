@@ -362,8 +362,6 @@ JSONC supports:
 - BOM;
 - comment-like text in strings.
 
-Legacy `.json` is readable.
-
 Runtime key is never serialized into config.
 
 Current schema-v9 profile can persist:
@@ -395,14 +393,18 @@ Compact numbered choices:
 2  stdio           Local MCP clients
 3  HTTP            Claude.ai / web MCP clients
 all
-none
+0 / none / cancel  cancel setup without saving
 ```
 
-When HTTP is selected, setup asks about local ephemeral paths, optional public ngrok, and (when ngrok is enabled) an ephemeral ngrok MCP path.
+When HTTP is selected, setup asks about local ephemeral paths, optional public ngrok, and (when ngrok is enabled) an ephemeral ngrok MCP path. Re-running setup uses the existing profile as defaults and masks stored keys as `[existing key]`; blank keeps them.
 
-Every configured transport starts automatically. Runtime `--stdio` / `--http` add local transports, while `--no-stdio` / `--no-http` suppress profile defaults and `--no-ngrok` suppresses profile ngrok.
+Every configured transport starts automatically. Runtime `--stdio` / `--http` add local transports, while `--no-stdio` / `--no-http` suppress profile defaults and `--no-ngrok` suppresses profile ngrok. Setup never persists a zero-transport selection; direct profile disable commands may intentionally create one.
 
 If OpenAI is not chosen, skip OpenAI configuration entirely.
+
+### Profile management
+
+`dotlink profile` supports list/show/create/edit/delete, allow/deny rule add/remove, and persisted boolean enable/disable. `default` addresses the unnamed default profile. OpenAI secrets are never printed; `profile show` reports only `[existing key]`.
 
 ### Local permission step
 
@@ -691,7 +693,7 @@ git diff --check
 Latest observed full test pass:
 
 ```text
-80 tests
+85 tests
 ```
 
 The 2026-09-30 continuation pass also revalidated the current source with the intended Rust 1.98.1 toolchain:
@@ -703,7 +705,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-All 80 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
+All 85 tests passed, Clippy and formatting were clean, the current binary rebuilt successfully, and the opt-in real Bubblewrap runtime/cache smokes passed with `DOTLINK_TEST_BWRAP=1`. Recovery coverage includes the 10-failure OpenAI escalation, restart-marker propagation, bounded peer teardown, and restart-backoff reset/cap behavior.
 
 Live smokes have validated:
 

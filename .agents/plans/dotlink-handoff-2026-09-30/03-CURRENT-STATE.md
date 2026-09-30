@@ -56,8 +56,6 @@ Named profile `work`:
 ~/.config/abird/dotlink/runtime.work.key
 ```
 
-Legacy `.json` profiles remain readable.
-
 Persistent profile state supports:
 
 ```text
@@ -130,6 +128,9 @@ Important:
 - every transport enabled in the selected profile starts automatically.
 - explicit `--stdio` / `--http` add those transports for one run; `--no-stdio` / `--no-http` suppress profile defaults.
 - `--no-ngrok` suppresses profile ngrok while keeping effective HTTP.
+- setup cancellation (`0` / `none` / `cancel`) exits successfully and writes nothing;
+- re-setup uses current profile values as defaults and masks saved keys as `[existing key]`;
+- `dotlink profile` manages profile lifecycle, path rules, and persisted booleans.
 - bare `--allow-rw` means RW on the launch directory.
 - bare `--allow-write` means RW on the launch directory; explicit `--allow-write=/path` is write-only.
 - `--allow-rw=/` is unrestricted filesystem RW inside the sandbox model; it does not disable Bubblewrap.
@@ -263,7 +264,7 @@ dotlink-windows-x86_64.exe.sha256
 Validated on 2026-09-30:
 
 - `flake.lock` locks Crane v0.24.0 and rust-overlay.
-- Rust fmt/test/Clippy passes; 80/80 tests after automatic tunnel recovery and restart-backoff coverage.
+- Rust fmt/test/Clippy passes; 85/85 tests, including profile-manager, transactional setup, tunnel recovery, and restart-backoff coverage.
 - real Bubblewrap runtime and cache-mount smokes pass.
 - full x86_64-linux `nix flake check` passes using an isolated writable Nix store without exposing the host daemon.
 - `nix flake check --all-systems --no-build` evaluates x86_64 Linux, aarch64 Linux and aarch64 Darwin.

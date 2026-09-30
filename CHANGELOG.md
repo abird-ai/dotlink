@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Make setup transactional: cancel/none exits successfully without writing a profile, so first-run setup restarts cleanly on the next launch.
+- Make re-setup profile-aware: existing transport/access/cache/tunnel values become prompt defaults, stored Runtime API keys display only as `[existing key]`, and blank secret input preserves them.
+- Add `dotlink profile` management for list/show/create/edit/delete, allow/deny rule add/remove, and persisted boolean enable/disable operations.
+- Preserve OpenAI tunnel/key data when OpenAI is disabled and remove the saved key only when the profile is deleted.
+
 - Rebrand the project as **abird dotlink** for human-facing branding and `dotlink` for the crate, executable, MCP identity, config/env namespace, Nix outputs, installers, and release assets.
 - Move dotlink-owned XDG paths under the shared Abird namespace: `~/.config/abird/dotlink` / `$XDG_CONFIG_HOME/abird/dotlink`, with future private XDG cache/state/data paths under `abird/dotlink` as well.
 - Set the canonical upstream to `https://github.com/abird-ai/dotlink` and update installer defaults/release URLs accordingly.

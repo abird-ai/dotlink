@@ -16,7 +16,7 @@ git diff --check
 Final observed suite:
 
 ```text
-80 tests passed
+85 tests passed
 Clippy clean
 fmt clean
 diff check clean
@@ -84,7 +84,10 @@ Verified historically and during the implementation phase:
 - HTTP initialize;
 - profile-only HTTP starts without repeating `--http`;
 - profile-only stdio starts without repeating `--stdio`;
-- a profile with no configured transport fails normally but can start with one-run `--stdio` / `--http`;
+- setup cancel/none writes no profile and exits successfully;
+- re-setup preserves existing defaults and masks retained Runtime API keys;
+- profile manager create/list/show/edit/delete plus allow/deny add/remove and bool enable/disable workflows;
+- direct profile disable commands may intentionally leave no configured transport; such a profile can start with one-run `--stdio` / `--http`;
 - `--no-stdio` / `--no-http` suppress persisted local transports and `--no-ngrok` suppresses persisted ngrok;
 - clean stdio EOF does not kill active peer transports;
 - explicit runtime `--stdio` / `--http` override persisted false;
