@@ -2,10 +2,6 @@
 
 **Connect ChatGPT Web — including Spaces and dots — to the files and tools on your computer, securely from a single binary.**
 
-abird-link turns your local project into a **live working context for ChatGPT**. Keep briefs, design decisions, research, handoffs, and other durable project knowledge in **Spaces**; use ChatGPT to reason and design with that context; let a **dot** carry ongoing work forward where available; then reconnect to the same live repository and toolchain to continue implementation.
-
-Your local project becomes the shared source of truth across **ChatGPT, Codex, Spaces, and dots**: the same Git history, plans, files, generated artifacts, and tools can carry work from one surface to another without pretending their private model state or memory is literally shared.
-
 - **Let ChatGPT Web build, test, and run tools on your machine securely** — read and edit code, run Git, builds, tests, scripts, compilers, package managers, and other tools you explicitly expose.
 - **Move between thinking and implementation without losing the project** — plan or document in ChatGPT and Spaces, then reconnect to the live repo and keep building from the current state.
 - **Work with local data and files without the upload/download loop** — let ChatGPT read data directly from your machine for analysis, reports, documents, or slide decks instead of repeatedly copy-pasting or moving files in and out of chat.
