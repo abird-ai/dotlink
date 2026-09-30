@@ -16,7 +16,9 @@ Windows x86_64/ARM64 PowerShell:
 irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
 ```
 
-The installers verify SHA-256 sidecars before replacement. Unix replacement is atomic.
+By default, both installers resolve GitHub's **latest published release**, choose the correct architecture-specific asset internally, and verify its SHA-256 sidecar. The user-facing command is always `dotlink`; architecture suffixes exist only on release asset names (`dotlink.exe` is the Windows file on disk).
+
+Re-running the same install command doubles as the updater. If the installed binary already matches the latest release hash, it is left untouched and reported as up to date; otherwise it is replaced with the newly verified release. Unix replacement is atomic.
 
 Supported overrides:
 
@@ -44,9 +46,6 @@ dotlink-windows-aarch64.exe.sha256
 
 dotlink-macos-aarch64
 dotlink-macos-aarch64.sha256
-
-VERSION
-PLATFORMS.txt
 ```
 
 The Linux binaries are static musl builds with no distro-specific glibc dependency, so the same artifact runs across NixOS, Debian, and other compatible Linux distributions.

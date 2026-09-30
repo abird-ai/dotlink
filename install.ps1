@@ -5,6 +5,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-DotlinkVersion {
+    param([string]$Path)
+
+    try {
+        $Output = & $Path --version 2>$null | Select-Object -First 1
+        if ($Output -match '^dotlink\s+(.+)$') {
+            return $Matches[1].Trim()
+        }
+    }
+    catch {
+    }
+
+    return $null
+}
+
 if (-not $InstallDir) {
     if (-not $HOME) {
         throw "HOME is not set; pass -InstallDir or set DOTLINK_INSTALL_DIR."
@@ -44,7 +59,7 @@ try {
     $BinaryPath = Join-Path $WorkDir $Asset
     $ChecksumPath = "$BinaryPath.sha256"
 
-    Write-Host "Downloading $Asset..."
+    Write-Host "Downloading dotlink..."
     Invoke-WebRequest -UseBasicParsing -Uri "$($BaseUrl.TrimEnd('/'))/$Asset" -OutFile $BinaryPath
     Invoke-WebRequest -UseBasicParsing -Uri "$($BaseUrl.TrimEnd('/'))/$Asset.sha256" -OutFile $ChecksumPath
 
@@ -58,11 +73,43 @@ try {
         throw "SHA-256 verification failed."
     }
 
+    $DownloadedVersion = Get-DotlinkVersion $BinaryPath
+
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $Destination = Join-Path $InstallDir "dotlink.exe"
-    Copy-Item -Force $BinaryPath $Destination
+    $HadExisting = Test-Path -LiteralPath $Destination
+    $OldVersion = $null
+    $InstalledHash = $null
 
-    Write-Host "Installed dotlink to $Destination"
+    if ($HadExisting) {
+        $OldVersion = Get-DotlinkVersion $Destination
+        $InstalledHash = (Get-FileHash -Algorithm SHA256 $Destination).Hash.ToLowerInvariant()
+    }
+
+    if ($InstalledHash -eq $Expected) {
+        if ($DownloadedVersion) {
+            Write-Host "dotlink $DownloadedVersion is already up to date at $Destination"
+        } else {
+            Write-Host "dotlink is already up to date at $Destination"
+        }
+    } else {
+        Copy-Item -Force $BinaryPath $Destination
+
+        if ($HadExisting) {
+            if ($OldVersion -and $DownloadedVersion) {
+                Write-Host "Updated dotlink $OldVersion -> $DownloadedVersion at $Destination"
+            } elseif ($DownloadedVersion) {
+                Write-Host "Updated dotlink to $DownloadedVersion at $Destination"
+            } else {
+                Write-Host "Updated dotlink at $Destination"
+            }
+        } elseif ($DownloadedVersion) {
+            Write-Host "Installed dotlink $DownloadedVersion to $Destination"
+        } else {
+            Write-Host "Installed dotlink to $Destination"
+        }
+    }
+
     if (-not (($env:PATH -split ';') -contains $InstallDir)) {
         Write-Host "Add $InstallDir to PATH to run 'dotlink' directly."
     }

@@ -33,6 +33,8 @@ Windows x86_64/ARM64 PowerShell:
 irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
 ~~~
 
+Both installers download the **latest published GitHub Release** by default, select the correct architecture internally, and verify its SHA-256. The command you run is always simply **`dotlink`**; architecture suffixes exist only on the release assets (`dotlink.exe` is the Windows file on disk). Re-run the same install command at any time to update; if the installed binary already matches the latest release, it is left unchanged.
+
 Or build with Nix/Cargo; see **Build** below.
 
 ### Setup
