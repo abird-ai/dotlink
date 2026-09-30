@@ -4,7 +4,7 @@
 
 - Add a single-host Nix release graph: x86_64 Linux now cross-builds static Linux x86_64/ARM64, Windows x86_64/ARM64, and macOS ARM64, aggregated by `nix build .#release-all`.
 - Keep the release surface OS-level only: generic static Linux x86_64/ARM64 artifacts, Windows x86_64/ARM64, and macOS ARM64; Windows ARM64 uses pinned LLVM-MinGW/UCRT and macOS ARM64 uses pinned Apple SDK 14.4 + clang/ld64.lld.
-- Add a minimal GitHub Actions workflow that installs Nix, builds `release-all`, and uploads the resulting bundle; all target/toolchain logic remains in `flake.nix`.
+- Add a minimal GitHub Actions workflow that installs Nix and builds `release-all`; normal runs keep a CI artifact, while `v*` tags create/update a GitHub Release with each binary and checksum sidecar uploaded as an individual asset.
 - Extend installers to select Linux ARM64, Windows ARM64, and Apple Silicon macOS artifacts automatically; simplify the local release helper to delegate entirely to `release-all`.
 
 - Offer an Admin-key-free OpenAI Tunnel setup path: create/manage the tunnel in OpenAI Platform and paste its existing `tunnel_...` ID; keep the one-time Admin-key flow as the optional automated path.

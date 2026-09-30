@@ -101,6 +101,34 @@ To materialize the complete bundle under `./dist`:
 
 The helper enables `nix-command` and `flakes` explicitly and delegates all target logic to `release-all`.
 
+## GitHub Releases
+
+Push a version tag that matches the built `VERSION` exactly:
+
+```bash
+git tag v0.5.0
+git push origin v0.5.0
+```
+
+The `Build binaries` workflow rebuilds `release-all`, verifies every SHA-256 sidecar, checks the Linux x86_64 binary, and refuses to publish if the tag does not equal `v$(cat VERSION)`.
+
+On a `v*` tag, GitHub creates or updates the release named **abird dotlink <tag>** and uploads each release file individually:
+
+```text
+dotlink-linux-x86_64
+dotlink-linux-x86_64.sha256
+dotlink-linux-aarch64
+dotlink-linux-aarch64.sha256
+dotlink-windows-x86_64.exe
+dotlink-windows-x86_64.exe.sha256
+dotlink-windows-aarch64.exe
+dotlink-windows-aarch64.exe.sha256
+dotlink-macos-aarch64
+dotlink-macos-aarch64.sha256
+```
+
+The GitHub Actions artifact named `dotlink-binaries` is only an internal CI handoff/debug artifact. The GitHub Release does **not** publish that ZIP bundle. `VERSION` and `PLATFORMS.txt` remain CI metadata and are not uploaded as release assets.
+
 ## Platform notes
 
 - Linux x86_64/ARM64 release binaries are static and run on NixOS, Debian, and other compatible Linux distributions without a Nix runtime.
