@@ -19,14 +19,14 @@ Copy the printed `tunnel_...` ID. Never paste Runtime or Admin API keys into Cha
 
 ## 2. Register the tunnel in ChatGPT
 
-1. Open **Settings → Security and login**.
-2. Enable **Developer mode**.
-3. Open **Plugins** and select **+**.
-4. Create a developer connection:
-   - Name: `abird dotlink`
-   - Connection: **Tunnel**
-   - Tunnel ID: the printed `tunnel_...` value.
-5. Create the connection and review discovered tools.
+1. Open **https://chatgpt.com/plugins**.
+2. Select **Add → Create plugin**.
+3. Name it **abird dotlink** and optionally add a short description.
+4. Under **Connection**, choose **Tunnel**.
+5. Paste the printed `tunnel_...` ID.
+6. Accept the custom-MCP warning and create the plugin.
+
+If **Create plugin** is unavailable, enable **Developer mode** under **Settings → Security and login** first.
 
 The tool list is permission-dependent:
 
@@ -55,7 +55,7 @@ Run the tests and fix the failures.
 Read the local data and build a slide deck from it.
 ```
 
-After changing tool names, schemas, or permissions, restart dotlink and refresh the developer connection before retesting.
+After changing tool names, schemas, or permissions, restart dotlink (or press `Ctrl+R` in an interactive run), then open **https://chatgpt.com/settings/plugins-settings**, select **abird dotlink**, and click **Refresh tools** before retesting.
 
 ## Troubleshooting
 

@@ -104,12 +104,36 @@ Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity
 
 ## Connect dotlink to ChatGPT
 
-1. Run `dotlink --setup` and select **OpenAI Tunnel**.
-2. Start dotlink from the project directory and keep it running.
-3. In ChatGPT, enable **Developer mode**, add a **Tunnel** connection, and select/paste the `tunnel_...` ID printed by dotlink.
-4. Enable **abird dotlink** from the chat tools menu and ask normally.
+### 1. Start dotlink
 
-The discovered tool surface follows local permissions:
+Run setup once and select **OpenAI Tunnel**:
+
+~~~bash
+dotlink --setup
+~~~
+
+Then start dotlink from the project you want ChatGPT to access:
+
+~~~bash
+cd ~/src/my-project
+dotlink
+~~~
+
+Copy the printed `tunnel_...` ID and keep dotlink running.
+
+### 2. Add it to ChatGPT
+
+1. Open **https://chatgpt.com/plugins**.
+2. Select **Add → Create plugin**.
+3. Name it **abird dotlink** and optionally add a short description.
+4. Under **Connection**, choose **Tunnel**.
+5. Paste the `tunnel_...` ID printed by dotlink.
+6. Accept the custom-MCP warning and create the plugin.
+7. In a ChatGPT conversation, open the tools menu, enable **abird dotlink**, and ask normally.
+
+If **Create plugin** is unavailable, enable **Developer mode** under **Settings → Security and login** first.
+
+The tools ChatGPT discovers follow dotlink's local permissions:
 
 ~~~text
 read-only     ls, read, read_binary
@@ -117,11 +141,11 @@ write        + write, edit, write_binary, patch_binary
 shell        + bash (Unix) / powershell (Windows)
 ~~~
 
-After changing tool schemas or permissions, restart dotlink and refresh the ChatGPT connection.
+Never paste a Runtime or Admin API key into ChatGPT. ChatGPT only needs the `tunnel_...` ID.
 
-If the tunnel is not found, verify that dotlink is connected, Developer mode is enabled, the tunnel belongs to the current workspace, and the Runtime API key has **Tunnels Read + Use**.
+If the tunnel is not found, verify that dotlink shows `✓ Connected — ready`, the tunnel belongs to the current ChatGPT workspace, and the Runtime API key has **Tunnels Read + Use**.
 
-Detailed ChatGPT connection steps: `docs/CHATGPT_PLUGIN.md`.
+Detailed reference: `docs/CHATGPT_PLUGIN.md`.
 
 ## Connect dotlink to Claude.ai
 
@@ -401,6 +425,42 @@ dotlink profile <COMMAND>       list/create/edit/delete/mutate persisted profile
 --color=<auto|always|never>     control ANSI colors (default: auto)
 --print-id                      print configured OpenAI Tunnel ID
 ~~~
+
+## FAQ
+
+### I changed dotlink permissions. How do I update ChatGPT?
+
+Restart dotlink (or press `Ctrl+R` in an interactive run) so the new profile/policy is active, then open **https://chatgpt.com/settings/plugins-settings**, select **abird dotlink**, and click **Refresh tools**.
+
+Refreshing is especially important when the exposed tool set changes — for example, adding/removing write or shell access. It is also a good habit after changing path permissions so ChatGPT's connection metadata is definitely current.
+
+### Does ChatGPT get access to my whole computer?
+
+No. dotlink starts read-only on the launch directory and exposes only the capabilities you grant. Write, shell, network, extra paths, caches, and unsandboxed access are separate opt-ins; deny rules always win.
+
+### Do I need to upload files to ChatGPT first?
+
+No. Once connected, ChatGPT can read permitted local files directly through dotlink. That is useful for code, data analysis, reports, slide decks, and other local artifacts without repeatedly uploading/downloading files.
+
+### Do I need to expose a public port for ChatGPT?
+
+No. The ChatGPT path uses the outbound OpenAI Secure MCP Tunnel. Your MCP server stays local; no public inbound port or third-party relay is required.
+
+### Can I use more than one project or permission set?
+
+Yes. Use named profiles such as `dotlink -p work` and manage them with `dotlink profile ...`. Each profile can keep its own transports, permissions, shell/network settings, caches, and OpenAI tunnel state.
+
+### Does changing a profile automatically change a running dotlink process?
+
+Not until the runtime reloads it. Restart dotlink or press `Ctrl+R` during an interactive run. If the ChatGPT-visible tool surface changed, also use **Refresh tools** in ChatGPT afterward.
+
+### Can I use dotlink with Claude.ai or local MCP clients too?
+
+Yes. Claude.ai and other remote MCP clients can use the HTTP/ngrok transport; local clients can use stdio or loopback Streamable HTTP. All transports share the same local permission policy.
+
+### Where are dotlink's config and secrets stored?
+
+Profiles live under `~/.config/abird/dotlink/` (or the equivalent XDG config directory). Runtime API keys are stored separately from JSONC profiles and are never shown back in plaintext during setup.
 
 ## Build
 
