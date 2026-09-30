@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::mcp::LocalMachine;
+use crate::{logging::LogConfig, mcp::LocalMachine};
 
 const POLL_LIMIT: u8 = 25;
 const POLL_TIMEOUT_MS: u64 = 15_000;
@@ -54,7 +54,7 @@ pub struct Config {
     pub runtime_api_key: String,
     pub organization_id: Option<String>,
     pub new_tunnel: bool,
-    pub verbose: bool,
+    pub log: LogConfig,
 }
 
 pub async fn run(
@@ -69,7 +69,7 @@ pub async fn run(
         config.runtime_api_key,
         config.organization_id,
         config.new_tunnel,
-        config.verbose,
+        config.log,
         cancellation,
     )?;
     tunnel.run(embedded).await
@@ -264,7 +264,7 @@ pub struct TunnelClient {
     organization_id: Option<Arc<str>>,
     instance_id: Arc<str>,
     activation_grace_until: Option<Instant>,
-    verbose: bool,
+    log: LogConfig,
     cancellation: CancellationToken,
     concurrency: Arc<Semaphore>,
 }
@@ -322,7 +322,7 @@ impl TunnelClient {
         api_key: String,
         organization_id: Option<String>,
         newly_created: bool,
-        verbose: bool,
+        log: LogConfig,
         cancellation: CancellationToken,
     ) -> Result<Self> {
         if tunnel_id.trim().is_empty() || api_key.trim().is_empty() {
@@ -341,7 +341,7 @@ impl TunnelClient {
             organization_id: organization_id.map(Arc::from),
             instance_id: Arc::from(Uuid::new_v4().to_string()),
             activation_grace_until: newly_created.then(|| Instant::now() + Duration::from_secs(45)),
-            verbose,
+            log,
             cancellation,
             concurrency: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         })
@@ -503,10 +503,8 @@ impl TunnelClient {
                     return Ok(());
                 };
                 let has_request_id = jsonrpc.get("id").is_some();
-                let started = Instant::now();
-                if self.verbose {
-                    eprintln!("{}", verbose_request_summary(jsonrpc));
-                }
+                let request_label = verbose_request_label(jsonrpc);
+                let started = self.log.request("openai", &request_label);
                 let dispatch = mcp.dispatch(&command.headers, jsonrpc);
                 let local = match await_before_deadline(deadline, dispatch).await {
                     Ok(Some(result)) => match result {
@@ -547,14 +545,8 @@ impl TunnelClient {
                     Err(error) => return Err(error),
                 };
 
-                if self.verbose {
-                    eprintln!(
-                        "← {}  {}  {}ms",
-                        verbose_request_label(jsonrpc),
-                        local.status,
-                        started.elapsed().as_millis()
-                    );
-                }
+                self.log
+                    .request_done("openai", &request_label, started, local.status.to_string());
 
                 if !has_request_id {
                     let response = TunnelResponse {
@@ -818,6 +810,7 @@ fn verbose_request_label(jsonrpc: &Value) -> String {
     method.to_owned()
 }
 
+#[cfg(test)]
 fn verbose_request_summary(jsonrpc: &Value) -> String {
     let method = jsonrpc
         .get("method")
@@ -840,6 +833,7 @@ fn verbose_request_summary(jsonrpc: &Value) -> String {
     }
 }
 
+#[cfg(test)]
 fn summarize_tool_arguments(arguments: &Value) -> String {
     let Some(object) = arguments.as_object() else {
         return String::new();
@@ -872,6 +866,7 @@ fn summarize_tool_arguments(arguments: &Value) -> String {
     parts.join(" ")
 }
 
+#[cfg(test)]
 fn summarize_value(value: &Value) -> String {
     match value {
         Value::String(value) => {

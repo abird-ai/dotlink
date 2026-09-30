@@ -1,7 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result, anyhow};
-use axum::Router;
+use axum::{
+    Router,
+    body::Body,
+    http::Request,
+    middleware::{self, Next},
+    response::Response,
+};
 use ngrok::{
     config::{Binding, ForwarderBuilder},
     prelude::EndpointInfo,
@@ -14,14 +20,15 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-use crate::mcp::LocalMachine;
+use crate::{logging::LogConfig, mcp::LocalMachine};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
     pub ngrok: bool,
     pub http_ephemeral_url: bool,
     pub ngrok_ephemeral_url: bool,
+    pub log: LogConfig,
 }
 
 pub async fn run(
@@ -40,7 +47,14 @@ pub async fn run(
     eprintln!("✓ HTTP MCP: http://{http_addr}{http_path}");
 
     if !config.ngrok {
-        return run_server(machine, http_listener, http_path, cancellation).await;
+        return run_server(
+            machine,
+            http_listener,
+            http_path,
+            config.log.clone(),
+            cancellation,
+        )
+        .await;
     }
 
     // ngrok gets a separate loopback-only backend so its public route can be
@@ -76,8 +90,20 @@ pub async fn run(
 
     let http_ct = cancellation.child_token();
     let ngrok_ct = cancellation.child_token();
-    let mut http_task = spawn_server(machine.clone(), http_listener, http_path, http_ct);
-    let mut ngrok_task = spawn_server(machine, ngrok_listener, ngrok_path, ngrok_ct);
+    let mut http_task = spawn_server(
+        machine.clone(),
+        http_listener,
+        http_path,
+        config.log.clone(),
+        http_ct,
+    );
+    let mut ngrok_task = spawn_server(
+        machine,
+        ngrok_listener,
+        ngrok_path,
+        config.log.clone(),
+        ngrok_ct,
+    );
 
     let result = tokio::select! {
         result = &mut http_task => join_server("HTTP MCP server", result),
@@ -105,9 +131,10 @@ async fn run_server(
     machine: LocalMachine,
     listener: TcpListener,
     path: String,
+    log: LogConfig,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let router = mcp_router(machine, &path, cancellation.child_token());
+    let router = mcp_router(machine, &path, log, cancellation.child_token());
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             cancellation.cancelled_owned().await;
@@ -120,9 +147,10 @@ fn spawn_server(
     machine: LocalMachine,
     listener: TcpListener,
     path: String,
+    log: LogConfig,
     cancellation: CancellationToken,
 ) -> JoinHandle<Result<()>> {
-    tokio::spawn(async move { run_server(machine, listener, path, cancellation).await })
+    tokio::spawn(async move { run_server(machine, listener, path, log, cancellation).await })
 }
 
 fn join_server(name: &str, result: Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
@@ -132,7 +160,12 @@ fn join_server(name: &str, result: Result<Result<()>, tokio::task::JoinError>) -
     }
 }
 
-fn mcp_router(machine: LocalMachine, path: &str, cancellation: CancellationToken) -> Router {
+fn mcp_router(
+    machine: LocalMachine,
+    path: &str,
+    log: LogConfig,
+    cancellation: CancellationToken,
+) -> Router {
     let server_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
@@ -147,7 +180,32 @@ fn mcp_router(machine: LocalMachine, path: &str, cancellation: CancellationToken
             server_config,
         );
 
-    Router::new().nest_service(path, service)
+    let router = Router::new().nest_service(path, service);
+    if log.developer_enabled() {
+        router.layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| {
+                let log = log.clone();
+                async move { log_http_request(log, request, next).await }
+            },
+        ))
+    } else {
+        router
+    }
+}
+
+async fn log_http_request(log: LogConfig, request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().path().to_owned();
+    let label = format!("{method} {uri}");
+    let started = log.request("http", &label);
+    let response = next.run(request).await;
+    log.request_done(
+        "http",
+        &label,
+        started,
+        response.status().as_u16().to_string(),
+    );
+    response
 }
 
 fn mcp_path(ephemeral: bool) -> String {

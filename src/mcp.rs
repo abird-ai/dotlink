@@ -6,15 +6,22 @@ use std::{
     time::Duration,
 };
 
+use crate::logging::{LogConfig, truncate};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     ErrorData as McpError,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ResourceContents},
-    schemars, tool, tool_router,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ResourceContents,
+    },
+    schemars,
+    service::{RequestContext, RoleServer},
+    tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -31,12 +38,15 @@ pub struct AccessSpec {
     pub write_roots: Vec<PathBuf>,
     pub deny_read_roots: Vec<PathBuf>,
     pub deny_write_roots: Vec<PathBuf>,
-    pub rw_all_dangerous: bool,
+    pub unrestricted_fs: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct MachineConfig {
     pub access: AccessSpec,
+    pub cache_mounts: Vec<SandboxCacheMount>,
+    pub shell_env: Vec<(String, String)>,
+    pub log: LogConfig,
     pub allow_shell: bool,
     pub sandbox_shell: bool,
     pub allow_network: bool,
@@ -48,18 +58,28 @@ pub struct MachineConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct SandboxCacheMount {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub writable: bool,
+}
+
+#[derive(Clone, Debug)]
 struct AccessPolicy {
     cwd: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
     deny_read_roots: Vec<PathBuf>,
     deny_write_roots: Vec<PathBuf>,
-    rw_all_dangerous: bool,
+    unrestricted_fs: bool,
 }
 
 #[derive(Clone, Debug)]
 struct RuntimeConfig {
     access: AccessPolicy,
+    cache_mounts: Vec<SandboxCacheMount>,
+    shell_env: Vec<(String, String)>,
+    log: LogConfig,
     allow_shell: bool,
     sandbox_shell: bool,
     allow_network: bool,
@@ -441,7 +461,7 @@ impl AccessPolicy {
             write_roots: spec.write_roots,
             deny_read_roots: spec.deny_read_roots,
             deny_write_roots: spec.deny_write_roots,
-            rw_all_dangerous: spec.rw_all_dangerous,
+            unrestricted_fs: spec.unrestricted_fs,
         })
     }
 
@@ -470,11 +490,11 @@ impl AccessPolicy {
     }
 
     fn grant_read(&self, path: &Path) -> bool {
-        self.rw_all_dangerous || self.read_roots.iter().any(|root| path.starts_with(root))
+        self.unrestricted_fs || self.read_roots.iter().any(|root| path.starts_with(root))
     }
 
     fn grant_write(&self, path: &Path) -> bool {
-        self.rw_all_dangerous || self.write_roots.iter().any(|root| path.starts_with(root))
+        self.unrestricted_fs || self.write_roots.iter().any(|root| path.starts_with(root))
     }
 
     fn can_read(&self, path: &Path) -> bool {
@@ -571,7 +591,7 @@ impl AccessPolicy {
     }
 
     fn sandbox_mounts(&self) -> Vec<(PathBuf, bool)> {
-        if self.rw_all_dangerous {
+        if self.unrestricted_fs {
             return vec![(PathBuf::from("/"), true)];
         }
 
@@ -634,8 +654,50 @@ impl LocalMachine {
             write_roots,
             deny_read_roots,
             deny_write_roots,
-            rw_all_dangerous: args.access.rw_all_dangerous,
+            unrestricted_fs: args.access.unrestricted_fs,
         })?;
+
+        let mut cache_mounts = Vec::with_capacity(args.cache_mounts.len());
+        let mut cache_targets = BTreeSet::new();
+        for mount in args.cache_mounts {
+            if !mount.target.is_absolute()
+                || !mount.target.starts_with("/tmp/home")
+                || mount
+                    .target
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+            {
+                bail!(
+                    "internal error: cache sandbox target must stay below /tmp/home: {}",
+                    mount.target.display()
+                );
+            }
+
+            let source = match fs::canonicalize(&mount.source).await {
+                Ok(source) => source,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !fs::metadata(&source).await?.is_dir() {
+                continue;
+            }
+            if access.denied_read(&source) {
+                continue;
+            }
+            let writable = mount.writable && !access.denied_write(&source);
+            if !cache_targets.insert(mount.target.clone()) {
+                bail!(
+                    "internal error: duplicate cache sandbox target: {}",
+                    mount.target.display()
+                );
+            }
+
+            cache_mounts.push(SandboxCacheMount {
+                source,
+                target: mount.target,
+                writable,
+            });
+        }
 
         let mut protected_paths = Vec::with_capacity(args.protected_paths.len());
         for path in args.protected_paths {
@@ -696,6 +758,9 @@ impl LocalMachine {
         Ok(Self {
             config: RuntimeConfig {
                 access,
+                cache_mounts,
+                shell_env: args.shell_env,
+                log: args.log,
                 allow_shell: args.allow_shell,
                 sandbox_shell: args.sandbox_shell,
                 allow_network: args.allow_network,
@@ -708,6 +773,10 @@ impl LocalMachine {
                 protected_paths,
             },
         })
+    }
+
+    pub fn log(&self) -> &LogConfig {
+        &self.config.log
     }
 
     pub fn cwd(&self) -> &Path {
@@ -727,15 +796,16 @@ impl LocalMachine {
     }
 
     pub fn access_summary(&self) -> String {
-        if self.config.access.rw_all_dangerous {
+        if self.config.access.unrestricted_fs {
             return "unrestricted read+write".to_owned();
         }
         format!(
-            "read:{} write:{} deny-read:{} deny-write:{}{}",
+            "read:{} write:{} deny-read:{} deny-write:{} caches:{}{}",
             self.config.access.read_roots.len(),
             self.config.access.write_roots.len(),
             self.config.access.deny_read_roots.len(),
             self.config.access.deny_write_roots.len(),
+            self.config.cache_mounts.len(),
             if self.config.allow_shell {
                 " + shell"
             } else {
@@ -767,7 +837,7 @@ impl LocalMachine {
 
     fn policy_tool_router(&self) -> ToolRouter<Self> {
         Self::tool_router_for_policy(
-            self.config.access.rw_all_dangerous || !self.config.access.write_roots.is_empty(),
+            self.config.access.unrestricted_fs || !self.config.access.write_roots.is_empty(),
             self.config.allow_shell,
         )
     }
@@ -1020,19 +1090,16 @@ impl LocalMachine {
             command.arg("--unshare-net");
         }
 
-        if self.config.access.rw_all_dangerous {
+        if self.config.access.unrestricted_fs {
             command.arg("--bind").arg("/").arg("/");
         }
 
         if !self.config.allow_network {
-            for daemon_socket in [
-                Path::new("/nix/var/nix/daemon-socket/socket"),
-                Path::new("/run/nix-daemon/socket"),
+            for daemon_endpoint in [
+                Path::new("/nix/var/nix/daemon-socket"),
+                Path::new("/run/nix-daemon"),
             ] {
-                if daemon_socket.exists() {
-                    add_parent_dirs(&mut command, daemon_socket);
-                    command.arg("--ro-bind").arg("/dev/null").arg(daemon_socket);
-                }
+                mask_path(&mut command, daemon_endpoint);
             }
         }
 
@@ -1045,14 +1112,14 @@ impl LocalMachine {
             .arg("/tmp")
             .arg("--dir")
             .arg("/tmp/home");
-        if !self.config.access.rw_all_dangerous {
+        if !self.config.access.unrestricted_fs {
             command.arg("--dir").arg("/etc");
         }
 
         let mounts = self.config.access.sandbox_mounts();
-        if !self.config.access.rw_all_dangerous {
+        if !self.config.access.unrestricted_fs {
             for path in sandbox_runtime_mounts() {
-                add_parent_dirs(&mut command, &path);
+                prepare_mount_target_dirs(&mut command, &path);
                 command.arg("--ro-bind").arg(&path).arg(&path);
             }
 
@@ -1067,14 +1134,14 @@ impl LocalMachine {
                 ] {
                     let path = Path::new(network_path);
                     if path.exists() {
-                        add_parent_dirs(&mut command, path);
+                        prepare_mount_target_dirs(&mut command, path);
                         command.arg("--ro-bind").arg(path).arg(path);
                     }
                 }
             }
 
             for (path, writable) in mounts {
-                add_parent_dirs(&mut command, &path);
+                prepare_mount_target_dirs(&mut command, &path);
                 if writable {
                     command.arg("--bind");
                 } else {
@@ -1084,6 +1151,16 @@ impl LocalMachine {
             }
         }
 
+        for cache in &self.config.cache_mounts {
+            prepare_directory_mount_target(&mut command, &cache.target);
+            if cache.writable {
+                command.arg("--bind");
+            } else {
+                command.arg("--ro-bind");
+            }
+            command.arg(&cache.source).arg(&cache.target);
+        }
+
         for denied in self.config.access.deny_write_roots() {
             if self.config.access.denied_read(denied)
                 || !self.config.access.grant_read(denied)
@@ -1091,7 +1168,7 @@ impl LocalMachine {
             {
                 continue;
             }
-            add_parent_dirs(&mut command, denied);
+            prepare_mount_target_dirs(&mut command, denied);
             if denied.exists() {
                 command.arg("--ro-bind").arg(denied).arg(denied);
             }
@@ -1101,31 +1178,14 @@ impl LocalMachine {
             if !(self.config.access.grant_read(denied) || self.config.access.grant_write(denied)) {
                 continue;
             }
-            add_parent_dirs(&mut command, denied);
-            match std::fs::symlink_metadata(denied) {
-                Ok(metadata) if metadata.is_dir() => {
-                    command
-                        .arg("--tmpfs")
-                        .arg(denied)
-                        .arg("--chmod")
-                        .arg("000")
-                        .arg(denied);
-                }
-                Ok(_) => {
-                    command.arg("--ro-bind").arg("/dev/null").arg(denied);
-                }
-                Err(_) => {
-                    // Startup validation rejects this case for sandboxed granted trees.
-                }
-            }
+            mask_path(&mut command, denied);
         }
 
         for protected in &self.config.protected_paths {
             if self.config.access.grant_read(protected)
                 && !self.config.access.denied_read(protected)
             {
-                add_parent_dirs(&mut command, protected);
-                command.arg("--ro-bind").arg("/dev/null").arg(protected);
+                mask_path(&mut command, protected);
             }
         }
 
@@ -1149,6 +1209,10 @@ impl LocalMachine {
             }
         }
 
+        for (name, value) in &self.config.shell_env {
+            command.arg("--setenv").arg(name).arg(value);
+        }
+
         command
             .arg("--")
             .arg(shell)
@@ -1161,14 +1225,40 @@ impl LocalMachine {
 }
 
 #[cfg(target_os = "linux")]
-fn add_parent_dirs(command: &mut Command, path: &Path) {
+fn mask_path(command: &mut Command, path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+
+    prepare_mount_target_dirs(command, path);
+
+    if metadata.is_dir() {
+        command
+            .arg("--tmpfs")
+            .arg(path)
+            .arg("--chmod")
+            .arg("000")
+            .arg(path);
+    } else {
+        command.arg("--ro-bind").arg("/dev/null").arg(path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_directory_mount_target(command: &mut Command, path: &Path) {
+    prepare_mount_target_dirs(command, path);
+    command.arg("--dir").arg(path);
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_mount_target_dirs(command: &mut Command, path: &Path) {
     if path == Path::new("/") {
         return;
     }
 
     let mut current = PathBuf::from("/");
     let components = path.components().collect::<Vec<_>>();
-    let final_is_file = path.is_file();
+    let final_is_directory = path.is_dir();
 
     for (index, component) in components.iter().enumerate() {
         match component {
@@ -1176,7 +1266,7 @@ fn add_parent_dirs(command: &mut Command, path: &Path) {
             Component::CurDir | Component::ParentDir => continue,
             Component::Normal(part) => current.push(part),
         }
-        if final_is_file && index + 1 == components.len() {
+        if !final_is_directory && index + 1 == components.len() {
             break;
         }
         command.arg("--dir").arg(&current);
@@ -1201,6 +1291,55 @@ fn direct_shell_command(shell: &Path, powershell: bool, cwd: &Path, script: &str
     }
     command.current_dir(cwd);
     command
+}
+
+fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Value>>) -> String {
+    let Some(arguments) = arguments else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+    for key in [
+        "path",
+        "cwd",
+        "command",
+        "format",
+        "encoding",
+        "recursive",
+        "replace_all",
+        "offset",
+        "limit",
+        "length",
+        "timeout_secs",
+        "max_entries",
+        "max_output_bytes",
+    ] {
+        let Some(value) = arguments.get(key) else {
+            continue;
+        };
+        let rendered = match value {
+            Value::String(value) if key == "command" => truncate(value, 180),
+            Value::String(value) => truncate(value, 240),
+            Value::Bool(value) => value.to_string(),
+            Value::Number(value) => value.to_string(),
+            Value::Null => "null".to_owned(),
+            _ => continue,
+        };
+        parts.push(format!("{key}={rendered}"));
+    }
+
+    for (key, label) in [
+        ("content", "content_bytes"),
+        ("data", "encoded_chars"),
+        ("old_text", "old_bytes"),
+        ("new_text", "new_bytes"),
+    ] {
+        if let Some(Value::String(value)) = arguments.get(key) {
+            parts.push(format!("{label}={}", value.len()));
+        }
+    }
+
+    parts.join(" ")
 }
 
 #[tool_router(vis = "pub")]
@@ -1571,7 +1710,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Run Bash. On Linux it is Bubblewrap-sandboxed unless dangerous unsandboxed access was explicitly enabled.",
+        description = "Run Bash. On Linux it is Bubblewrap-sandboxed unless --no-sandbox --allow-all was explicitly selected.",
         annotations(
             title = "Run Bash command",
             read_only_hint = false,
@@ -1588,7 +1727,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Run PowerShell on Windows. Unsandboxed use requires explicit dangerous access.",
+        description = "Run PowerShell on Windows. Unsandboxed shell access requires --no-sandbox --allow-all.",
         annotations(
             title = "Run PowerShell command",
             read_only_hint = false,
@@ -1610,7 +1749,31 @@ impl LocalMachine {
     name = "abird-link",
     instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
 )]
-impl rmcp::ServerHandler for LocalMachine {}
+impl rmcp::ServerHandler for LocalMachine {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.to_string();
+        let detail = summarize_tool_call_arguments(request.arguments.as_ref());
+        let started = self.config.log.activity_start(&name, detail);
+
+        let context = ToolCallContext::new(self, request, context);
+        let result = self.policy_tool_router().call(context).await;
+
+        let outcome = match &result {
+            Ok(CallToolResponse::Complete(result)) if result.is_error.unwrap_or(false) => "error",
+            Ok(CallToolResponse::Complete(_)) => "ok",
+            Ok(CallToolResponse::InputRequired(_)) => "input-required",
+            Ok(CallToolResponse::Task(_)) => "task",
+            Ok(_) => "ok",
+            Err(_) => "protocol-error",
+        };
+        self.config.log.activity_done(&name, started, outcome);
+        result
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1623,7 +1786,7 @@ mod tests {
             write_roots: Vec::new(),
             deny_read_roots: Vec::new(),
             deny_write_roots: Vec::new(),
-            rw_all_dangerous: false,
+            unrestricted_fs: false,
         })
         .unwrap()
     }
@@ -1650,7 +1813,7 @@ mod tests {
             write_roots: vec![child.clone()],
             deny_read_roots: Vec::new(),
             deny_write_roots: Vec::new(),
-            rw_all_dangerous: false,
+            unrestricted_fs: false,
         })
         .unwrap();
 
@@ -1671,7 +1834,7 @@ mod tests {
             write_roots: vec![root],
             deny_read_roots: vec![denied.clone()],
             deny_write_roots: vec![denied.clone()],
-            rw_all_dangerous: false,
+            unrestricted_fs: false,
         })
         .unwrap();
 
@@ -1694,7 +1857,7 @@ mod tests {
             write_roots: vec![root],
             deny_read_roots: vec![read_denied.clone()],
             deny_write_roots: vec![write_denied.clone()],
-            rw_all_dangerous: false,
+            unrestricted_fs: false,
         })
         .unwrap();
 
@@ -1738,7 +1901,7 @@ mod tests {
             write_roots: vec![root],
             deny_read_roots: Vec::new(),
             deny_write_roots: Vec::new(),
-            rw_all_dangerous: false,
+            unrestricted_fs: false,
         })
         .unwrap();
 
@@ -1770,8 +1933,11 @@ mod tests {
                 write_roots: Vec::new(),
                 deny_read_roots: Vec::new(),
                 deny_write_roots: Vec::new(),
-                rw_all_dangerous: false,
+                unrestricted_fs: false,
             },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            log: LogConfig::default(),
             allow_shell: false,
             sandbox_shell: false,
             allow_network: false,
@@ -1839,6 +2005,59 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn prepare_mount_target_dirs_treats_unix_socket_as_leaf() {
+        use std::{ffi::OsStr, os::unix::net::UnixListener};
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("daemon.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        let mut command = Command::new("true");
+        prepare_mount_target_dirs(&mut command, &socket);
+        let args: Vec<_> = command.as_std().get_args().collect();
+
+        assert!(
+            !args.windows(2).any(|window| {
+                window[0] == OsStr::new("--dir") && window[1] == socket.as_os_str()
+            }),
+            "socket leaf itself must not be created as a directory"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mask_path_is_type_aware() {
+        use std::{ffi::OsStr, os::unix::net::UnixListener};
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        let socket = temp.path().join("daemon.sock");
+        std::fs::create_dir(&directory).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        let mut command = Command::new("true");
+        mask_path(&mut command, &directory);
+        mask_path(&mut command, &socket);
+        let args: Vec<_> = command.as_std().get_args().collect();
+
+        assert!(
+            args.windows(2).any(|window| {
+                window[0] == OsStr::new("--tmpfs") && window[1] == directory.as_os_str()
+            }),
+            "directories should be hidden with an inaccessible tmpfs mount"
+        );
+        assert!(
+            args.windows(3).any(|window| {
+                window[0] == OsStr::new("--ro-bind")
+                    && window[1] == OsStr::new("/dev/null")
+                    && window[2] == socket.as_os_str()
+            }),
+            "non-directories should be hidden behind /dev/null"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sandbox_runtime_mounts_include_available_nix_profiles_without_home_root() {
         let mounts = sandbox_runtime_mounts();
 
@@ -1886,7 +2105,7 @@ mod tests {
             write_roots: vec![writable.clone()],
             deny_read_roots: vec![denied.clone()],
             deny_write_roots: vec![denied.clone()],
-            rw_all_dangerous: false,
+            unrestricted_fs: false,
         })
         .unwrap();
 
@@ -1910,13 +2129,183 @@ mod tests {
             write_roots: vec![root.clone()],
             deny_read_roots: Vec::new(),
             deny_write_roots: vec![denied.clone()],
-            rw_all_dangerous: false,
+            unrestricted_fs: false,
         })
         .unwrap();
 
         let mounts = access.sandbox_mounts();
         assert!(mounts.contains(&(root, true)));
         assert!(mounts.contains(&(denied, false)));
+    }
+
+    #[tokio::test]
+    async fn filesystem_denies_override_cache_grants() {
+        let project = tempfile::tempdir().unwrap();
+        let caches = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let denied_read = caches.path().join("deny-read");
+        let denied_write = caches.path().join("deny-write");
+        std::fs::create_dir(&denied_read).unwrap();
+        std::fs::create_dir(&denied_write).unwrap();
+
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                cwd: root.clone(),
+                read_roots: vec![root],
+                write_roots: Vec::new(),
+                deny_read_roots: vec![denied_read.clone()],
+                deny_write_roots: vec![denied_write.clone()],
+                unrestricted_fs: false,
+            },
+            cache_mounts: vec![
+                SandboxCacheMount {
+                    source: denied_read,
+                    target: PathBuf::from("/tmp/home/.cache/read-denied"),
+                    writable: true,
+                },
+                SandboxCacheMount {
+                    source: denied_write,
+                    target: PathBuf::from("/tmp/home/.cache/write-denied"),
+                    writable: true,
+                },
+            ],
+            shell_env: Vec::new(),
+            log: LogConfig::default(),
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(machine.config.cache_mounts.len(), 1);
+        assert_eq!(
+            machine.config.cache_mounts[0].target,
+            PathBuf::from("/tmp/home/.cache/write-denied")
+        );
+        assert!(
+            !machine.config.cache_mounts[0].writable,
+            "deny-write must downgrade a shared cache to read-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_mounts_do_not_expand_mcp_filesystem_access() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let cache_root = cache.path().canonicalize().unwrap();
+
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                cwd: root.clone(),
+                read_roots: vec![root],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: vec![SandboxCacheMount {
+                source: cache_root.clone(),
+                target: PathBuf::from("/tmp/home/.cargo/registry"),
+                writable: true,
+            }],
+            shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
+            log: LogConfig::default(),
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            machine
+                .resolve_existing(cache_root.to_str().unwrap(), AccessNeed::Read)
+                .await
+                .is_err(),
+            "cache sharing must not grant MCP read access to the host cache"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_cache_mounts_preserve_ro_rw_and_cache_env() {
+        use std::ffi::OsStr;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let read_only = root.join("cache-ro");
+        let read_write = root.join("cache-rw");
+        std::fs::create_dir(&read_only).unwrap();
+        std::fs::create_dir(&read_write).unwrap();
+
+        let machine = LocalMachine {
+            config: RuntimeConfig {
+                access: AccessPolicy::from_spec(AccessSpec {
+                    cwd: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                })
+                .unwrap(),
+                cache_mounts: vec![
+                    SandboxCacheMount {
+                        source: read_only.clone(),
+                        target: PathBuf::from("/tmp/home/.cargo/registry"),
+                        writable: false,
+                    },
+                    SandboxCacheMount {
+                        source: read_write.clone(),
+                        target: PathBuf::from("/tmp/home/.cargo/git"),
+                        writable: true,
+                    },
+                ],
+                shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
+                log: LogConfig::default(),
+                allow_shell: true,
+                sandbox_shell: true,
+                allow_network: false,
+                shell_program: Some(PathBuf::from("/bin/bash")),
+                bwrap_program: Some(PathBuf::from("/bin/bwrap")),
+                max_shell_timeout_secs: 5,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                protected_paths: Vec::new(),
+            },
+        };
+
+        let command = machine.bubblewrap_command(Path::new("/bin/bash"), &root, "true");
+        let args: Vec<_> = command.as_std().get_args().collect();
+
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--ro-bind")
+                && window[1] == read_only.as_os_str()
+                && window[2] == OsStr::new("/tmp/home/.cargo/registry")
+        }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--bind")
+                && window[1] == read_write.as_os_str()
+                && window[2] == OsStr::new("/tmp/home/.cargo/git")
+        }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--setenv")
+                && window[1] == OsStr::new("CARGO_HOME")
+                && window[2] == OsStr::new("/tmp/home/.cargo")
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -1937,9 +2326,12 @@ mod tests {
                     write_roots: Vec::new(),
                     deny_read_roots: vec![denied.clone()],
                     deny_write_roots: vec![denied.clone()],
-                    rw_all_dangerous: false,
+                    unrestricted_fs: false,
                 })
                 .unwrap(),
+                cache_mounts: Vec::new(),
+                shell_env: Vec::new(),
+                log: LogConfig::default(),
                 allow_shell: true,
                 sandbox_shell: true,
                 allow_network: false,
@@ -1958,18 +2350,29 @@ mod tests {
 
         assert!(args.iter().any(|arg| *arg == OsStr::new("--unshare-net")));
 
-        for socket in [
-            Path::new("/nix/var/nix/daemon-socket/socket"),
-            Path::new("/run/nix-daemon/socket"),
+        for endpoint in [
+            Path::new("/nix/var/nix/daemon-socket"),
+            Path::new("/run/nix-daemon"),
         ] {
-            if socket.exists() {
+            let Ok(metadata) = std::fs::symlink_metadata(endpoint) else {
+                continue;
+            };
+
+            if metadata.is_dir() {
+                assert!(
+                    args.windows(2).any(|window| {
+                        window[0] == OsStr::new("--tmpfs") && window[1] == endpoint.as_os_str()
+                    }),
+                    "Nix daemon endpoint directory should be hidden when network is denied"
+                );
+            } else {
                 assert!(
                     args.windows(3).any(|window| {
                         window[0] == OsStr::new("--ro-bind")
                             && window[1] == OsStr::new("/dev/null")
-                            && window[2] == socket.as_os_str()
+                            && window[2] == endpoint.as_os_str()
                     }),
-                    "Nix daemon socket should be masked when network is denied"
+                    "Nix daemon endpoint should be hidden when network is denied"
                 );
             }
         }
@@ -1998,6 +2401,98 @@ mod tests {
                 .get_args()
                 .any(|arg| arg == OsStr::new("--unshare-net"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_cache_runtime_smoke_when_requested() {
+        if std::env::var_os("ABIRD_TEST_BWRAP").is_none() {
+            return;
+        }
+
+        let Some(bwrap) = resolve_executable("bwrap") else {
+            panic!("ABIRD_TEST_BWRAP requested but bwrap is not installed");
+        };
+        let Some(bash) = resolve_executable("bash") else {
+            panic!("ABIRD_TEST_BWRAP requested but bash is not installed");
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let caches = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let read_only = caches.path().join("registry");
+        let read_write = caches.path().join("git");
+        std::fs::create_dir(&read_only).unwrap();
+        std::fs::create_dir(&read_write).unwrap();
+        std::fs::write(read_only.join("cached.txt"), b"cached").unwrap();
+
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                cwd: root.clone(),
+                read_roots: vec![root],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: vec![
+                SandboxCacheMount {
+                    source: read_only.clone(),
+                    target: PathBuf::from("/tmp/home/.cargo/registry"),
+                    writable: false,
+                },
+                SandboxCacheMount {
+                    source: read_write.clone(),
+                    target: PathBuf::from("/tmp/home/.cargo/git"),
+                    writable: true,
+                },
+            ],
+            shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
+            log: LogConfig::default(),
+            allow_shell: true,
+            sandbox_shell: true,
+            allow_network: false,
+            max_shell_timeout_secs: 10,
+            max_output_bytes: 16 * 1024,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        // Use the executable paths resolved by LocalMachine::new.
+        assert_eq!(machine.config.shell_program.as_ref(), Some(&bash));
+        assert_eq!(machine.config.bwrap_program.as_ref(), Some(&bwrap));
+
+        let result = machine
+            .execute_shell(
+                ShellArgs {
+                    command: concat!(
+                        "set -eu; ",
+                        "test \"$CARGO_HOME\" = /tmp/home/.cargo; ",
+                        "cat \"$CARGO_HOME/registry/cached.txt\" >/dev/null; ",
+                        "if touch \"$CARGO_HOME/registry/blocked\" >/dev/null 2>&1; then exit 21; fi; ",
+                        "touch \"$CARGO_HOME/git/works\""
+                    )
+                    .to_owned(),
+                    cwd: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(10),
+                    max_output_bytes: Some(16 * 1024),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(
+            serialized.contains("\\\"exit_code\\\":0"),
+            "cache sandbox smoke failed: {serialized}"
+        );
+        assert!(!read_only.join("blocked").exists());
+        assert!(read_write.join("works").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -2031,9 +2526,12 @@ mod tests {
                     write_roots: vec![writable.clone()],
                     deny_read_roots: vec![denied.clone()],
                     deny_write_roots: vec![denied],
-                    rw_all_dangerous: false,
+                    unrestricted_fs: false,
                 })
                 .unwrap(),
+                cache_mounts: Vec::new(),
+                shell_env: Vec::new(),
+                log: LogConfig::default(),
                 allow_shell: true,
                 sandbox_shell: true,
                 allow_network: false,
