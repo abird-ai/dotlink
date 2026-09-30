@@ -840,6 +840,15 @@ async fn interactive_setup(
             "────────────────────────────────────────────────────────"
         )
     );
+    println!(
+        "{}",
+        setup_style(
+            color,
+            "2",
+            "Help: https://github.com/abird-ai/dotlink#readme"
+        )
+    );
+    println!();
     if let Some(profile) = profile {
         println!(
             "{} {}",
