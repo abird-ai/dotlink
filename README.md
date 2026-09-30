@@ -490,7 +490,7 @@ nix build .#release-all
 ./scripts/build-release-artifacts.sh
 ~~~
 
-The bundle contains static Linux x86_64/ARM64 binaries (the same bits work on NixOS and Debian), Windows x86_64/ARM64, and macOS ARM64. Individual Nix outputs are also available, including `dist-nixos-*`, `dist-debian-*`, `dist-windows-*`, and `dist-macos-aarch64`.
+The bundle contains static Linux x86_64/ARM64 binaries, Windows x86_64/ARM64, and macOS ARM64. The static Linux builds run across NixOS, Debian, and other compatible distributions. Individual Nix outputs are available as `dist-linux-*`, `dist-windows-*`, and `dist-macos-aarch64`.
 
 Cross-build outputs, stable filenames, installer overrides, and platform release details: `.agents/docs/release-install.md`.
 

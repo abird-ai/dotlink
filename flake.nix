@@ -377,8 +377,8 @@
                   cp "${macosAarch64Dist}"/dotlink-macos-aarch64* "$out/"
                   printf '%s\n' '${version}' > "$out/VERSION"
                   cat > "$out/PLATFORMS.txt" <<'EOF'
-                  dotlink-linux-x86_64: NixOS x86_64, Debian x86_64, and other x86_64 Linux
-                  dotlink-linux-aarch64: NixOS ARM64, Debian ARM64, and other ARM64 Linux
+                  dotlink-linux-x86_64: Linux x86_64 (static musl)
+                  dotlink-linux-aarch64: Linux ARM64 (static musl)
                   dotlink-windows-x86_64.exe: Windows x86_64
                   dotlink-windows-aarch64.exe: Windows ARM64
                   dotlink-macos-aarch64: macOS ARM64 (Apple Silicon)
@@ -389,14 +389,10 @@
             cross-linux-x86_64-deps = linuxX86_64.cargoArtifacts;
             cross-linux-x86_64 = linuxX86_64.package;
             dist-linux-x86_64 = linuxX86_64Dist;
-            dist-nixos-x86_64 = linuxX86_64Dist;
-            dist-debian-x86_64 = linuxX86_64Dist;
 
             cross-linux-aarch64-deps = linuxAarch64.cargoArtifacts;
             cross-linux-aarch64 = linuxAarch64.package;
             dist-linux-aarch64 = linuxAarch64Dist;
-            dist-nixos-aarch64 = linuxAarch64Dist;
-            dist-debian-aarch64 = linuxAarch64Dist;
 
             cross-windows-x86_64-deps = windowsX86_64.cargoArtifacts;
             cross-windows-x86_64 = windowsX86_64.package;

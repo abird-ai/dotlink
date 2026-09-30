@@ -335,7 +335,7 @@ Windows ARM64  aarch64-pc-windows-gnullvm
 macOS ARM64    aarch64-apple-darwin
 ~~~
 
-Each target exposes `cross-*-deps`, `cross-*`, and `dist-*` outputs. `dist-nixos-*` and `dist-debian-*` are aliases to the same static musl Linux artifact for each architecture. `release-all` aggregates every published binary, checksum sidecar, `VERSION`, and `PLATFORMS.txt` into one derivation.
+Each target exposes `cross-*-deps`, `cross-*`, and `dist-*` outputs. Linux is published only as generic static musl `dist-linux-*` artifacts; no distro-specific aliases are needed. `release-all` aggregates every published binary, checksum sidecar, `VERSION`, and `PLATFORMS.txt` into one derivation.
 
 Windows ARM64 uses nixpkgs' pinned LLVM-MinGW/UCRT toolchain. macOS ARM64 uses the hashed Apple SDK 14.4 fetch derivation directly with Linux-hosted clang/ld64.lld and a macOS 11.0 deployment target, avoiding a host-specific Darwin build step.
 

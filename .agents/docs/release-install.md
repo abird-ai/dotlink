@@ -49,7 +49,7 @@ VERSION
 PLATFORMS.txt
 ```
 
-The Linux binaries are static musl builds. NixOS and Debian outputs intentionally alias the same binary per architecture; there is no distro-specific glibc dependency.
+The Linux binaries are static musl builds with no distro-specific glibc dependency, so the same artifact runs across NixOS, Debian, and other compatible Linux distributions.
 
 ## Nix / Crane outputs
 
@@ -69,7 +69,7 @@ Complete release bundle from x86_64 Linux:
 nix build .#release-all
 ```
 
-The build host distribution is not part of the target ABI: the GitHub workflow uses an x86_64 Linux hosted runner, while the same `release-all` output can be built directly from your NixOS x86_64 machine. All target compilers, SDKs, and linkers are pinned by Nix.
+The build host distribution is not part of the target ABI: the GitHub workflow uses an x86_64 Linux hosted runner, while the same `release-all` output can be built directly from any suitable x86_64 Linux Nix host. All target compilers, SDKs, and linkers are pinned by Nix.
 
 Individual cross outputs:
 
@@ -79,12 +79,6 @@ nix build .#cross-linux-x86_64
 nix build .#cross-linux-aarch64
 nix build .#dist-linux-x86_64
 nix build .#dist-linux-aarch64
-
-# Explicit distro aliases to the same static Linux artifacts
-nix build .#dist-nixos-x86_64
-nix build .#dist-nixos-aarch64
-nix build .#dist-debian-x86_64
-nix build .#dist-debian-aarch64
 
 # Windows x86_64 / ARM64
 nix build .#cross-windows-x86_64

@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Add a single-host Nix release graph: x86_64 Linux now cross-builds static Linux x86_64/ARM64, Windows x86_64/ARM64, and macOS ARM64, aggregated by `nix build .#release-all`.
-- Add NixOS/Debian release aliases to the same distro-independent static Linux binaries, Windows ARM64 via pinned LLVM-MinGW/UCRT, and macOS ARM64 via pinned Apple SDK 14.4 + clang/ld64.lld.
+- Keep the release surface OS-level only: generic static Linux x86_64/ARM64 artifacts, Windows x86_64/ARM64, and macOS ARM64; Windows ARM64 uses pinned LLVM-MinGW/UCRT and macOS ARM64 uses pinned Apple SDK 14.4 + clang/ld64.lld.
 - Add a minimal GitHub Actions workflow that installs Nix, builds `release-all`, and uploads the resulting bundle; all target/toolchain logic remains in `flake.nix`.
 - Extend installers to select Linux ARM64, Windows ARM64, and Apple Silicon macOS artifacts automatically; simplify the local release helper to delegate entirely to `release-all`.
 
