@@ -124,14 +124,14 @@ Copy the printed `tunnel_...` ID and keep dotlink running.
 ### 2. Add it to ChatGPT
 
 1. Open **https://chatgpt.com/plugins**.
-2. Select **Add → Create plugin**.
+2. Select **Add → Create MCP App**.
 3. Name it **abird dotlink** and optionally add a short description.
 4. Under **Connection**, choose **Tunnel**.
 5. Paste the `tunnel_...` ID printed by dotlink.
-6. Accept the custom-MCP warning and create the plugin.
+6. Accept the custom-MCP warning and create the MCP app.
 7. In a ChatGPT conversation, open the tools menu, enable **abird dotlink**, and ask normally.
 
-If **Create plugin** is unavailable, enable **Developer mode** under **Settings → Security and login** first.
+If **Create MCP App** is unavailable, enable **Developer mode** under **Settings → Security and login** first.
 
 The tools ChatGPT discovers follow dotlink's local permissions:
 

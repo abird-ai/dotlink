@@ -20,13 +20,13 @@ Copy the printed `tunnel_...` ID. Never paste Runtime or Admin API keys into Cha
 ## 2. Register the tunnel in ChatGPT
 
 1. Open **https://chatgpt.com/plugins**.
-2. Select **Add → Create plugin**.
+2. Select **Add → Create MCP App**.
 3. Name it **abird dotlink** and optionally add a short description.
 4. Under **Connection**, choose **Tunnel**.
 5. Paste the printed `tunnel_...` ID.
-6. Accept the custom-MCP warning and create the plugin.
+6. Accept the custom-MCP warning and create the MCP app.
 
-If **Create plugin** is unavailable, enable **Developer mode** under **Settings → Security and login** first.
+If **Create MCP App** is unavailable, enable **Developer mode** under **Settings → Security and login** first.
 
 The tool list is permission-dependent:
 
