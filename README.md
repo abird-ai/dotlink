@@ -2,7 +2,7 @@
 
 **Connect ChatGPT on the web to the files and tools on your computer — securely, from one local binary.**
 
-abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memory when enabled, and supported Codex/Work workflows — permission-scoped access to your local computer** through MCP. ChatGPT can read project files and use the tools you already have locally: Git, builds, tests, scripts, compilers, package managers, and more.
+abird-link gives the **same ChatGPT you already use — Web, Spaces, Sites, Memory when enabled, and supported Codex/Work workflows — permission-scoped access to your local computer** through MCP. It brings many of the local development abilities you might normally use Codex for — reading and editing code, running Git, builds, tests, scripts, compilers, package managers, and other local tools — into your regular ChatGPT experience, where they can work alongside the broader conversation context and memories ChatGPT has available to you.
 
 For ChatGPT, `abird-link` opens an outbound **OpenAI Secure MCP Tunnel directly from your machine to OpenAI**. Your MCP server stays local: no public inbound port, no ngrok, and no third-party relay in the ChatGPT path. One binary provides the MCP server, tunnel transport, permission engine, profiles, activity logging, and — on Linux — a Bubblewrap shell sandbox.
 
