@@ -40,7 +40,7 @@ The opt-in real runtime smokes passed with `DOTLINK_TEST_BWRAP=1`, including:
 
 ## Runtime key-control validation
 
-A pseudo-terminal smoke verified: banner key hint, three-step live `v` verbosity cycle with log notices, full `Ctrl+R` transport/runtime restart with a second banner, preserved verbosity state, and clean `Ctrl+C` exit. stdio intentionally does not enable runtime key capture.
+A pseudo-terminal smoke verified: aligned banner/log output while raw key input is active, banner key hint, three-step live `v` verbosity cycle with log notices, full `Ctrl+R` transport/runtime restart with a second banner, preserved verbosity state, and clean `Ctrl+C` exit. `stty -g` before/after was byte-for-byte identical. A separate forced HTTP bind failure after runtime controls started also restored the exact pre-run terminal state before returning exit 1. stdio intentionally does not enable runtime key capture.
 
 ## Logging validation
 

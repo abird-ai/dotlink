@@ -18,7 +18,7 @@ Use this as the first agent-facing entrypoint for the repository.
 - Profile transports start automatically. `--stdio` / `--http` add local transports for one run; `--no-stdio` / `--no-http` / `--no-ngrok` suppress profile defaults. Setup is transactional/default-aware, and `dotlink profile` owns persistent profile mutation.
 - Linux shell execution is Bubblewrap-sandboxed by default. Network is off unless explicitly granted.
 - Filesystem denies win over allows. Cache mounts never expand MCP filesystem authority.
-- Logging is quiet by default: `-v` = TOOL, `-vv` = TOOL + REQ. Interactive non-stdio runs support live `v` cycling plus `Ctrl+R` restart; stdio never shares stdin with runtime controls. `--silent -vv` is REQ-only.
+- Logging is quiet by default: `-v` = TOOL, `-vv` = TOOL + REQ. Interactive non-stdio runs support live `v` cycling plus `Ctrl+R` restart; stdio never shares stdin with runtime controls. Runtime controls must snapshot/restore the exact terminal state on every exit/error path. `--silent -vv` is REQ-only.
 - Keep stdout protocol-clean for stdio; human output goes to stderr.
 
 ## Validation before commit

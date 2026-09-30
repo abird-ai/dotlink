@@ -603,7 +603,7 @@ Register printed URL as custom connector.
 
 ## Runtime terminal controls
 
-Interactive non-stdio runs show `Ctrl-C: exit · Ctrl-R: restart · v: verbosity`. `v` mutates shared logging state live, `Ctrl+R` tears down and reconstructs the runtime, and stdio disables key capture to protect protocol stdin.
+Interactive non-stdio runs show `Ctrl-C: exit · Ctrl-R: restart · v: verbosity`. `v` mutates shared logging state live, `Ctrl+R` tears down and reconstructs the runtime, and stdio disables key capture to protect protocol stdin. Runtime controls capture the exact original terminal state; raw input preserves the original output flags, and RAII restoration returns the TTY to its pre-dotlink state on exit, restart, transport failure, or unwind.
 
 ## 15. Logging
 

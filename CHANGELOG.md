@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix runtime-control terminal output by preserving the terminal's original output flags while raw input is active, preventing stair-stepped/garbled banners and logs.
+- Snapshot the exact pre-dotlink terminal state and restore it via RAII on normal exit, `Ctrl+R` restart, transport errors, and unwind/error paths.
+
 - Add live terminal controls for interactive runs: `v` cycles quiet/TOOL/TOOL+REQ verbosity, `Ctrl+R` fully restarts the runtime, and `Ctrl+C` exits.
 - Make runtime verbosity shared/mutable so all transports react immediately; HTTP REQ logging can now turn on after startup.
 - Keep stdio protocol-safe by disabling runtime key capture whenever stdio transport is active.
