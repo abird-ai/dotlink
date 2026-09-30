@@ -258,8 +258,10 @@ Do not let discovery create a cache directory merely to report it.
 If OpenAI selected:
 
 - Runtime API key with Tunnels Read + Use;
-- existing Tunnel ID or one-time Admin key;
-- Workspace ID or Organization ID when creating tunnel;
+- tunnel choice:
+  - create/manage it directly at https://platform.openai.com/settings/organization/tunnels and paste the existing `tunnel_...` ID — no Admin key is given to dotlink;
+  - or type `new` and let dotlink create it with a one-time Admin key (Tunnels Manage);
+- Workspace ID or Organization ID only when dotlink creates the tunnel;
 - Admin key used once and never persisted;
 - Runtime key stored separately per profile.
 

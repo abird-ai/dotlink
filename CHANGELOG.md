@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Offer an Admin-key-free OpenAI Tunnel setup path: create/manage the tunnel in OpenAI Platform and paste its existing `tunnel_...` ID; keep the one-time Admin-key flow as the optional automated path.
 - Fresh correctness/security review: make Runtime-key writes atomic, keep credentials in dotlink's owned XDG directory even with `DOTLINK_CONFIG`, and protect active config/credentials from MCP and shell self-modification.
 - Make tool discovery use the canonical runtime policy, including write-only and deny-shadowed capability handling; existing write symlinks now resolve to their canonical target before protected-path checks.
 - Make shell timeout one absolute deadline across stdin, process execution, and output collection; explicitly reap failed/timed-out child processes.

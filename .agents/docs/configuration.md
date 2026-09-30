@@ -32,6 +32,8 @@ Local access setup asks whether to:
 
 On Linux, setup can also discover existing developer caches and grant none/read-only/read+write access per cache. Re-running setup uses current profile values as defaults, preserves rules not directly edited by the wizard, and shows stored secrets only as `[existing key]`; blank secret input keeps the current value.
 
+For OpenAI Tunnel setup, either create/manage the tunnel yourself at https://platform.openai.com/settings/organization/tunnels and paste its existing `tunnel_...` ID (no Admin key is given to dotlink), or type `new` and let dotlink create it with a one-time Admin key that has Tunnels Manage.
+
 ## Schema
 
 ```jsonc

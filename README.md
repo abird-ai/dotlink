@@ -296,10 +296,12 @@ This setup is shown only when OpenAI transport is enabled.
 Setup asks for:
 
 1. a Runtime API key with Tunnels Read + Use;
-2. an existing Tunnel ID, or a one-time Admin API key with Tunnels Manage;
-3. a ChatGPT Workspace ID or OpenAI Organization ID when creating a tunnel.
+2. a tunnel:
+   - **No Admin key in dotlink:** create one at https://platform.openai.com/settings/organization/tunnels, then paste its existing `tunnel_...` ID;
+   - **Create from dotlink:** type `new` and provide a one-time Admin API key with Tunnels Manage;
+3. a ChatGPT Workspace ID or OpenAI Organization ID only when dotlink creates the tunnel.
 
-The Admin key is never persisted.
+The one-time Admin key is never persisted.
 
 The Runtime key is stored separately from JSONC config and follows the selected profile:
 
@@ -322,6 +324,7 @@ If a freshly restarted runtime keeps failing, restarts back off from 1 second up
 
 Useful locations:
 
+- Tunnels: https://platform.openai.com/settings/organization/tunnels
 - Runtime API keys: https://platform.openai.com/settings/organization/api-keys
 - Admin API keys: https://platform.openai.com/settings/organization/admin-keys
 - ChatGPT Workspace ID: https://chatgpt.com/admin

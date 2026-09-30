@@ -1228,10 +1228,16 @@ async fn setup_openai(
 
     println!();
     println!("   {}", setup_style(color, "1", "Choose a tunnel"));
+    println!(
+        "   • Create/manage tunnels: https://platform.openai.com/settings/organization/tunnels"
+    );
+    println!(
+        "   • Paste an existing tunnel_... ID, or type 'new' to create one here with a one-time Admin key."
+    );
     let existing_id = existing.and_then(|config| config.tunnel_id.as_deref());
     let tunnel_prompt = match existing_id {
-        Some(id) => format!("   Tunnel ID [{id}] (type 'new' to create): "),
-        None => "   Tunnel ID [create new]: ".to_owned(),
+        Some(id) => format!("   Tunnel ID [{id}] (or 'new'): "),
+        None => "   Tunnel ID [new]: ".to_owned(),
     };
     let selected_id = prompt_line(&tunnel_prompt)?;
     let create_new = selected_id.eq_ignore_ascii_case("new")
@@ -1241,7 +1247,7 @@ async fn setup_openai(
         println!();
         println!(
             "   {}",
-            setup_style(color, "1", "Create a one-time Admin key")
+            setup_style(color, "1", "Create tunnel with a one-time Admin key")
         );
         println!("   • Permission: Tunnels Manage");
         println!("   • Used once and never saved; you can delete it after setup.");

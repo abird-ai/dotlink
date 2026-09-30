@@ -504,8 +504,8 @@ Private ChatGPT developer path.
 OpenAI setup:
 
 - Runtime API key: Tunnels Read + Use;
-- existing Tunnel ID or one-time Admin key;
-- Workspace ID/Organization ID when creating tunnel;
+- either create/manage a tunnel at https://platform.openai.com/settings/organization/tunnels and paste its existing `tunnel_...` ID (no Admin key in dotlink), or type `new` and use a one-time Admin key with Tunnels Manage;
+- Workspace ID/Organization ID only when dotlink creates the tunnel;
 - Admin key never saved;
 - Runtime key per profile.
 
