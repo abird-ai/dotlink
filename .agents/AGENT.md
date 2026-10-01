@@ -4,12 +4,14 @@ Use this as the first agent-facing entrypoint for the repository.
 
 ## Read first
 
-1. `README.md` for the product surface and user workflow.
-2. `ARCHITECTURE.md` for runtime boundaries.
-3. `SECURITY.md` for authority and sandbox invariants.
-4. `.agents/docs/configuration.md` for schema-v10 profiles, OAuth/ngrok behavior, and CLI precedence.
-5. `.agents/docs/release-install.md` for release/install details.
-6. `.agents/plans/dotlink-handoff-2026-09-30/00-START-HERE.md` only when historical implementation context is needed.
+1. `.agents/plans/START_HERE.md` for the current canonical handoff and authority order.
+2. `.agents/plans/dotlink-handoff-2026-10-01/HANDOFF.md` for the comprehensive current state/design handoff.
+3. `README.md` for the product surface and user workflow.
+4. `ARCHITECTURE.md` for runtime boundaries.
+5. `SECURITY.md` for authority and sandbox invariants.
+6. `.agents/docs/configuration.md` for schema-v10 profiles, OAuth/ngrok behavior, and CLI precedence.
+7. `.agents/docs/release-install.md` for release/install details.
+8. `.agents/plans/dotlink-handoff-2026-09-30/` only when historical implementation context is specifically needed; it is not current-state authority.
 
 ## Current invariants
 
