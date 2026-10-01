@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Organize `dotlink --help` into task-oriented sections with terminal-aware color styling, and make `--color=auto|always|never` apply to help/error rendering as well as runtime output.
+- Emphasize the everyday ChatGPT workflow in the README: mention `@dotlink` from chats/Spaces to reach permitted machine projects, and connect several machines without installing the ChatGPT desktop app on them.
 - Bump dotlink to 0.6.0 and strict profile schema v10 for embedded HTTP OAuth and stable ngrok-domain configuration; normal startup rejects incompatible schemas, while `--setup` can replace an older profile from scratch after explicit confirmation.
 - Add a single-owner embedded OAuth 2.1 authorization/resource server for Streamable HTTP: Protected Resource Metadata, Authorization Server Metadata, authorization code + mandatory PKCE S256, exact resource/issuer binding, RFC 9207 `iss`, CIMD with SSRF-resistant fetching, DCR fallback, revocation, rotating refresh tokens, and short-lived opaque access tokens.
 - Protect public ngrok ingress with OAuth by default, independently of local HTTP OAuth; add stable `--ngrok-domain`, explicit reverse-proxy `--public-url`, local `--oauth/--no-oauth`, and the intentionally unsafe one-run `--allow-public-no-auth` escape hatch.

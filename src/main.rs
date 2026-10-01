@@ -12,7 +12,10 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{
+    ArgAction, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand,
+    builder::styling::{AnsiColor, Styles},
+};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -28,12 +31,20 @@ use crate::{
     transports::ActiveTransports,
 };
 
+const HELP_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Cyan.on_default().bold())
+    .usage(AnsiColor::Cyan.on_default().bold())
+    .literal(AnsiColor::Green.on_default().bold())
+    .placeholder(AnsiColor::Yellow.on_default());
+
 #[derive(Debug, Parser)]
 #[command(
     name = "dotlink",
     version,
     about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP",
-    args_conflicts_with_subcommands = true
+    args_conflicts_with_subcommands = true,
+    subcommand_help_heading = "Management commands",
+    styles = HELP_STYLES
 )]
 struct Args {
     /// Manage persisted profiles.
@@ -62,66 +73,82 @@ struct Args {
             "ngrok_ephemeral_url"
         ]
     )]
+    #[arg(help_heading = "Setup & profiles")]
     setup: bool,
 
     /// Select a named config profile (config.<profile>.jsonc).
     #[arg(short = 'p', long, value_name = "NAME")]
+    #[arg(help_heading = "Setup & profiles")]
     profile: Option<String>,
 
     /// Add the stdio MCP server for this run.
     #[arg(long, conflicts_with = "no_stdio")]
+    #[arg(help_heading = "Transports")]
     stdio: bool,
 
     /// Disable stdio even if enabled in the selected profile.
     #[arg(long, conflicts_with = "stdio")]
+    #[arg(help_heading = "Transports")]
     no_stdio: bool,
 
     /// Add the HTTP MCP server for this run.
     #[arg(long, conflicts_with = "no_http")]
+    #[arg(help_heading = "Transports")]
     http: bool,
 
     /// Disable HTTP (and ngrok) even if enabled in the selected profile.
     #[arg(long, conflicts_with = "http")]
+    #[arg(help_heading = "Transports")]
     no_http: bool,
 
     /// Override the configured HTTP listen address for this run.
     #[arg(long, value_name = "ADDR")]
+    #[arg(help_heading = "Transports")]
     http_bind: Option<SocketAddr>,
 
     /// Publish the effective HTTP MCP server through ngrok for this run.
     #[arg(long, conflicts_with = "no_ngrok")]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     ngrok: bool,
 
     /// Disable ngrok even if enabled in the selected profile.
     #[arg(long, conflicts_with = "ngrok")]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     no_ngrok: bool,
 
     /// Override the ngrok domain for this run. The domain must already be available to the ngrok account.
     #[arg(long, value_name = "DOMAIN", conflicts_with_all = ["no_ngrok", "no_ngrok_domain"])]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     ngrok_domain: Option<String>,
 
     /// Ignore a persisted ngrok domain for this run and let ngrok choose one.
     #[arg(long, conflicts_with = "ngrok_domain")]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     no_ngrok_domain: bool,
 
     /// Protect local/reverse-proxied HTTP with embedded OAuth. Public ngrok is protected independently.
     #[arg(long, conflicts_with = "no_oauth")]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     oauth: bool,
 
     /// Disable profile OAuth for local HTTP. Public ngrok still requires OAuth.
     #[arg(long, conflicts_with = "oauth")]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     no_oauth: bool,
 
     /// Canonical public OAuth origin for reverse-proxied HTTP (for example https://mcp.example.com).
     #[arg(long, value_name = "URL")]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     public_url: Option<String>,
 
     /// Allow externally reachable HTTP/ngrok without OAuth for this run. This is intentionally unsafe.
     #[arg(long)]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     allow_public_no_auth: bool,
 
     /// Use fresh hard-to-guess URL paths for both local HTTP and ngrok.
     #[arg(long)]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     ephemeral_url: bool,
 
     /// Override local HTTP ephemeral-path behavior. Bare flag means true.
@@ -133,6 +160,7 @@ struct Args {
         require_equals = true,
         alias = "http-emphemeral-url"
     )]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     http_ephemeral_url: Option<bool>,
 
     /// Override ngrok ephemeral-path behavior. Bare flag means true.
@@ -144,6 +172,7 @@ struct Args {
         require_equals = true,
         alias = "ngrok-emphemeral-url"
     )]
+    #[arg(help_heading = "Remote HTTP & OAuth")]
     ngrok_ephemeral_url: Option<bool>,
 
     /// Add readable access. Bare --allow-read means the launch directory.
@@ -154,6 +183,7 @@ struct Args {
         default_missing_value = ".",
         require_equals = true
     )]
+    #[arg(help_heading = "Filesystem access")]
     allow_read: Vec<PathBuf>,
 
     /// Add writable access. Bare --allow-write means read+write on the launch directory.
@@ -164,6 +194,7 @@ struct Args {
         default_missing_value = ".",
         require_equals = true
     )]
+    #[arg(help_heading = "Filesystem access")]
     allow_write: Vec<PathBuf>,
 
     /// Add read+write access. Bare --allow-rw means the launch directory.
@@ -174,10 +205,12 @@ struct Args {
         default_missing_value = ".",
         require_equals = true
     )]
+    #[arg(help_heading = "Filesystem access")]
     allow_rw: Vec<PathBuf>,
 
     /// Do not implicitly grant read access to the launch directory for this run.
     #[arg(long)]
+    #[arg(help_heading = "Filesystem access")]
     no_default_allow: bool,
 
     /// Deny reads. Bare --deny-read means the launch directory. Denies override allows.
@@ -188,6 +221,7 @@ struct Args {
         default_missing_value = ".",
         require_equals = true
     )]
+    #[arg(help_heading = "Filesystem access")]
     deny_read: Vec<PathBuf>,
 
     /// Deny writes. Bare --deny-write means the launch directory. Denies override allows.
@@ -198,6 +232,7 @@ struct Args {
         default_missing_value = ".",
         require_equals = true
     )]
+    #[arg(help_heading = "Filesystem access")]
     deny_write: Vec<PathBuf>,
 
     /// Deny both reads and writes. Bare --deny-rw means the launch directory.
@@ -208,54 +243,67 @@ struct Args {
         default_missing_value = ".",
         require_equals = true
     )]
+    #[arg(help_heading = "Filesystem access")]
     deny_rw: Vec<PathBuf>,
 
     /// Legacy synonym for --deny-rw=<PATH>.
     #[arg(long, value_name = "PATH")]
+    #[arg(help_heading = "Filesystem access")]
     deny: Vec<PathBuf>,
 
     /// Enable the platform shell (Bash on Unix, PowerShell on Windows).
     #[arg(long)]
+    #[arg(help_heading = "Shell & network")]
     allow_shell: bool,
 
     /// Disable shell even if config or another flag enables it.
     #[arg(long)]
+    #[arg(help_heading = "Shell & network")]
     deny_shell: bool,
 
     /// Allow network access from a Bubblewrap-sandboxed shell.
     #[arg(long)]
+    #[arg(help_heading = "Shell & network")]
     allow_network: bool,
 
     /// Deny shell network access. On Linux this forces sandboxing when needed.
     #[arg(long)]
+    #[arg(help_heading = "Shell & network")]
     deny_network: bool,
 
     /// Disable the shell sandbox. Requires --allow-all.
     #[arg(long, requires = "allow_all")]
+    #[arg(help_heading = "Shell & network")]
     no_sandbox: bool,
 
     /// Grant unrestricted filesystem, shell, and network access. Requires --no-sandbox.
     #[arg(long, requires = "no_sandbox")]
+    #[arg(help_heading = "Shell & network")]
     allow_all: bool,
 
     /// Print the configured OpenAI Tunnel ID and exit.
     #[arg(long)]
+    #[arg(help_heading = "Output & diagnostics")]
     print_id: bool,
 
     /// Suppress TOOL activity even when verbosity enables it.
     #[arg(short = 'q', long)]
+    #[arg(help_heading = "Output & diagnostics")]
     quiet: bool,
 
     /// Increase logging verbosity: -v shows TOOL activity; -vv also shows REQ diagnostics.
     #[arg(short = 'v', long, action = ArgAction::Count)]
+    #[arg(help_heading = "Output & diagnostics")]
     verbose: u8,
 
-    /// Control ANSI colors in human-facing stderr output.
+    /// Control ANSI colors in human-facing output, including help.
     #[arg(long, value_enum, default_value_t = ColorMode::Auto, global = true)]
+    #[arg(help_heading = "Output & diagnostics")]
     color: ColorMode,
 
     /// List the MCP tools exposed under the effective policy and exit.
     #[arg(long)]
+    #[arg(help_heading = "Output & diagnostics")]
     list_tools: bool,
 }
 
@@ -536,9 +584,47 @@ enum RuntimeOutcome {
     Restart,
 }
 
+fn help_color_choice<I>(args: I) -> ColorChoice
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+
+        let value = if let Some(value) = arg.strip_prefix("--color=") {
+            Some(value.to_owned())
+        } else if arg == "--color" {
+            args.next()
+                .and_then(|value| value.to_str().map(str::to_owned))
+        } else {
+            None
+        };
+
+        match value.as_deref() {
+            Some("always") => return ColorChoice::Always,
+            Some("never") => return ColorChoice::Never,
+            Some("auto") => return ColorChoice::Auto,
+            _ => {}
+        }
+    }
+    ColorChoice::Auto
+}
+
+fn parse_args() -> Args {
+    let color = help_color_choice(std::env::args_os().skip(1));
+    let matches = Args::command().color(color).get_matches();
+    Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = parse_args();
     let launch_dir = std::env::current_dir()?;
 
     let log = LogConfig::new(args.verbose, args.quiet, args.color);
@@ -1195,6 +1281,48 @@ mod tests {
 
     fn loopback_http_bind() -> Option<SocketAddr> {
         Some("127.0.0.1:3000".parse().unwrap())
+    }
+
+    #[test]
+    fn help_is_grouped_and_styled() {
+        let mut plain = Vec::new();
+        Args::command()
+            .color(ColorChoice::Never)
+            .write_long_help(&mut plain)
+            .unwrap();
+        let plain = String::from_utf8(plain).unwrap();
+        for heading in [
+            "Management commands",
+            "Setup & profiles",
+            "Transports",
+            "Remote HTTP & OAuth",
+            "Filesystem access",
+            "Shell & network",
+            "Output & diagnostics",
+        ] {
+            assert!(
+                plain.contains(&format!("{heading}:")),
+                "missing {heading:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_color_follows_global_color_flag() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            help_color_choice(["--color=always", "--help"].map(OsString::from)),
+            ColorChoice::Always
+        );
+        assert_eq!(
+            help_color_choice(["--color", "never", "profile", "--help"].map(OsString::from)),
+            ColorChoice::Never
+        );
+        assert_eq!(
+            help_color_choice(["--help"].map(OsString::from)),
+            ColorChoice::Auto
+        );
     }
 
     #[test]

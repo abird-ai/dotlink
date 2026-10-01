@@ -1,12 +1,12 @@
 # abird dotlink
 
-Connect **your ChatGPT dot**, **your ChatGPT Web and Spaces** to files and tools on **your computer** — securely with a single command.
+**Simply mention `@dotlink` anywhere in ChatGPT — in chat, a Space, or your dot** to work on the files on *your machine*, use local tools and projects you exposed — securely with a single command.
 
 A single lightweight binary with an MCP server, OpenAI tunnel transport, permission engine, profiles, activity logging, and a full Bubblewrap sandbox on Linux — no UI, no third-party relay, guided setup.
 
 - **Let your ChatGPT Web and your dot work directly on your computer through controlled, fine-grained access**: read and edit files, run Git, build, test, execute scripts, and use only the tools you explicitly expose.
+- **Give ChatGPT controlled access to several machines without installing the ChatGPT desktop app or provisioning ssh**: run dotlink on each machine and expose only the projects, files, and capabilities you choose.
 - **Use local data without the upload/download loop**: analyze files, build reports or slide decks, and work with artifacts directly from your machine.
-- **Keep project context connected**: reason and document in ChatGPT/Spaces, then continue against the same live repository and toolchain, then talk to dot about it.
 - **Use ChatGPT as a practical fallback when Codex usage is unavailable or exhausted**: reconnect to the same project state and keep going.
 
 When your machine is offline, keep planning against context already in ChatGPT; reconnect later and let ChatGPT re-read the live project before continuing.
@@ -132,6 +132,10 @@ Copy the printed `tunnel_...` ID and keep dotlink running.
 5. Paste the `tunnel_...` ID printed by dotlink.
 6. Accept the custom-MCP warning and create the MCP app.
 7. In a ChatGPT conversation, open the tools menu, enable **abird dotlink**, and ask normally.
+
+After that, simply mention **`@dotlink`** in ChatGPT Web — in a normal chat, a Space, or your dot — whenever you want to work with the files and projects that machine has exposed.
+
+For several computers, run dotlink on each machine and add each tunnel as its own MCP App. Name the connections by machine or project if useful. ChatGPT can then reach each machine under its own local permission policy, with no ChatGPT desktop app required on those machines.
 
 If **Create MCP App** is unavailable, enable **Developer mode** under **Settings → Security and login** first.
 
