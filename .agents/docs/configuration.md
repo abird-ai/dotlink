@@ -1,6 +1,6 @@
 # Configuration reference
 
-Current profile schema: **v10**. Normal startup rejects any other schema version. Running `dotlink --setup` on an older profile offers to replace it from scratch; values are deliberately not migrated across the strict schema boundary. A profile created by a newer schema is never overwritten by an older binary.
+Current profile schema: **v10**. Compatible older schemas migrate forward automatically in memory through explicit version-to-version migrations; v9 → v10 is supported because the v10 additions are defaulted and preserve existing meaning. The profile is written as the current schema the next time it is edited or saved. Newer schemas, and older schemas without a defined migration path, are rejected rather than guessed.
 
 ## Files
 

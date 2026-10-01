@@ -15,7 +15,7 @@ Use this as the first agent-facing entrypoint for the repository.
 
 ## Current invariants
 
-- Config schema is **v10 only**. Normal startup rejects other schemas; `--setup` may replace an older profile from scratch after explicit confirmation. OAuth state is separate from JSONC under the Abird XDG state namespace.
+- Config schema is currently **v10**. Compatible older schemas migrate forward only through explicit versioned migration steps (currently v9 → v10); newer schemas and older versions without a defined migration path are rejected rather than guessed. OAuth state is separate from JSONC under the Abird XDG state namespace.
 - The launch directory is the internal relative-path base and is read-allowed by default unless `default_allow=false` or `--no-default-allow` is used.
 - Profile transports start automatically. `--stdio` / `--http` add local transports for one run; `--no-stdio` / `--no-http` / `--no-ngrok` suppress profile defaults. Setup is transactional/default-aware, and `dotlink profile` owns persistent profile mutation. Any externally reachable HTTP is OAuth-protected by default: ngrok is protected automatically, direct non-loopback binds require OAuth + an explicit HTTPS public origin, and only the one-run `--allow-public-no-auth` escape hatch permits unauthenticated public ingress.
 - Linux shell execution is Bubblewrap-sandboxed by default. Network is off unless explicitly granted.

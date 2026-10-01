@@ -1,11 +1,11 @@
 # abird dotlink
 
-**Simply mention `@dotlink` anywhere in ChatGPT — in chat, a Space, or your dot** to work on the files on *your machine*, use local tools and projects you exposed — securely with a single command.
+Simply **`@dotlink`** anywhere in ChatGPT — chat, space, or your dot to work with files on your machine, use local tools and projects you exposed — securely, from a single binary.
 
 A single lightweight binary with an MCP server, OpenAI tunnel transport, permission engine, profiles, activity logging, and a full Bubblewrap sandbox on Linux — no UI, no third-party relay, guided setup.
 
 - **Let your ChatGPT Web and your dot work directly on your computer through controlled, fine-grained access**: read and edit files, run Git, build, test, execute scripts, and use only the tools you explicitly expose.
-- **Give ChatGPT controlled access to several machines without installing the ChatGPT desktop app or provisioning ssh**: run dotlink on each machine and expose only the projects, files, and capabilities you choose.
+- **Give ChatGPT controlled access to several machines without installing the ChatGPT desktop app or provisioning SSH**: run dotlink on each machine and expose only the projects, files, and capabilities you choose.
 - **Use local data without the upload/download loop**: analyze files, build reports or slide decks, and work with artifacts directly from your machine.
 - **Use ChatGPT as a practical fallback when Codex usage is unavailable or exhausted**: reconnect to the same project state and keep going.
 
@@ -47,6 +47,8 @@ dotlink
 
 Setup is transactional: choose `0`, `none`, or `cancel` to exit successfully without writing anything. Re-running `--setup` on an existing profile uses its current values as defaults; secret prompts show only `[existing key]`, and blank input keeps the stored key.
 
+Compatible older profile schemas are migrated forward automatically in memory. In particular, schema v9 loads directly as v10 because the v10 fields are additive/defaulted; the profile is written as the current schema the next time it is edited or saved. Newer schemas are never guessed, and older configs that need an explicit security decision—such as newly protected public ingress—fail with the specific setting that must be updated.
+
 The launch directory is readable by default. Add capabilities only when needed:
 
 ~~~bash
@@ -74,7 +76,7 @@ dotlink profile enable work network
 dotlink profile disable work network
 ~~~
 
-Use `default` as the profile name to manage the unnamed default profile. Persisted booleans can be toggled with `profile enable/disable`: `openai`, `stdio`, `http`, `http-ephemeral-url`, `ngrok`, `ngrok-ephemeral-url`, `default-allow`, `shell`, and `network`. Enabling a dependent setting automatically enables its prerequisite (`network` → `shell`, `ngrok` → `http`); disabling a parent safely disables its dependents.
+Use `default` as the profile name to manage the unnamed default profile. Persisted settings can be toggled with `profile enable/disable`: `openai`, `stdio`, `http`, `http-ephemeral-url`, `ngrok`, `ngrok-ephemeral-url`, `oauth`, `default-allow`, `shell`, and `network`. Enabling a dependent setting automatically enables its prerequisite (`network` → `shell`, `ngrok` → `http`, `oauth` → `http`); disabling a parent safely disables its dependents. Enabling `ngrok` or `oauth` requires an owner OAuth credential; use `dotlink profile edit <name>` when one still needs to be configured.
 
 ### What it looks like
 
@@ -414,56 +416,83 @@ With `-vv`, transport diagnostics are added:
 
 Logs include safe metadata such as paths, methods, status, and latency; file contents, binary payloads, runtime keys, and raw request bodies are not intentionally logged.
 
-Color is automatic on interactive stderr. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
+Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
 
 ## CLI summary
 
-~~~text
-dotlink -S, --setup             interactive setup/editor for selected profile
--p, --profile <NAME>            use config.<NAME>.jsonc
-dotlink profile <COMMAND>       list/create/edit/delete/mutate persisted profiles
-dotlink oauth <COMMAND>         inspect/revoke OAuth clients and refresh grants
+The built-in help is the source of truth: `dotlink --help`, `dotlink profile --help`, and `dotlink oauth --help`.
 
+~~~text
+SETUP & PROFILES
+-S, --setup                     interactive setup/editor for the selected profile
+-p, --profile <NAME>            run/setup with config.<NAME>.jsonc
+
+dotlink profile list
+dotlink profile show <NAME>
+dotlink profile create <NAME>
+dotlink profile edit <NAME>
+dotlink profile delete <NAME>
+dotlink profile allow <NAME> <read|write|rw> <PATH>
+dotlink profile remove-allow <NAME> <read|write|rw> <PATH>
+dotlink profile deny <NAME> <read|write|rw> <PATH>
+dotlink profile remove-deny <NAME> <read|write|rw> <PATH>
+dotlink profile enable <NAME> <SETTING>
+dotlink profile disable <NAME> <SETTING>
+
+Persisted SETTING values:
+openai, stdio, http, http-ephemeral-url, ngrok, ngrok-ephemeral-url,
+oauth, default-allow, shell, network
+
+OAUTH MANAGEMENT
+dotlink oauth status [-p <NAME>]
+dotlink oauth clients [-p <NAME>]
+dotlink oauth revoke [-p <NAME>] <CLIENT_ID>
+dotlink oauth revoke-all [-p <NAME>]
+
+TRANSPORTS
 --stdio                         add stdio MCP for this run
 --no-stdio                      suppress profile stdio for this run
 --http                          add HTTP MCP for this run
 --no-http                       suppress profile HTTP + ngrok for this run
---http-bind=<ADDR>              override HTTP listen address
---ngrok                         enable ngrok for effective HTTP
---no-ngrok                      suppress profile ngrok for this run
---ngrok-domain=<DOMAIN>         use a stable/reserved ngrok hostname
---no-ngrok-domain               ignore persisted ngrok domain for this run
---oauth                         protect local HTTP with OAuth
---no-oauth                      disable local HTTP OAuth for this run
---public-url=<HTTPS-ORIGIN>     canonical OAuth origin behind a reverse proxy
---allow-public-no-auth          intentionally allow externally reachable HTTP/ngrok without OAuth
---ephemeral-url                 ephemeral local HTTP + ngrok paths
---http-ephemeral-url[=BOOL]     override local HTTP path behavior
---ngrok-ephemeral-url[=BOOL]    override ngrok path behavior
+--http-bind <ADDR>              override HTTP listen address
 
---no-default-allow              do not implicitly read the launch directory
+REMOTE HTTP & OAUTH
+--ngrok                         publish effective HTTP through ngrok
+--no-ngrok                      suppress profile ngrok for this run
+--ngrok-domain <DOMAIN>         use a stable/reserved ngrok hostname
+--no-ngrok-domain               ignore persisted ngrok domain for this run
+--oauth                         protect local/reverse-proxied HTTP with OAuth
+--no-oauth                      disable local HTTP OAuth for this run
+--public-url <HTTPS-ORIGIN>     canonical OAuth origin behind a reverse proxy
+--allow-public-no-auth          deliberately expose public HTTP/ngrok without OAuth
+--ephemeral-url                 use ephemeral local HTTP + ngrok MCP paths
+--http-ephemeral-url[=<BOOL>]   override local HTTP path behavior
+--ngrok-ephemeral-url[=<BOOL>]  override ngrok path behavior
+
+FILESYSTEM ACCESS
 --allow-read[=<DIR>]            add read; bare means launch directory
 --allow-write[=<DIR>]           bare: rw launch directory; with DIR: write-only
 --allow-rw[=<DIR>]              add rw; bare means launch directory
-
+--no-default-allow              remove implicit launch-directory read for this run
 --deny-read[=<DIR>]             deny read; bare means launch directory
 --deny-write[=<DIR>]            deny write; bare means launch directory
---deny-rw[=<DIR>]               deny rw; bare means launch directory
---deny=<PATH>                   legacy synonym for deny-rw
---deny-shell                    deny shell; always wins
---deny-network                  deny shell network; always wins
+--deny-rw[=<DIR>]               deny read+write; bare means launch directory
+--deny <PATH>                   legacy synonym for --deny-rw=<PATH>
 
---allow-shell                   add platform shell
---allow-network                 network inside Linux shell sandbox
---allow-rw=/                    unrestricted filesystem read+write
---allow-all                     full host filesystem + shell + network; requires --no-sandbox
---no-sandbox                    disable shell sandbox; requires --allow-all
+SHELL & NETWORK
+--allow-shell                   enable Bash (Unix) / PowerShell (Windows)
+--deny-shell                    disable shell; deny always wins
+--allow-network                 network inside the Linux shell sandbox
+--deny-network                  deny shell network; deny always wins
+--allow-rw=/                    filesystem rw / while keeping Linux sandboxing
+--allow-all --no-sandbox        explicit full-host filesystem + shell + network
 
---list-tools                    show exposed tools
--q, --quiet                    suppress TOOL activity
--v, --verbose                   repeatable: -v TOOL, -vv TOOL + REQ
---color=<auto|always|never>     control ANSI colors (default: auto)
+OUTPUT & DIAGNOSTICS
+--list-tools                    show tools exposed by the effective policy
 --print-id                      print configured OpenAI Tunnel ID
+-q, --quiet                     suppress TOOL activity
+-v, --verbose                   -v TOOL; -vv TOOL + REQ
+--color <auto|always|never>     control colors in help and human output
 ~~~
 
 ## FAQ

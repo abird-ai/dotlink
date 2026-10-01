@@ -10,7 +10,11 @@ function Get-DotlinkVersion {
 
     try {
         $Output = & $Path --version 2>$null | Select-Object -First 1
+        if ($Output -match '^dotlink\s+v(.+)$') {
+            return $Matches[1].Trim()
+        }
         if ($Output -match '^dotlink\s+(.+)$') {
+            # Accept pre-0.6.0 binaries when checking an existing installation.
             return $Matches[1].Trim()
         }
     }

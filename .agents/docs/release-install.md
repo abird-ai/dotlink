@@ -16,7 +16,7 @@ Windows x86_64/ARM64 PowerShell:
 irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
 ```
 
-By default, both installers resolve GitHub's **latest published release**, choose the correct architecture-specific asset internally, verify its SHA-256 sidecar, and require the downloaded executable to identify itself as `dotlink`. When `DOTLINK_VERSION` is set, the executable's reported version must match before replacement. The user-facing command is always `dotlink`; architecture suffixes exist only on release asset names (`dotlink.exe` is the Windows file on disk).
+By default, both installers resolve GitHub's **latest published release**, choose the correct architecture-specific asset internally, verify its SHA-256 sidecar, and require the downloaded executable to identify itself as `dotlink v<version>`. When `DOTLINK_VERSION` is set, the executable's reported version must match before replacement. For update compatibility, the installers also recognize the older `dotlink <version>` output from already-installed pre-0.6.0 binaries. The user-facing command is always `dotlink`; architecture suffixes exist only on release asset names (`dotlink.exe` is the Windows file on disk).
 
 Re-running the same install command doubles as the updater. If the installed binary already matches the latest release hash, it is left untouched and reported as up to date; otherwise it is replaced from a same-directory temporary file so the final replacement is atomic on supported filesystems.
 
@@ -111,7 +111,7 @@ git push origin v0.6.0
 
 The `Build binaries` workflow rebuilds `release-all`, verifies every SHA-256 sidecar, checks the Linux x86_64 binary, and refuses to publish if the tag does not equal `v$(cat VERSION)`.
 
-On a `v*` tag, GitHub creates or updates the release named **abird dotlink <tag>** and uploads each release file individually:
+On a `v*` tag, GitHub creates or updates the release named **dotlink <tag>** and uploads each release file individually:
 
 ```text
 dotlink-linux-x86_64

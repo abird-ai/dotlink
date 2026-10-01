@@ -14,7 +14,7 @@ and the launch directory is the only implicit readable directory. `--no-default-
 
 ## Profiles and permission precedence
 
-Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v10 JSONC is the only supported profile format. Normal startup rejects any other schema; `--setup` may replace an older profile from scratch only after explicit confirmation.
+Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v10 is the current profile format. Known compatible older schemas are migrated forward in memory (v9 → v10 is additive); newer schemas and older schemas without an explicit migration path are rejected rather than guessed. A migrated profile is written as the current schema the next time it is edited or saved.
 
 Runtime allow rules are additive. Denies always take precedence over profile defaults, ordinary allows, and developer-cache grants.
 

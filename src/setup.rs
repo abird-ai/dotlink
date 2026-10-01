@@ -405,7 +405,35 @@ fn default_app_config() -> AppConfig {
     }
 }
 
-fn read_profile_config(profile: Option<&str>) -> Result<Option<AppConfig>> {
+fn migrate_config(mut config: AppConfig) -> Result<AppConfig> {
+    let current = config_version();
+    if config.version > current {
+        bail!(
+            "profile uses newer schema version {}; this dotlink supports version {}. Upgrade dotlink instead of overwriting the profile",
+            config.version,
+            current
+        );
+    }
+
+    while config.version < current {
+        match config.version {
+            // v10 added only additive/defaulted fields: oauth (disabled by default)
+            // and transports.ngrok_domain (None by default). Existing v9 values
+            // retain the same meaning under v10 unless the new public-ingress
+            // safety validation requires the user to configure OAuth explicitly.
+            9 => config.version = 10,
+            version => {
+                bail!(
+                    "profile uses schema version {version}; no automatic migration path to version {current} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one"
+                );
+            }
+        }
+    }
+
+    Ok(config)
+}
+
+fn read_profile_config_migrated(profile: Option<&str>) -> Result<Option<AppConfig>> {
     let path = config_path(profile)?;
     if !path.exists() {
         return Ok(None);
@@ -414,12 +442,21 @@ fn read_profile_config(profile: Option<&str>) -> Result<Option<AppConfig>> {
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let config: AppConfig =
         parse_jsonc(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+    let config =
+        migrate_config(config).with_context(|| format!("failed to migrate {}", path.display()))?;
+    Ok(Some(config))
+}
+
+fn read_profile_config(profile: Option<&str>) -> Result<Option<AppConfig>> {
+    let Some(config) = read_profile_config_migrated(profile)? else {
+        return Ok(None);
+    };
     validate_config_structure(&config)?;
     Ok(Some(config))
 }
 
 fn load_profile_for_edit(profile: Option<&str>) -> Result<Option<AppConfig>> {
-    let Some(mut config) = read_profile_config(profile)? else {
+    let Some(mut config) = read_profile_config_migrated(profile)? else {
         return Ok(None);
     };
     config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
@@ -434,14 +471,7 @@ pub async fn load_or_setup(
     validate_profile(profile)?;
 
     if !force_setup {
-        let path = config_path(profile)?;
-
-        if path.exists() {
-            let text = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            let mut config: AppConfig = parse_jsonc(&text)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-
+        if let Some(mut config) = read_profile_config(profile)? {
             config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
             apply_env_overrides(&mut config, profile.is_none())?;
             validate_config(&config)?;
@@ -474,74 +504,8 @@ pub async fn load_or_setup(
         );
     }
 
-    let mut reset_older_schema = false;
-    let existing = if force_setup {
-        let path = config_path(profile)?;
-        if path.exists() {
-            let text = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            let mut config: AppConfig = parse_jsonc(&text)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-
-            if config.version > config_version() {
-                bail!(
-                    "profile uses newer schema version {}; this dotlink supports version {}. Upgrade dotlink instead of overwriting the profile",
-                    config.version,
-                    config_version()
-                );
-            }
-            if config.version < config_version() {
-                println!();
-                println!(
-                    "{}",
-                    setup_style(
-                        color,
-                        "1;33",
-                        format!(
-                            "This profile uses schema v{}; dotlink now requires strict schema v{}.",
-                            config.version,
-                            config_version()
-                        )
-                    )
-                );
-                if !prompt_yes_no(
-                    &format!(
-                        "   {} ",
-                        setup_style(
-                            color,
-                            "33",
-                            "Replace this profile from scratch? Existing values will not be migrated. [y/N]:"
-                        )
-                    ),
-                    false,
-                )? {
-                    println!("Setup cancelled. No changes saved.");
-                    return Ok(None);
-                }
-                reset_older_schema = true;
-                None
-            } else {
-                validate_config_structure(&config)?;
-                config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
-                Some(config)
-            }
-        } else {
-            None
-        }
-    } else {
-        load_profile_for_edit(profile)?
-    };
-
-    let result = interactive_setup(profile, color, existing).await?;
-    if reset_older_schema && let Some(result) = result.as_ref() {
-        if !result.config.transports.openai {
-            remove_runtime_key_file(profile)?;
-        }
-        if !result.config.oauth.enabled && !result.config.transports.ngrok {
-            oauth::delete_profile_state(profile)?;
-        }
-    }
-    Ok(result)
+    let existing = load_profile_for_edit(profile)?;
+    interactive_setup(profile, color, existing).await
 }
 
 fn secret_env_connection() -> Result<Option<(String, String)>> {
@@ -1207,12 +1171,16 @@ async fn interactive_setup(
     permissions.default_allow = prompt_yes_no(
         &format!(
             "   {} {} ",
-            setup_style(color, "33", "Allow read access to:"),
+            setup_style(
+                color,
+                "33",
+                "Always allow read access to the directory dotlink is started from?"
+            ),
             setup_style(
                 color,
                 "36",
                 format!(
-                    "{} {}:",
+                    "(current: {}) {}:",
                     setup_dir.display(),
                     yes_no_hint(permissions.default_allow)
                 )
@@ -1232,7 +1200,10 @@ async fn interactive_setup(
                 setup_style(
                     color,
                     "33",
-                    format!("Allow write access too? {}:", yes_no_hint(current_rw_base))
+                    format!(
+                        "Also allow write access to that launch directory? {}:",
+                        yes_no_hint(current_rw_base)
+                    )
                 )
             ),
             current_rw_base,
@@ -2880,11 +2851,74 @@ mod tests {
     }
 
     #[test]
-    fn only_schema_v10_is_accepted() {
+    fn schema_v9_migrates_to_v10_with_additive_defaults() {
+        let v9 = r#"
+        {
+          "version": 9,
+          "transports": {
+            "openai": false,
+            "stdio": true,
+            "http": false,
+            "http_bind": "127.0.0.1:3000",
+            "http_ephemeral_url": false,
+            "ngrok": false,
+            "ngrok_ephemeral_url": false
+          },
+          "permissions": {
+            "default_allow": true
+          }
+        }
+        "#;
+        let parsed = parse_jsonc::<AppConfig>(v9).unwrap();
+        assert_eq!(parsed.version, 9);
+        assert!(parsed.transports.ngrok_domain.is_none());
+        assert!(!parsed.oauth.enabled);
+        assert!(parsed.oauth.public_url.is_none());
+
+        let migrated = migrate_config(parsed).unwrap();
+        assert_eq!(migrated.version, 10);
+        assert!(migrated.transports.stdio);
+        assert!(migrated.transports.ngrok_domain.is_none());
+        assert!(!migrated.oauth.enabled);
+        validate_config_structure(&migrated).unwrap();
+    }
+
+    #[test]
+    fn migrated_v9_public_http_still_requires_new_oauth_safety() {
         let mut config = example_config();
         config.version = 9;
-        let error = validate_config(&config).unwrap_err();
-        assert!(error.to_string().contains("unsupported config version 9"));
+        config.transports.openai = false;
+        config.transports.http = true;
+        config.transports.http_bind = "0.0.0.0:3000".to_owned();
+        config.tunnel_id = None;
+        config.runtime_api_key.clear();
+        config.oauth = OAuthConfig::default();
+
+        let mut migrated = migrate_config(config).unwrap();
+        assert_eq!(migrated.version, 10);
+        let error = validate_config_structure(&migrated).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("persisted non-loopback HTTP requires oauth.enabled=true")
+        );
+
+        // Profile management must still be able to move a migrated profile
+        // back into a safe state before saving it as the current schema.
+        apply_profile_bool(&mut migrated, ProfileBool::Http, false).unwrap();
+        validate_config_structure(&migrated).unwrap();
+    }
+
+    #[test]
+    fn unknown_older_and_newer_schemas_are_not_guessed() {
+        let mut config = example_config();
+        config.version = 8;
+        let error = migrate_config(config.clone()).err().unwrap();
+        assert!(error.to_string().contains("no automatic migration path"));
+
+        config.version = 11;
+        let error = migrate_config(config).err().unwrap();
+        assert!(error.to_string().contains("newer schema version 11"));
 
         let missing =
             parse_jsonc::<AppConfig>(r#"{ "transports": { "openai": false }, "permissions": {} }"#);

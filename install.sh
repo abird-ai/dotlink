@@ -23,7 +23,11 @@ sha256_file() {
 dotlink_version() {
   output="$("$1" --version 2>/dev/null || true)"
   case "$output" in
+    "dotlink v"*)
+      printf '%s' "${output#dotlink v}"
+      ;;
     "dotlink "*)
+      # Accept pre-0.6.0 binaries when checking an existing installation.
       printf '%s' "${output#dotlink }"
       ;;
   esac

@@ -40,10 +40,11 @@ const HELP_STYLES: Styles = Styles::styled()
 #[derive(Debug, Parser)]
 #[command(
     name = "dotlink",
-    version,
-    about = "Permission-scoped local MCP bridge over OpenAI Tunnel, stdio, or HTTP",
+    version = concat!("v", env!("CARGO_PKG_VERSION")),
+    about = "Connect ChatGPT and other MCP clients to permission-scoped files and tools on this machine",
     args_conflicts_with_subcommands = true,
     subcommand_help_heading = "Management commands",
+    after_help = "Quick start:\n  dotlink --setup\n  dotlink --allow-rw --allow-shell\n  dotlink profile --help\n  dotlink oauth --help",
     styles = HELP_STYLES
 )]
 struct Args {
@@ -309,12 +310,20 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List, create, edit, delete, or mutate profiles.
+    /// Manage persisted profiles, permissions, transports, and runtime defaults.
+    #[command(
+        subcommand_help_heading = "Profile commands",
+        after_help = "Examples:\n  dotlink profile list\n  dotlink profile show work\n  dotlink profile allow work rw /shared\n  dotlink profile enable work shell"
+    )]
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
     },
-    /// Inspect or revoke persisted OAuth clients/grants.
+    /// Inspect OAuth state and revoke approved remote clients or refresh grants.
+    #[command(
+        subcommand_help_heading = "OAuth commands",
+        after_help = "Examples:\n  dotlink oauth status\n  dotlink oauth clients -p work\n  dotlink oauth revoke -p work <CLIENT_ID>\n  dotlink oauth revoke-all -p work"
+    )]
     Oauth {
         #[command(subcommand)]
         command: OAuthCommand,
@@ -323,79 +332,112 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum OAuthCommand {
-    /// Show OAuth state for a profile.
+    /// Show owner/client/refresh-grant OAuth state for a profile.
     Status {
-        #[arg(short = 'p', long, default_value = "default")]
+        /// Profile name; use "default" for the unnamed default profile.
+        #[arg(short = 'p', long, default_value = "default", value_name = "NAME")]
         profile: String,
     },
-    /// List dynamically registered OAuth clients.
+    /// List approved dynamically registered OAuth clients.
     Clients {
-        #[arg(short = 'p', long, default_value = "default")]
+        /// Profile name; use "default" for the unnamed default profile.
+        #[arg(short = 'p', long, default_value = "default", value_name = "NAME")]
         profile: String,
     },
-    /// Revoke a DCR client and its persisted refresh grants.
+    /// Revoke an approved DCR client and all of its persisted refresh grants.
     Revoke {
+        /// Client ID shown by `dotlink oauth clients`.
         client_id: String,
-        #[arg(short = 'p', long, default_value = "default")]
+        /// Profile name; use "default" for the unnamed default profile.
+        #[arg(short = 'p', long, default_value = "default", value_name = "NAME")]
         profile: String,
     },
-    /// Revoke all persisted refresh grants for a profile.
+    /// Revoke every persisted OAuth refresh grant for a profile.
     RevokeAll {
-        #[arg(short = 'p', long, default_value = "default")]
+        /// Profile name; use "default" for the unnamed default profile.
+        #[arg(short = 'p', long, default_value = "default", value_name = "NAME")]
         profile: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
-    /// List available profiles.
+    /// List configured profiles.
     List,
     /// Show a profile without exposing secret key material.
-    Show { name: String },
-    /// Create a new profile with the interactive setup editor.
-    Create { name: String },
-    /// Edit an existing profile using its current values as defaults.
-    Edit { name: String },
-    /// Delete a profile and its saved runtime key.
-    Delete { name: String },
-    /// Add an allow rule.
+    Show {
+        /// Profile name; use "default" for the unnamed default profile.
+        name: String,
+    },
+    /// Create a profile with the interactive setup editor.
+    Create {
+        /// New profile name.
+        name: String,
+    },
+    /// Edit a profile using its current values as defaults.
+    Edit {
+        /// Profile name; use "default" for the unnamed default profile.
+        name: String,
+    },
+    /// Delete a profile plus its saved Runtime key and OAuth state.
+    Delete {
+        /// Profile name; use "default" for the unnamed default profile.
+        name: String,
+    },
+    /// Add a persisted filesystem allow rule.
     Allow {
+        /// Profile name; use "default" for the unnamed default profile.
         name: String,
-        #[arg(value_enum)]
+        /// Permission kind to allow.
+        #[arg(value_enum, value_name = "KIND")]
         kind: ProfileRuleKind,
+        /// Path to add; relative paths resolve from the launch directory.
         path: PathBuf,
     },
-    /// Remove an allow rule.
+    /// Remove a persisted filesystem allow rule.
     RemoveAllow {
+        /// Profile name; use "default" for the unnamed default profile.
         name: String,
-        #[arg(value_enum)]
+        /// Permission kind to remove.
+        #[arg(value_enum, value_name = "KIND")]
         kind: ProfileRuleKind,
+        /// Path to remove.
         path: PathBuf,
     },
-    /// Add a deny rule.
+    /// Add a persisted filesystem deny rule. Denies override allows.
     Deny {
+        /// Profile name; use "default" for the unnamed default profile.
         name: String,
-        #[arg(value_enum)]
+        /// Permission kind to deny.
+        #[arg(value_enum, value_name = "KIND")]
         kind: ProfileRuleKind,
+        /// Path to deny; relative paths resolve from the launch directory.
         path: PathBuf,
     },
-    /// Remove a deny rule.
+    /// Remove a persisted filesystem deny rule.
     RemoveDeny {
+        /// Profile name; use "default" for the unnamed default profile.
         name: String,
-        #[arg(value_enum)]
+        /// Permission kind to remove.
+        #[arg(value_enum, value_name = "KIND")]
         kind: ProfileRuleKind,
+        /// Path to remove.
         path: PathBuf,
     },
-    /// Enable a persisted boolean setting.
+    /// Enable a persisted transport or capability setting.
     Enable {
+        /// Profile name; use "default" for the unnamed default profile.
         name: String,
-        #[arg(value_enum)]
+        /// Setting to enable.
+        #[arg(value_enum, value_name = "SETTING")]
         setting: ProfileBool,
     },
-    /// Disable a persisted boolean setting.
+    /// Disable a persisted transport or capability setting.
     Disable {
+        /// Profile name; use "default" for the unnamed default profile.
         name: String,
-        #[arg(value_enum)]
+        /// Setting to disable.
+        #[arg(value_enum, value_name = "SETTING")]
         setting: ProfileBool,
     },
 }
@@ -1305,6 +1347,36 @@ mod tests {
                 "missing {heading:?}"
             );
         }
+    }
+
+    #[test]
+    fn cli_version_uses_v_prefix() {
+        assert_eq!(
+            Args::command().get_version(),
+            Some(concat!("v", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    #[test]
+    fn management_help_documents_current_commands() {
+        let mut command = Args::command();
+
+        let profile = command.find_subcommand_mut("profile").unwrap();
+        let mut profile_help = Vec::new();
+        profile.write_long_help(&mut profile_help).unwrap();
+        let profile_help = String::from_utf8(profile_help).unwrap();
+        assert!(profile_help.contains("Profile commands:"));
+        assert!(profile_help.contains("dotlink profile allow work rw /shared"));
+        assert!(
+            profile_help.contains("Delete a profile plus its saved Runtime key and OAuth state")
+        );
+
+        let oauth = command.find_subcommand_mut("oauth").unwrap();
+        let mut oauth_help = Vec::new();
+        oauth.write_long_help(&mut oauth_help).unwrap();
+        let oauth_help = String::from_utf8(oauth_help).unwrap();
+        assert!(oauth_help.contains("OAuth commands:"));
+        assert!(oauth_help.contains("dotlink oauth revoke -p work <CLIENT_ID>"));
     }
 
     #[test]

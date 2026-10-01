@@ -38,7 +38,7 @@ jobs:
             cd artifacts
             sha256sum -c ./*.sha256
           )
-          test "$(./artifacts/dotlink-linux-x86_64 --version)" = "dotlink $(cat artifacts/VERSION)"
+          test "$(./artifacts/dotlink-linux-x86_64 --version)" = "dotlink v$(cat artifacts/VERSION)"
 
       - name: Upload CI artifacts
         uses: actions/upload-artifact@v4
@@ -79,6 +79,6 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" artifacts/dotlink-* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "abird dotlink $GITHUB_REF_NAME" \
+              --title "dotlink $GITHUB_REF_NAME" \
               --generate-notes
           fi
