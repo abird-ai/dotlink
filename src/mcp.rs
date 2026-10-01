@@ -3,6 +3,7 @@ use std::{
     env,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -26,6 +27,7 @@ use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
+    sync::RwLock,
     time::{Instant, timeout_at},
 };
 
@@ -95,6 +97,7 @@ struct RuntimeConfig {
 #[derive(Clone, Debug)]
 pub struct LocalMachine {
     config: RuntimeConfig,
+    operation_gate: Arc<RwLock<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -470,11 +473,21 @@ impl AccessPolicy {
         if contains_parent_component(path) {
             bail!("parent traversal ('..') is not accepted; use a canonical path instead");
         }
-        if path.is_absolute() {
-            Ok(path.to_path_buf())
+
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
         } else {
-            Ok(self.base_dir.join(path))
+            self.base_dir.join(path)
+        };
+        let mut normalized = PathBuf::new();
+        for component in joined.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => unreachable!("parent components were rejected above"),
+                other => normalized.push(other.as_os_str()),
+            }
         }
+        Ok(normalized)
     }
 
     fn denied_read(&self, path: &Path) -> bool {
@@ -505,7 +518,7 @@ impl AccessPolicy {
         !self.denied_write(path) && self.grant_write(path)
     }
 
-    fn check(&self, path: &Path, need: AccessNeed) -> Result<()> {
+    fn check_denies(&self, path: &Path, need: AccessNeed) -> Result<()> {
         match need {
             AccessNeed::Read if self.denied_read(path) => {
                 bail!("read access is denied by policy: {}", path.display())
@@ -516,6 +529,13 @@ impl AccessPolicy {
             AccessNeed::ReadWrite if self.denied_read(path) || self.denied_write(path) => {
                 bail!("read+write access is denied by policy: {}", path.display())
             }
+            _ => Ok(()),
+        }
+    }
+
+    fn check(&self, path: &Path, need: AccessNeed) -> Result<()> {
+        self.check_denies(path, need)?;
+        match need {
             AccessNeed::Read if !self.can_read(path) => {
                 bail!("read access is not allowed: {}", path.display())
             }
@@ -531,6 +551,7 @@ impl AccessPolicy {
 
     async fn resolve_existing(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
         let target = self.lexical_target(input)?;
+        self.check_denies(&target, need)?;
         let canonical = fs::canonicalize(&target)
             .await
             .with_context(|| format!("path does not exist or cannot be resolved: {input}"))?;
@@ -540,6 +561,7 @@ impl AccessPolicy {
 
     async fn resolve_for_create(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
         let target = self.lexical_target(input)?;
+        self.check_denies(&target, need)?;
 
         match fs::symlink_metadata(&target).await {
             Ok(_) => {
@@ -825,6 +847,7 @@ impl LocalMachine {
                 max_write_bytes: args.max_write_bytes.max(1024),
                 protected_paths,
             },
+            operation_gate: Arc::new(RwLock::new(())),
         })
     }
 
@@ -946,6 +969,23 @@ impl LocalMachine {
         let path = self.config.access.resolve_for_create(input, need).await?;
         self.ensure_not_protected(&path)?;
         Ok(path)
+    }
+
+    async fn require_regular_or_missing(&self, path: &Path) -> Result<()> {
+        match fs::metadata(path).await {
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => bail!("path is not a regular file: {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn require_regular_file(&self, path: &Path) -> Result<()> {
+        let metadata = fs::metadata(path).await?;
+        if !metadata.is_file() {
+            bail!("path is not a regular file: {}", path.display());
+        }
+        Ok(())
     }
 
     async fn list_impl(&self, args: ListArgs) -> Result<Vec<FsEntry>> {
@@ -1408,6 +1448,10 @@ fn direct_shell_command(
     command
 }
 
+fn is_concurrent_read_tool(name: &str) -> bool {
+    matches!(name, "ls" | "read" | "read_binary")
+}
+
 fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Value>>) -> String {
     let Some(arguments) = arguments else {
         return String::new();
@@ -1549,6 +1593,9 @@ impl LocalMachine {
             Ok(path) => path,
             Err(error) => return tool_error(error),
         };
+        if let Err(error) = self.require_regular_or_missing(&path).await {
+            return tool_error(error);
+        }
         if let Some(parent) = path.parent()
             && let Err(error) = fs::create_dir_all(parent).await
         {
@@ -1585,6 +1632,9 @@ impl LocalMachine {
             Ok(path) => path,
             Err(error) => return tool_error(error),
         };
+        if let Err(error) = self.require_regular_file(&path).await {
+            return tool_error(error);
+        }
         let bytes = match fs::read(&path).await {
             Ok(bytes) if bytes.len() <= self.config.max_read_bytes => bytes,
             Ok(bytes) => {
@@ -1747,6 +1797,9 @@ impl LocalMachine {
             Ok(path) => path,
             Err(error) => return tool_error(error),
         };
+        if let Err(error) = self.require_regular_or_missing(&path).await {
+            return tool_error(error);
+        }
         if let Some(parent) = path.parent()
             && let Err(error) = fs::create_dir_all(parent).await
         {
@@ -1875,7 +1928,19 @@ impl rmcp::ServerHandler for LocalMachine {
         let started = self.config.log.activity_start(&name, detail);
 
         let context = ToolCallContext::new(self, request, context);
-        let result = self.policy_tool_router().call(context).await;
+
+        // Path authorization canonicalizes before the actual host operation.
+        // Keep dotlink-originated mutations/shell execution exclusive with all
+        // filesystem calls so another concurrent tool cannot swap a symlink
+        // between authorization and use. Unknown/future tools default to the
+        // exclusive side until explicitly reviewed as pure reads.
+        let result = if is_concurrent_read_tool(&name) {
+            let _guard = self.operation_gate.read().await;
+            self.policy_tool_router().call(context).await
+        } else {
+            let _guard = self.operation_gate.write().await;
+            self.policy_tool_router().call(context).await
+        };
 
         let outcome = match &result {
             Ok(CallToolResponse::Complete(result)) if result.is_error.unwrap_or(false) => "error",
@@ -1904,6 +1969,24 @@ mod tests {
             unrestricted_fs: false,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn only_explicit_pure_reads_share_the_operation_gate() {
+        for name in ["ls", "read", "read_binary"] {
+            assert!(is_concurrent_read_tool(name), "{name}");
+        }
+        for name in [
+            "write",
+            "edit",
+            "write_binary",
+            "patch_binary",
+            "bash",
+            "powershell",
+            "future_tool",
+        ] {
+            assert!(!is_concurrent_read_tool(name), "{name}");
+        }
     }
 
     #[test]
@@ -2032,6 +2115,90 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_deny_cannot_be_bypassed_by_later_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("file"), b"visible").unwrap();
+
+        let denied = root.join("secret");
+        let policy = AccessPolicy::from_spec(AccessSpec {
+            base_dir: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![root],
+            deny_read_roots: vec![denied.clone()],
+            deny_write_roots: vec![denied.clone()],
+            unrestricted_fs: false,
+        })
+        .unwrap();
+
+        symlink(&other, &denied).unwrap();
+
+        assert!(
+            policy
+                .resolve_existing("secret/file", AccessNeed::Read)
+                .await
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve_for_create("secret/new-file", AccessNeed::Write)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_targets_accept_regular_files_or_missing_paths_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let regular = root.join("regular");
+        let directory = root.join("directory");
+        let missing = root.join("missing");
+        std::fs::write(&regular, b"x").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            log: LogConfig::default(),
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        assert!(machine.require_regular_or_missing(&regular).await.is_ok());
+        assert!(machine.require_regular_or_missing(&missing).await.is_ok());
+        assert!(
+            machine
+                .require_regular_or_missing(&directory)
+                .await
+                .is_err()
+        );
+        assert!(machine.require_regular_file(&regular).await.is_ok());
+        assert!(machine.require_regular_file(&directory).await.is_err());
     }
 
     #[tokio::test]
@@ -2468,6 +2635,7 @@ mod tests {
                 max_write_bytes: 4096,
                 protected_paths: Vec::new(),
             },
+            operation_gate: Arc::new(RwLock::new(())),
         };
 
         let command = machine.bubblewrap_command(Path::new("/bin/bash"), &root, "true");
@@ -2525,6 +2693,7 @@ mod tests {
                 max_write_bytes: 4096,
                 protected_paths: Vec::new(),
             },
+            operation_gate: Arc::new(RwLock::new(())),
         };
 
         let command = machine.bubblewrap_command(Path::new("/bin/bash"), &root, "true");
@@ -2619,6 +2788,7 @@ mod tests {
                 max_write_bytes: 4096,
                 protected_paths: Vec::new(),
             },
+            operation_gate: Arc::new(RwLock::new(())),
         };
 
         let started = Instant::now();
@@ -2787,6 +2957,7 @@ mod tests {
                 max_write_bytes: 4096,
                 protected_paths: Vec::new(),
             },
+            operation_gate: Arc::new(RwLock::new(())),
         };
 
         let result = machine
@@ -2818,5 +2989,33 @@ mod tests {
         );
         assert!(writable.join("works").exists());
         assert!(!root.join("should-not-work").exists());
+
+        let late = writable.join("late");
+        let background = machine
+            .execute_shell(
+                ShellArgs {
+                    command: "(sleep 2; touch writable/late) >/dev/null 2>&1 &".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(10),
+                    max_output_bytes: Some(16 * 1024),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let serialized = serde_json::to_string(&background).unwrap();
+        assert!(
+            serialized.contains("\\\"exit_code\\\":0"),
+            "background sandbox smoke failed: {serialized}"
+        );
+
+        if !late.exists() {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            assert!(
+                !late.exists(),
+                "sandbox descendant mutated a host mount after the shell tool returned"
+            );
+        }
     }
 }

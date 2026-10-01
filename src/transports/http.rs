@@ -33,7 +33,7 @@ pub struct Config {
     pub local_oauth: bool,
     pub ngrok_oauth: bool,
     pub oauth_public_url: Option<Url>,
-    pub public_no_auth: bool,
+    pub ngrok_no_auth: bool,
     pub log: LogConfig,
 }
 
@@ -161,7 +161,7 @@ pub async fn run(
                 "  Note: ngrok MCP path is ephemeral; reconnect the OAuth client after each restart."
             );
         }
-    } else if config.public_no_auth {
+    } else if config.ngrok_no_auth {
         eprintln!("  WARNING: public ngrok MCP is intentionally unauthenticated for this run.");
     }
     eprintln!("  Connect any Streamable HTTP MCP client directly to that URL.");

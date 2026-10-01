@@ -151,7 +151,7 @@ protected MCP subrouter
 
 Bearer validation happens **before** rmcp receives the request. OAuth authenticates a remote caller; the existing `LocalMachine` permission policy still determines what that authenticated caller may actually do.
 
-`oauth.enabled` controls local/reverse-proxied HTTP only. A non-loopback OAuth listener requires an explicit canonical `--public-url`; issuer/resource identity is never inferred from request headers.
+`oauth.enabled` controls local/reverse-proxied HTTP only. Any direct non-loopback HTTP listener is treated as public ingress: persisted configuration requires OAuth plus an explicit HTTPS `oauth.public_url`, and one-run overrides require either the same OAuth/public-origin pair or `--allow-public-no-auth`. Issuer/resource identity is never inferred from request headers.
 
 The embedded OAuth server is single-owner and uses:
 
@@ -161,8 +161,9 @@ The embedded OAuth server is single-owner and uses:
 - CIMD client metadata with SSRF-resistant HTTPS fetching;
 - DCR fallback;
 - opaque in-memory access tokens;
-- rotating refresh tokens persisted only as hashes;
-- an Argon2id owner-password hash.
+- rotating refresh tokens persisted only as hashes and issued only to clients that advertise the refresh grant;
+- an Argon2id owner-password hash with bounded `spawn_blocking` verification;
+- cross-process file locking around OAuth state read/modify/write operations so setup, a live server, and management commands compose without lost updates.
 
 Unauthenticated DCR registrations stay bounded/in-memory until successful owner consent; only approved clients are persisted.
 
@@ -256,7 +257,9 @@ The base directory is where dotlink was launched. It is readable by default unle
 
 Bare --allow-write and --allow-rw add rw permission to the launch/base directory. Bare deny-read/deny-write/deny-rw target that same directory symmetrically.
 
-Existing paths are canonicalized before checks. Create targets canonicalize their nearest existing ancestor before the final path is checked.
+Existing paths are canonicalized before allow checks. Create targets canonicalize their nearest existing ancestor before the final path is checked. Denies are evaluated against both the normalized lexical request path and the resolved canonical target, so a denied path cannot be reintroduced as a symlink alias to another allowed subtree.
+
+All `LocalMachine` tool calls share one async read/write operation gate. Pure reads (`ls`, `read`, `read_binary`) may run concurrently; filesystem mutators, binary/text edits, and shell execution take the exclusive side. This prevents dotlink-originated concurrent calls from changing symlink/path topology between authorization and the host operation. Unknown future tools default to exclusive until explicitly reviewed as pure reads.
 
 Developer caches are modeled separately from filesystem grants. A cache record stores its tool family, host source path, and RO/RW mode. At runtime the source is canonicalized and mounted only into the shell sandbox, typically below `/tmp/home` at the tool's expected path. Cache mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical cache sources before mounting.
 

@@ -37,7 +37,7 @@ Capability controls are also symmetric:
 
 `--allow-rw=/` is unrestricted filesystem read+write; no separate all-rw flag exists.
 
-Rust file tools canonicalize existing targets and ancestors before policy checks so symlink traversal cannot escape a grant.
+Rust file tools canonicalize existing targets and ancestors before allow checks. Denies are checked against both the normalized lexical request path and the canonical target, so a denied namespace cannot be bypassed by replacing it with a symlink. Reads may run concurrently, but filesystem mutators and shell execution use a shared/exclusive operation gate so dotlink-originated concurrent tools cannot swap path topology between authorization and use. Existing write/edit targets must be regular files; special files are rejected.
 
 Tool requirements:
 
@@ -75,11 +75,9 @@ HTTP defaults to loopback:
 127.0.0.1:3000
 ~~~
 
-Changing `--http-bind` to a non-loopback address can expose the MCP server to other machines on the network.
+Loopback HTTP is unauthenticated by default. Any **non-loopback** HTTP listener is treated as public ingress and is refused unless it is OAuth-protected with an explicit HTTPS `--public-url`, or the operator deliberately supplies the one-run `--allow-public-no-auth` escape hatch.
 
-Loopback HTTP is unauthenticated by default. `--oauth` (or the persisted `oauth.enabled` setting) protects local/reverse-proxied HTTP with dotlink's embedded single-owner OAuth server.
-
-For OAuth behind a reverse proxy, `--public-url=https://...` supplies the canonical external origin. dotlink never derives OAuth issuer/resource identity from Host, Forwarded, or X-Forwarded-* headers. If OAuth is enabled on a non-loopback bind without an explicit public URL, startup fails rather than guessing.
+`--oauth` (or persisted `oauth.enabled`) protects local/reverse-proxied HTTP with dotlink's embedded single-owner OAuth server. For a reverse proxy, `--public-url=https://...` is the canonical external origin. dotlink never derives OAuth issuer/resource identity from Host, Forwarded, or X-Forwarded-* headers.
 
 Local OAuth and public-ngrok OAuth are intentionally independent. `--no-oauth` disables only local/reverse-proxied HTTP OAuth; it does not weaken an active public ngrok endpoint.
 
@@ -101,7 +99,7 @@ The ngrok SDK credential is read from `NGROK_AUTHTOKEN`. It authenticates dotlin
 
 For durable OAuth, configure a reserved/stable ngrok hostname with `--ngrok-domain=<DOMAIN>` (or setup) and keep the stable `/mcp` path. OAuth access/refresh grants are bound to the exact issuer and resource URL, so changing the ngrok hostname or using an ephemeral MCP path requires the remote client to reconnect.
 
-`--allow-public-no-auth` is the only runtime escape hatch that disables OAuth on public ngrok. It is intentionally explicit and should be treated as full exposure of every MCP capability granted to that process.
+`--allow-public-no-auth` is the only runtime escape hatch for externally reachable HTTP without OAuth, whether that exposure is ngrok or a direct non-loopback bind. It is intentionally one-run-only and should be treated as full exposure of every MCP capability granted to that process.
 
 The ngrok backend remains a separate loopback-only listener from the local HTTP listener, so local and public MCP path/auth policies cannot accidentally share a route.
 
@@ -123,7 +121,9 @@ Protocol/security properties:
 - one-time authorization codes held only in memory;
 - owner password persisted only as an Argon2id hash;
 - bounded pending registrations, authorization requests/codes, access tokens, refresh grants, and DCR clients;
-- login failure throttling;
+- Argon2 verification offloaded to a bounded blocking pool path, with concurrent checks capped and failed attempts delayed without a remotely triggerable global lockout;
+- cross-process locked OAuth state mutations so a live server, setup, and `dotlink oauth` management command cannot lose each other's approved-client/refresh/password changes;
+- refresh tokens issued only when the approved client advertises the `refresh_token` grant; `offline_access` requires that capability;
 - no JWT signing key or external auth service.
 
 Unauthenticated DCR registrations are bounded and memory-only. A DCR client is persisted only after the owner successfully approves it. Approved DCR clients and hashed refresh grants live in the profile-specific OAuth state file.

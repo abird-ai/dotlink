@@ -33,7 +33,7 @@ When HTTP is selected, setup can persist:
 - OAuth protection for local/reverse-proxied HTTP;
 - the canonical external OAuth origin when a reverse proxy is used.
 
-**Public ngrok ingress is OAuth-protected automatically.** `oauth.enabled` controls local/reverse-proxied HTTP only. The one-run `--allow-public-no-auth` flag is the explicit unsafe opt-out for public ngrok.
+**Externally reachable HTTP is OAuth-protected by default.** Public ngrok is protected automatically. A persisted/direct non-loopback HTTP listener must enable local OAuth and provide an HTTPS `oauth.public_url`; otherwise startup/config validation refuses it. `oauth.enabled` controls local/reverse-proxied HTTP only. The one-run `--allow-public-no-auth` flag is the explicit unsafe opt-out for public ngrok or a direct non-loopback listener.
 
 The first time any OAuth-protected route is configured, setup asks for one owner password. The plaintext password is never persisted; dotlink stores only an Argon2id hash. Existing setup shows only `[existing credential]`, and changing it requires a new hidden password + confirmation.
 
@@ -179,14 +179,14 @@ Every profile-enabled transport starts automatically.
 --oauth                      protect local HTTP with OAuth
 --no-oauth                   disable local HTTP OAuth for one run
 --public-url=HTTPS-ORIGIN    canonical reverse-proxy OAuth origin
---allow-public-no-auth       intentionally disable public ngrok OAuth
+--allow-public-no-auth       intentionally allow public HTTP/ngrok without OAuth
 
 --ephemeral-url              enable both local/ngrok ephemeral paths
 --http-ephemeral-url         override local HTTP path behavior
 --ngrok-ephemeral-url        override ngrok path behavior
 ```
 
-`--allow-public-no-auth` is valid only with effective ngrok and is intentionally explicit because it exposes the granted MCP surface to anyone who can reach the public URL.
+`--allow-public-no-auth` is valid only when the effective endpoint is externally reachable (ngrok or a non-loopback HTTP bind). It is intentionally one-run-only because it exposes the granted MCP surface to anyone who can reach that endpoint.
 
 Interactive setup never saves a zero-transport selection; that choice cancels setup. Direct `profile disable` commands can intentionally leave a profile with no transports, in which case normal startup requires a one-run `--stdio` or `--http`.
 

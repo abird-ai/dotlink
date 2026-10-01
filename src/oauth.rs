@@ -30,10 +30,13 @@ use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
-use crate::setup::{atomic_write_private, set_private_dir_permissions};
+use crate::setup::{
+    atomic_write_private, set_private_dir_permissions, set_private_file_permissions,
+};
 
 const STATE_VERSION: u32 = 1;
 const ACCESS_TOKEN_TTL_SECS: i64 = 15 * 60;
@@ -41,7 +44,7 @@ const AUTH_CODE_TTL_SECS: i64 = 60;
 const PENDING_AUTH_TTL_SECS: i64 = 5 * 60;
 const REFRESH_TOKEN_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MAX_DCR_CLIENTS: usize = 64;
-const PENDING_DCR_TTL_SECS: i64 = 60 * 60;
+const PENDING_DCR_TTL_SECS: i64 = 15 * 60;
 const MAX_PENDING_DCR_CLIENTS: usize = 256;
 const MAX_PENDING_AUTHORIZATIONS: usize = 256;
 const MAX_AUTHORIZATION_CODES: usize = 256;
@@ -49,8 +52,9 @@ const MAX_ACCESS_TOKENS: usize = 512;
 const MAX_REFRESH_GRANTS: usize = 256;
 const MAX_CLIENT_METADATA_BYTES: usize = 64 * 1024;
 const OWNER_PASSWORD_MIN_LEN: usize = 12;
-const LOGIN_FAILURE_LIMIT: u32 = 5;
-const LOGIN_LOCK_SECS: i64 = 30;
+const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 2;
+const PASSWORD_CHECK_WAIT: Duration = Duration::from_secs(2);
+const FAILED_PASSWORD_DELAY: Duration = Duration::from_millis(300);
 const SCOPE_MCP: &str = "mcp:access";
 const SCOPE_OFFLINE: &str = "offline_access";
 
@@ -120,6 +124,7 @@ struct AuthorizationCode {
     resource: String,
     scope: String,
     code_challenge: String,
+    issue_refresh: bool,
     expires_at: i64,
 }
 
@@ -133,13 +138,8 @@ struct PendingAuthorization {
     scope: String,
     state: Option<String>,
     code_challenge: String,
+    issue_refresh: bool,
     expires_at: i64,
-}
-
-#[derive(Clone, Debug, Default)]
-struct LoginThrottle {
-    failures: u32,
-    blocked_until: i64,
 }
 
 struct RuntimeState {
@@ -149,7 +149,7 @@ struct RuntimeState {
     access_tokens: Mutex<HashMap<String, AccessGrant>>,
     authorization_codes: Mutex<HashMap<String, AuthorizationCode>>,
     pending: Mutex<HashMap<String, PendingAuthorization>>,
-    login_throttle: Mutex<LoginThrottle>,
+    password_checks: Semaphore,
 }
 
 #[derive(Clone)]
@@ -176,9 +176,8 @@ pub struct Server {
 
 pub struct OwnerPasswordChange {
     path: PathBuf,
-    existed_before: bool,
-    previous: PersistentState,
-    updated: PersistentState,
+    previous_hash: Option<String>,
+    updated_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -294,13 +293,23 @@ impl Runtime {
                 access_tokens: Mutex::new(HashMap::new()),
                 authorization_codes: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
-                login_throttle: Mutex::new(LoginThrottle::default()),
+                password_checks: Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS),
             }),
         })
     }
 
-    fn persist_locked(&self, state: &PersistentState) -> Result<()> {
-        write_state(&self.inner.state_path, state)
+    fn update_persistent<T>(
+        &self,
+        update: impl FnOnce(&mut PersistentState) -> Result<T>,
+    ) -> Result<T> {
+        let mut memory = self
+            .inner
+            .persistent
+            .lock()
+            .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
+        let (latest, value) = update_state(&self.inner.state_path, update)?;
+        *memory = latest;
+        Ok(value)
     }
 
     fn reload_persistent(&self) -> Result<()> {
@@ -314,22 +323,13 @@ impl Runtime {
         Ok(())
     }
 
-    fn verify_owner_password(&self, password: &str) -> Result<bool> {
+    async fn verify_owner_password(&self, password: &str) -> Result<bool> {
         if password.len() > 1024 {
+            tokio::time::sleep(FAILED_PASSWORD_DELAY).await;
             return Ok(false);
         }
-        let current = now();
-        {
-            let throttle = self
-                .inner
-                .login_throttle
-                .lock()
-                .map_err(|_| anyhow!("OAuth login throttle lock poisoned"))?;
-            if throttle.blocked_until > current {
-                return Ok(false);
-            }
-        }
 
+        self.reload_persistent()?;
         let hash = {
             let state = self
                 .inner
@@ -342,26 +342,25 @@ impl Runtime {
                 .ok_or_else(|| anyhow!("OAuth owner password is not configured"))?
         };
 
-        let parsed = PasswordHash::new(&hash)
-            .map_err(|error| anyhow!("stored OAuth owner hash is invalid: {error}"))?;
-        let valid = Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok();
-
-        let mut throttle = self
-            .inner
-            .login_throttle
-            .lock()
-            .map_err(|_| anyhow!("OAuth login throttle lock poisoned"))?;
-        if valid {
-            *throttle = LoginThrottle::default();
-        } else {
-            throttle.failures = throttle.failures.saturating_add(1);
-            if throttle.failures >= LOGIN_FAILURE_LIMIT {
-                throttle.failures = 0;
-                throttle.blocked_until = current + LOGIN_LOCK_SECS;
-            }
+        let permit =
+            tokio::time::timeout(PASSWORD_CHECK_WAIT, self.inner.password_checks.acquire())
+                .await
+                .map_err(|_| anyhow!("OAuth password verifier is busy; retry shortly"))?
+                .map_err(|_| anyhow!("OAuth password verifier is unavailable"))?;
+        let password = Zeroizing::new(password.as_bytes().to_vec());
+        let valid = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let parsed = PasswordHash::new(&hash)
+                .map_err(|error| anyhow!("stored OAuth owner hash is invalid: {error}"))?;
+            Ok(Argon2::default()
+                .verify_password(password.as_slice(), &parsed)
+                .is_ok())
+        })
+        .await
+        .context("OAuth password verifier task failed")??;
+        if !valid {
+            tokio::time::sleep(FAILED_PASSWORD_DELAY).await;
         }
+        drop(permit);
         Ok(valid)
     }
 
@@ -440,8 +439,15 @@ impl Runtime {
             .map_err(|_| anyhow!("OAuth pending-client lock poisoned"))?;
         let cutoff = now() - PENDING_DCR_TTL_SECS;
         pending.retain(|_, existing| existing.issued_at >= cutoff);
-        if pending.len() >= MAX_PENDING_DCR_CLIENTS {
-            bail!("too many pending dynamic client registrations; retry later");
+        while pending.len() >= MAX_PENDING_DCR_CLIENTS {
+            let Some(oldest) = pending
+                .iter()
+                .min_by_key(|(_, client)| client.issued_at)
+                .map(|(client_id, _)| client_id.clone())
+            else {
+                break;
+            };
+            pending.remove(&oldest);
         }
         pending.insert(client.client_id.clone(), client.clone());
         Ok(client)
@@ -452,20 +458,7 @@ impl Runtime {
             return Ok(());
         }
 
-        self.reload_persistent()?;
-
-        {
-            let state = self
-                .inner
-                .persistent
-                .lock()
-                .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-            if state.clients.contains_key(client_id) {
-                return Ok(());
-            }
-        }
-
-        let client = {
+        let pending_client = {
             let mut pending = self
                 .inner
                 .pending_clients
@@ -473,32 +466,26 @@ impl Runtime {
                 .map_err(|_| anyhow!("OAuth pending-client lock poisoned"))?;
             let cutoff = now() - PENDING_DCR_TTL_SECS;
             pending.retain(|_, existing| existing.issued_at >= cutoff);
-            pending
-                .get(client_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("dynamic client registration expired; register again"))?
+            pending.get(client_id).cloned()
         };
 
-        let mut state = self
-            .inner
-            .persistent
-            .lock()
-            .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-        if state.clients.len() >= MAX_DCR_CLIENTS {
-            bail!(
-                "approved OAuth client limit reached; revoke an unused client before approving another"
-            );
-        }
+        let promoted = self.update_persistent(|state| {
+            if state.clients.contains_key(client_id) {
+                return Ok(false);
+            }
+            let client = pending_client.clone().ok_or_else(|| {
+                anyhow!("dynamic client registration expired; register again")
+            })?;
+            if state.clients.len() >= MAX_DCR_CLIENTS {
+                bail!(
+                    "approved OAuth client limit reached; revoke an unused client before approving another"
+                );
+            }
+            state.clients.insert(client_id.to_owned(), client);
+            Ok(true)
+        })?;
 
-        let previous = state.clone();
-        state.clients.insert(client_id.to_owned(), client);
-        if let Err(error) = self.persist_locked(&state) {
-            *state = previous;
-            return Err(error);
-        }
-        drop(state);
-
-        if let Ok(mut pending) = self.inner.pending_clients.lock() {
+        if promoted && let Ok(mut pending) = self.inner.pending_clients.lock() {
             pending.remove(client_id);
         }
         Ok(())
@@ -510,61 +497,55 @@ impl Runtime {
         issuer: &str,
         resource: &str,
         scope: &str,
+        issue_refresh: bool,
     ) -> Result<(String, Option<String>)> {
-        self.reload_persistent()?;
-        if client_id.starts_with("dcr_") {
-            let state = self
-                .inner
-                .persistent
-                .lock()
-                .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-            if !state.clients.contains_key(client_id) {
-                bail!("OAuth client is no longer approved");
-            }
-        }
+        let refresh = if issue_refresh {
+            let refresh = random_token()?;
+            let grant = RefreshGrant {
+                client_id: client_id.to_owned(),
+                issuer: issuer.to_owned(),
+                resource: resource.to_owned(),
+                scope: scope.to_owned(),
+                expires_at: now() + REFRESH_TOKEN_TTL_SECS,
+            };
+            self.update_persistent(|state| {
+                if client_id.starts_with("dcr_") && !state.clients.contains_key(client_id) {
+                    bail!("OAuth client is no longer approved");
+                }
+                make_room_for_refresh_grant(state);
+                state.refresh_tokens.insert(token_hash(&refresh), grant);
+                Ok(())
+            })?;
+            Some(refresh)
+        } else {
+            self.update_persistent(|state| {
+                if client_id.starts_with("dcr_") && !state.clients.contains_key(client_id) {
+                    bail!("OAuth client is no longer approved");
+                }
+                Ok(())
+            })?;
+            None
+        };
 
         let access = random_token()?;
-        {
-            let mut access_tokens = self
-                .inner
-                .access_tokens
-                .lock()
-                .map_err(|_| anyhow!("OAuth access-token lock poisoned"))?;
-            make_room_for_access_token(&mut access_tokens);
-            access_tokens.insert(
-                token_hash(&access),
-                AccessGrant {
-                    client_id: client_id.to_owned(),
-                    issuer: issuer.to_owned(),
-                    resource: resource.to_owned(),
-                    scope: scope.to_owned(),
-                    expires_at: now() + ACCESS_TOKEN_TTL_SECS,
-                },
-            );
-        }
-
-        let refresh = random_token()?;
-        let grant = RefreshGrant {
-            client_id: client_id.to_owned(),
-            issuer: issuer.to_owned(),
-            resource: resource.to_owned(),
-            scope: scope.to_owned(),
-            expires_at: now() + REFRESH_TOKEN_TTL_SECS,
-        };
-        let mut state = self
+        let mut access_tokens = self
             .inner
-            .persistent
+            .access_tokens
             .lock()
-            .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-        let previous = state.clone();
-        make_room_for_refresh_grant(&mut state);
-        state.refresh_tokens.insert(token_hash(&refresh), grant);
-        if let Err(error) = self.persist_locked(&state) {
-            *state = previous;
-            return Err(error);
-        }
+            .map_err(|_| anyhow!("OAuth access-token lock poisoned"))?;
+        make_room_for_access_token(&mut access_tokens);
+        access_tokens.insert(
+            token_hash(&access),
+            AccessGrant {
+                client_id: client_id.to_owned(),
+                issuer: issuer.to_owned(),
+                resource: resource.to_owned(),
+                scope: scope.to_owned(),
+                expires_at: now() + ACCESS_TOKEN_TTL_SECS,
+            },
+        );
 
-        Ok((access, Some(refresh)))
+        Ok((access, refresh))
     }
 
     fn rotate_refresh(
@@ -574,45 +555,35 @@ impl Runtime {
         issuer: &str,
         resource: &str,
     ) -> Result<Option<(String, String, String)>> {
-        self.reload_persistent()?;
         let hash = token_hash(raw);
-        let mut state = self
-            .inner
-            .persistent
-            .lock()
-            .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-        let previous = state.clone();
-        let Some(grant) = state.refresh_tokens.remove(&hash) else {
-            return Ok(None);
-        };
-
         let current = now();
-        if grant.expires_at <= current
-            || grant.client_id != client_id
-            || grant.issuer != issuer
-            || grant.resource != resource
-        {
-            if let Err(error) = self.persist_locked(&state) {
-                *state = previous;
-                return Err(error);
+        let rotated = self.update_persistent(|state| {
+            let Some(grant) = state.refresh_tokens.remove(&hash) else {
+                return Ok(None);
+            };
+            if grant.expires_at <= current
+                || grant.client_id != client_id
+                || grant.issuer != issuer
+                || grant.resource != resource
+            {
+                return Ok(None);
             }
-            return Ok(None);
-        }
 
-        let new_refresh = random_token()?;
-        let new_grant = RefreshGrant {
-            expires_at: current + REFRESH_TOKEN_TTL_SECS,
-            ..grant.clone()
+            let new_refresh = random_token()?;
+            let new_grant = RefreshGrant {
+                expires_at: current + REFRESH_TOKEN_TTL_SECS,
+                ..grant.clone()
+            };
+            make_room_for_refresh_grant(state);
+            state
+                .refresh_tokens
+                .insert(token_hash(&new_refresh), new_grant);
+            Ok(Some((grant, new_refresh)))
+        })?;
+
+        let Some((grant, new_refresh)) = rotated else {
+            return Ok(None);
         };
-        make_room_for_refresh_grant(&mut state);
-        state
-            .refresh_tokens
-            .insert(token_hash(&new_refresh), new_grant);
-        if let Err(error) = self.persist_locked(&state) {
-            *state = previous;
-            return Err(error);
-        }
-        drop(state);
 
         let access = random_token()?;
         let mut access_tokens = self
@@ -661,20 +632,10 @@ impl Runtime {
             .map_err(|_| anyhow!("OAuth access-token lock poisoned"))?
             .remove(&hash);
 
-        let mut state = self
-            .inner
-            .persistent
-            .lock()
-            .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-        if state.refresh_tokens.contains_key(&hash) {
-            let previous = state.clone();
+        self.update_persistent(|state| {
             state.refresh_tokens.remove(&hash);
-            if let Err(error) = self.persist_locked(&state) {
-                *state = previous;
-                return Err(error);
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -795,9 +756,9 @@ fn validate_profile_component(profile: &str) -> Result<()> {
         || profile.len() > 64
         || !profile
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        bail!("invalid profile name");
+        bail!("invalid profile name; use 1-64 letters, digits, '-' or '_'");
     }
     Ok(())
 }
@@ -815,51 +776,65 @@ pub fn prepare_owner_password(
 ) -> Result<OwnerPasswordChange> {
     validate_owner_password(password)?;
     let path = state_path(profile)?;
-    let existed_before = path.exists();
-    let previous = read_state(&path)?;
+    let previous_hash = read_state(&path)?.owner_password_hash;
 
     let mut salt_bytes = [0u8; 16];
     getrandom::fill(&mut salt_bytes)
         .map_err(|error| anyhow!("failed to generate OAuth password salt: {error}"))?;
     let salt = SaltString::encode_b64(&salt_bytes)
         .map_err(|error| anyhow!("failed to encode OAuth password salt: {error}"))?;
-    let hash = Argon2::default()
+    let updated_hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|error| anyhow!("failed to hash OAuth owner password: {error}"))?
         .to_string();
 
-    let mut updated = previous.clone();
-    updated.owner_password_hash = Some(hash);
-
     Ok(OwnerPasswordChange {
         path,
-        existed_before,
-        previous,
-        updated,
+        previous_hash,
+        updated_hash,
     })
 }
 
 impl OwnerPasswordChange {
     pub fn apply(&self) -> Result<()> {
-        write_state(&self.path, &self.updated)
+        let updated = self.updated_hash.clone();
+        update_state(&self.path, move |state| {
+            state.owner_password_hash = Some(updated);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn rollback(&self) -> Result<()> {
-        if !self.existed_before {
-            return match fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => {
-                    Err(error).with_context(|| format!("failed to remove {}", self.path.display()))
+        let previous = self.previous_hash.clone();
+        let updated = self.updated_hash.clone();
+        let (state, ()) = update_state(&self.path, move |state| {
+            if state.owner_password_hash.as_deref() == Some(updated.as_str()) {
+                state.owner_password_hash = previous;
+            }
+            Ok(())
+        })?;
+
+        if state == PersistentState::default() {
+            let _lock = open_state_lock(&self.path)?;
+            if read_state(&self.path)? == PersistentState::default() {
+                match fs::remove_file(&self.path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("failed to remove {}", self.path.display()));
+                    }
                 }
-            };
+            }
         }
-        write_state(&self.path, &self.previous)
+        Ok(())
     }
 }
 
 pub fn delete_profile_state(profile: Option<&str>) -> Result<()> {
     let path = state_path(profile)?;
+    let _lock = open_state_lock(&path)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -902,27 +877,24 @@ pub fn clients(profile: Option<&str>) -> Result<Vec<String>> {
 
 pub fn revoke_client(profile: Option<&str>, client_id: &str) -> Result<bool> {
     let path = state_path(profile)?;
-    let mut state = read_state(&path)?;
-    let removed_client = state.clients.remove(client_id).is_some();
-    let before = state.refresh_tokens.len();
-    state
-        .refresh_tokens
-        .retain(|_, grant| grant.client_id != client_id);
-    let changed = removed_client || before != state.refresh_tokens.len();
-    if changed {
-        write_state(&path, &state)?;
-    }
+    let (_, changed) = update_state(&path, |state| {
+        let removed_client = state.clients.remove(client_id).is_some();
+        let before = state.refresh_tokens.len();
+        state
+            .refresh_tokens
+            .retain(|_, grant| grant.client_id != client_id);
+        Ok(removed_client || before != state.refresh_tokens.len())
+    })?;
     Ok(changed)
 }
 
 pub fn revoke_all(profile: Option<&str>) -> Result<usize> {
     let path = state_path(profile)?;
-    let mut state = read_state(&path)?;
-    let count = state.refresh_tokens.len();
-    if count > 0 {
+    let (_, count) = update_state(&path, |state| {
+        let count = state.refresh_tokens.len();
         state.refresh_tokens.clear();
-        write_state(&path, &state)?;
-    }
+        Ok(count)
+    })?;
     Ok(count)
 }
 
@@ -1025,16 +997,25 @@ async fn prepare_authorization(server: &Server, query: AuthorizeQuery) -> Result
     }
 
     let scope = normalize_scope(query.scope.as_deref())?;
+    let issue_refresh = metadata
+        .grant_types
+        .iter()
+        .any(|grant| grant == "refresh_token");
+    if scope_contains(&scope, SCOPE_OFFLINE) && !issue_refresh {
+        bail!("client does not support refresh_token grant required by offline_access");
+    }
+
     let request_id = random_token()?;
     let pending = PendingAuthorization {
         client_id: query.client_id,
-        client_name: metadata.client_name,
+        client_name: metadata.client_name.map(|name| bounded_text(&name, 200)),
         issuer: server.issuer.clone(),
         redirect_uri: query.redirect_uri,
         resource: server.resource.clone(),
         scope,
         state: query.state,
         code_challenge: query.code_challenge,
+        issue_refresh,
         expires_at: now() + PENDING_AUTH_TTL_SECS,
     };
 
@@ -1045,14 +1026,32 @@ async fn prepare_authorization(server: &Server, query: AuthorizeQuery) -> Result
         .lock()
         .map_err(|_| anyhow!("OAuth pending-request lock poisoned"))?;
     requests.retain(|_, request| request.expires_at > now());
-    if requests.len() >= MAX_PENDING_AUTHORIZATIONS {
-        bail!("too many pending OAuth authorization requests");
+    while requests.len() >= MAX_PENDING_AUTHORIZATIONS {
+        let Some(oldest) = requests
+            .iter()
+            .min_by_key(|(_, request)| request.expires_at)
+            .map(|(request_id, _)| request_id.clone())
+        else {
+            break;
+        };
+        requests.remove(&oldest);
     }
     requests.insert(request_id.clone(), pending);
     Ok(request_id)
 }
 
 async fn authorize_post(State(server): State<Server>, Form(form): Form<AuthorizeForm>) -> Response {
+    if ensure_max_len("request_id", &form.request_id, 512).is_err()
+        || ensure_max_len("decision", &form.decision, 16).is_err()
+        || !matches!(form.decision.as_str(), "allow" | "deny")
+    {
+        return oauth_error_page(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Authorization form is invalid",
+        );
+    }
+
     let request = {
         let mut pending = match server.runtime.inner.pending.lock() {
             Ok(pending) => pending,
@@ -1096,7 +1095,11 @@ async fn authorize_post(State(server): State<Server>, Form(form): Form<Authorize
     }
 
     let password = Zeroizing::new(form.password);
-    match server.runtime.verify_owner_password(password.as_str()) {
+    match server
+        .runtime
+        .verify_owner_password(password.as_str())
+        .await
+    {
         Ok(true) => {}
         Ok(false) => {
             let retry_id = match random_token() {
@@ -1149,6 +1152,7 @@ async fn authorize_post(State(server): State<Server>, Form(form): Form<Authorize
         resource: request.resource,
         scope: request.scope,
         code_challenge: request.code_challenge,
+        issue_refresh: request.issue_refresh,
         expires_at: now() + AUTH_CODE_TTL_SECS,
     };
     if let Ok(mut codes) = server.runtime.inner.authorization_codes.lock() {
@@ -1181,6 +1185,10 @@ async fn authorize_post(State(server): State<Server>, Form(form): Form<Authorize
 }
 
 async fn token(State(server): State<Server>, Form(form): Form<TokenForm>) -> Response {
+    if ensure_max_len("grant_type", &form.grant_type, 64).is_err() {
+        return token_error("invalid_request", "grant_type is too long");
+    }
+
     let result = match form.grant_type.as_str() {
         "authorization_code" => exchange_authorization_code(&server, form),
         "refresh_token" => exchange_refresh_token(&server, form),
@@ -1247,6 +1255,7 @@ fn exchange_authorization_code(server: &Server, form: TokenForm) -> Result<Value
         &server.issuer,
         &server.resource,
         &record.scope,
+        record.issue_refresh,
     )?;
     Ok(token_response(access, refresh, record.scope))
 }
@@ -1307,8 +1316,20 @@ async fn register(
 }
 
 async fn revoke(State(server): State<Server>, Form(form): Form<RevokeForm>) -> Response {
-    let _ = server.runtime.revoke(&form.token);
-    StatusCode::OK.into_response()
+    if form.token.len() > 512 {
+        return StatusCode::OK.into_response();
+    }
+
+    match server.runtime.revoke(&form.token) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => no_store_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "server_error",
+                "error_description": "Token revocation could not be persisted"
+            }),
+        ),
+    }
 }
 
 fn token_response(access: String, refresh: Option<String>, scope: String) -> Value {
@@ -1481,12 +1502,11 @@ async fn fetch_cimd(client_id: &str) -> Result<ClientMetadata> {
         bail!("CIMD host resolves to a non-public address");
     }
 
-    let pinned = addresses[0];
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
         .timeout(Duration::from_secs(5))
         .https_only(true)
-        .resolve(&host, pinned)
+        .resolve_to_addrs(&host, &addresses)
         .user_agent(format!("dotlink-oauth/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to build CIMD HTTP client")?;
@@ -1529,7 +1549,7 @@ async fn fetch_cimd(client_id: &str) -> Result<ClientMetadata> {
 fn validate_client_metadata(client_id: &str, metadata: &ClientMetadata) -> Result<()> {
     validate_client_redirect_uris(&metadata.redirect_uris)?;
     if !metadata.response_types.is_empty()
-        && metadata.response_types.iter().any(|value| value != "code")
+        && !metadata.response_types.iter().any(|value| value == "code")
     {
         bail!("client does not support response_type=code");
     }
@@ -1542,14 +1562,17 @@ fn validate_client_metadata(client_id: &str, metadata: &ClientMetadata) -> Resul
         bail!("client does not support authorization_code grant");
     }
 
-    let supports_none = metadata
-        .token_endpoint_auth_methods_supported
-        .iter()
-        .any(|value| value == "none")
-        || metadata
+    let supports_none = if metadata.token_endpoint_auth_methods_supported.is_empty() {
+        metadata
             .token_endpoint_auth_method
             .as_deref()
-            .is_none_or(|value| value == "none");
+            .is_none_or(|value| value == "none")
+    } else {
+        metadata
+            .token_endpoint_auth_methods_supported
+            .iter()
+            .any(|value| value == "none")
+    };
     if !supports_none {
         bail!("client metadata does not allow public token exchange");
     }
@@ -1715,6 +1738,47 @@ fn make_room_for_refresh_grant(state: &mut PersistentState) {
         };
         state.refresh_tokens.remove(&oldest);
     }
+}
+
+fn state_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
+fn open_state_lock(path: &Path) -> Result<fs::File> {
+    let lock_path = state_lock_path(path);
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| anyhow!("OAuth state lock path has no parent"))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    set_private_dir_permissions(parent)?;
+
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    set_private_file_permissions(&lock_path)?;
+    lock.lock()
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(lock)
+}
+
+fn update_state<T>(
+    path: &Path,
+    update: impl FnOnce(&mut PersistentState) -> Result<T>,
+) -> Result<(PersistentState, T)> {
+    let _lock = open_state_lock(path)?;
+    let mut state = read_state(path)?;
+    let before = state.clone();
+    let value = update(&mut state)?;
+    if state != before {
+        write_state(path, &state)?;
+    }
+    Ok((state, value))
 }
 
 fn read_state(path: &Path) -> Result<PersistentState> {
@@ -1903,7 +1967,7 @@ mod tests {
                     access_tokens: Mutex::new(HashMap::new()),
                     authorization_codes: Mutex::new(HashMap::new()),
                     pending: Mutex::new(HashMap::new()),
-                    login_throttle: Mutex::new(LoginThrottle::default()),
+                    password_checks: Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS),
                 }),
             },
             Url::parse("https://example.com").unwrap(),
@@ -1923,6 +1987,29 @@ mod tests {
         assert!(!is_public_ip("fd00::1".parse().unwrap()));
         assert!(is_public_ip("8.8.8.8".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn cimd_plural_token_auth_methods_are_authoritative() {
+        let client_id = "https://chatgpt.com/oauth/client.json";
+        let base = ClientMetadata {
+            client_id: Some(client_id.to_owned()),
+            client_name: Some("ChatGPT".to_owned()),
+            redirect_uris: vec!["https://chatgpt.com/connector_platform_oauth_redirect".to_owned()],
+            grant_types: vec!["authorization_code".to_owned(), "refresh_token".to_owned()],
+            response_types: vec!["code".to_owned(), "token".to_owned()],
+            token_endpoint_auth_method: Some("private_key_jwt".to_owned()),
+            token_endpoint_auth_methods_supported: vec![
+                "none".to_owned(),
+                "private_key_jwt".to_owned(),
+            ],
+        };
+        assert!(validate_client_metadata(client_id, &base).is_ok());
+
+        let mut private_key_only = base;
+        private_key_only.token_endpoint_auth_methods_supported = vec!["private_key_jwt".to_owned()];
+        private_key_only.token_endpoint_auth_method = None;
+        assert!(validate_client_metadata(client_id, &private_key_only).is_err());
     }
 
     #[tokio::test]
@@ -1981,21 +2068,71 @@ mod tests {
     }
 
     #[test]
-    fn owner_password_change_is_private_and_reversible() {
+    fn new_owner_password_rollback_removes_empty_state_file() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("oauth.json");
-        let previous = PersistentState::default();
-        let mut updated = previous.clone();
-        updated.owner_password_hash = Some("hash".to_owned());
         let change = OwnerPasswordChange {
             path: path.clone(),
-            existed_before: false,
-            previous,
-            updated,
+            previous_hash: None,
+            updated_hash: "new-hash".to_owned(),
         };
 
         change.apply().unwrap();
         assert!(path.exists());
+        change.rollback().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn owner_password_change_preserves_concurrent_oauth_state() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("oauth.json");
+        let mut initial = PersistentState {
+            owner_password_hash: Some("old-hash".to_owned()),
+            ..PersistentState::default()
+        };
+        initial.clients.insert(
+            "client-a".to_owned(),
+            RegisteredClient {
+                client_id: "client-a".to_owned(),
+                client_name: Some("Client A".to_owned()),
+                redirect_uris: vec!["https://client.example/callback".to_owned()],
+                grant_types: vec!["authorization_code".to_owned(), "refresh_token".to_owned()],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: "none".to_owned(),
+                issued_at: now(),
+            },
+        );
+        write_state(&path, &initial).unwrap();
+
+        let change = OwnerPasswordChange {
+            path: path.clone(),
+            previous_hash: Some("old-hash".to_owned()),
+            updated_hash: "new-hash".to_owned(),
+        };
+        change.apply().unwrap();
+
+        update_state(&path, |state| {
+            state.refresh_tokens.insert(
+                "refresh-hash".to_owned(),
+                RefreshGrant {
+                    client_id: "client-a".to_owned(),
+                    issuer: "https://mcp.example.com".to_owned(),
+                    resource: "https://mcp.example.com/mcp".to_owned(),
+                    scope: SCOPE_MCP.to_owned(),
+                    expires_at: now() + REFRESH_TOKEN_TTL_SECS,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        change.rollback().unwrap();
+        let state = read_state(&path).unwrap();
+        assert_eq!(state.owner_password_hash.as_deref(), Some("old-hash"));
+        assert!(state.clients.contains_key("client-a"));
+        assert!(state.refresh_tokens.contains_key("refresh-hash"));
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2003,9 +2140,52 @@ mod tests {
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            assert_eq!(
+                fs::metadata(state_lock_path(&path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
-        change.rollback().unwrap();
-        assert!(!path.exists());
+    }
+
+    #[test]
+    fn concurrent_state_updates_do_not_lose_clients() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("oauth.json");
+        write_state(&path, &PersistentState::default()).unwrap();
+
+        let mut threads = Vec::new();
+        for index in 0..8 {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                let client_id = format!("client-{index}");
+                update_state(&path, |state| {
+                    state.clients.insert(
+                        client_id.clone(),
+                        RegisteredClient {
+                            client_id: client_id.clone(),
+                            client_name: None,
+                            redirect_uris: vec!["https://client.example/callback".to_owned()],
+                            grant_types: vec!["authorization_code".to_owned()],
+                            response_types: vec!["code".to_owned()],
+                            token_endpoint_auth_method: "none".to_owned(),
+                            issued_at: now(),
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let state = read_state(&path).unwrap();
+        assert_eq!(state.clients.len(), 8);
     }
 
     #[test]
@@ -2036,10 +2216,129 @@ mod tests {
                 access_tokens: Mutex::new(HashMap::new()),
                 authorization_codes: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
-                login_throttle: Mutex::new(LoginThrottle::default()),
+                password_checks: Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS),
             }),
         };
         (runtime, temp)
+    }
+
+    #[tokio::test]
+    async fn offline_access_requires_refresh_token_grant() {
+        let (runtime, _temp) = test_runtime("long-enough-owner-password");
+        let server = Server::new(
+            runtime.clone(),
+            Url::parse("https://mcp.example.com").unwrap(),
+            "/mcp",
+        )
+        .unwrap();
+        let client = runtime
+            .insert_dcr_client(RegistrationRequest {
+                client_name: Some("No refresh client".to_owned()),
+                redirect_uris: vec!["https://client.example/callback".to_owned()],
+                grant_types: vec!["authorization_code".to_owned()],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: Some("none".to_owned()),
+            })
+            .unwrap();
+
+        let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abc";
+        let error = prepare_authorization(
+            &server,
+            AuthorizeQuery {
+                response_type: "code".to_owned(),
+                client_id: client.client_id,
+                redirect_uri: "https://client.example/callback".to_owned(),
+                state: None,
+                scope: Some("mcp:access offline_access".to_owned()),
+                resource: Some(server.resource().to_owned()),
+                code_challenge: pkce_challenge(verifier),
+                code_challenge_method: "S256".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn owner_password_changes_are_observed_without_restart() {
+        let (runtime, _temp) = test_runtime("first-long-owner-password");
+        assert!(
+            runtime
+                .verify_owner_password("first-long-owner-password")
+                .await
+                .unwrap()
+        );
+
+        let salt = SaltString::encode_b64(&[9u8; 16]).unwrap();
+        let new_hash = Argon2::default()
+            .hash_password(b"second-long-owner-password", &salt)
+            .unwrap()
+            .to_string();
+        let mut disk = read_state(&runtime.inner.state_path).unwrap();
+        disk.owner_password_hash = Some(new_hash);
+        write_state(&runtime.inner.state_path, &disk).unwrap();
+
+        assert!(
+            !runtime
+                .verify_owner_password("first-long-owner-password")
+                .await
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .verify_owner_password("second-long-owner-password")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_password_attempts_do_not_globally_lock_out_owner() {
+        let (runtime, _temp) = test_runtime("correct-long-owner-password");
+        for _ in 0..5 {
+            assert!(
+                !runtime
+                    .verify_owner_password("wrong-password")
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            runtime
+                .verify_owner_password("correct-long-owner-password")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn access_only_client_does_not_receive_refresh_token() {
+        let (runtime, _temp) = test_runtime("long-enough-owner-password");
+        let issuer = "https://mcp.example.com";
+        let resource = "https://mcp.example.com/mcp";
+        let (access, refresh) = runtime
+            .issue_access_and_refresh(
+                "https://client.example/oauth.json",
+                issuer,
+                resource,
+                SCOPE_MCP,
+                false,
+            )
+            .unwrap();
+
+        assert!(refresh.is_none());
+        assert!(
+            runtime
+                .validate_access_token(&access, issuer, resource)
+                .unwrap()
+        );
+        assert!(
+            read_state(&runtime.inner.state_path)
+                .unwrap()
+                .refresh_tokens
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2053,6 +2352,7 @@ mod tests {
                 issuer,
                 resource,
                 SCOPE_MCP,
+                true,
             )
             .unwrap();
         let refresh = refresh.expect("refresh token");

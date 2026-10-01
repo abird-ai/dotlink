@@ -121,6 +121,15 @@ actual="$(sha256_file "$WORKDIR/$ASSET" | tr 'A-F' 'a-f')"
 
 chmod 0755 "$WORKDIR/$ASSET"
 new_version="$(dotlink_version "$WORKDIR/$ASSET")"
+[ -n "$new_version" ] || die "downloaded asset did not report a valid dotlink version"
+if [ "$VERSION" != "latest" ]; then
+  case "$VERSION" in
+    v*) requested_version="${VERSION#v}" ;;
+    *) requested_version="$VERSION" ;;
+  esac
+  [ "$new_version" = "$requested_version" ] ||
+    die "downloaded dotlink version $new_version does not match requested version $requested_version"
+fi
 
 mkdir -p "$INSTALL_DIR"
 DESTINATION="$INSTALL_DIR/$BINARY"

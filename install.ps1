@@ -74,6 +74,15 @@ try {
     }
 
     $DownloadedVersion = Get-DotlinkVersion $BinaryPath
+    if (-not $DownloadedVersion) {
+        throw "Downloaded asset did not report a valid dotlink version."
+    }
+    if ($Version -ne "latest") {
+        $RequestedVersion = if ($Version.StartsWith("v")) { $Version.Substring(1) } else { $Version }
+        if ($DownloadedVersion -ne $RequestedVersion) {
+            throw "Downloaded dotlink version $DownloadedVersion does not match requested version $RequestedVersion."
+        }
+    }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $Destination = Join-Path $InstallDir "dotlink.exe"
@@ -93,7 +102,20 @@ try {
             Write-Host "dotlink is already up to date at $Destination"
         }
     } else {
-        Copy-Item -Force $BinaryPath $Destination
+        $DestinationTemp = Join-Path $InstallDir (".dotlink.exe.tmp." + [guid]::NewGuid().ToString("N"))
+        $DestinationBackup = Join-Path $InstallDir (".dotlink.exe.bak." + [guid]::NewGuid().ToString("N"))
+        try {
+            Copy-Item -LiteralPath $BinaryPath -Destination $DestinationTemp
+            if ($HadExisting) {
+                [System.IO.File]::Replace($DestinationTemp, $Destination, $DestinationBackup)
+            } else {
+                [System.IO.File]::Move($DestinationTemp, $Destination)
+            }
+        }
+        finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $DestinationTemp
+            Remove-Item -Force -ErrorAction SilentlyContinue $DestinationBackup
+        }
 
         if ($HadExisting) {
             if ($OldVersion -and $DownloadedVersion) {

@@ -2360,6 +2360,31 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
         oauth::validate_public_base_url(public_url)?;
     }
 
+    let http_bind = config
+        .transports
+        .http_bind
+        .parse::<SocketAddr>()
+        .with_context(|| {
+            format!(
+                "invalid HTTP bind address {:?}",
+                config.transports.http_bind
+            )
+        })?;
+    if config.transports.http && !http_bind.ip().is_loopback() {
+        if !config.oauth.enabled {
+            bail!(
+                "persisted non-loopback HTTP requires oauth.enabled=true; use --allow-public-no-auth only as an explicit one-run override"
+            );
+        }
+        let public_url = config.oauth.public_url.as_deref().ok_or_else(|| {
+            anyhow!("persisted non-loopback HTTP with OAuth requires oauth.public_url=https://...")
+        })?;
+        let parsed_public_url = Url::parse(public_url).context("OAuth public URL is invalid")?;
+        if parsed_public_url.scheme() != "https" {
+            bail!("persisted non-loopback HTTP OAuth public URL must use HTTPS");
+        }
+    }
+
     let mut cache_kinds = std::collections::BTreeSet::new();
     for cache in &config.caches {
         if !cache.path.is_absolute() {
@@ -2373,17 +2398,6 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
             bail!("duplicate cache grant for {}", cache.kind.label());
         }
     }
-
-    config
-        .transports
-        .http_bind
-        .parse::<SocketAddr>()
-        .with_context(|| {
-            format!(
-                "invalid HTTP bind address {:?}",
-                config.transports.http_bind
-            )
-        })?;
 
     if let Some(tunnel_id) = config.tunnel_id.as_deref() {
         validate_tunnel_id(tunnel_id)?;
@@ -2509,14 +2523,14 @@ fn bounded(value: &str, limit: usize) -> String {
 }
 
 #[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<()> {
+pub(crate) fn set_private_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn set_private_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2830,6 +2844,29 @@ mod tests {
         assert!(serialized.starts_with("// dotlink configuration (JSONC)"));
         assert!(!serialized.contains("secret-runtime-key"));
         assert!(!serialized.contains("runtime_api_key"));
+    }
+
+    #[test]
+    fn persisted_non_loopback_http_requires_https_oauth_origin() {
+        let mut config = example_config();
+        config.transports.openai = false;
+        config.runtime_api_key.clear();
+        config.tunnel_id = None;
+        config.transports.http = true;
+        config.transports.http_bind = "0.0.0.0:3000".to_owned();
+
+        config.oauth.enabled = false;
+        config.oauth.public_url = None;
+        assert!(validate_config(&config).is_err());
+
+        config.oauth.enabled = true;
+        assert!(validate_config(&config).is_err());
+
+        config.oauth.public_url = Some("http://127.0.0.1:3000".to_owned());
+        assert!(validate_config(&config).is_err());
+
+        config.oauth.public_url = Some("https://mcp.example.com".to_owned());
+        validate_config(&config).unwrap();
     }
 
     #[test]

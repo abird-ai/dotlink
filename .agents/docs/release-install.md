@@ -16,9 +16,9 @@ Windows x86_64/ARM64 PowerShell:
 irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
 ```
 
-By default, both installers resolve GitHub's **latest published release**, choose the correct architecture-specific asset internally, and verify its SHA-256 sidecar. The user-facing command is always `dotlink`; architecture suffixes exist only on release asset names (`dotlink.exe` is the Windows file on disk).
+By default, both installers resolve GitHub's **latest published release**, choose the correct architecture-specific asset internally, verify its SHA-256 sidecar, and require the downloaded executable to identify itself as `dotlink`. When `DOTLINK_VERSION` is set, the executable's reported version must match before replacement. The user-facing command is always `dotlink`; architecture suffixes exist only on release asset names (`dotlink.exe` is the Windows file on disk).
 
-Re-running the same install command doubles as the updater. If the installed binary already matches the latest release hash, it is left untouched and reported as up to date; otherwise it is replaced with the newly verified release. Unix replacement is atomic.
+Re-running the same install command doubles as the updater. If the installed binary already matches the latest release hash, it is left untouched and reported as up to date; otherwise it is replaced from a same-directory temporary file so the final replacement is atomic on supported filesystems.
 
 Supported overrides:
 

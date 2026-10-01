@@ -116,7 +116,7 @@ struct Args {
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
 
-    /// Expose ngrok without OAuth for this run. Local HTTP may still use --oauth. This is intentionally unsafe.
+    /// Allow externally reachable HTTP/ngrok without OAuth for this run. This is intentionally unsafe.
     #[arg(long)]
     allow_public_no_auth: bool,
 
@@ -721,12 +721,6 @@ async fn run_runtime(
     }
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
-    let http_auth = resolve_http_auth(args, &setup.config.oauth, &local_transports)?;
-    let oauth_runtime = if http_auth.local_oauth || http_auth.ngrok_oauth {
-        Some(oauth::Runtime::load(args.profile.as_deref())?)
-    } else {
-        None
-    };
 
     let http_bind = if local_transports.http {
         Some(match args.http_bind {
@@ -740,6 +734,13 @@ async fn run_runtime(
                     anyhow::anyhow!("invalid configured HTTP bind address: {error}")
                 })?,
         })
+    } else {
+        None
+    };
+
+    let http_auth = resolve_http_auth(args, &setup.config.oauth, &local_transports, http_bind)?;
+    let oauth_runtime = if http_auth.local_oauth || http_auth.ngrok_oauth {
+        Some(oauth::Runtime::load(args.profile.as_deref())?)
     } else {
         None
     };
@@ -773,7 +774,7 @@ async fn run_runtime(
             local_oauth: http_auth.local_oauth,
             ngrok_oauth: http_auth.ngrok_oauth,
             oauth_public_url: http_auth.public_url,
-            public_no_auth: http_auth.public_no_auth,
+            ngrok_no_auth: http_auth.ngrok_no_auth,
             log: log.clone(),
         }),
     };
@@ -983,13 +984,14 @@ struct EffectiveHttpAuth {
     local_oauth: bool,
     ngrok_oauth: bool,
     public_url: Option<url::Url>,
-    public_no_auth: bool,
+    ngrok_no_auth: bool,
 }
 
 fn resolve_http_auth(
     args: &Args,
     defaults: &oauth::OAuthConfig,
     transports: &EffectiveLocalTransports,
+    http_bind: Option<SocketAddr>,
 ) -> Result<EffectiveHttpAuth> {
     if !transports.http {
         if args.oauth || args.no_oauth || args.public_url.is_some() || args.allow_public_no_auth {
@@ -999,17 +1001,24 @@ fn resolve_http_auth(
             local_oauth: false,
             ngrok_oauth: false,
             public_url: None,
-            public_no_auth: false,
+            ngrok_no_auth: false,
         });
     }
 
-    if args.allow_public_no_auth && !transports.ngrok {
-        bail!("--allow-public-no-auth is valid only when ngrok is enabled");
+    let bind = http_bind.ok_or_else(|| anyhow::anyhow!("HTTP bind is missing"))?;
+    let non_loopback_http = !bind.ip().is_loopback();
+    if args.allow_public_no_auth && !transports.ngrok && !non_loopback_http {
+        bail!("--allow-public-no-auth is valid only for ngrok or a non-loopback HTTP listener");
     }
 
-    let local_oauth = (defaults.enabled || args.oauth) && !args.no_oauth;
-    let public_no_auth = transports.ngrok && args.allow_public_no_auth;
-    let ngrok_oauth = transports.ngrok && !public_no_auth;
+    let requested_local_oauth = (defaults.enabled || args.oauth) && !args.no_oauth;
+    let local_oauth = if non_loopback_http && args.allow_public_no_auth {
+        false
+    } else {
+        requested_local_oauth
+    };
+    let ngrok_no_auth = transports.ngrok && args.allow_public_no_auth;
+    let ngrok_oauth = transports.ngrok && !ngrok_no_auth;
 
     if args.public_url.is_some() && !local_oauth {
         bail!("--public-url requires local HTTP OAuth to be enabled");
@@ -1025,11 +1034,29 @@ fn resolve_http_auth(
         None
     };
 
+    if non_loopback_http {
+        if !local_oauth && !args.allow_public_no_auth {
+            bail!(
+                "non-loopback HTTP requires OAuth; use --oauth with --public-url=https://... or explicitly opt out with --allow-public-no-auth"
+            );
+        }
+        if local_oauth {
+            let public_url = public_url.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OAuth on non-loopback HTTP requires --public-url=https://... so issuer/resource identity is explicit"
+                )
+            })?;
+            if public_url.scheme() != "https" {
+                bail!("OAuth on non-loopback HTTP requires an HTTPS --public-url");
+            }
+        }
+    }
+
     Ok(EffectiveHttpAuth {
         local_oauth,
         ngrok_oauth,
         public_url,
-        public_no_auth,
+        ngrok_no_auth,
     })
 }
 
@@ -1091,7 +1118,7 @@ fn print_banner(
             } else {
                 eprintln!("• ngrok      {domain}; public URL will be printed after connection");
             }
-            if http.public_no_auth {
+            if http.ngrok_no_auth {
                 eprintln!("• OAuth      WARNING: public ngrok authentication disabled");
             } else if http.ngrok_oauth {
                 eprintln!("• OAuth      public ngrok protected");
@@ -1164,6 +1191,10 @@ mod tests {
 
     fn no_defaults() -> PermissionConfig {
         PermissionConfig::default()
+    }
+
+    fn loopback_http_bind() -> Option<SocketAddr> {
+        Some("127.0.0.1:3000".parse().unwrap())
     }
 
     #[test]
@@ -1379,10 +1410,16 @@ mod tests {
             ..TransportConfig::default()
         };
         let transports = resolve_local_transports(&args, &defaults).unwrap();
-        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig::default(),
+            &transports,
+            loopback_http_bind(),
+        )
+        .unwrap();
         assert!(!auth.local_oauth);
         assert!(auth.ngrok_oauth);
-        assert!(!auth.public_no_auth);
+        assert!(!auth.ngrok_no_auth);
     }
 
     #[test]
@@ -1395,13 +1432,19 @@ mod tests {
             ..TransportConfig::default()
         };
         let transports = resolve_local_transports(&args, &defaults).unwrap();
-        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig::default(),
+            &transports,
+            loopback_http_bind(),
+        )
+        .unwrap();
         assert!(!auth.ngrok_oauth);
-        assert!(auth.public_no_auth);
+        assert!(auth.ngrok_no_auth);
     }
 
     #[test]
-    fn local_oauth_can_coexist_with_public_no_auth_override() {
+    fn local_oauth_can_coexist_with_ngrok_no_auth_override() {
         let args = Args::try_parse_from(["dotlink", "--oauth", "--allow-public-no-auth"]).unwrap();
         let defaults = TransportConfig {
             openai: false,
@@ -1410,10 +1453,16 @@ mod tests {
             ..TransportConfig::default()
         };
         let transports = resolve_local_transports(&args, &defaults).unwrap();
-        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig::default(),
+            &transports,
+            loopback_http_bind(),
+        )
+        .unwrap();
         assert!(auth.local_oauth);
         assert!(!auth.ngrok_oauth);
-        assert!(auth.public_no_auth);
+        assert!(auth.ngrok_no_auth);
     }
 
     #[test]
@@ -1433,6 +1482,7 @@ mod tests {
                 public_url: None,
             },
             &transports,
+            loopback_http_bind(),
         )
         .unwrap();
         assert!(!auth.local_oauth);
@@ -1449,7 +1499,15 @@ mod tests {
         ])
         .unwrap();
         let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
-        assert!(resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).is_err());
+        assert!(
+            resolve_http_auth(
+                &args,
+                &oauth::OAuthConfig::default(),
+                &transports,
+                loopback_http_bind()
+            )
+            .is_err()
+        );
 
         let args = Args::try_parse_from([
             "dotlink",
@@ -1459,12 +1517,65 @@ mod tests {
         ])
         .unwrap();
         let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
-        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig::default(),
+            &transports,
+            loopback_http_bind(),
+        )
+        .unwrap();
         assert!(auth.local_oauth);
         assert_eq!(
             auth.public_url.unwrap().as_str(),
             "https://mcp.example.com/"
         );
+    }
+
+    #[test]
+    fn non_loopback_http_requires_oauth_or_explicit_opt_out() {
+        let bind = Some("0.0.0.0:3000".parse().unwrap());
+
+        let args = Args::try_parse_from(["dotlink", "--http"]).unwrap();
+        let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
+        assert!(
+            resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports, bind).is_err()
+        );
+
+        let args = Args::try_parse_from(["dotlink", "--http", "--allow-public-no-auth"]).unwrap();
+        let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
+        let auth =
+            resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports, bind).unwrap();
+        assert!(!auth.local_oauth);
+
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig {
+                enabled: true,
+                public_url: Some("https://mcp.example.com".to_owned()),
+            },
+            &transports,
+            bind,
+        )
+        .unwrap();
+        assert!(!auth.local_oauth);
+
+        let args = Args::try_parse_from(["dotlink", "--http", "--oauth"]).unwrap();
+        let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
+        assert!(
+            resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports, bind).is_err()
+        );
+
+        let args = Args::try_parse_from([
+            "dotlink",
+            "--http",
+            "--oauth",
+            "--public-url=https://mcp.example.com",
+        ])
+        .unwrap();
+        let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
+        let auth =
+            resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports, bind).unwrap();
+        assert!(auth.local_oauth);
     }
 
     #[test]

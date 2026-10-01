@@ -33,7 +33,7 @@ Windows x86_64/ARM64 PowerShell:
 irm https://raw.githubusercontent.com/abird-ai/dotlink/main/install.ps1 | iex
 ~~~
 
-Both installers download the **latest published GitHub Release** by default, select the correct architecture internally, and verify its SHA-256. The command you run is always simply **`dotlink`**; architecture suffixes exist only on the release assets (`dotlink.exe` is the Windows file on disk). Re-run the same install command at any time to update; if the installed binary already matches the latest release, it is left unchanged.
+Both installers download the **latest published GitHub Release** by default, select the correct architecture internally, verify its SHA-256, and require the downloaded executable to identify itself as the requested dotlink version before replacement. The command you run is always simply **`dotlink`**; architecture suffixes exist only on the release assets (`dotlink.exe` is the Windows file on disk). Re-run the same install command at any time to update; if the installed binary already matches the latest release, it is left unchanged.
 
 Or build with Nix/Cargo; see **Build** below.
 
@@ -221,13 +221,15 @@ dotlink --http --oauth --http-bind=127.0.0.1:3000 \
 
 Never derive the OAuth issuer from proxy/Host headers; `--public-url` is the explicit trust boundary.
 
-Public ngrok ingress is OAuth-protected by default. The only way to intentionally expose it without application-layer authentication is the explicit one-run escape hatch:
+Public ngrok ingress is OAuth-protected by default. Direct non-loopback HTTP binds are also refused unless OAuth is enabled with an explicit HTTPS public origin. The only way to intentionally expose either form of public ingress without application-layer authentication is the explicit one-run escape hatch:
 
 ~~~bash
 dotlink --http --ngrok --allow-public-no-auth
+# or, for an intentionally unauthenticated LAN listener:
+dotlink --http --http-bind=0.0.0.0:3000 --allow-public-no-auth
 ~~~
 
-That mode exposes every MCP capability granted to the process to anyone who can reach the URL and is not recommended.
+That mode exposes every MCP capability granted to the process to anyone who can reach the endpoint and is not recommended.
 
 ## Use dotlink as a local sandboxed MCP server
 
@@ -430,7 +432,7 @@ dotlink oauth <COMMAND>         inspect/revoke OAuth clients and refresh grants
 --oauth                         protect local HTTP with OAuth
 --no-oauth                      disable local HTTP OAuth for this run
 --public-url=<HTTPS-ORIGIN>     canonical OAuth origin behind a reverse proxy
---allow-public-no-auth          intentionally disable ngrok OAuth for this run
+--allow-public-no-auth          intentionally allow externally reachable HTTP/ngrok without OAuth
 --ephemeral-url                 ephemeral local HTTP + ngrok paths
 --http-ephemeral-url[=BOOL]     override local HTTP path behavior
 --ngrok-ephemeral-url[=BOOL]    override ngrok path behavior
