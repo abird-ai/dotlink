@@ -15,6 +15,8 @@ use tokio::{process::Command, time::timeout};
 use url::Url;
 use zeroize::Zeroizing;
 
+use crate::oauth::{self, OAuthConfig};
+
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_MAX_SHELL_TIMEOUT_SECS: u64 = 120;
@@ -36,6 +38,8 @@ pub struct TransportConfig {
     #[serde(default)]
     pub ngrok: bool,
     #[serde(default)]
+    pub ngrok_domain: Option<String>,
+    #[serde(default)]
     pub ngrok_ephemeral_url: bool,
 }
 
@@ -48,6 +52,7 @@ impl Default for TransportConfig {
             http_bind: default_http_bind(),
             http_ephemeral_url: false,
             ngrok: false,
+            ngrok_domain: None,
             ngrok_ephemeral_url: false,
         }
     }
@@ -261,6 +266,9 @@ pub struct AppConfig {
     pub transports: TransportConfig,
 
     #[serde(default)]
+    pub oauth: OAuthConfig,
+
+    #[serde(default)]
     pub permissions: PermissionConfig,
 
     #[serde(default)]
@@ -310,6 +318,7 @@ pub enum ProfileBool {
     Ngrok,
     #[value(name = "ngrok-ephemeral-url", alias = "ngrok-ephemeral")]
     NgrokEphemeral,
+    Oauth,
     #[value(alias = "default-read")]
     DefaultAllow,
     Shell,
@@ -322,7 +331,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    9
+    10
 }
 
 fn default_true() -> bool {
@@ -335,6 +344,35 @@ fn default_base_url() -> String {
 
 fn default_http_bind() -> String {
     DEFAULT_HTTP_BIND.to_owned()
+}
+
+pub(crate) fn validate_ngrok_domain(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 253
+        || value.contains("://")
+        || value.contains('/')
+        || value.contains('?')
+        || value.contains('#')
+        || value.contains('@')
+        || value.contains(':')
+        || value.chars().any(char::is_whitespace)
+    {
+        bail!("ngrok domain must be a hostname only, without scheme, path, port, or credentials");
+    }
+
+    let url = Url::parse(&format!("https://{value}")).context("invalid ngrok domain")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("ngrok domain requires a hostname"))?;
+    if url.port().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("ngrok domain must be a hostname only");
+    }
+    Ok(host.to_ascii_lowercase())
 }
 
 fn default_shell_timeout() -> u64 {
@@ -353,6 +391,7 @@ fn default_app_config() -> AppConfig {
     AppConfig {
         version: config_version(),
         transports: TransportConfig::default(),
+        oauth: OAuthConfig::default(),
         permissions: PermissionConfig::default(),
         caches: Vec::new(),
         tunnel_id: None,
@@ -435,8 +474,74 @@ pub async fn load_or_setup(
         );
     }
 
-    let existing = load_profile_for_edit(profile)?;
-    interactive_setup(profile, color, existing).await
+    let mut reset_older_schema = false;
+    let existing = if force_setup {
+        let path = config_path(profile)?;
+        if path.exists() {
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let mut config: AppConfig = parse_jsonc(&text)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+
+            if config.version > config_version() {
+                bail!(
+                    "profile uses newer schema version {}; this dotlink supports version {}. Upgrade dotlink instead of overwriting the profile",
+                    config.version,
+                    config_version()
+                );
+            }
+            if config.version < config_version() {
+                println!();
+                println!(
+                    "{}",
+                    setup_style(
+                        color,
+                        "1;33",
+                        format!(
+                            "This profile uses schema v{}; dotlink now requires strict schema v{}.",
+                            config.version,
+                            config_version()
+                        )
+                    )
+                );
+                if !prompt_yes_no(
+                    &format!(
+                        "   {} ",
+                        setup_style(
+                            color,
+                            "33",
+                            "Replace this profile from scratch? Existing values will not be migrated. [y/N]:"
+                        )
+                    ),
+                    false,
+                )? {
+                    println!("Setup cancelled. No changes saved.");
+                    return Ok(None);
+                }
+                reset_older_schema = true;
+                None
+            } else {
+                validate_config_structure(&config)?;
+                config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
+                Some(config)
+            }
+        } else {
+            None
+        }
+    } else {
+        load_profile_for_edit(profile)?
+    };
+
+    let result = interactive_setup(profile, color, existing).await?;
+    if reset_older_schema && let Some(result) = result.as_ref() {
+        if !result.config.transports.openai {
+            remove_runtime_key_file(profile)?;
+        }
+        if !result.config.oauth.enabled && !result.config.transports.ngrok {
+            oauth::delete_profile_state(profile)?;
+        }
+    }
+    Ok(result)
 }
 
 fn secret_env_connection() -> Result<Option<(String, String)>> {
@@ -950,6 +1055,24 @@ async fn interactive_setup(
             current_transports.ngrok,
         )?;
         if transports.ngrok {
+            let current_domain = current_transports.ngrok_domain.clone();
+            let domain_hint = current_domain
+                .as_deref()
+                .unwrap_or("automatic / ephemeral hostname");
+            let entered = prompt_line(&format!(
+                "   {} ",
+                setup_style(
+                    color,
+                    "33",
+                    format!("Stable ngrok domain [{domain_hint}] (blank keep, '-' automatic):")
+                )
+            ))?;
+            transports.ngrok_domain = match entered.trim() {
+                "" => current_domain,
+                "-" | "auto" | "automatic" | "none" => None,
+                value => Some(validate_ngrok_domain(value)?),
+            };
+
             transports.ngrok_ephemeral_url = prompt_yes_no(
                 &format!(
                     "   {} ",
@@ -957,7 +1080,7 @@ async fn interactive_setup(
                         color,
                         "33",
                         format!(
-                            "Use an ephemeral ngrok MCP URL? {}:",
+                            "Use an ephemeral ngrok MCP path? {}:",
                             yes_no_hint(current_transports.ngrok_ephemeral_url)
                         )
                     )
@@ -965,12 +1088,116 @@ async fn interactive_setup(
                 current_transports.ngrok_ephemeral_url,
             )?;
         } else {
+            transports.ngrok_domain = None;
             transports.ngrok_ephemeral_url = false;
         }
     } else {
         transports.http_ephemeral_url = false;
         transports.ngrok = false;
+        transports.ngrok_domain = None;
         transports.ngrok_ephemeral_url = false;
+    }
+
+    let mut oauth_config = config.oauth.clone();
+    let mut owner_password_change = None;
+    if transports.http {
+        println!();
+        println!("   {}", setup_style(color, "1", "HTTP authentication"));
+
+        if transports.ngrok {
+            println!(
+                "   {}",
+                setup_style(
+                    color,
+                    "2",
+                    "Public ngrok access is OAuth-protected automatically."
+                )
+            );
+            oauth_config.enabled = prompt_yes_no(
+                &format!(
+                    "   {} ",
+                    setup_style(
+                        color,
+                        "33",
+                        format!(
+                            "Protect local HTTP with OAuth too? {}:",
+                            yes_no_hint(oauth_config.enabled)
+                        )
+                    )
+                ),
+                oauth_config.enabled,
+            )?;
+        } else {
+            oauth_config.enabled = prompt_yes_no(
+                &format!(
+                    "   {} ",
+                    setup_style(
+                        color,
+                        "33",
+                        format!(
+                            "Protect HTTP with OAuth? {}:",
+                            yes_no_hint(oauth_config.enabled)
+                        )
+                    )
+                ),
+                oauth_config.enabled,
+            )?;
+        }
+
+        if oauth_config.enabled {
+            let existing = oauth_config.public_url.clone().unwrap_or_default();
+            let hint = if existing.is_empty() {
+                "auto loopback".to_owned()
+            } else {
+                existing.clone()
+            };
+            let entered = prompt_line(&format!(
+                "   {} ",
+                setup_style(
+                    color,
+                    "33",
+                    format!("Local/reverse-proxy OAuth public origin [{hint}]:")
+                )
+            ))?;
+            if !entered.is_empty() {
+                oauth::validate_public_base_url(&entered)?;
+                oauth_config.public_url = Some(entered);
+            }
+        }
+
+        if oauth_config.enabled || transports.ngrok {
+            if oauth::owner_configured(profile)? {
+                println!(
+                    "   {}",
+                    setup_style(color, "2", "Owner credential: [existing credential]")
+                );
+                if prompt_yes_no(
+                    &format!(
+                        "   {} ",
+                        setup_style(color, "33", "Change owner password? [y/N]:")
+                    ),
+                    false,
+                )? {
+                    let password = prompt_oauth_owner_password()?;
+                    owner_password_change =
+                        Some(oauth::prepare_owner_password(profile, password.as_str())?);
+                }
+            } else {
+                println!(
+                    "   {}",
+                    setup_style(
+                        color,
+                        "2",
+                        "Set one owner password for OAuth authorization (minimum 12 characters)."
+                    )
+                );
+                let password = prompt_oauth_owner_password()?;
+                owner_password_change =
+                    Some(oauth::prepare_owner_password(profile, password.as_str())?);
+            }
+        }
+    } else {
+        oauth_config.enabled = false;
     }
 
     println!();
@@ -1073,6 +1300,7 @@ async fn interactive_setup(
 
     config.version = config_version();
     config.transports = transports;
+    config.oauth = oauth_config;
     config.permissions = permissions;
     config.caches = caches;
     config.tunnel_id = tunnel_id;
@@ -1080,7 +1308,19 @@ async fn interactive_setup(
     config.organization_id = organization_id;
 
     validate_config(&config)?;
-    save_config(&config, profile)?;
+    if let Some(change) = owner_password_change.as_ref() {
+        change.apply()?;
+    }
+    if let Err(error) = save_config(&config, profile) {
+        if let Some(change) = owner_password_change.as_ref()
+            && let Err(rollback_error) = change.rollback()
+        {
+            return Err(error).context(format!(
+                "profile save failed and OAuth owner-credential rollback also failed: {rollback_error:#}"
+            ));
+        }
+        return Err(error);
+    }
 
     println!();
     println!("{}", setup_style(color, "1;32", "✓ Setup complete"));
@@ -1144,15 +1384,28 @@ async fn interactive_setup(
                 "/mcp"
             }
         );
+        if config.oauth.enabled {
+            println!("  • Local HTTP OAuth: protected");
+        }
         if config.transports.ngrok {
+            let domain = config
+                .transports
+                .ngrok_domain
+                .as_deref()
+                .unwrap_or("automatic hostname");
             println!(
-                "  • ngrok: public HTTPS{}",
+                "  • ngrok: public HTTPS ({domain}){} + OAuth",
                 if config.transports.ngrok_ephemeral_url {
                     " + ephemeral MCP path"
                 } else {
                     ""
                 }
             );
+            if config.transports.ngrok_domain.is_none() || config.transports.ngrok_ephemeral_url {
+                println!(
+                    "    OAuth identity is not durable across URL changes; use a stable domain and stable /mcp path to avoid re-linking."
+                );
+            }
         }
     }
 
@@ -1438,7 +1691,11 @@ fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn atomic_write_private(path: &Path, contents: &[u8], harden_parent: bool) -> Result<()> {
+pub(crate) fn atomic_write_private(
+    path: &Path,
+    contents: &[u8],
+    harden_parent: bool,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("private file path has no parent"))?;
@@ -1738,11 +1995,15 @@ fn control_plane_paths(
 }
 
 fn protected_paths_for_config(_config: &AppConfig, profile: Option<&str>) -> Result<Vec<PathBuf>> {
-    control_plane_paths(
+    let mut protected = control_plane_paths(
         config_path(profile)?,
         dotlink_config_dir()?,
         config_parent_is_dotlink_owned(),
-    )
+    )?;
+    protected.push(oauth::state_dir()?);
+    protected.sort();
+    protected.dedup();
+    Ok(protected)
 }
 
 fn profile_target(name: &str) -> Result<Option<&str>> {
@@ -1826,6 +2087,9 @@ pub fn show_profile(name: &str) -> Result<String> {
     if has_key {
         output.push_str("// Runtime API key: [existing key]\n");
     }
+    if oauth::owner_configured(target)? {
+        output.push_str("// OAuth owner credential: [existing credential]\n");
+    }
     output.push_str(&serialize_jsonc(&config)?);
     Ok(output)
 }
@@ -1833,7 +2097,7 @@ pub fn show_profile(name: &str) -> Result<String> {
 pub async fn create_profile(name: &str, color: bool) -> Result<bool> {
     let target = profile_target(name)?;
     let path = config_path(target)?;
-    if path.exists() || credential_path(target)?.exists() {
+    if path.exists() || credential_path(target)?.exists() || oauth::state_path(target)?.exists() {
         bail!("profile {name:?} already exists");
     }
     if !io::stdin().is_terminal() {
@@ -1876,7 +2140,17 @@ fn delete_profile_artifacts(name: &str, config: &Path, key: &Path) -> Result<()>
 
 pub fn delete_profile(name: &str) -> Result<()> {
     let target = profile_target(name)?;
-    delete_profile_artifacts(name, &config_path(target)?, &credential_path(target)?)
+    let config = config_path(target)?;
+    let key = credential_path(target)?;
+    let oauth_state = oauth::state_path(target)?;
+
+    if !config.exists() && !key.exists() && !oauth_state.exists() {
+        bail!("profile {name:?} does not exist");
+    }
+    if config.exists() || key.exists() {
+        delete_profile_artifacts(name, &config, &key)?;
+    }
+    oauth::delete_profile_state(target)
 }
 
 fn rule_paths_mut(config: &mut AppConfig, allow: bool, kind: ProfileRuleKind) -> &mut Vec<PathBuf> {
@@ -1921,7 +2195,9 @@ fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: boo
             config.transports.http = false;
             config.transports.http_ephemeral_url = false;
             config.transports.ngrok = false;
+            config.transports.ngrok_domain = None;
             config.transports.ngrok_ephemeral_url = false;
+            config.oauth.enabled = false;
         }
         (ProfileBool::HttpEphemeral, true) => {
             config.transports.http = true;
@@ -1934,6 +2210,7 @@ fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: boo
         }
         (ProfileBool::Ngrok, false) => {
             config.transports.ngrok = false;
+            config.transports.ngrok_domain = None;
             config.transports.ngrok_ephemeral_url = false;
         }
         (ProfileBool::NgrokEphemeral, true) => {
@@ -1942,6 +2219,11 @@ fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: boo
             config.transports.ngrok_ephemeral_url = true;
         }
         (ProfileBool::NgrokEphemeral, false) => config.transports.ngrok_ephemeral_url = false,
+        (ProfileBool::Oauth, true) => {
+            config.transports.http = true;
+            config.oauth.enabled = true;
+        }
+        (ProfileBool::Oauth, false) => config.oauth.enabled = false,
         (ProfileBool::DefaultAllow, value) => config.permissions.default_allow = value,
         (ProfileBool::Shell, true) => config.permissions.allow_shell = true,
         (ProfileBool::Shell, false) => {
@@ -1964,7 +2246,12 @@ pub fn set_profile_bool(name: &str, setting: ProfileBool, enabled: bool) -> Resu
         && (config.tunnel_id.is_none() || config.runtime_api_key.trim().is_empty())
     {
         bail!(
-            "OpenAI is not fully configured for profile {name:?}; run `dotlink profile edit {name}` first"
+            "OpenAI is not fully configured for profile {name:?}; run dotlink profile edit {name} first"
+        );
+    }
+    if (config.oauth.enabled || config.transports.ngrok) && !oauth::owner_configured(target)? {
+        bail!(
+            "OAuth has no owner credential for profile {name:?}; run dotlink profile edit {name} first"
         );
     }
     validate_config(&config)?;
@@ -2059,6 +2346,18 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
     }
     if config.transports.ngrok_ephemeral_url && !config.transports.ngrok {
         bail!("transports.ngrok_ephemeral_url requires transports.ngrok");
+    }
+    if config.transports.ngrok_domain.is_some() && !config.transports.ngrok {
+        bail!("transports.ngrok_domain requires transports.ngrok");
+    }
+    if let Some(domain) = config.transports.ngrok_domain.as_deref() {
+        validate_ngrok_domain(domain)?;
+    }
+    if config.oauth.enabled && !config.transports.http {
+        bail!("oauth.enabled requires transports.http");
+    }
+    if let Some(public_url) = config.oauth.public_url.as_deref() {
+        oauth::validate_public_base_url(public_url)?;
     }
 
     let mut cache_kinds = std::collections::BTreeSet::new();
@@ -2179,6 +2478,23 @@ fn prompt_secret(prompt: &str) -> Result<String> {
     rpassword::prompt_password(prompt).context("failed to read secret from terminal")
 }
 
+fn prompt_oauth_owner_password() -> Result<Zeroizing<String>> {
+    loop {
+        let password = Zeroizing::new(prompt_secret("   Owner password: ")?);
+        if let Err(error) = oauth::validate_owner_password(password.as_str()) {
+            println!("   {error}");
+            continue;
+        }
+
+        let confirm = Zeroizing::new(prompt_secret("   Confirm owner password: ")?);
+        if password.as_str() != confirm.as_str() {
+            println!("   Passwords do not match.");
+            continue;
+        }
+        return Ok(password);
+    }
+}
+
 fn env_first(names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
         env::var(name)
@@ -2205,14 +2521,14 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_private_dir_permissions(path: &Path) -> Result<()> {
+pub(crate) fn set_private_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_dir_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn set_private_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2224,6 +2540,7 @@ mod tests {
         AppConfig {
             version: config_version(),
             transports: TransportConfig::default(),
+            oauth: OAuthConfig::default(),
             permissions: PermissionConfig::default(),
             caches: Vec::new(),
             tunnel_id: Some("tunnel_0123456789abcdef0123456789abcdef".to_owned()),
@@ -2398,6 +2715,36 @@ mod tests {
     }
 
     #[test]
+    fn ngrok_domain_validation_is_hostname_only() {
+        assert_eq!(
+            validate_ngrok_domain("My-Dotlink.Ngrok.App").unwrap(),
+            "my-dotlink.ngrok.app"
+        );
+        for invalid in [
+            "",
+            "https://example.ngrok.app",
+            "example.ngrok.app/path",
+            "example.ngrok.app:443",
+            "user@example.ngrok.app",
+            "example.ngrok.app?x=1",
+        ] {
+            assert!(validate_ngrok_domain(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn ngrok_domain_requires_ngrok() {
+        let mut config = example_config();
+        config.transports.openai = false;
+        config.runtime_api_key.clear();
+        config.tunnel_id = None;
+        config.transports.http = true;
+        config.transports.ngrok = false;
+        config.transports.ngrok_domain = Some("dotlink.ngrok.app".to_owned());
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
     fn profile_paths_are_predictable() {
         let base = Path::new("/tmp/dotlink/config.jsonc");
         assert_eq!(
@@ -2496,11 +2843,11 @@ mod tests {
     }
 
     #[test]
-    fn only_schema_v9_is_accepted() {
+    fn only_schema_v10_is_accepted() {
         let mut config = example_config();
-        config.version = 8;
+        config.version = 9;
         let error = validate_config(&config).unwrap_err();
-        assert!(error.to_string().contains("unsupported config version 8"));
+        assert!(error.to_string().contains("unsupported config version 9"));
 
         let missing =
             parse_jsonc::<AppConfig>(r#"{ "transports": { "openai": false }, "permissions": {} }"#);
@@ -2517,6 +2864,7 @@ mod tests {
             http_bind: "127.0.0.1:4321".to_owned(),
             http_ephemeral_url: true,
             ngrok: true,
+            ngrok_domain: Some("dotlink.example.ngrok.app".to_owned()),
             ngrok_ephemeral_url: true,
         };
         config.tunnel_id = None;
@@ -2528,6 +2876,10 @@ mod tests {
         assert_eq!(parsed.transports.http_bind, "127.0.0.1:4321");
         assert!(parsed.transports.http_ephemeral_url);
         assert!(parsed.transports.ngrok);
+        assert_eq!(
+            parsed.transports.ngrok_domain.as_deref(),
+            Some("dotlink.example.ngrok.app")
+        );
         assert!(parsed.transports.ngrok_ephemeral_url);
         validate_config(&parsed).unwrap();
     }
@@ -2588,6 +2940,7 @@ mod tests {
         assert!(config.transports.ngrok);
         assert!(config.transports.ngrok_ephemeral_url);
         assert!(config.transports.http_ephemeral_url);
+        assert!(!config.oauth.enabled);
         assert!(config.permissions.allow_shell);
         assert!(config.permissions.allow_network);
 
@@ -2596,6 +2949,14 @@ mod tests {
         assert!(!config.transports.ngrok);
         assert!(!config.transports.ngrok_ephemeral_url);
         assert!(!config.transports.http_ephemeral_url);
+        assert!(!config.oauth.enabled);
+
+        config.transports.http = true;
+        config.transports.ngrok = true;
+        config.oauth.enabled = true;
+        apply_profile_bool(&mut config, ProfileBool::Oauth, false).unwrap();
+        assert!(!config.oauth.enabled);
+        assert!(config.transports.ngrok);
 
         apply_profile_bool(&mut config, ProfileBool::Shell, true).unwrap();
         apply_profile_bool(&mut config, ProfileBool::Network, true).unwrap();

@@ -39,7 +39,7 @@ No transport owns filesystem policy.
 
 ## Profiles and persisted defaults
 
-The default config is ~/.config/abird/dotlink/config.jsonc. Named profiles use config.<profile>.jsonc and are selected with -p/--profile. Setup can target the same profile with -S/--setup -p <name>. Schema v9 JSONC supports line/block comments and trailing commas.
+The default config is `~/.config/abird/dotlink/config.jsonc`. Named profiles use `config.<profile>.jsonc` and are selected with `-p/--profile`. Setup can target the same profile with `-S/--setup -p <name>`. Schema v10 JSONC supports line/block comments and trailing commas. Normal startup rejects incompatible schemas; forced setup may replace an older profile from scratch after explicit confirmation.
 
 Each profile persists transport behavior plus the local permission model:
 
@@ -60,8 +60,14 @@ transports.http
 transports.http_bind
 transports.http_ephemeral_url
 transports.ngrok
+transports.ngrok_domain
 transports.ngrok_ephemeral_url
+
+oauth.enabled
+oauth.public_url
 ~~~
+
+OAuth secrets/grants are deliberately not stored in JSONC. Profile-specific OAuth state lives under the Abird XDG state namespace (`$XDG_STATE_HOME/abird/dotlink/oauth[.<profile>].json`), while OpenAI Runtime keys remain under the Abird XDG config namespace. Both are protected control-plane paths.
 
 The process launch directory is the internal relative-path base. It is readable by default when `permissions.default_allow=true`; `--no-default-allow` removes that implicit grant for one run. Relative profile/CLI paths resolve from the launch directory. `allow_rw: ["."]` means rw on the launch directory; `allow_rw: ["/"]` is unrestricted filesystem read+write.
 
@@ -73,6 +79,10 @@ Every transport enabled in the selected profile starts automatically. Runtime fl
 --stdio / --no-stdio
 --http  / --no-http
 --ngrok / --no-ngrok
+--ngrok-domain / --no-ngrok-domain
+--oauth / --no-oauth
+--public-url
+--allow-public-no-auth
 ~~~
 
 `--ngrok` modifies the HTTP transport; it is not a fourth MCP transport. HTTP bind and ephemeral-path flags override persisted HTTP/ngrok settings without requiring `--http` again when HTTP is already enabled in the profile.
@@ -119,7 +129,42 @@ Runtime override:
 --http-bind=<ADDR>
 ~~~
 
-HTTP uses LocalSessionManager for normal Streamable HTTP sessions.
+HTTP uses `LocalSessionManager` for normal Streamable HTTP sessions.
+
+When OAuth is enabled for a route, the Axum topology is deliberately split:
+
+~~~text
+public OAuth routes
+  /.well-known/oauth-protected-resource
+  /.well-known/oauth-authorization-server
+  /oauth/authorize
+  /oauth/token
+  /oauth/register
+  /oauth/revoke
+
+protected MCP subrouter
+  bearer middleware
+    -> /mcp[/<ephemeral>]
+      -> rmcp StreamableHttpService
+        -> LocalMachine
+~~~
+
+Bearer validation happens **before** rmcp receives the request. OAuth authenticates a remote caller; the existing `LocalMachine` permission policy still determines what that authenticated caller may actually do.
+
+`oauth.enabled` controls local/reverse-proxied HTTP only. A non-loopback OAuth listener requires an explicit canonical `--public-url`; issuer/resource identity is never inferred from request headers.
+
+The embedded OAuth server is single-owner and uses:
+
+- authorization code + mandatory PKCE S256;
+- Protected Resource Metadata + Authorization Server Metadata;
+- exact resource/issuer binding;
+- CIMD client metadata with SSRF-resistant HTTPS fetching;
+- DCR fallback;
+- opaque in-memory access tokens;
+- rotating refresh tokens persisted only as hashes;
+- an Argon2id owner-password hash.
+
+Unauthenticated DCR registrations stay bounded/in-memory until successful owner consent; only approved clients are persisted.
 
 ## Independent ephemeral HTTP routes
 
@@ -140,16 +185,22 @@ Each ephemeral path is generated independently on process start.
 
 ## ngrok
 
-When --http --ngrok is selected:
+When `--http --ngrok` is selected:
 
-1. the local HTTP MCP listener is bound first;
-2. the ngrok Rust SDK opens a public HTTP endpoint;
-3. ngrok forwards that endpoint to the local HTTP listener;
-4. dotlink prints the public URL with /mcp appended.
+1. the normal local HTTP listener is bound;
+2. a second loopback-only backend listener is created for ngrok;
+3. the ngrok Rust SDK opens a public HTTPS endpoint, optionally requesting `transports.ngrok_domain`;
+4. dotlink verifies that a requested stable domain matches the hostname ngrok actually returned;
+5. a separate OAuth server instance is bound to the exact public issuer/resource URL;
+6. ngrok forwards to its private backend and dotlink prints the public MCP URL.
 
-The public URL speaks ordinary MCP Streamable HTTP. Clients connect directly to it.
+Public ngrok is OAuth-protected automatically, even when local HTTP OAuth is disabled. Only the explicit one-run `--allow-public-no-auth` flag suppresses that protection.
 
-ngrok uses NGROK_AUTHTOKEN through the SDK's authtoken-from-environment flow.
+The OAuth runtime is shared across the local/public HTTP servers for the same dotlink process, but each `Server` instance binds tokens/grants to its own exact issuer/resource. This prevents a token issued for local HTTP from being replayed against the public ngrok resource or vice versa.
+
+For durable remote connectors, both the ngrok hostname and MCP path must stay stable. An automatic ngrok hostname or `ngrok_ephemeral_url` changes OAuth identity and requires re-linking.
+
+ngrok uses `NGROK_AUTHTOKEN` through the SDK's authtoken-from-environment flow.
 
 ## OpenAI Secure MCP Tunnel
 

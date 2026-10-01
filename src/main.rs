@@ -1,6 +1,7 @@
 mod controls;
 mod logging;
 mod mcp;
+mod oauth;
 mod setup;
 mod transports;
 
@@ -22,7 +23,7 @@ use crate::{
     setup::{
         PermissionConfig, ProfileBool, ProfileRuleKind, TransportConfig, create_profile,
         delete_profile, edit_profile, list_profiles, load_or_setup, mutate_profile_rule,
-        set_profile_bool, show_profile,
+        set_profile_bool, show_profile, validate_ngrok_domain,
     },
     transports::ActiveTransports,
 };
@@ -50,6 +51,12 @@ struct Args {
             "no_http",
             "ngrok",
             "no_ngrok",
+            "ngrok_domain",
+            "no_ngrok_domain",
+            "oauth",
+            "no_oauth",
+            "public_url",
+            "allow_public_no_auth",
             "ephemeral_url",
             "http_ephemeral_url",
             "ngrok_ephemeral_url"
@@ -88,6 +95,30 @@ struct Args {
     /// Disable ngrok even if enabled in the selected profile.
     #[arg(long, conflicts_with = "ngrok")]
     no_ngrok: bool,
+
+    /// Override the ngrok domain for this run. The domain must already be available to the ngrok account.
+    #[arg(long, value_name = "DOMAIN", conflicts_with_all = ["no_ngrok", "no_ngrok_domain"])]
+    ngrok_domain: Option<String>,
+
+    /// Ignore a persisted ngrok domain for this run and let ngrok choose one.
+    #[arg(long, conflicts_with = "ngrok_domain")]
+    no_ngrok_domain: bool,
+
+    /// Protect local/reverse-proxied HTTP with embedded OAuth. Public ngrok is protected independently.
+    #[arg(long, conflicts_with = "no_oauth")]
+    oauth: bool,
+
+    /// Disable profile OAuth for local HTTP. Public ngrok still requires OAuth.
+    #[arg(long, conflicts_with = "oauth")]
+    no_oauth: bool,
+
+    /// Canonical public OAuth origin for reverse-proxied HTTP (for example https://mcp.example.com).
+    #[arg(long, value_name = "URL")]
+    public_url: Option<String>,
+
+    /// Expose ngrok without OAuth for this run. Local HTTP may still use --oauth. This is intentionally unsafe.
+    #[arg(long)]
+    allow_public_no_auth: bool,
 
     /// Use fresh hard-to-guess URL paths for both local HTTP and ngrok.
     #[arg(long)]
@@ -234,6 +265,36 @@ enum Command {
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
+    },
+    /// Inspect or revoke persisted OAuth clients/grants.
+    Oauth {
+        #[command(subcommand)]
+        command: OAuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OAuthCommand {
+    /// Show OAuth state for a profile.
+    Status {
+        #[arg(short = 'p', long, default_value = "default")]
+        profile: String,
+    },
+    /// List dynamically registered OAuth clients.
+    Clients {
+        #[arg(short = 'p', long, default_value = "default")]
+        profile: String,
+    },
+    /// Revoke a DCR client and its persisted refresh grants.
+    Revoke {
+        client_id: String,
+        #[arg(short = 'p', long, default_value = "default")]
+        profile: String,
+    },
+    /// Revoke all persisted refresh grants for a profile.
+    RevokeAll {
+        #[arg(short = 'p', long, default_value = "default")]
+        profile: String,
     },
 }
 
@@ -591,8 +652,46 @@ async fn run_command(command: &Command, color: bool) -> Result<()> {
                 println!("Profile {name:?} updated.");
             }
         },
+        Command::Oauth { command } => match command {
+            OAuthCommand::Status { profile } => {
+                print!("{}", oauth::status(oauth_profile_target(profile))?);
+            }
+            OAuthCommand::Clients { profile } => {
+                let clients = oauth::clients(oauth_profile_target(profile))?;
+                if clients.is_empty() {
+                    println!("No dynamically registered OAuth clients.");
+                } else {
+                    for client in clients {
+                        println!("{client}");
+                    }
+                }
+            }
+            OAuthCommand::Revoke { profile, client_id } => {
+                if oauth::revoke_client(oauth_profile_target(profile), client_id)? {
+                    println!("OAuth client {client_id:?} revoked.");
+                    println!(
+                        "Restart dotlink to invalidate any short-lived access token immediately."
+                    );
+                } else {
+                    bail!("OAuth client {client_id:?} was not found");
+                }
+            }
+            OAuthCommand::RevokeAll { profile } => {
+                let count = oauth::revoke_all(oauth_profile_target(profile))?;
+                println!("Revoked {count} persisted OAuth refresh grant(s).");
+                println!("Restart dotlink to invalidate any short-lived access token immediately.");
+            }
+        },
     }
     Ok(())
+}
+
+fn oauth_profile_target(name: &str) -> Option<&str> {
+    if name.eq_ignore_ascii_case("default") {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 async fn run_runtime(
@@ -622,6 +721,12 @@ async fn run_runtime(
     }
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
+    let http_auth = resolve_http_auth(args, &setup.config.oauth, &local_transports)?;
+    let oauth_runtime = if http_auth.local_oauth || http_auth.ngrok_oauth {
+        Some(oauth::Runtime::load(args.profile.as_deref())?)
+    } else {
+        None
+    };
 
     let http_bind = if local_transports.http {
         Some(match args.http_bind {
@@ -661,8 +766,14 @@ async fn run_runtime(
         http: http_bind.map(|bind| transports::http::Config {
             bind,
             ngrok: local_transports.ngrok,
+            ngrok_domain: local_transports.ngrok_domain.clone(),
             http_ephemeral_url: local_transports.http_ephemeral_url,
             ngrok_ephemeral_url: local_transports.ngrok_ephemeral_url,
+            oauth: oauth_runtime,
+            local_oauth: http_auth.local_oauth,
+            ngrok_oauth: http_auth.ngrok_oauth,
+            oauth_public_url: http_auth.public_url,
+            public_no_auth: http_auth.public_no_auth,
             log: log.clone(),
         }),
     };
@@ -800,11 +911,12 @@ async fn stop_runtime_transports(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectiveLocalTransports {
     stdio: bool,
     http: bool,
     ngrok: bool,
+    ngrok_domain: Option<String>,
     http_ephemeral_url: bool,
     ngrok_ephemeral_url: bool,
 }
@@ -819,6 +931,12 @@ fn resolve_local_transports(
     let http_options_requested = args.http_bind.is_some()
         || args.ngrok
         || args.no_ngrok
+        || args.ngrok_domain.is_some()
+        || args.no_ngrok_domain
+        || args.oauth
+        || args.no_oauth
+        || args.public_url.is_some()
+        || args.allow_public_no_auth
         || args.ephemeral_url
         || args.http_ephemeral_url.is_some()
         || args.ngrok_ephemeral_url.is_some();
@@ -832,6 +950,21 @@ fn resolve_local_transports(
     if args.ngrok_ephemeral_url.is_some() && !ngrok {
         bail!("--ngrok-ephemeral-url requires ngrok to be enabled in the profile or with --ngrok");
     }
+    if (args.ngrok_domain.is_some() || args.no_ngrok_domain) && !ngrok {
+        bail!("ngrok domain overrides require ngrok to be enabled in the profile or with --ngrok");
+    }
+
+    let ngrok_domain = if ngrok {
+        if args.no_ngrok_domain {
+            None
+        } else if let Some(domain) = args.ngrok_domain.as_deref() {
+            Some(validate_ngrok_domain(domain)?)
+        } else {
+            defaults.ngrok_domain.clone()
+        }
+    } else {
+        None
+    };
 
     let (http_ephemeral_url, ngrok_ephemeral_url) = ephemeral_url_policy(args, defaults);
 
@@ -839,8 +972,64 @@ fn resolve_local_transports(
         stdio,
         http,
         ngrok,
+        ngrok_domain,
         http_ephemeral_url,
         ngrok_ephemeral_url,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveHttpAuth {
+    local_oauth: bool,
+    ngrok_oauth: bool,
+    public_url: Option<url::Url>,
+    public_no_auth: bool,
+}
+
+fn resolve_http_auth(
+    args: &Args,
+    defaults: &oauth::OAuthConfig,
+    transports: &EffectiveLocalTransports,
+) -> Result<EffectiveHttpAuth> {
+    if !transports.http {
+        if args.oauth || args.no_oauth || args.public_url.is_some() || args.allow_public_no_auth {
+            bail!("OAuth/public HTTP options require the HTTP transport");
+        }
+        return Ok(EffectiveHttpAuth {
+            local_oauth: false,
+            ngrok_oauth: false,
+            public_url: None,
+            public_no_auth: false,
+        });
+    }
+
+    if args.allow_public_no_auth && !transports.ngrok {
+        bail!("--allow-public-no-auth is valid only when ngrok is enabled");
+    }
+
+    let local_oauth = (defaults.enabled || args.oauth) && !args.no_oauth;
+    let public_no_auth = transports.ngrok && args.allow_public_no_auth;
+    let ngrok_oauth = transports.ngrok && !public_no_auth;
+
+    if args.public_url.is_some() && !local_oauth {
+        bail!("--public-url requires local HTTP OAuth to be enabled");
+    }
+
+    let public_url = if local_oauth {
+        args.public_url
+            .as_deref()
+            .or(defaults.public_url.as_deref())
+            .map(oauth::validate_public_base_url)
+            .transpose()?
+    } else {
+        None
+    };
+
+    Ok(EffectiveHttpAuth {
+        local_oauth,
+        ngrok_oauth,
+        public_url,
+        public_no_auth,
     })
 }
 
@@ -883,16 +1072,29 @@ fn print_banner(
         eprintln!("• Tunnel     {}", openai.tunnel_id);
     }
     if let Some(http) = &transports.http {
-        if http.http_ephemeral_url {
+        if http.bind.port() == 0 {
+            eprintln!("• HTTP       dynamic port; exact URL will be printed after bind");
+        } else if http.http_ephemeral_url {
             eprintln!("• HTTP       ephemeral URL; exact path will be printed after bind");
         } else {
             eprintln!("• HTTP       http://{}/mcp", http.bind);
         }
+        if http.local_oauth {
+            eprintln!("• OAuth      local HTTP protected");
+        } else if !http.bind.ip().is_loopback() {
+            eprintln!("• OAuth      WARNING: non-loopback HTTP is unauthenticated");
+        }
         if http.ngrok {
+            let domain = http.ngrok_domain.as_deref().unwrap_or("automatic hostname");
             if http.ngrok_ephemeral_url {
-                eprintln!("• ngrok      enabled with independent ephemeral MCP path");
+                eprintln!("• ngrok      {domain}; OAuth resource path is ephemeral");
             } else {
-                eprintln!("• ngrok      enabled; public URL will be printed after connection");
+                eprintln!("• ngrok      {domain}; public URL will be printed after connection");
+            }
+            if http.public_no_auth {
+                eprintln!("• OAuth      WARNING: public ngrok authentication disabled");
+            } else if http.ngrok_oauth {
+                eprintln!("• OAuth      public ngrok protected");
             }
         }
     }
@@ -1165,6 +1367,146 @@ mod tests {
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(effective.stdio);
         assert!(effective.http);
+    }
+
+    #[test]
+    fn public_ngrok_is_oauth_protected_by_default() {
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            ..TransportConfig::default()
+        };
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        assert!(!auth.local_oauth);
+        assert!(auth.ngrok_oauth);
+        assert!(!auth.public_no_auth);
+    }
+
+    #[test]
+    fn public_ngrok_requires_explicit_unsafe_opt_out() {
+        let args = Args::try_parse_from(["dotlink", "--allow-public-no-auth"]).unwrap();
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            ..TransportConfig::default()
+        };
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        assert!(!auth.ngrok_oauth);
+        assert!(auth.public_no_auth);
+    }
+
+    #[test]
+    fn local_oauth_can_coexist_with_public_no_auth_override() {
+        let args = Args::try_parse_from(["dotlink", "--oauth", "--allow-public-no-auth"]).unwrap();
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            ..TransportConfig::default()
+        };
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        assert!(auth.local_oauth);
+        assert!(!auth.ngrok_oauth);
+        assert!(auth.public_no_auth);
+    }
+
+    #[test]
+    fn no_oauth_only_disables_local_http_auth() {
+        let args = Args::try_parse_from(["dotlink", "--no-oauth"]).unwrap();
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            ..TransportConfig::default()
+        };
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig {
+                enabled: true,
+                public_url: None,
+            },
+            &transports,
+        )
+        .unwrap();
+        assert!(!auth.local_oauth);
+        assert!(auth.ngrok_oauth);
+    }
+
+    #[test]
+    fn public_url_requires_local_oauth() {
+        let args = Args::try_parse_from([
+            "dotlink",
+            "--http",
+            "--no-oauth",
+            "--public-url=https://mcp.example.com",
+        ])
+        .unwrap();
+        let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
+        assert!(resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).is_err());
+
+        let args = Args::try_parse_from([
+            "dotlink",
+            "--http",
+            "--oauth",
+            "--public-url=https://mcp.example.com",
+        ])
+        .unwrap();
+        let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
+        let auth = resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports).unwrap();
+        assert!(auth.local_oauth);
+        assert_eq!(
+            auth.public_url.unwrap().as_str(),
+            "https://mcp.example.com/"
+        );
+    }
+
+    #[test]
+    fn ngrok_domain_uses_profile_or_cli_override() {
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ngrok: true,
+            ngrok_domain: Some("profile.ngrok.app".to_owned()),
+            ..TransportConfig::default()
+        };
+
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        assert_eq!(
+            transports.ngrok_domain.as_deref(),
+            Some("profile.ngrok.app")
+        );
+
+        let args = Args::try_parse_from(["dotlink", "--ngrok-domain=CLI.NGROK.APP"]).unwrap();
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        assert_eq!(transports.ngrok_domain.as_deref(), Some("cli.ngrok.app"));
+
+        let args = Args::try_parse_from(["dotlink", "--no-ngrok-domain"]).unwrap();
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        assert!(transports.ngrok_domain.is_none());
+    }
+
+    #[test]
+    fn ngrok_domain_override_requires_effective_ngrok() {
+        let args =
+            Args::try_parse_from(["dotlink", "--http", "--ngrok-domain=x.ngrok.app"]).unwrap();
+        assert!(
+            resolve_local_transports(
+                &args,
+                &TransportConfig {
+                    openai: false,
+                    ..TransportConfig::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Bump dotlink to 0.6.0 and strict profile schema v10 for embedded HTTP OAuth and stable ngrok-domain configuration; normal startup rejects incompatible schemas, while `--setup` can replace an older profile from scratch after explicit confirmation.
+- Add a single-owner embedded OAuth 2.1 authorization/resource server for Streamable HTTP: Protected Resource Metadata, Authorization Server Metadata, authorization code + mandatory PKCE S256, exact resource/issuer binding, RFC 9207 `iss`, CIMD with SSRF-resistant fetching, DCR fallback, revocation, rotating refresh tokens, and short-lived opaque access tokens.
+- Protect public ngrok ingress with OAuth by default, independently of local HTTP OAuth; add stable `--ngrok-domain`, explicit reverse-proxy `--public-url`, local `--oauth/--no-oauth`, and the intentionally unsafe one-run `--allow-public-no-auth` escape hatch.
+- Persist only an Argon2id owner-password hash, approved DCR clients, and hashed refresh grants under the private Abird XDG state directory; keep access tokens/authorization codes in memory and hold unauthenticated DCR registrations in bounded memory until owner approval.
+- Add `dotlink oauth status/clients/revoke/revoke-all`, transactional hidden owner-credential setup, bounded OAuth state, consent-page client/redirect/resource review, and end-to-end OAuth/MCP regression coverage.
+
 - Add a single-host Nix release graph: x86_64 Linux now cross-builds static Linux x86_64/ARM64, Windows x86_64/ARM64, and macOS ARM64, aggregated by `nix build .#release-all`.
 - Keep the release surface OS-level only: generic static Linux x86_64/ARM64 artifacts, Windows x86_64/ARM64, and macOS ARM64; Windows ARM64 uses pinned LLVM-MinGW/UCRT and macOS ARM64 uses pinned Apple SDK 14.4 + clang/ld64.lld.
 - Add a minimal GitHub Actions workflow that installs Nix and builds `release-all`; normal runs keep a CI artifact, while `v*` tags create/update a GitHub Release with each binary and checksum sidecar uploaded as an individual asset.

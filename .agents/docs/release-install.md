@@ -105,8 +105,8 @@ The helper enables `nix-command` and `flakes` explicitly and delegates all targe
 Push a version tag that matches the built `VERSION` exactly:
 
 ```bash
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 The `Build binaries` workflow rebuilds `release-all`, verifies every SHA-256 sidecar, checks the Linux x86_64 binary, and refuses to publish if the tag does not equal `v$(cat VERSION)`.

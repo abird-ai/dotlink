@@ -14,7 +14,7 @@ and the launch directory is the only implicit readable directory. `--no-default-
 
 ## Profiles and permission precedence
 
-Profiles persist `default_allow`, path grants/denies, shell/network policy, and transport/HTTP/ngrok defaults. Named profiles use config.<profile>.jsonc; the default uses config.jsonc. Schema v9 JSONC is the only supported profile format.
+Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v10 JSONC is the only supported profile format. Normal startup rejects any other schema; `--setup` may replace an older profile from scratch only after explicit confirmation.
 
 Runtime allow rules are additive. Denies always take precedence over profile defaults, ordinary allows, and developer-cache grants.
 
@@ -75,9 +75,13 @@ HTTP defaults to loopback:
 127.0.0.1:3000
 ~~~
 
-Changing --http-bind to a non-loopback address can expose the MCP server to other machines on the network.
+Changing `--http-bind` to a non-loopback address can expose the MCP server to other machines on the network.
 
-The HTTP transport does not add application-layer authentication by itself.
+Loopback HTTP is unauthenticated by default. `--oauth` (or the persisted `oauth.enabled` setting) protects local/reverse-proxied HTTP with dotlink's embedded single-owner OAuth server.
+
+For OAuth behind a reverse proxy, `--public-url=https://...` supplies the canonical external origin. dotlink never derives OAuth issuer/resource identity from Host, Forwarded, or X-Forwarded-* headers. If OAuth is enabled on a non-loopback bind without an explicit public URL, startup fails rather than guessing.
+
+Local OAuth and public-ngrok OAuth are intentionally independent. `--no-oauth` disables only local/reverse-proxied HTTP OAuth; it does not weaken an active public ngrok endpoint.
 
 ### Ephemeral URL paths
 
@@ -91,15 +95,51 @@ The generated path is approximately 244 bits of randomness and is intended to ma
 
 ### ngrok
 
---ngrok creates a public HTTPS endpoint for the configured HTTP MCP server.
+`--ngrok` creates a public HTTPS endpoint for the configured HTTP MCP server. Public ngrok ingress is **OAuth-protected by default**, independently of whether local HTTP OAuth is enabled.
 
-That endpoint exposes the same MCP tools and filesystem/shell permissions as the local server.
+The ngrok SDK credential is read from `NGROK_AUTHTOKEN`. It authenticates dotlink to ngrok; caller authentication is provided separately by dotlink OAuth.
 
-Anyone who can reach an unprotected public endpoint may be able to exercise those permissions.
+For durable OAuth, configure a reserved/stable ngrok hostname with `--ngrok-domain=<DOMAIN>` (or setup) and keep the stable `/mcp` path. OAuth access/refresh grants are bound to the exact issuer and resource URL, so changing the ngrok hostname or using an ephemeral MCP path requires the remote client to reconnect.
 
-Use ngrok access controls when appropriate and grant only the minimum abird filesystem/shell permissions required.
+`--allow-public-no-auth` is the only runtime escape hatch that disables OAuth on public ngrok. It is intentionally explicit and should be treated as full exposure of every MCP capability granted to that process.
 
-The ngrok SDK credential is read from NGROK_AUTHTOKEN. It authenticates dotlink to ngrok; it is not, by itself, authentication for MCP callers.
+The ngrok backend remains a separate loopback-only listener from the local HTTP listener, so local and public MCP path/auth policies cannot accidentally share a route.
+
+### Embedded OAuth
+
+dotlink's HTTP OAuth mode is intentionally single-owner rather than a general identity provider.
+
+Protocol/security properties:
+
+- OAuth authorization-code flow with mandatory PKCE S256;
+- Protected Resource Metadata and OAuth Authorization Server Metadata discovery;
+- exact `resource` binding on authorization, token exchange, refresh, and bearer validation;
+- RFC 9207 `iss` on authorization responses;
+- CIMD client metadata with HTTPS-only fetches, redirects disabled, public-IP/DNS checks, response-size limits, and DNS pinning to reduce SSRF/rebinding risk;
+- DCR fallback for clients that still require dynamic registration;
+- HTTPS redirect URIs, with loopback HTTP allowed for native/local callbacks;
+- short-lived opaque access tokens kept only in memory;
+- rotating opaque refresh tokens persisted only as SHA-256 hashes;
+- one-time authorization codes held only in memory;
+- owner password persisted only as an Argon2id hash;
+- bounded pending registrations, authorization requests/codes, access tokens, refresh grants, and DCR clients;
+- login failure throttling;
+- no JWT signing key or external auth service.
+
+Unauthenticated DCR registrations are bounded and memory-only. A DCR client is persisted only after the owner successfully approves it. Approved DCR clients and hashed refresh grants live in the profile-specific OAuth state file.
+
+OAuth state lives under the Abird XDG state namespace:
+
+~~~text
+$XDG_STATE_HOME/abird/dotlink/oauth.json
+$XDG_STATE_HOME/abird/dotlink/oauth.<profile>.json
+~~~
+
+with the usual `~/.local/state/abird/dotlink` fallback on Unix. On Unix the directory is mode 0700 and state files are mode 0600. The state directory is part of dotlink's protected control-plane paths, so MCP filesystem tools and the normal sandboxed shell cannot read or modify it.
+
+`dotlink oauth status/clients/revoke/revoke-all` provides the management surface. Revoking a refresh grant prevents future refresh immediately. Access tokens are short-lived/in-memory; restart dotlink (or `Ctrl+R`) when immediate invalidation of all outstanding access tokens is required.
+
+The embedded authorization page uses no external scripts/assets and sends restrictive CSP, frame, referrer, cache, and content-type headers. It shows the client ID, redirect URI, resource, and requested scope before owner approval.
 
 ## OpenAI credentials
 
@@ -138,7 +178,7 @@ The sandbox:
 - mounts effective read+write grants read-write;
 - does not expose purely write-only host grants;
 - masks read-denied paths and rebinds write-denied readable subtrees read-only;
-- masks dotlink control-plane state: the active JSONC config and the owned Runtime-key directory;
+- masks dotlink control-plane state: the active JSONC config, owned Runtime-key directory, and OAuth state directory;
 - uses an empty temporary home, with only explicitly approved developer caches mounted back into package-manager-specific subdirectories;
 - mounts required system runtime paths read-only;
 - on NixOS, mounts the standard Nix store/profile symlink graph read-only (/nix/store, /run/current-system, /etc/profiles, /nix/var/nix/profiles, and ~/.nix-profile when present) without mounting the whole home directory;
@@ -204,6 +244,7 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - text/binary reads and writes are bounded;
 - shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants);
 - HTTP and transport lifecycles share cancellation;
+- OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded;
 - recovery teardown waits at most 5 seconds before aborting unresponsive peer transport tasks;
 - ngrok forwarding terminates with the HTTP transport/process lifecycle.
 
@@ -233,10 +274,12 @@ Local HTTP:
 dotlink --http
 ~~~
 
-Public HTTP through ngrok:
+Public HTTP through ngrok (OAuth-protected automatically):
 
 ~~~bash
-dotlink --http --ngrok
+dotlink --http --ngrok --ngrok-domain=my-dotlink.ngrok.app
 ~~~
+
+Use a stable hostname and stable `/mcp` path for a durable remote OAuth connection. Use `--allow-public-no-auth` only when intentionally exposing the granted MCP surface without caller authentication.
 
 Use --allow-all --no-sandbox only when unrestricted host access is explicitly intended.

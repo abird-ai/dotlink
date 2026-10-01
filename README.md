@@ -83,7 +83,7 @@ Default runs are quiet. Add `-v` to see tool activity:
 ~~~text
 $ dotlink -v -p aw
 
-abird dotlink 0.5.0
+abird dotlink 0.6.0
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
@@ -151,58 +151,83 @@ Detailed reference: `docs/CHATGPT_PLUGIN.md`.
 
 ## Connect dotlink to Claude.ai
 
-Claude.ai custom connectors use **remote MCP**: Claude connects from Anthropic's cloud, not from your local machine. That means `http://127.0.0.1:3000/mcp` will not work directly with claude.ai; expose dotlink through a public HTTPS endpoint such as ngrok.
+Claude.ai custom connectors connect from Anthropic's cloud, so a loopback URL cannot be used directly. dotlink can publish its Streamable HTTP server through ngrok and **automatically protects the public endpoint with OAuth**.
 
-### 1. Start a public Streamable HTTP MCP endpoint
+### 1. Configure HTTP + ngrok
 
-Set your ngrok token, then run:
+Run setup, select **HTTP**, then enable the public ngrok endpoint:
+
+~~~bash
+dotlink --setup
+~~~
+
+Setup asks for one **owner password** the first time OAuth is needed. The password itself is never stored; dotlink persists only an Argon2id hash in its private state directory.
+
+Set your ngrok account token and start dotlink:
 
 ~~~bash
 export NGROK_AUTHTOKEN='...'
-dotlink --http --ngrok --ngrok-ephemeral-url
+dotlink
 ~~~
 
-Add whatever local permissions you actually want Claude to have, for example:
+You can also add HTTP/ngrok for one run:
 
 ~~~bash
-dotlink --http --ngrok --ngrok-ephemeral-url \
-  --allow-rw --allow-shell
+dotlink --http --ngrok
 ~~~
 
-dotlink prints a URL similar to:
+dotlink prints the public MCP resource and OAuth issuer:
 
 ~~~text
-✓ ngrok MCP: https://example.ngrok.app/mcp/<ephemeral-token>
+✓ ngrok MCP: https://my-dotlink.ngrok.app/mcp
+✓ OAuth: https://my-dotlink.ngrok.app (resource https://my-dotlink.ngrok.app/mcp)
 ~~~
+
+For a durable connector, reserve an ngrok domain and persist it during setup or use:
+
+~~~bash
+dotlink --http --ngrok --ngrok-domain=my-dotlink.ngrok.app
+~~~
+
+Keep the normal stable `/mcp` path for durable OAuth. An automatic ngrok hostname or `--ngrok-ephemeral-url` changes the OAuth resource identity when the URL changes, so the remote client must be re-linked.
 
 ### 2. Add it to Claude.ai
 
-For individual Claude plans:
-
 1. Open **Customize → Connectors**.
-2. Select **+**.
-3. Choose **Add custom connector**.
-4. Give it a name such as **abird dotlink**.
-5. Paste the ngrok MCP URL printed by dotlink.
-6. Add the connector.
+2. Select **+ → Add custom connector**.
+3. Name it **abird dotlink**.
+4. Paste the printed ngrok MCP URL.
+5. Connect it.
+6. When OAuth opens, review the client ID, redirect URI, resource, and scope, then enter your dotlink owner password and approve access.
 
-For Team/Enterprise organizations, an owner may need to register the custom connector under the organization's connector settings first; members can then connect and enable it.
+The client receives short-lived bearer tokens plus rotating refresh tokens; reconnects do not require re-entering the owner password while the durable refresh grant remains valid.
+
+For Team/Enterprise organizations, an owner may need to register the custom connector in organization connector settings before members can enable it.
 
 ### 3. Enable it in a conversation
 
-In Claude, use the **+** menu in the chat composer, open **Connectors**, and enable **abird dotlink** for that conversation. Claude can then call the tools exposed by the running dotlink process.
+In Claude, use the **+** menu in the composer, open **Connectors**, and enable **abird dotlink**. Claude sees only the MCP tools allowed by the running dotlink profile.
 
-> **Security:** dotlink's HTTP/ngrok transport does not currently add application-layer authentication. Treat the public URL as sensitive. An ephemeral path makes accidental discovery much harder, but it is not authentication. Use ngrok access controls where appropriate and grant only the minimum local permissions needed.
+## Connect other remote MCP clients
 
-## Connect other remote MCP clients through ngrok
+Any remote client that supports MCP Streamable HTTP + OAuth 2.1 can use the same endpoint. dotlink exposes Protected Resource Metadata, OAuth Authorization Server Metadata, authorization-code + PKCE S256, CIMD, DCR fallback, rotating refresh tokens, and revocation.
 
-Any MCP client that supports remote **Streamable HTTP** can use the same public endpoint:
+For a reverse proxy other than ngrok, protect local HTTP with OAuth and tell dotlink its canonical external origin:
 
 ~~~bash
-dotlink --http --ngrok --ngrok-ephemeral-url
+dotlink --http --oauth --http-bind=127.0.0.1:3000 \
+  --public-url=https://mcp.example.com
 ~~~
 
-Then give the client the printed HTTPS MCP URL. The remote client receives exactly the tool surface and permissions exposed by that dotlink process.
+Never derive the OAuth issuer from proxy/Host headers; `--public-url` is the explicit trust boundary.
+
+Public ngrok ingress is OAuth-protected by default. The only way to intentionally expose it without application-layer authentication is the explicit one-run escape hatch:
+
+~~~bash
+dotlink --http --ngrok --allow-public-no-auth
+~~~
+
+That mode exposes every MCP capability granted to the process to anyone who can reach the URL and is not recommended.
 
 ## Use dotlink as a local sandboxed MCP server
 
@@ -245,7 +270,7 @@ Connect to:
 http://127.0.0.1:3000/mcp
 ~~~
 
-This stays loopback-only unless you explicitly change `--http-bind`.
+This stays loopback-only unless you explicitly change `--http-bind`. Loopback HTTP is unauthenticated by default; add `--oauth` to protect it. When putting local HTTP behind a reverse proxy, also provide the canonical external origin with `--public-url=https://...`.
 
 ## Architecture and security
 
@@ -391,6 +416,7 @@ Color is automatic on interactive stderr. Override with `--color=always`, `--col
 dotlink -S, --setup             interactive setup/editor for selected profile
 -p, --profile <NAME>            use config.<NAME>.jsonc
 dotlink profile <COMMAND>       list/create/edit/delete/mutate persisted profiles
+dotlink oauth <COMMAND>         inspect/revoke OAuth clients and refresh grants
 
 --stdio                         add stdio MCP for this run
 --no-stdio                      suppress profile stdio for this run
@@ -399,6 +425,12 @@ dotlink profile <COMMAND>       list/create/edit/delete/mutate persisted profile
 --http-bind=<ADDR>              override HTTP listen address
 --ngrok                         enable ngrok for effective HTTP
 --no-ngrok                      suppress profile ngrok for this run
+--ngrok-domain=<DOMAIN>         use a stable/reserved ngrok hostname
+--no-ngrok-domain               ignore persisted ngrok domain for this run
+--oauth                         protect local HTTP with OAuth
+--no-oauth                      disable local HTTP OAuth for this run
+--public-url=<HTTPS-ORIGIN>     canonical OAuth origin behind a reverse proxy
+--allow-public-no-auth          intentionally disable ngrok OAuth for this run
 --ephemeral-url                 ephemeral local HTTP + ngrok paths
 --http-ephemeral-url[=BOOL]     override local HTTP path behavior
 --ngrok-ephemeral-url[=BOOL]    override ngrok path behavior
@@ -462,7 +494,13 @@ Yes. Claude.ai and other remote MCP clients can use the HTTP/ngrok transport; lo
 
 ### Where are dotlink's config and secrets stored?
 
-Profiles live under `~/.config/abird/dotlink/` (or the equivalent XDG config directory). Runtime API keys are stored separately from JSONC profiles and are never shown back in plaintext during setup.
+Profiles live under `~/.config/abird/dotlink/` (or the equivalent XDG config directory). OpenAI Runtime API keys are stored separately from JSONC profiles and are never shown back in plaintext during setup.
+
+OAuth state lives separately under `$XDG_STATE_HOME/abird/dotlink/` (normally `~/.local/state/abird/dotlink/`). dotlink stores only the Argon2id owner-password hash, approved DCR client metadata, and SHA-256 hashes of refresh tokens there; plaintext owner passwords, access tokens, and authorization codes are not persisted.
+
+### How do I revoke a remote OAuth client?
+
+Use `dotlink oauth clients -p <profile>` to inspect approved DCR clients, then `dotlink oauth revoke -p <profile> <client-id>`. `dotlink oauth revoke-all -p <profile>` revokes all persisted refresh grants. Restart dotlink or press `Ctrl+R` if you also want all currently issued short-lived access tokens invalidated immediately.
 
 ## Build
 
@@ -494,7 +532,7 @@ nix build .#release-all
 
 The bundle contains static Linux x86_64/ARM64 binaries, Windows x86_64/ARM64, and macOS ARM64. The static Linux builds run across NixOS, Debian, and other compatible distributions. Individual Nix outputs are available as `dist-linux-*`, `dist-windows-*`, and `dist-macos-aarch64`.
 
-To publish a GitHub Release, push a matching version tag such as `v0.5.0`. CI rebuilds the Nix release graph and uploads each binary plus its `.sha256` sidecar as an individual release asset; the Actions ZIP bundle is not published as the release.
+To publish a GitHub Release, push a matching version tag such as `v0.6.0`. CI rebuilds the Nix release graph and uploads each binary plus its `.sha256` sidecar as an individual release asset; the Actions ZIP bundle is not published as the release.
 
 Cross-build outputs, stable filenames, installer overrides, and platform release details: `.agents/docs/release-install.md`.
 
