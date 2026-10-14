@@ -1,0 +1,87 @@
+name: Build binaries
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build reproducible binaries
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Run tests and lint checks
+        run: nix flake check
+
+      - name: Build every release binary
+        run: nix build .#release-all --out-link result-release
+
+      - name: Materialize artifact directory
+        run: |
+          mkdir -p artifacts
+          cp -L result-release/* artifacts/
+
+      - name: Validate release artifacts
+        run: |
+          (
+            cd artifacts
+            sha256sum -c ./*.sha256
+          )
+          test "$(./artifacts/dotlink-linux-x86_64 --version)" = "dotlink v$(cat artifacts/VERSION)"
+
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotlink-binaries
+          path: artifacts/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download built files
+        uses: actions/download-artifact@v4
+        with:
+          name: dotlink-binaries
+          path: artifacts
+
+      - name: Publish individual release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          expected_tag="v$(cat artifacts/VERSION)"
+          if [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
+            echo "Release tag $GITHUB_REF_NAME does not match built version $expected_tag" >&2
+            exit 1
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/dotlink-* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/dotlink-* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "dotlink $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
