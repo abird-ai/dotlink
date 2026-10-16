@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-16
+
+### Fixed
+
+- Host-mount deny/protected policy is now validated before resolving `bash` or Bubblewrap, so sandbox policy violations fail closed even when the sandbox tooling is absent from `PATH` (restores `nix flake check` in minimal build environments).
+
+### Changed
+
+- Attribute the MIT license to Prasanna Loganathar and dotlink contributors, and document the project's human-led, AI-assisted development posture.
+
 ## [0.9.0] - 2026-10-14
 
 ### Added
@@ -154,7 +164,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/abird-ai/dotlink/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/abird-ai/dotlink/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/abird-ai/dotlink/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/abird-ai/dotlink/compare/v0.7.0...v0.8.0
