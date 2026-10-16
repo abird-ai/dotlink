@@ -1,4 +1,4 @@
-# abird dotlink
+# dotlink
 
 Simply **`@dotlink`** anywhere in ChatGPT — chat, space, or your dot to work with files on your machine, use local tools and projects you exposed — securely, from a single binary.
 
@@ -785,6 +785,15 @@ macOS can use the Rust filesystem tools with the same allow/deny policy, plus st
 
 Apple Silicon release binaries are cross-built reproducibly from the same x86_64 Linux Nix release graph using a pinned Apple SDK and LLVM's Mach-O linker. Intel macOS is not currently published; build it from source with Cargo if needed.
 
+## AI disclosure
+
+**Human-centric design. AI-centric implementation.** dotlink is built with extensive AI
+assistance for research, code, and tests. Humans lead the architecture, priorities,
+and acceptance criteria. We neither hand over direction to autonomous models nor
+claim that every generated line is manually reviewed. We rely on explicit designs,
+reproducible tests, engineering evidence, and continuous validation.
+
 ## License
 
-MIT.
+[MIT](LICENSE) © 2026 Prasanna Loganathar and dotlink contributors. Third-party
+libraries and assets retain their respective licenses.
