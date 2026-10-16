@@ -787,6 +787,32 @@ impl LocalMachine {
             );
         }
 
+        // Deny/protected policy is validated before resolving any sandbox or
+        // shell tooling so that a policy violation fails closed even when
+        // bwrap/bash are absent from PATH (for example inside a Nix build).
+        #[cfg(target_os = "linux")]
+        for mount in &args.host_shell.mounts {
+            // Denies/protected control-plane paths cover both the requested
+            // lexical spelling and the resolved path captured when the file
+            // descriptor was opened. Never re-resolve a mutable alias here.
+            if [mount.source.as_path(), mount.resolved.as_path()]
+                .iter()
+                .any(|path| {
+                    access.denied_read(path)
+                        || (mount.kind == crate::host_services::HostMountKind::CharacterDevice
+                            && access.denied_write(path))
+                        || protected_paths
+                            .iter()
+                            .any(|protected| *path == protected || path.starts_with(protected))
+                })
+            {
+                bail!(
+                    "host integration source is denied or protected: {}",
+                    mount.source.display()
+                );
+            }
+        }
+
         let shell_program = if args.allow_shell {
             #[cfg(windows)]
             {
@@ -837,29 +863,6 @@ impl LocalMachine {
         };
         #[cfg(not(target_os = "linux"))]
         let bwrap_program = None;
-
-        #[cfg(target_os = "linux")]
-        for mount in &args.host_shell.mounts {
-            // Denies/protected control-plane paths cover both the requested
-            // lexical spelling and the resolved path captured when the file
-            // descriptor was opened. Never re-resolve a mutable alias here.
-            if [mount.source.as_path(), mount.resolved.as_path()]
-                .iter()
-                .any(|path| {
-                    access.denied_read(path)
-                        || (mount.kind == crate::host_services::HostMountKind::CharacterDevice
-                            && access.denied_write(path))
-                        || protected_paths
-                            .iter()
-                            .any(|protected| *path == protected || path.starts_with(protected))
-                })
-            {
-                bail!(
-                    "host integration source is denied or protected: {}",
-                    mount.source.display()
-                );
-            }
-        }
 
         #[cfg(target_os = "linux")]
         let secure_fs = Arc::new(crate::secure_fs::SecureFs::new(
