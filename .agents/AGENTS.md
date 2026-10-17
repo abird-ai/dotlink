@@ -60,3 +60,12 @@ For a machine with configured GPU drivers, optionally run
 to exercise actual `nvidia-smi` and `vulkaninfo` within Bubblewrap (when installed). Profile/setup changes should also smoke `dotlink profile` lifecycle/mutations and transactional setup cancellation. For release/build changes, run the Nix flake checks and relevant dist outputs.
 
 Do not weaken permissions, sandboxing, credential masking, or transport isolation to make a test pass.
+
+## Git safety
+
+Commits are signed; never disable signing. Never push, force-push, tag,
+publish, deploy, or run destructive operations — history rewrite, `reset
+--hard`, branch deletion, or touching another agent's staged or uncommitted
+work — without explicit user confirmation for that action. Confirm each such
+action on its own: a request to "commit" or "apply" is not authorization to
+push.
