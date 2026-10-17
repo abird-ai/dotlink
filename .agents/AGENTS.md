@@ -33,8 +33,12 @@ All paths and validation commands below are relative to the repository root.
 
 Plan status is tracked in `.agents/plans/TODO.md`, the plan checklist in
 `.agents/plans/<plan>/TODO.md`, and the rules in `.agents/plans/TODO-SPEC.md`.
-Tick an item only after its checks pass, in the same session, on the commit you
-are marking. Do not record a pass that was not run.
+A plan may add an optional `README.md` (details with Design/Decisions/References
+sections and `Author:`/`Co-authors:`); `TODO.md` is required, grouped by the
+commit that landed each set, with a `## Tests and verification` section that
+must be fully checked before the plan closes. Tick an item only after its checks
+pass, in the same session, on the commit you are marking. Do not record a pass
+that was not run.
 
 ## Validation before commit
 
