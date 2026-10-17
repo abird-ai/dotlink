@@ -785,13 +785,21 @@ macOS can use the Rust filesystem tools with the same allow/deny policy, plus st
 
 Apple Silicon release binaries are cross-built reproducibly from the same x86_64 Linux Nix release graph using a pinned Apple SDK and LLVM's Mach-O linker. Intel macOS is not currently published; build it from source with Cargo if needed.
 
+## Contributing
+
+We build dotlink in the open and would love your ideas, architectural challenges,
+research, and focused improvements. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the best ways to take part.
+
 ## AI disclosure
 
-**Human-centric design. AI-centric implementation.** dotlink is built with extensive AI
-assistance for research, code, and tests. Humans lead the architecture, priorities,
-and acceptance criteria. We neither hand over direction to autonomous models nor
-claim that every generated line is manually reviewed. We rely on explicit designs,
-reproducible tests, engineering evidence, and continuous validation.
+**Human-centric design. AI-centric implementation.** dotlink is built with
+extensive AI assistance for research, code, tests, and documentation. We believe
+the best software comes from human-led design and AI-assisted implementation:
+humans own the architecture, priorities, and acceptance criteria, while AI helps
+implement, test, and iterate. We don't hand direction to autonomous models or
+claim every generated line is manually reviewed — correctness rests on explicit
+designs, reproducible tests, and continuous validation.
 
 ## License
 
