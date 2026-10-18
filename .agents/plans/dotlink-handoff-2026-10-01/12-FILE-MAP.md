@@ -560,7 +560,7 @@ Detailed ChatGPT connection instructions.
 
 Keep current with ChatGPT plugin/MCP App wording and current URLs.
 
-## .agents/AGENTS.md
+## AGENTS.md
 
 Short maintainer entry guide.
 

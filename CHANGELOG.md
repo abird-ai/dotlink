@@ -41,7 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Moved the agent guide to `.agents/AGENTS.md` and updated its references.
+- Moved the agent guide to `AGENTS.md` and updated its references.
 - `nix fmt` now uses Alejandra for Nix formatting.
 - Split Nix build, release, check, and development definitions into `nix/`; package versions now come from `Cargo.toml`.
 

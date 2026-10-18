@@ -3,7 +3,7 @@
 Date: 2026-10-01
 
 Validation receipts are not stored here. Re-run the gates in
-`.agents/AGENTS.md` → "Validation before commit" and record results in
+`AGENTS.md` → "Validation before commit" and record results in
 `TODO.md` in this directory. This file records only the accepted boundaries of
 the current design.
 
@@ -135,5 +135,5 @@ touches:
 - Bubblewrap;
 - OAuth or public ingress.
 
-Run the relevant gates from `.agents/AGENTS.md` and record the result in the
+Run the relevant gates from `AGENTS.md` and record the result in the
 plan checklist.

@@ -632,7 +632,7 @@ README.md
 SECURITY.md
 ARCHITECTURE.md
 CHANGELOG.md
-.agents/AGENTS.md
+AGENTS.md
 .agents/docs/configuration.md
 .agents/docs/release-install.md
 ```

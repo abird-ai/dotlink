@@ -50,7 +50,7 @@ When anything disagrees, use this order:
 1. Current Rust source under `src/`.
 2. Current `Cargo.toml`, `Cargo.lock`, `flake.nix`, `flake.lock`, scripts and workflow.
 3. Current `README.md`, `SECURITY.md`, `ARCHITECTURE.md`, `CHANGELOG.md`.
-4. Current `.agents/AGENTS.md` and `.agents/docs/`.
+4. Current `AGENTS.md` and `.agents/docs/`.
 5. This 2026-10-01 handoff bundle.
 6. Git history.
 7. The 2026-09-30 handoff bundle and older notes, which are historical only.
@@ -106,7 +106,7 @@ The implementation described here is considered complete for the 0.6.0 phase.
 
 Validation receipts are not stored in this handoff. Plan status and open items
 are tracked in `TODO.md` in this directory, and the canonical gate list is
-`.agents/AGENTS.md` → "Validation before commit". Tick an item only after its
+`AGENTS.md` → "Validation before commit". Tick an item only after its
 checks pass, in the same session, on the commit you are marking.
 
 ## Historical handoff warning

@@ -30,7 +30,7 @@ Current Rust source is always authoritative.
 1. Current Rust source.
 2. Current Cargo/Nix/scripts/workflow.
 3. Current README.md, SECURITY.md, ARCHITECTURE.md, CHANGELOG.md.
-4. Current .agents/AGENTS.md and .agents/docs/.
+4. Current AGENTS.md and .agents/docs/.
 5. This 2026-10-01 handoff package.
 6. Git history.
 7. The 2026-09-30 handoff, historical only.
@@ -879,7 +879,7 @@ Default:
 ## Validation
 
 Validation receipts live with the run that produced them, not in this handoff.
-Re-run the gates in `.agents/AGENTS.md` → "Validation before commit" and record
+Re-run the gates in `AGENTS.md` → "Validation before commit" and record
 results in the plan checklist at
 `.agents/plans/dotlink-handoff-2026-10-01/TODO.md`. The authoritative
 known-limitations list is `11-VALIDATION-AND-KNOWN-LIMITATIONS.md`.
@@ -907,7 +907,7 @@ README.md
 SECURITY.md
 ARCHITECTURE.md
 CHANGELOG.md
-.agents/AGENTS.md
+AGENTS.md
 .agents/docs/configuration.md
 .agents/docs/release-install.md
 ~~~

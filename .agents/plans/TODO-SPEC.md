@@ -102,7 +102,7 @@ outside this repository.
 - Checklists are hand-edited. A generated checklist that rejects editing is a
   report, not a TODO.
 - Invariant and contract gates stay executable scripts. The canonical gate list
-  is `.agents/AGENTS.md` → "Validation before commit". A checklist may name and
+  is `AGENTS.md` → "Validation before commit". A checklist may name and
   require a gate; only a script enforces it.
 - Flow: an agent works in `.agents/runs/<plan>-<agent>/TODO.md`, appends finished
   lines to `.agents/plans/<plan>/TODO.md` in one atomic write, then deletes its

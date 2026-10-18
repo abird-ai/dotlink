@@ -138,7 +138,7 @@ ChatGPT developer tunnel connection workflow.
 
 ## Agent-facing repository docs
 
-### `.agents/AGENTS.md`
+### `AGENTS.md`
 
 First entrypoint for agents: invariants, reading order, and validation rules.
 
