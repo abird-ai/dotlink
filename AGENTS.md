@@ -34,8 +34,8 @@ All paths and validation commands below are relative to the repository root.
 
 ## Read first
 
-1. `.agents/plans/START_HERE.md` for the current canonical handoff and authority order.
-2. `.agents/plans/TODO.md` and `.agents/plans/README.md` for plan status and the tick rule.
+1. `.agents/plans/README.md` for the entry and spec.
+2. `.agents/plans/TODO.md` for plan status and the tick rule.
 3. `.agents/plans/dotlink-handoff-2026-10-01/TODO.md` for the current plan's checklist.
 4. `.agents/plans/dotlink-handoff-2026-10-01/HANDOFF.md` for the comprehensive current state/design handoff.
 5. `README.md` for the product surface and user workflow.
@@ -44,7 +44,7 @@ All paths and validation commands below are relative to the repository root.
 8. `.agents/docs/configuration.md` for schema-v10 profiles, OAuth/ngrok behavior, and CLI precedence.
 9. `.agents/docs/release-install.md` for release/install details.
 10. `.agents/docs/nixos-service.md` for declarative service/module and systemd-credential semantics.
-11. `.agents/plans/dotlink-handoff-2026-09-30/` only when historical implementation context is specifically needed; it is not current-state authority.
+11. `.agents/plans/archive/history/dotlink-handoff-2026-09-30/` only when historical implementation context is specifically needed; it is not current-state authority.
 
 ## Current invariants
 
