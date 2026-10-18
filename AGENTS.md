@@ -30,6 +30,9 @@ follow the markers below.
   full sentences; prefer symbols and fragments unless the user asked for an
   explanation or the topic is design-level or otherwise complex. Prefer bullets
   and engineering focus over prose in other docs.
+- **Terse output.** Keep replies short and on point, preferably bulleted; avoid
+  prose unless the user asked for an explanation. Be terse without dropping
+  detail.
 - **Git safety.** Commits are signed; never disable signing. Never push,
   force-push, tag, publish, deploy, or run destructive operations — history
   rewrite, `reset --hard`, branch deletion, or touching another agent's staged
