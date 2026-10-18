@@ -1,20 +1,38 @@
+# Git
+/worktrees/
+/.agents/runs/*
+!/.agents/runs/README.md
+
+# Nix
+result/
+result-*
+.direnv/
+
+# Common build and dep dirs
+/tmp/
+**/target/
+**/node_modules/
+**/dist/
+.venv
+
+# Misc
+crash.log
+**/__pycache__/
+/.continue/
+/.kilocode/
+/.vscode/
+/.claude/
+.codex
+.kilo/
+
+# Repo-specific
 # Rust build output and local backup artifacts.
-/target/
 *.rs.bk
 /Cargo.toml.orig
-
-# Nix / direnv build links and local environments.
 /result
-/result-*
-/.direnv/
 
 # Local environment, logs, and generated release output.
 .env
 .env.*
 !.env.example
 *.log
-/dist/
-
-# Agent scratch checklists and run directories; the plan record lives in
-# .agents/plans/.
-/.agents/runs/
