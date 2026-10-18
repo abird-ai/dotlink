@@ -1,12 +1,41 @@
-# dotlink agent guide
+# AGENTS.md
+
+<!-- BEGIN common -->
+## Shared conventions
+
+These are byte-identical across all abird repositories. Repo-specific rules
+follow the markers below.
+
+- **Source of truth.** Live source, tests and executed results outrank dated
+  prose. Start at `.agents/plans/README.md` (overview + spec), then work from
+  `.agents/plans/TODO.md` (the queue).
+- **XDG paths.** Where the project owns user config, data, cache or state,
+  resolve it under `$XDG_*_HOME/abird/<project>` — an absolute XDG base, falling
+  back to `HOME` when unset. No legacy or alternate root.
+- **Shared `.gitignore`.** The block at the top of `.gitignore` is identical
+  across repos; repo-specific entries follow it. Keep it mechanical.
+- **Preserve other work.** Never revert or overwrite changes you did not make.
+  Stage explicit paths, not broad globs, and leave other agents' staged or
+  uncommitted work untouched.
+- **Git safety.** Commits are signed; never disable signing. Never push,
+  force-push, tag, publish, deploy, or run destructive operations — history
+  rewrite, `reset --hard`, branch deletion, or touching another agent's
+  staged or uncommitted work — without explicit user confirmation for each
+  action. A request to "commit" or "apply" is not authorization to push.
+<!-- END common -->
+
+<!-- BEGIN repo-specific -->
+## Repository
 
 Use `AGENTS.md` as the first agent-facing entrypoint for the repository.
 All paths and validation commands below are relative to the repository root.
 
+- **XDG project:** `abird/dotlink`.
+
 ## Read first
 
 1. `.agents/plans/START_HERE.md` for the current canonical handoff and authority order.
-2. `.agents/plans/TODO.md` and `.agents/plans/TODO-SPEC.md` for plan status and the tick rule.
+2. `.agents/plans/TODO.md` and `.agents/plans/README.md` for plan status and the tick rule.
 3. `.agents/plans/dotlink-handoff-2026-10-01/TODO.md` for the current plan's checklist.
 4. `.agents/plans/dotlink-handoff-2026-10-01/HANDOFF.md` for the comprehensive current state/design handoff.
 5. `README.md` for the product surface and user workflow.
@@ -29,16 +58,11 @@ All paths and validation commands below are relative to the repository root.
 - Linux KVM/GPU grants are independent opt-ins: vendor-check DRM devices, pin character-device FDs and use Bubblewrap `--dev-bind` rather than regular `--bind-fd`; read-only driver resources must not expand native MCP FS grants. NixOS hardware permissions affect only the corresponding systemd unit.
 - Keep stdout protocol-clean for stdio; human output goes to stderr.
 
-## Checklists before prose
+## Plans and parallel work
 
-Plan status is tracked in `.agents/plans/TODO.md`, the plan checklist in
-`.agents/plans/<plan>/TODO.md`, and the rules in `.agents/plans/TODO-SPEC.md`.
-A plan may add an optional `README.md` (details with Design/Decisions/References
-sections and `Author:`/`Co-authors:`); `TODO.md` is required, grouped by the
-commit that landed each set, with a `## Tests and verification` section that
-must be fully checked before the plan closes. Tick an item only after its checks
-pass, in the same session, on the commit you are marking. Do not record a pass
-that was not run.
+Plan status and checklists follow `.agents/plans/README.md`; the plan record
+lives in `.agents/plans/`. Do not add a private evidence file or a second status
+log.
 
 ## Validation before commit
 
@@ -61,11 +85,4 @@ to exercise actual `nvidia-smi` and `vulkaninfo` within Bubblewrap (when install
 
 Do not weaken permissions, sandboxing, credential masking, or transport isolation to make a test pass.
 
-## Git safety
-
-Commits are signed; never disable signing. Never push, force-push, tag,
-publish, deploy, or run destructive operations — history rewrite, `reset
---hard`, branch deletion, or touching another agent's staged or uncommitted
-work — without explicit user confirmation for that action. Confirm each such
-action on its own: a request to "commit" or "apply" is not authorization to
-push.
+<!-- END repo-specific -->
