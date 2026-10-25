@@ -40,7 +40,7 @@ Landed commits: `4d07303` (0 v1 set), `ffed785` (1 deps/glob), `751e42e` (2 rena
 - [x] Native `secure_fs`-rooted walk reusing the `list_impl` shape; no pathname traversal
 - [x] `output_mode` `content`/`files`/`count`; `before`/`after` capped at 8; `numbered` option; `offset` paging
 - [x] `literal`, `ignore_case`, `glob`, regex size limits, per-file cap 50, 1 MiB file cap
-- [x] `respect_gitignore` and `skip_hidden` opt-in; `.gitignore` read through `secure_fs`, 64 KiB / 1024-line bounds, invalid patterns fail closed
+- [x] `gitignore` and `skip_hidden` opt-in; `.gitignore` read through `secure_fs`, 64 KiB / 1024-line bounds, invalid patterns fail closed
 
 ### Commit 5 — edit multi-file — `7a68e72`
 

@@ -269,7 +269,7 @@ struct GrepArgs {
 
     /// Honour `.gitignore` files below `path`. Off by default.
     #[serde(default)]
-    respect_gitignore: bool,
+    gitignore: bool,
 
     /// Skip entries whose name starts with `.`. Off by default.
     #[serde(default)]
@@ -573,7 +573,7 @@ impl GlobFilter {
 #[derive(Default, Clone, Copy)]
 struct WalkFilter {
     skip_hidden: bool,
-    respect_gitignore: bool,
+    gitignore: bool,
 }
 
 fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
@@ -1916,7 +1916,7 @@ impl LocalMachine {
             vec![(root.to_path_buf(), depth.max(1), Vec::new())];
 
         while let Some((dir, remaining, mut ignores)) = pending.pop() {
-            if filter.respect_gitignore
+            if filter.gitignore
                 && let Some(ignore) = self.load_gitignore(&dir).await?
             {
                 ignores.push(Arc::new(ignore));
@@ -2158,7 +2158,7 @@ impl LocalMachine {
             usize::MAX,
             WalkFilter {
                 skip_hidden: args.skip_hidden,
-                respect_gitignore: args.respect_gitignore,
+                gitignore: args.gitignore,
             },
             |entry| {
                 if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
@@ -4239,7 +4239,7 @@ mod tests {
             numbered: None,
             offset: None,
             limit: None,
-            respect_gitignore: false,
+            gitignore: false,
             skip_hidden: false,
         }
     }
@@ -4469,7 +4469,7 @@ mod tests {
 
         let mut args = grep_args("needle");
         args.output_mode = GrepOutputMode::Files;
-        args.respect_gitignore = true;
+        args.gitignore = true;
         let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
         assert_eq!(
             files["files"],
@@ -4488,7 +4488,7 @@ mod tests {
         let mut args = grep_args("needle");
         args.output_mode = GrepOutputMode::Files;
         args.skip_hidden = true;
-        args.respect_gitignore = true;
+        args.gitignore = true;
         let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
         assert_eq!(
             files["files"],
@@ -4498,7 +4498,7 @@ mod tests {
         // An invalid gitignore pattern fails closed.
         std::fs::write(root.join(".gitignore"), "{unclosed\n").unwrap();
         let mut args = grep_args("needle");
-        args.respect_gitignore = true;
+        args.gitignore = true;
         let error = machine.grep_impl(args).await.unwrap_err().to_string();
         assert!(error.contains("invalid .gitignore pattern"), "{error}");
     }
@@ -5233,12 +5233,12 @@ mod tests {
         std::fs::write(root.join("build/out.rs"), "needle\n").unwrap();
         std::fs::write(root.join("src.rs"), "needle\n").unwrap();
         let mut machine = test_machine(root.clone());
-        // A deny on the ignore file itself must win over `respect_gitignore`.
+        // A deny on the ignore file itself must win over `gitignore`.
         machine.config.access.deny_read_roots = vec![root.join(".gitignore")];
 
         let mut args = grep_args("needle");
         args.output_mode = GrepOutputMode::Files;
-        args.respect_gitignore = true;
+        args.gitignore = true;
         let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
         assert_eq!(
             files["files"],

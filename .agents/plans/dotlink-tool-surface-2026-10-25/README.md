@@ -107,7 +107,7 @@ Depth rule must be visible in the description: "Defaults to 1, or 4 when `patter
 | `numbered` | true | `path:line:` prefix in `content` mode |
 | `offset` | 0 | skip N hits or files before `limit` |
 | `limit` | 200 | hard maximum 200 |
-| `respect_gitignore` | false | opt-in |
+| `gitignore` | false | opt-in |
 | `skip_hidden` | false | opt-in |
 
 Bounds: UTF-8 files ≤1 MiB each, per-file match cap 50, regex compiled with `size_limit` and `dfa_size_limit` of 1 MiB, output capped at `max_output_bytes` with `truncated`.
@@ -118,7 +118,7 @@ Output shapes:
 - `files` → `{"files":[…],"truncated":bool}`;
 - `count` → `{"counts":[{"path","count"}],"total":n,"truncated":bool}`.
 
-Gitignore handling: when `respect_gitignore` is set, load `.gitignore` files through `secure_fs` (never the ambient path namespace) with 64 KiB / 1024-line bounds per file, reject invalid patterns, and honour nested files relative to the search root, including negation. `skip_hidden` drops entries whose name starts with `.` from both listing and descent (except the search root itself).
+Gitignore handling: when `gitignore` is set, load `.gitignore` files through `secure_fs` (never the ambient path namespace) with 64 KiB / 1024-line bounds per file, reject invalid patterns, and honour nested files relative to the search root, including negation. `skip_hidden` drops entries whose name starts with `.` from both listing and descent (except the search root itself).
 
 ### read
 
@@ -288,7 +288,7 @@ Never added: `walkdir`, `ignore::Walk`/`WalkParallel`, `grep-*` searcher crates.
 - `read.limit` defaults to 4096 lines.
 - `ls.depth` defaults to 4 when the pattern implies recursion, else 1.
 - `numbered` is an option on `read` and `grep`, default true, one tab separator.
-- `respect_gitignore` and `skip_hidden` are opt-in.
+- `gitignore` and `skip_hidden` are opt-in.
 - `patch` uses the Codex grammar; delete/move are rejected in v1.
 - `bedit` takes an optional `sha256` precondition.
 - Clean cut on renames and on the flat `edit` form.
@@ -302,6 +302,7 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 
 - Glob candidates: `ls` and `grep` test the pattern against the entry path relative to the tool's `path` root **and** against the bare entry name, so `*.rs` stays useful at any depth while `src/**/*.rs` addresses a subtree. `literal_separator(true)` means a bare `*` never crosses `/`. An invalid pattern is a tool error, not an empty result.
 - `grep` requires an existing directory at `path`; searching one file is `read`.
+- The grep filter is `gitignore` (renamed from `respect_gitignore`); `src/transports/openai.rs` keeps a test-only request-argument key list that still spells it the old way at the time of the rename, because that file carried another agent's in-flight work — the one-word update belongs with that change.
 - `grep` collects candidate files first and sorts them by path, so paging and output order do not depend on directory enumeration order. Candidate files are bounded at 65536, after which `truncated` is set.
 - Files above 1 MiB and files that are not valid UTF-8 are skipped silently rather than reported; text tools stay UTF-8-only.
 - The `--` group separator is only emitted when `before`/`after` requested context, because without context there is no gap to mark. Context windows are per file.
