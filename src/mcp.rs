@@ -49,6 +49,8 @@ const MAX_GREP_CONTEXT: usize = 8;
 const MAX_GREP_FILES: usize = 65_536;
 const MAX_EDIT_OPS: usize = 64;
 const MAX_EDIT_FILES: usize = 16;
+const MAX_PATCH_FILES: usize = 32;
+const MAX_PATCH_HUNKS: usize = 64;
 const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
 const GITIGNORE_MAX_LINES: usize = 1024;
 
@@ -310,6 +312,23 @@ struct EditOp {
     replace_all: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PatchArgs {
+    /// Base directory for the patch's relative paths. Relative paths resolve
+    /// from the directory where dotlink was launched.
+    #[serde(default = "dot")]
+    dir: String,
+
+    /// Codex patch text: `*** Begin Patch`, `*** Update File:` / `*** Add File:`
+    /// sections, then `*** End Patch`.
+    patch: String,
+
+    /// Write the files that planned cleanly and report the rest instead of
+    /// failing the whole call.
+    #[serde(default)]
+    best_effort: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum BreadFormat {
@@ -551,6 +570,282 @@ fn list_entry_limit(requested: Option<usize>) -> usize {
     requested
         .unwrap_or(DEFAULT_MAX_LIST_ENTRIES)
         .clamp(1, MAX_LIST_ENTRIES)
+}
+
+/// Codex `*** Begin Patch` grammar, v1: `*** Update File:` and
+/// `*** Add File:` only. Delete and Move are rejected explicitly rather than
+/// silently ignored.
+#[derive(Debug)]
+enum PatchOp {
+    Update { path: String, hunks: Vec<PatchHunk> },
+    Add { path: String, lines: Vec<String> },
+}
+
+#[derive(Debug)]
+struct PatchHunk {
+    anchor: Option<String>,
+    lines: Vec<PatchLine>,
+}
+
+#[derive(Debug)]
+enum PatchLine {
+    Context(String),
+    Removed(String),
+    Added(String),
+}
+
+fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
+    let mut ops: Vec<PatchOp> = Vec::new();
+    let mut saw_begin = false;
+    let mut saw_end = false;
+    let mut hunks = 0_usize;
+
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        if !saw_begin {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.trim_end() != "*** Begin Patch" {
+                bail!("patch: missing '*** Begin Patch' header");
+            }
+            saw_begin = true;
+            continue;
+        }
+        if saw_end {
+            if !line.trim().is_empty() {
+                bail!("patch: line {number}: unexpected text after '*** End Patch'");
+            }
+            continue;
+        }
+
+        if let Some(directive) = line.strip_prefix("*** ") {
+            let directive = directive.trim_end();
+            if directive == "End Patch" {
+                saw_end = true;
+                continue;
+            }
+            if let Some(path) = directive.strip_prefix("Update File:") {
+                let path = path.trim().to_owned();
+                if path.is_empty() {
+                    bail!("patch: line {number}: '*** Update File' needs a path");
+                }
+                ops.push(PatchOp::Update {
+                    path,
+                    hunks: Vec::new(),
+                });
+                continue;
+            }
+            if let Some(path) = directive.strip_prefix("Add File:") {
+                let path = path.trim().to_owned();
+                if path.is_empty() {
+                    bail!("patch: line {number}: '*** Add File' needs a path");
+                }
+                ops.push(PatchOp::Add {
+                    path,
+                    lines: Vec::new(),
+                });
+                continue;
+            }
+            let name = directive.split(':').next().unwrap_or(directive);
+            bail!("patch: line {number}: unsupported directive '*** {name}'");
+        }
+
+        let Some(current) = ops.last_mut() else {
+            bail!("patch: line {number}: text outside a file section");
+        };
+
+        if let Some(rest) = line.strip_prefix("@@") {
+            let PatchOp::Update { hunks: list, .. } = current else {
+                bail!("patch: line {number}: '*** Add File' does not take hunks");
+            };
+            hunks += 1;
+            if hunks > MAX_PATCH_HUNKS {
+                bail!("patch: {hunks} hunks, above the {MAX_PATCH_HUNKS} hunk limit");
+            }
+            list.push(PatchHunk {
+                anchor: parse_patch_anchor(rest),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        match current {
+            PatchOp::Update { hunks: list, .. } => {
+                let Some(hunk) = list.last_mut() else {
+                    bail!("patch: line {number}: text outside a hunk");
+                };
+                match line.as_bytes().first() {
+                    Some(b' ') => hunk.lines.push(PatchLine::Context(line[1..].to_owned())),
+                    Some(b'-') => hunk.lines.push(PatchLine::Removed(line[1..].to_owned())),
+                    Some(b'+') => hunk.lines.push(PatchLine::Added(line[1..].to_owned())),
+                    _ if line.trim().is_empty() => {
+                        hunk.lines.push(PatchLine::Context(String::new()))
+                    }
+                    _ => {
+                        bail!("patch: line {number}: unexpected text '{line}'");
+                    }
+                }
+            }
+            PatchOp::Add { lines, .. } => match line.as_bytes().first() {
+                Some(b'+') => lines.push(line[1..].to_owned()),
+                Some(b' ') => lines.push(line[1..].to_owned()),
+                _ if line.trim().is_empty() => lines.push(String::new()),
+                _ => bail!("patch: line {number}: unexpected text '{line}'"),
+            },
+        }
+    }
+
+    if !saw_begin {
+        bail!("patch: missing '*** Begin Patch' header");
+    }
+    if !saw_end {
+        bail!("patch: missing '*** End Patch' terminator");
+    }
+    if ops.len() > MAX_PATCH_FILES {
+        bail!(
+            "patch: {} files, above the {MAX_PATCH_FILES} file limit",
+            ops.len()
+        );
+    }
+    for op in &ops {
+        if let PatchOp::Update { path, hunks } = op
+            && hunks.is_empty()
+        {
+            bail!("patch: '*** Update File' for {path} has no hunks");
+        }
+    }
+    Ok(ops)
+}
+
+/// `@@` may carry anchor text or unified-diff line numbers. Numbers are
+/// accepted and ignored; anchor text narrows where the search starts.
+fn parse_patch_anchor(rest: &str) -> Option<String> {
+    let rest = rest.trim();
+    if rest.is_empty() || rest.starts_with('-') || rest.starts_with('+') {
+        return None;
+    }
+    Some(rest.to_owned())
+}
+
+/// Hunk location is content-based: exact match first, then a per-line
+/// `trim_end` comparison. Ambiguity is an error, and hunks within a file apply
+/// top-down without re-scanning above the previous match.
+fn apply_patch_hunks(
+    text: &str,
+    hunks: &[PatchHunk],
+    display: &str,
+    first_hunk: usize,
+    total_hunks: usize,
+) -> Result<(String, usize, usize)> {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    let mut from_line = 0_usize;
+    let mut added = 0_usize;
+    let mut removed = 0_usize;
+
+    for (offset, hunk) in hunks.iter().enumerate() {
+        let position = first_hunk + offset + 1;
+        let block = hunk
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                PatchLine::Context(text) => Some(text.as_str()),
+                PatchLine::Removed(text) => Some(text.as_str()),
+                PatchLine::Added(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut search_start = from_line;
+        if let Some(anchor) = hunk.anchor.as_deref()
+            && let Some(at) = lines
+                .iter()
+                .enumerate()
+                .skip(search_start)
+                .find(|(_, line)| line.contains(anchor))
+                .map(|(index, _)| index)
+        {
+            search_start = at;
+        }
+        let near = search_start + 1;
+
+        if block.is_empty() {
+            bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
+        }
+
+        let mut exact = Vec::new();
+        let mut lenient = Vec::new();
+        for start in search_start..lines.len() {
+            if start + block.len() > lines.len() {
+                break;
+            }
+            if lines[start..start + block.len()]
+                .iter()
+                .zip(&block)
+                .all(|(file, patch)| file == patch)
+            {
+                exact.push(start);
+                continue;
+            }
+            if lines[start..start + block.len()]
+                .iter()
+                .zip(&block)
+                .all(|(file, patch)| file.trim_end() == patch.trim_end())
+            {
+                lenient.push(start);
+            }
+        }
+        let matches = if exact.is_empty() { lenient } else { exact };
+        let Some(&start) = matches.first() else {
+            bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
+        };
+        if matches.len() > 1 {
+            let lines_listed = matches
+                .iter()
+                .take(10)
+                .map(|line| (line + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "hunk {position}/{total_hunks} ({display}): context matches {} locations (lines {lines_listed})",
+                matches.len()
+            );
+        }
+
+        let mut replacement = Vec::with_capacity(hunk.lines.len());
+        // Cursor into the consumed block: only context/removed lines consume
+        // existing file lines.
+        let mut consumed_at = 0_usize;
+        for line in &hunk.lines {
+            match line {
+                // Keep the file's own bytes for context lines, so a lenient
+                // match never rewrites trailing whitespace it did not touch.
+                PatchLine::Context(_) => {
+                    replacement.push(lines[start + consumed_at].clone());
+                    consumed_at += 1;
+                }
+                PatchLine::Removed(_) => {
+                    removed += 1;
+                    consumed_at += 1;
+                }
+                PatchLine::Added(text) => {
+                    added += 1;
+                    replacement.push(text.clone());
+                }
+            }
+        }
+        let replacement_len = replacement.len();
+        lines.splice(start..start + block.len(), replacement);
+        from_line = start + replacement_len;
+    }
+
+    Ok((lines.join("\n"), added, removed))
+}
+
+/// Patch paths are relative to the patch's `dir`, not to the launch directory.
+fn join_patch_path(dir: &str, path: &str) -> String {
+    if Path::new(path).is_absolute() || dir == "." {
+        return path.to_owned();
+    }
+    Path::new(dir).join(path).to_string_lossy().into_owned()
 }
 
 /// Byte offsets of every occurrence of `needle` in `haystack`.
@@ -1350,7 +1645,7 @@ impl LocalMachine {
             }
         }
         if !any_read_write {
-            for name in ["edit", "bedit"] {
+            for name in ["edit", "patch", "bedit"] {
                 router.disable_route(name.to_owned());
             }
         }
@@ -2851,6 +3146,226 @@ impl LocalMachine {
         }
     }
 
+    /// Codex-grammar patch application: plan every file in memory, verify each
+    /// snapshot, then write. `best_effort` writes the files that planned
+    /// cleanly and reports the failures instead.
+    async fn patch_impl(&self, args: PatchArgs) -> Result<String> {
+        if args.patch.len() > self.config.max_write_bytes {
+            bail!(
+                "patch: {} bytes, above the {} byte write limit",
+                args.patch.len(),
+                self.config.max_write_bytes
+            );
+        }
+        let ops = parse_patch(&args.patch)?;
+        let total_hunks = ops
+            .iter()
+            .map(|op| match op {
+                PatchOp::Update { hunks, .. } => hunks.len(),
+                PatchOp::Add { .. } => 0,
+            })
+            .sum::<usize>();
+
+        struct PlannedFile {
+            path: PathBuf,
+            display: String,
+            snapshot: Option<Vec<u8>>,
+            text: String,
+            hunks: usize,
+            added: usize,
+            removed: usize,
+        }
+
+        let mut planned: Vec<PlannedFile> = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let mut hunk_index = 0_usize;
+        let dir = args.dir.clone();
+
+        for op in &ops {
+            match op {
+                PatchOp::Update { path, hunks } => {
+                    let first_hunk = hunk_index;
+                    hunk_index += hunks.len();
+                    let resolved = match self
+                        .resolve_existing(&join_patch_path(&dir, path), AccessNeed::ReadWrite)
+                        .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            if !args.best_effort {
+                                return Err(error);
+                            }
+                            failures.push((path.clone(), error.to_string()));
+                            continue;
+                        }
+                    };
+                    let display = self.config.access.relative_display(&resolved);
+                    if seen.contains(&resolved) {
+                        let error = format!("patch: {display} appears in more than one section");
+                        if !args.best_effort {
+                            bail!("{error}");
+                        }
+                        failures.push((display, error));
+                        continue;
+                    }
+                    let outcome = async {
+                        let mut handle = self.open_edit_file(&resolved).await?;
+                        let snapshot =
+                            Self::read_bounded(&mut handle, self.config.max_read_bytes).await?;
+                        let text = String::from_utf8(snapshot.clone())
+                            .map_err(|_| anyhow!("{display}: binary file; use bedit"))?;
+                        let (edited, added, removed) =
+                            apply_patch_hunks(&text, hunks, &display, first_hunk, total_hunks)?;
+                        if edited.len() > self.config.max_write_bytes {
+                            bail!(
+                                "{display}: patched file would be {} bytes, above the {} byte write limit",
+                                edited.len(),
+                                self.config.max_write_bytes
+                            );
+                        }
+                        Ok(PlannedFile {
+                            path: resolved.clone(),
+                            display: display.clone(),
+                            snapshot: Some(snapshot),
+                            text: edited,
+                            hunks: hunks.len(),
+                            added,
+                            removed,
+                        })
+                    }
+                    .await;
+                    match outcome {
+                        Ok(file) => planned.push(file),
+                        Err(error) => {
+                            if !args.best_effort {
+                                return Err(error);
+                            }
+                            failures.push((display, error.to_string()));
+                        }
+                    }
+                    seen.push(resolved);
+                }
+                PatchOp::Add { path, lines } => {
+                    let resolved = match self
+                        .resolve_for_create(&join_patch_path(&dir, path), AccessNeed::Write)
+                        .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            if !args.best_effort {
+                                return Err(error);
+                            }
+                            failures.push((path.clone(), error.to_string()));
+                            continue;
+                        }
+                    };
+                    let display = self.config.access.relative_display(&resolved);
+                    if fs::symlink_metadata(&resolved).await.is_ok() {
+                        let error = format!("{display}: '*** Add File' target already exists");
+                        if !args.best_effort {
+                            bail!("{error}");
+                        }
+                        failures.push((display.clone(), error));
+                        seen.push(resolved);
+                        continue;
+                    }
+                    let text = if lines.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}\n", lines.join("\n"))
+                    };
+                    if text.len() > self.config.max_write_bytes {
+                        let error = format!(
+                            "{display}: added file would be {} bytes, above the {} byte write limit",
+                            text.len(),
+                            self.config.max_write_bytes
+                        );
+                        if !args.best_effort {
+                            bail!("{error}");
+                        }
+                        failures.push((display, error));
+                        seen.push(resolved);
+                        continue;
+                    }
+                    planned.push(PlannedFile {
+                        path: resolved,
+                        display,
+                        snapshot: None,
+                        text,
+                        hunks: 0,
+                        added: lines.len(),
+                        removed: 0,
+                    });
+                }
+            }
+        }
+
+        // Verify every update snapshot before the first write.
+        for file in &planned {
+            if let Some(snapshot) = &file.snapshot {
+                let mut handle = self.open_edit_file(&file.path).await?;
+                let current = Self::read_bounded(&mut handle, self.config.max_read_bytes).await?;
+                verify_snapshot(&file.display, &current, snapshot, "patching")?;
+            }
+        }
+        for file in &planned {
+            let mut handle = match file.snapshot {
+                Some(_) => self.open_edit_file(&file.path).await?,
+                None => self.open_write_file(&file.path).await?,
+            };
+            if file.snapshot.is_some() {
+                handle.rewind().await?;
+                handle.set_len(0).await?;
+            }
+            Self::write_complete(&mut handle, file.text.as_bytes()).await?;
+        }
+
+        let mode = if args.best_effort {
+            "best_effort"
+        } else {
+            "atomic"
+        };
+        let mut receipt = serde_json::json!({
+            "files": planned
+                .iter()
+                .map(|file| serde_json::json!({
+                    "path": file.display,
+                    "hunks": file.hunks,
+                    "added": file.added,
+                    "removed": file.removed,
+                }))
+                .collect::<Vec<_>>(),
+            "mode": mode,
+        });
+        if !failures.is_empty() {
+            receipt["failures"] = serde_json::json!(
+                failures
+                    .iter()
+                    .map(|(path, error)| serde_json::json!({"path": path, "error": error}))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(receipt.to_string())
+    }
+
+    #[tool(
+        description = "Apply a Codex-grammar patch atomically. Supports \"*** Update File:\" hunks and \"*** Add File:\" only; Delete and Move are rejected. Hunks are located by their context lines (exact first, then trailing-whitespace-tolerant), an ambiguous match fails, and hunks apply top-down within a file. best_effort writes the files that planned cleanly and reports the rest. Returns a receipt with per-file hunks/added/removed and mode.",
+        annotations(
+            title = "Apply patch",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn patch(&self, Parameters(args): Parameters<PatchArgs>) -> CallToolResult {
+        match self.patch_impl(args).await {
+            Ok(receipt) => ok_text(receipt),
+            Err(error) => tool_error(error),
+        }
+    }
+
     #[tool(
         description = "Read a binary file. format=mcp returns typed MCP image/audio/blob content; base64 or hex returns encoded bytes.",
         annotations(
@@ -3985,6 +4500,273 @@ mod tests {
         assert_eq!(line_number("a\nb\nc", 4), 3);
     }
 
+    fn patch_args(patch: &str) -> PatchArgs {
+        PatchArgs {
+            dir: dot(),
+            patch: patch.to_owned(),
+            best_effort: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_applies_update_and_add_sections_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
+        std::fs::write(
+            root.join("crates/x/src/lib.rs"),
+            "fn main() {\n    one();\n    two();\n}\n",
+        )
+        .unwrap();
+        let machine = test_machine(root.clone());
+
+        let patch = r#"*** Begin Patch
+*** Update File: crates/x/src/lib.rs
+@@ fn main() {
+ fn main() {
+-    one();
++    uno();
+*** Add File: crates/new/src/lib.rs
++pub fn fresh() {}
++
+*** End Patch"#;
+        let receipt = machine.patch_impl(patch_args(patch)).await.unwrap();
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["mode"], "atomic");
+        assert_eq!(
+            receipt["files"],
+            serde_json::json!([
+                {"path": "crates/x/src/lib.rs", "hunks": 1, "added": 1, "removed": 1},
+                {"path": "crates/new/src/lib.rs", "hunks": 0, "added": 2, "removed": 0}
+            ])
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("crates/x/src/lib.rs")).unwrap(),
+            "fn main() {\n    uno();\n    two();\n}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("crates/new/src/lib.rs")).unwrap(),
+            "pub fn fresh() {}\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_parser_rejects_missing_header_terminator_and_directives() {
+        let machine = test_machine(tempfile::tempdir().unwrap().path().canonicalize().unwrap());
+
+        let error = machine
+            .patch_impl(patch_args("*** Update File: a.txt\n*** End Patch"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "patch: missing '*** Begin Patch' header");
+
+        let error = machine
+            .patch_impl(patch_args("*** Begin Patch\n*** Update File: a.txt"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "patch: missing '*** End Patch' terminator");
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "patch: line 2: unsupported directive '*** Delete File'"
+        );
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Update File: a.txt\n@@\n x\n*** Move to: b.txt\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "patch: line 5: unsupported directive '*** Move to'");
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Update File: a.txt\n@@\n x\nstray text\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "patch: line 5: unexpected text 'stray text'");
+    }
+
+    #[tokio::test]
+    async fn patch_hunk_location_reports_missing_and_ambiguous_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "same\nsame\nsame\n").unwrap();
+        std::fs::write(root.join("b.txt"), "alpha\nbeta\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Update File: b.txt\n@@\n-nope\n+yep\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "hunk 1/1 (b.txt): context not found near line 1");
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Update File: a.txt\n@@\n-same\n+other\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "hunk 1/1 (a.txt): context matches 3 locations (lines 1, 2, 3)"
+        );
+
+        // Nothing was written by either failure.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "same\nsame\nsame\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_falls_back_to_trim_end_and_applies_hunks_top_down() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "first  \nsecond\nthird\nfourth\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n\
+                 *** Update File: a.txt\n\
+                 @@\n\
+                 -first\n\
+                 +FIRST\n\
+                 @@\n\
+                 -third\n\
+                 +THIRD\n\
+                 *** End Patch",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "FIRST\nsecond\nTHIRD\nfourth\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_add_file_refuses_existing_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "present\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Add File: a.txt\n+new\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "a.txt: '*** Add File' target already exists");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "present\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_best_effort_writes_what_planned_cleanly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("good.txt"), "old\n").unwrap();
+        std::fs::write(root.join("exists.txt"), "keep\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let patch = "*** Begin Patch\n\
+                     *** Update File: good.txt\n\
+                     @@\n\
+                     -old\n\
+                     +new\n\
+                     *** Update File: missing.txt\n\
+                     @@\n\
+                     -x\n\
+                     +y\n\
+                     *** Add File: exists.txt\n\
+                     +nope\n\
+                     *** End Patch";
+        // Atomic mode fails the whole call.
+        let error = machine.patch_impl(patch_args(patch)).await.unwrap_err();
+        assert!(error.to_string().contains("missing.txt"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("good.txt")).unwrap(),
+            "old\n"
+        );
+
+        let mut args = patch_args(patch);
+        args.best_effort = true;
+        let receipt: Value =
+            serde_json::from_str(&machine.patch_impl(args).await.unwrap()).unwrap();
+        assert_eq!(receipt["mode"], "best_effort");
+        assert_eq!(receipt["files"][0]["path"], "good.txt");
+        assert_eq!(receipt["failures"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(root.join("good.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("exists.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn patch_parser_bounds_hunks_and_files() {
+        let mut patch = String::from("*** Begin Patch\n*** Update File: a.txt\n");
+        for _ in 0..=MAX_PATCH_HUNKS {
+            patch.push_str("@@\n x\n");
+        }
+        patch.push_str("*** End Patch\n");
+        let error = parse_patch(&patch).unwrap_err().to_string();
+        assert!(error.contains("hunk limit"), "{error}");
+
+        let mut patch = String::from("*** Begin Patch\n");
+        for index in 0..=MAX_PATCH_FILES {
+            patch.push_str(&format!("*** Add File: f{index}.txt\n+x\n"));
+        }
+        patch.push_str("*** End Patch\n");
+        let error = parse_patch(&patch).unwrap_err().to_string();
+        assert!(error.contains("file limit"), "{error}");
+
+        assert_eq!(
+            parse_patch(
+                "*** Begin Patch\n*** Update File: a.txt\n@@ -12,3 +12,4 @@\n-x\n+y\n*** End Patch"
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn patch_anchor_text_is_kept_and_line_numbers_are_ignored() {
+        assert_eq!(
+            parse_patch_anchor(" fn main() {"),
+            Some("fn main() {".to_owned())
+        );
+        assert_eq!(parse_patch_anchor(" -12,3 +12,4"), None);
+        assert_eq!(parse_patch_anchor(" +12,4"), None);
+        assert_eq!(parse_patch_anchor(""), None);
+    }
+
     #[test]
     fn list_entry_limit_defaults_to_4096_and_caps_at_16384() {
         assert_eq!(list_entry_limit(None), 4 * 1024);
@@ -4411,7 +5193,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "bedit", "bread", "bwrite", "edit", "grep", "ls", "read", "write"
+                "bedit", "bread", "bwrite", "edit", "grep", "ls", "patch", "read", "write"
             ]
         );
     }

@@ -1201,6 +1201,25 @@ mod tests {
             "another"
         );
 
+        // Patch dispatch: one Update section, planned and written atomically.
+        let patched_file = call(
+            "patch",
+            json!({"patch":"*** Begin Patch\n*** Update File: nested/test.txt\n@@\n-second!\n+second! patched\n*** End Patch"}),
+        )
+        .await;
+        assert_ne!(patched_file["result"]["isError"], true, "{patched_file}");
+        let patch_receipt: Value = serde_json::from_str(
+            patched_file["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(patch_receipt["mode"], "atomic");
+        assert_eq!(
+            fs::read_to_string(root.join("nested/test.txt")).unwrap(),
+            "second! patched"
+        );
+
         // Preserve existing in-grant symlink alias behavior while rejecting
         // aliases whose canonical target lies in an explicitly denied tree.
         std::os::unix::fs::symlink(root.join("nested/test.txt"), root.join("alias")).unwrap();

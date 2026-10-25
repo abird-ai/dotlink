@@ -315,6 +315,13 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 - File-count and combined-byte bounds are checked while planning, so a call that exceeds them does no IO beyond the reads already performed.
 - Hash verification happens for every changed file before the first write. Writes themselves are sequential and not rolled back if the filesystem fails mid-way; the guarantee is "no write when a snapshot no longer matches".
 - `edit` treats an entry that changes nothing as applied but not changed, so it does not appear in the receipt's `files` and does not touch disk.
+- `patch` applies over the file's line vector, not byte offsets, so a trailing newline (or its absence) is preserved exactly. Context lines keep the file's own bytes; added lines are inserted verbatim.
+- `@@` content that starts with `-` or `+` is treated as unified-diff line numbers and ignored. Anchor text only narrows the search start; if the anchor is not found the search starts at the previous hunk instead of failing.
+- A hunk whose old block has no context or removed lines cannot be located and reports `context not found` — v1 has no insertion-only hunks outside `*** Add File`.
+- The ambiguity message lists at most 10 line numbers.
+- `patch` accepts a bare `*** Update File` with no hunks as an error, and a repeated path across sections as an error (`appears in more than one section`) in both modes.
+- `best_effort` returns the receipt with an extra `failures: [{path, error}]` array when anything failed; `mode` says which contract applied. Atomic mode returns the first failure as a tool error with nothing written.
+- `Add File` content is the concatenation of `+` lines plus one trailing newline; an empty section creates an empty file.
 
 ## Validation
 
