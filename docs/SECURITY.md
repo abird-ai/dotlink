@@ -69,9 +69,23 @@ targets must be regular files; special files are rejected.
 
 Tool requirements:
 
-- read, bread, ls require read;
+- ls, grep, read, bread require read;
 - write, bwrite require write;
-- edit, bedit require read+write.
+- edit, patch, bedit require read+write.
+
+Search never reaches shell-only grants (cache mounts, Nix runtime paths): `grep`
+walks with filesystem read authority only, through the same descriptor-rooted
+enumerator as `ls`. Glob, regex and `.gitignore` matching are pure matchers over
+already-authorized paths and bounded buffers; `.gitignore`, `.gitconfig`-like
+inputs are read through the descriptor-rooted reader, never the ambient path
+namespace. Search bounds are explicit: 1 MiB per file, 50 matches per file, 200
+hits, 1024-character patterns, regex size/DFA limits of 1 MiB, 8 context lines
+per side, and 64 KiB / 1024 lines per `.gitignore` file with invalid patterns
+failing closed.
+
+Mutating text tools (edit, patch) plan against an in-memory snapshot and re-hash
+every affected file before the first write, so a concurrent change fails the
+call with nothing written.
 
 ## Opt-in host developer services
 
@@ -311,7 +325,9 @@ bread supports MCP typed media/blob content plus explicit base64 and hex.
 
 bwrite and bedit enforce write limits.
 
-bedit also caps total file size processed in memory.
+bedit applies at most 32 ranges at original-file offsets, rejects overlaps and
+out-of-bounds ranges, caps total file size processed in memory, and can require a
+`sha256` precondition before writing.
 
 ## Terminal state safety
 

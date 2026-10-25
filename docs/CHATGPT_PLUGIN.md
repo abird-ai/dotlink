@@ -31,9 +31,10 @@ If **Create MCP App** is unavailable, enable **Developer mode** under **Settings
 The tool list is permission-dependent:
 
 ```text
-default       ls, read, bread
-write grant   + edit, bedit, write, bwrite
-shell         + bash (Unix) / powershell (Windows)
+default        ls, grep, read, bread
+write grant    + write, bwrite
+read+write     + edit, patch, bedit
+shell          + bash (Unix) / powershell (Windows)
 ```
 
 Inspect the exact local surface at any time:

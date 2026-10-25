@@ -6,7 +6,7 @@ Co-authors: pi agent
 
 Owner: @pvl
 
-Status: design complete, decisions closed, implementation not started.
+Status: implemented and landed — see [TODO.md](TODO.md) for per-commit hashes.
 
 ## Handoff context
 
@@ -46,7 +46,7 @@ Model-behaviour cross-check (113 pi sessions driven by DeepSeek on the same host
 - Search never reaches shell-only grants (cache mounts, Nix paths); it uses filesystem read authority only.
 - Tool descriptions describe behaviour only; availability is expressed by hiding tools in `tool_router_for_policy`.
 
-## Current state (implemented, in the working tree)
+## State at handoff (landed as Commit 0, `4d07303`)
 
 | Area | Symbols / behaviour |
 | --- | --- |
@@ -55,7 +55,7 @@ Model-behaviour cross-check (113 pi sessions driven by DeepSeek on the same host
 | Heartbeat | `ProgressHeartbeat`, `SHELL_HEARTBEAT_INTERVAL` (10 s; 100 ms under `cfg(test)`), `heartbeat_tick` |
 | Shell timeout | `TIMEOUT_OUTPUT_GRACE = 250ms`; timed-out results carry `timed_out: true` plus partial output |
 | Schema | `with_profile_limits`, `shell_timeout_description`, `shell_output_description`; `list_tools`/`get_tool` overrides |
-| `ls` | `ListArgs { path, pattern, depth, max_entries }`; `list_entry_limit`; `DEFAULT_MAX_LIST_ENTRIES = 4096`, `MAX_LIST_ENTRIES = 16384`; returns `(Vec<FsEntry>, bool)`; hand-rolled `glob_matches` (to be replaced) |
+| `ls` v1 | `ListArgs { path, pattern, depth, max_entries }`; `list_entry_limit`; `DEFAULT_MAX_LIST_ENTRIES = 4096`, `MAX_LIST_ENTRIES = 16384`; returns `(Vec<FsEntry>, bool)`; hand-rolled glob matcher (replaced in Commit 1) |
 | `read` | `ReadArgs { path, offset, limit, numbered }`, numbering on by default |
 
 ## Target surface — 11 tools

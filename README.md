@@ -144,9 +144,10 @@ If **Create MCP App** is unavailable, enable **Developer mode** under **Settings
 The tools ChatGPT discovers follow dotlink's local permissions:
 
 ~~~text
-read-only     ls, read, bread
-write        + write, edit, bwrite, bedit
-shell        + bash (Unix) / powershell (Windows)
+read-only      ls, grep, read, bread
+write          + write, bwrite
+read + write   + edit, patch, bedit
+shell          + bash (Unix) / powershell (Windows)
 ~~~
 
 Never paste a Runtime or Admin API key into ChatGPT. ChatGPT only needs the `tunnel_...` ID.
@@ -313,12 +314,37 @@ Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--
 ### Filesystem policy
 
 ~~~text
-read / bread / ls             require read
+ls / grep / read / bread      require read
 write / bwrite                require write
-edit / bedit                  require read + write
+edit / patch / bedit          require read + write
 ~~~
 
 Targets are canonicalized before checks; create targets canonicalize their nearest existing ancestor, preventing symlink escapes. The advertised MCP tool list is permission-aware, so unavailable write/shell tools are omitted rather than merely rejected later.
+
+### Tools
+
+| Tool | Needs | What it does |
+| --- | --- | --- |
+| `ls` | read | List entries with `pattern` (glob), `depth`, `kind`, `sort`, `limit` |
+| `grep` | read | Regex search with `content`/`files`/`count` output, context, glob and `.gitignore` filters |
+| `read` | read | Read numbered lines from a UTF-8 file |
+| `write` | write | Create or replace a text file |
+| `edit` | read+write | Apply an ordered `edits[]` array across files, all or nothing |
+| `patch` | read+write | Apply a Codex-format patch atomically |
+| `bread` | read | Read binary content as MCP typed content, base64, or hex |
+| `bwrite` | write | Create or replace a binary file |
+| `bedit` | read+write | Apply byte ranges against original-file offsets |
+| `bash` / `powershell` | shell | Run a command inside the sandbox |
+
+One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
+`{a,b}` stay within one path segment and `**` recurses. Every list/search tool
+has a documented `limit` and reports `truncated`; `read` ends a capped result
+with a single marker line instead.
+
+~~~bash
+dotlink --list-tools
+dotlink --allow-rw --allow-shell --list-tools
+~~~
 
 ### Linux sandbox
 

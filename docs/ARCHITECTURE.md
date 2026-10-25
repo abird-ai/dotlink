@@ -289,15 +289,10 @@ Developer caches are modeled separately from filesystem grants. A cache record s
 The implementation defines:
 
 ~~~text
-read
-write
-edit
-ls
-bread
-bwrite
-bedit
-bash
-powershell
+discovery   ls     grep
+text        read   write   edit   patch
+binary      bread  bwrite  bedit
+shell       bash   powershell
 ~~~
 
 The visible router is policy-specific.
@@ -306,11 +301,14 @@ Default:
 
 ~~~text
 ls
+grep
 read
 bread
 ~~~
 
 Write tools are hidden if no write capability exists.
+
+`edit`, `patch`, and `bedit` need an overlapping read+write grant.
 
 Shell is hidden unless explicitly enabled.
 
@@ -457,6 +455,24 @@ Windows ARM64 uses nixpkgs' pinned LLVM-MinGW/UCRT toolchain. macOS ARM64 uses t
 
 Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases consume identical Nix results. `scripts/build-release-artifacts.sh` and the GitHub workflow both delegate target logic to `release-all`. `install.sh` selects Linux x86_64/ARM64 or macOS ARM64 automatically; `install.ps1` selects Windows x86_64/ARM64. The canonical upstream repository is `https://github.com/abird-ai/dotlink`; installers default to that repository while still allowing `DOTLINK_REPO` or a custom release base URL for forks and mirrors.
 
+## Text tools
+
+- `read` returns a window of lines with `N<TAB>` numbering by default and one
+  `… truncated at line N of M` marker when the window is capped.
+- `write` replaces a whole file.
+- `edit` takes an ordered `edits[]` array across up to 16 files, requires each
+  `old_text` to be unique (or `replace_all`), and re-hashes every snapshot
+  before writing: any mismatch writes nothing.
+- `patch` applies Codex `*** Begin Patch` / `*** Update File` / `*** Add File`
+  sections. Hunks are located by content, an ambiguous match fails, and the whole
+  call is atomic unless `best_effort` is set.
+- `ls`, `grep`, `read`, `bread`, `write`, `bwrite`, `edit`, `patch` and `bedit`
+  operate only inside canonicalized grants; denies and protected paths are
+  dropped before patterns, sorts, or limits apply.
+- `grep` walks with the same descriptor-rooted enumerator as `ls`; regex, glob
+  and `.gitignore` matching are pure matchers over paths and buffers already
+  held, and `.gitignore` files are read through the descriptor-rooted reader.
+
 ## Binary MCP content
 
 bread(format=mcp) maps bytes to MCP typed content:
@@ -469,4 +485,6 @@ base64 and hex modes return encoded text.
 
 bwrite decodes base64 or hex.
 
-bedit edits bounded byte ranges in a bounded file.
+bedit applies many byte ranges against original-file offsets, rejects overlaps
+and out-of-bounds ranges, supports an optional `sha256` precondition, and caps
+both the source and the result at the patchable file size.
