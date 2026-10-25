@@ -1150,7 +1150,7 @@ mod tests {
         assert!(read.to_string().contains("first"));
         let edited = call(
             "edit",
-            json!({"path":"nested/test.txt", "old_text":"first", "new_text":"second"}),
+            json!({"path":"nested/test.txt", "edits":[{"old_text":"first", "new_text":"second"}]}),
         )
         .await;
         assert_ne!(edited["result"]["isError"], true, "{edited}");
@@ -1174,6 +1174,32 @@ mod tests {
             serde_json::from_str(grep_count["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert_eq!(counted["total"], serde_json::json!(1));
+
+        // Multi-file edit in one call, with the top-level default path unused
+        // because every entry names its own file.
+        let prepared = call(
+            "write",
+            json!({"path":"nested/other.txt", "content":"other"}),
+        )
+        .await;
+        assert_ne!(prepared["result"]["isError"], true, "{prepared}");
+        let multi = call(
+            "edit",
+            json!({"edits":[
+                {"path":"nested/test.txt", "old_text":"second", "new_text":"second!"},
+                {"path":"nested/other.txt", "old_text":"other", "new_text":"another"}
+            ]}),
+        )
+        .await;
+        assert_ne!(multi["result"]["isError"], true, "{multi}");
+        assert_eq!(
+            fs::read_to_string(root.join("nested/test.txt")).unwrap(),
+            "second!"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("nested/other.txt")).unwrap(),
+            "another"
+        );
 
         // Preserve existing in-grant symlink alias behavior while rejecting
         // aliases whose canonical target lies in an explicitly denied tree.

@@ -309,6 +309,12 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 - `count.total` is the sum of the returned per-file counts (the current page), not the whole tree.
 - `.gitignore` handling builds one matcher per directory (loaded through the descriptor-rooted reader, never by ambient path), evaluates deepest-first, and lets a whitelist stop the search — git's precedence. A file over 64 KiB or 1024 lines is truncated rather than fatal; an invalid pattern fails the whole call.
 - `grep` output is capped at `max_output_bytes` with a trailing `… truncated at N bytes` marker, in addition to the hit-limit marker.
+- `edit` numbering in failure text is the 1-based position of the entry in the whole `edits` array; the parenthesised name is the resolved file displayed relative to the launch directory.
+- The ambiguity message lists at most 10 matching line numbers, then stops, so a pathological `old_text` cannot produce an unbounded error string.
+- Empty `old_text`, too many edits, too many files and combined-size overruns are attributed to the entry position as `edit i/n (path): …` or `edit i/n: …` when the file is not yet known.
+- File-count and combined-byte bounds are checked while planning, so a call that exceeds them does no IO beyond the reads already performed.
+- Hash verification happens for every changed file before the first write. Writes themselves are sequential and not rolled back if the filesystem fails mid-way; the guarantee is "no write when a snapshot no longer matches".
+- `edit` treats an entry that changes nothing as applied but not changed, so it does not appear in the receipt's `files` and does not touch disk.
 
 ## Validation
 

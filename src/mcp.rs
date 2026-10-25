@@ -47,6 +47,8 @@ const MAX_GREP_PATTERN: usize = 1024;
 const MAX_GREP_PER_FILE: usize = 50;
 const MAX_GREP_CONTEXT: usize = 8;
 const MAX_GREP_FILES: usize = 65_536;
+const MAX_EDIT_OPS: usize = 64;
+const MAX_EDIT_FILES: usize = 16;
 const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
 const GITIGNORE_MAX_LINES: usize = 1024;
 
@@ -282,16 +284,28 @@ struct WriteArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditArgs {
-    /// Existing UTF-8 text file path.
-    path: String,
+    /// Default file path for entries that omit their own. Relative paths resolve
+    /// from the directory where dotlink was launched.
+    #[serde(default)]
+    path: Option<String>,
 
-    /// Exact text to find.
+    /// Ordered edits. Entries for one file apply to that file's evolving buffer.
+    edits: Vec<EditOp>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EditOp {
+    /// File path for this entry. Falls back to the top-level `path`.
+    #[serde(default)]
+    path: Option<String>,
+
+    /// Exact text to find. Never include the `N\t` prefix that `read` adds.
     old_text: String,
 
     /// Replacement text. May be empty.
     new_text: String,
 
-    /// Replace every exact occurrence. Without this flag, the match must be unique.
+    /// Replace every exact occurrence. Without this flag the match must be unique.
     #[serde(default)]
     replace_all: bool,
 }
@@ -537,6 +551,45 @@ fn list_entry_limit(requested: Option<usize>) -> usize {
     requested
         .unwrap_or(DEFAULT_MAX_LIST_ENTRIES)
         .clamp(1, MAX_LIST_ENTRIES)
+}
+
+/// Byte offsets of every occurrence of `needle` in `haystack`.
+fn match_indices(haystack: &str, needle: &str) -> Vec<usize> {
+    haystack.match_indices(needle).map(|(at, _)| at).collect()
+}
+
+/// 1-based line number of a byte offset.
+fn line_number(text: &str, offset: usize) -> usize {
+    text.as_bytes()[..offset.min(text.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1
+}
+
+fn line_count(text: &str) -> usize {
+    text.lines().count()
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
+/// Every mutating text tool plans against a read snapshot and re-checks the
+/// content before writing, so a concurrent change fails the whole call.
+fn verify_snapshot(display: &str, current: &[u8], snapshot: &[u8], verb: &str) -> Result<()> {
+    if sha256(current) != sha256(snapshot) {
+        bail!("{display} changed while {verb}; nothing was written");
+    }
+    Ok(())
+}
+
+/// `read` numbers lines as `N\tline`; an `old_text` copied from that output
+/// starts with digits and a tab.
+fn has_line_number_prefix(text: &str) -> bool {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && text[digits..].starts_with('\t')
 }
 
 /// Trim rendered text at the policy byte ceiling without splitting a character,
@@ -2592,10 +2645,193 @@ impl LocalMachine {
         }
     }
 
+    /// Multi-file, all-or-nothing exact-text edit. Every entry is planned
+    /// against an in-memory snapshot in array order, then each file is
+    /// re-hashed before anything is written.
+    async fn edit_impl(&self, args: EditArgs) -> Result<String> {
+        let total = args.edits.len();
+        if total == 0 {
+            bail!("edit: edits must not be empty");
+        }
+        if total > MAX_EDIT_OPS {
+            bail!("edit: {total} edits, above the {MAX_EDIT_OPS} edit limit");
+        }
+
+        struct FilePlan {
+            path: PathBuf,
+            display: String,
+            snapshot: Vec<u8>,
+            text: String,
+            edits: usize,
+            new_texts: Vec<String>,
+        }
+
+        let mut files: Vec<FilePlan> = Vec::new();
+        let mut combined_bytes = 0_usize;
+
+        for (index, op) in args.edits.iter().enumerate() {
+            let position = index + 1;
+            combined_bytes = combined_bytes
+                .saturating_add(op.old_text.len())
+                .saturating_add(op.new_text.len());
+            if combined_bytes > self.config.max_write_bytes {
+                bail!(
+                    "edit {position}/{total}: edits are {combined_bytes} bytes, above the {} byte write limit",
+                    self.config.max_write_bytes
+                );
+            }
+
+            let target = op.path.as_deref().or(args.path.as_deref());
+            let Some(target) = target else {
+                bail!("edit {position}/{total}: no path (set edits[].path or a top-level path)");
+            };
+            let path = self.resolve_existing(target, AccessNeed::ReadWrite).await?;
+            let slot = match files.iter().position(|file| file.path == path) {
+                Some(slot) => slot,
+                None => {
+                    if files.len() >= MAX_EDIT_FILES {
+                        bail!(
+                            "edit {position}/{total}: {} files, above the {MAX_EDIT_FILES} file limit",
+                            files.len() + 1
+                        );
+                    }
+                    let mut file = self.open_edit_file(&path).await?;
+                    let snapshot =
+                        Self::read_bounded(&mut file, self.config.max_read_bytes).await?;
+                    let text = match String::from_utf8(snapshot.clone()) {
+                        Ok(text) => text,
+                        Err(_) => bail!(
+                            "edit {position}/{total} ({}): binary file; use bedit",
+                            self.config.access.relative_display(&path)
+                        ),
+                    };
+                    files.push(FilePlan {
+                        display: self.config.access.relative_display(&path),
+                        path,
+                        snapshot,
+                        text,
+                        edits: 0,
+                        new_texts: Vec::new(),
+                    });
+                    files.len() - 1
+                }
+            };
+            let file = &mut files[slot];
+            if op.old_text.is_empty() {
+                bail!(
+                    "edit {position}/{total} ({}): old_text must not be empty",
+                    file.display
+                );
+            }
+            if file
+                .new_texts
+                .iter()
+                .any(|new_text| new_text.contains(&op.old_text))
+            {
+                bail!(
+                    "edit {position}/{total} ({}): old_text is a substring of this edit's predecessor's new_text in the same file",
+                    file.display
+                );
+            }
+
+            let occurrences = match_indices(&file.text, &op.old_text);
+            if occurrences.is_empty() {
+                if has_line_number_prefix(&op.old_text) {
+                    bail!(
+                        "edit {position}/{total} ({}): old_text appears to include a read line-number prefix (digits then tab); strip it",
+                        file.display
+                    );
+                }
+                bail!(
+                    "edit {position}/{total} ({}): old_text does not occur at the point that edit applies",
+                    file.display
+                );
+            }
+            if !op.replace_all && occurrences.len() > 1 {
+                let lines = occurrences
+                    .iter()
+                    .take(10)
+                    .map(|offset| line_number(&file.text, *offset).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "edit {position}/{total} ({}): old_text occurs {} times at lines {lines}; make it unique or set replace_all",
+                    file.display,
+                    occurrences.len()
+                );
+            }
+
+            file.text = match op.replace_all {
+                true => file.text.replace(&op.old_text, &op.new_text),
+                false => file.text.replacen(&op.old_text, &op.new_text, 1),
+            };
+            file.edits += 1;
+            file.new_texts.push(op.new_text.clone());
+
+            if file.text.len() > self.config.max_write_bytes {
+                bail!(
+                    "edit {position}/{total} ({}): edited file would be {} bytes, above the {} byte write limit",
+                    file.display,
+                    file.text.len(),
+                    self.config.max_write_bytes
+                );
+            }
+        }
+
+        let changed = files
+            .iter()
+            .filter(|file| file.text.as_bytes() != file.snapshot.as_slice())
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            let receipt = serde_json::json!({
+                "files": [],
+                "edits_applied": total,
+                "changed_files": 0,
+            });
+            return Ok(receipt.to_string());
+        }
+
+        // Verify every snapshot before the first write: a file that changed
+        // since it was read fails the whole call.
+        let mut verified: Vec<(&PathBuf, &FilePlan)> = Vec::new();
+        for file in &changed {
+            let mut handle = self.open_edit_file(&file.path).await?;
+            let current = Self::read_bounded(&mut handle, self.config.max_read_bytes).await?;
+            verify_snapshot(&file.display, &current, &file.snapshot, "editing")?;
+            verified.push((&file.path, file));
+        }
+
+        for (path, file) in &verified {
+            let mut handle = self.open_edit_file(path).await?;
+            handle.rewind().await?;
+            handle.set_len(0).await?;
+            Self::write_complete(&mut handle, file.text.as_bytes()).await?;
+        }
+
+        let files = changed
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.display,
+                    "edits": file.edits,
+                    "line_delta": line_count(&file.text).wrapping_sub(line_count(
+                        &String::from_utf8_lossy(&file.snapshot),
+                    )),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "files": files,
+            "edits_applied": total,
+            "changed_files": changed.len(),
+        })
+        .to_string())
+    }
+
     #[tool(
-        description = "Replace exact text inside an existing file.",
+        description = "Replace exact text in one or more existing UTF-8 files, all or nothing. `edits` is an ordered array of {path?, old_text, new_text, replace_all?}; `path` is the inherited default. Each old_text must be unique unless replace_all is set, and must not be a substring of an earlier edit's new_text in the same file. `read` prefixes lines with a line number and a tab; never include that prefix in old_text. Returns a receipt with per-file path, edits and line_delta, plus edits_applied and changed_files.",
         annotations(
-            title = "Edit text file",
+            title = "Edit text files",
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
@@ -2603,59 +2839,14 @@ impl LocalMachine {
         )
     )]
     async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> CallToolResult {
-        if args.old_text.is_empty() {
-            return tool_error("old_text must not be empty");
-        }
-        let path = match self
-            .resolve_existing(&args.path, AccessNeed::ReadWrite)
-            .await
-        {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let mut file = match self.open_edit_file(&path).await {
-            Ok(file) => file,
-            Err(error) => return tool_error(error),
-        };
-        let bytes = match Self::read_bounded(&mut file, self.config.max_read_bytes).await {
-            Ok(bytes) => bytes,
-            Err(error) => return tool_error(error),
-        };
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => return tool_error("binary file; use bedit"),
-        };
-        let matches = text.match_indices(&args.old_text).count();
-        if matches == 0 {
-            return tool_error("old_text was not found");
-        }
-        if !args.replace_all && matches != 1 {
+        if args.edits.len() > MAX_EDIT_OPS {
             return tool_error(format!(
-                "old_text occurs {matches} times; make the match unique or set replace_all=true"
+                "edit: {} edits, above the {MAX_EDIT_OPS} edit limit",
+                args.edits.len()
             ));
         }
-
-        let edited = if args.replace_all {
-            text.replace(&args.old_text, &args.new_text)
-        } else {
-            text.replacen(&args.old_text, &args.new_text, 1)
-        };
-        if edited.len() > self.config.max_write_bytes {
-            return tool_error(format!(
-                "edited file would be {} bytes, above the {} byte write limit",
-                edited.len(),
-                self.config.max_write_bytes
-            ));
-        }
-
-        if let Err(error) = file.rewind().await {
-            return tool_error(error);
-        }
-        if let Err(error) = file.set_len(0).await {
-            return tool_error(error);
-        }
-        match Self::write_complete(&mut file, edited.as_bytes()).await {
-            Ok(()) => ok_text(format!("edited {}", args.path)),
+        match self.edit_impl(args).await {
+            Ok(receipt) => ok_text(receipt),
             Err(error) => tool_error(error),
         }
     }
@@ -3592,6 +3783,206 @@ mod tests {
         args.respect_gitignore = true;
         let error = machine.grep_impl(args).await.unwrap_err().to_string();
         assert!(error.contains("invalid .gitignore pattern"), "{error}");
+    }
+
+    fn edit_args(path: Option<&str>, edits: Vec<EditOp>) -> EditArgs {
+        EditArgs {
+            path: path.map(str::to_owned),
+            edits,
+        }
+    }
+
+    fn edit_op(path: Option<&str>, old_text: &str, new_text: &str) -> EditOp {
+        EditOp {
+            path: path.map(str::to_owned),
+            old_text: old_text.to_owned(),
+            new_text: new_text.to_owned(),
+            replace_all: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_applies_ordered_multi_file_edits_with_inherited_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/y/src")).unwrap();
+        std::fs::write(root.join("crates/x/src/lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        std::fs::write(root.join("crates/y/src/lib.rs"), "alpha\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let receipt = machine
+            .edit_impl(edit_args(
+                Some("crates/x/src/lib.rs"),
+                vec![
+                    edit_op(None, "fn a() {}", "fn a() { one() }"),
+                    // Same file, later in the array: applies to the buffer the
+                    // first edit produced.
+                    edit_op(None, "fn b() {}", "fn b() { two() }"),
+                    edit_op(Some("crates/y/src/lib.rs"), "alpha", "beta\ngamma"),
+                ],
+            ))
+            .await
+            .unwrap();
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["edits_applied"], serde_json::json!(3));
+        assert_eq!(receipt["changed_files"], serde_json::json!(2));
+        assert_eq!(
+            receipt["files"][0],
+            serde_json::json!({
+                "path": "crates/x/src/lib.rs",
+                "edits": 2,
+                "line_delta": 0
+            })
+        );
+        assert_eq!(receipt["files"][1]["line_delta"], serde_json::json!(1));
+        assert_eq!(
+            std::fs::read_to_string(root.join("crates/x/src/lib.rs")).unwrap(),
+            "fn a() { one() }\nfn b() { two() }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("crates/y/src/lib.rs")).unwrap(),
+            "beta\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_failures_with_contract_texts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
+        std::fs::write(root.join("crates/x/src/lib.rs"), "one\ntwo\ntwo\nthree\n").unwrap();
+        std::fs::write(root.join("plain.txt"), "plain\n").unwrap();
+        let machine = test_machine(root.clone());
+        let target = "crates/x/src/lib.rs";
+
+        // Missing path.
+        let error = machine
+            .edit_impl(edit_args(None, vec![edit_op(None, "one", "1")]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "edit 1/1: no path (set edits[].path or a top-level path)"
+        );
+
+        // Not found.
+        let error = machine
+            .edit_impl(edit_args(Some(target), vec![edit_op(None, "nope", "x")]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "edit 1/1 (crates/x/src/lib.rs): old_text does not occur at the point that edit applies"
+        );
+
+        // Ambiguity lists the matching lines.
+        let error = machine
+            .edit_impl(edit_args(
+                Some(target),
+                vec![edit_op(None, "one", "1"), edit_op(None, "two", "2")],
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "edit 2/2 (crates/x/src/lib.rs): old_text occurs 2 times at lines 2, 3; make it unique or set replace_all"
+        );
+
+        // The read line-number prefix hint.
+        let error = machine
+            .edit_impl(edit_args(Some(target), vec![edit_op(None, "2\ttwo", "2")]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "edit 1/1 (crates/x/src/lib.rs): old_text appears to include a read line-number prefix (digits then tab); strip it"
+        );
+
+        // old_text that is a substring of the predecessor's new_text.
+        let error = machine
+            .edit_impl(edit_args(
+                Some(target),
+                vec![
+                    edit_op(None, "one", "one and two"),
+                    edit_op(None, "two", "three"),
+                ],
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "edit 2/2 (crates/x/src/lib.rs): old_text is a substring of this edit's predecessor's new_text in the same file"
+        );
+
+        // Nothing was written by any failed plan.
+        assert_eq!(
+            std::fs::read_to_string(root.join(target)).unwrap(),
+            "one\ntwo\ntwo\nthree\n"
+        );
+
+        // A snapshot that no longer matches disk fails before any write.
+        let error = verify_snapshot("crates/y/src/lib.rs", b"changed", b"planned", "editing")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "crates/y/src/lib.rs changed while editing; nothing was written"
+        );
+        assert!(verify_snapshot("a.txt", b"same", b"same", "editing").is_ok());
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_and_bounds() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "x\ny\nx\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let mut op = edit_op(None, "x", "z");
+        op.replace_all = true;
+        let receipt = machine
+            .edit_impl(edit_args(Some("a.txt"), vec![op]))
+            .await
+            .unwrap();
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["files"][0]["edits"], serde_json::json!(1));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "z\ny\nz\n"
+        );
+
+        let error = machine
+            .edit_impl(edit_args(Some("a.txt"), Vec::new()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("edits must not be empty"), "{error}");
+
+        let too_many = (0..=MAX_EDIT_OPS)
+            .map(|index| edit_op(None, &format!("m{index}"), "n"))
+            .collect::<Vec<_>>();
+        let error = machine
+            .edit_impl(edit_args(Some("a.txt"), too_many))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("edit limit"), "{error}");
+    }
+
+    #[test]
+    fn edit_helpers_detect_line_prefixes_and_numbers() {
+        assert!(has_line_number_prefix("12\tfn main()"));
+        assert!(!has_line_number_prefix("fn main()"));
+        assert!(!has_line_number_prefix("\tfn main()"));
+        assert_eq!(line_number("a\nb\nc", 0), 1);
+        assert_eq!(line_number("a\nb\nc", 2), 2);
+        assert_eq!(line_number("a\nb\nc", 4), 3);
     }
 
     #[test]
