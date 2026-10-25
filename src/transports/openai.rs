@@ -1244,7 +1244,7 @@ mod tests {
         assert_ne!(bwrite["result"]["isError"], true, "{bwrite}");
         let patched = call(
             "bedit",
-            json!({"path":"nested/data.bin", "offset":1, "length":2, "data":"WFk="}),
+            json!({"path":"nested/data.bin", "edits":[{"offset":1, "length":2, "data":"WFk="}]}),
         )
         .await;
         assert_ne!(patched["result"]["isError"], true, "{patched}");

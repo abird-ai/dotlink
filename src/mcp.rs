@@ -51,6 +51,7 @@ const MAX_EDIT_OPS: usize = 64;
 const MAX_EDIT_FILES: usize = 16;
 const MAX_PATCH_FILES: usize = 32;
 const MAX_PATCH_HUNKS: usize = 64;
+const MAX_BEDIT_RANGES: usize = 32;
 const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
 const GITIGNORE_MAX_LINES: usize = 1024;
 
@@ -382,15 +383,27 @@ struct BeditArgs {
     /// Existing binary file path.
     path: String,
 
-    /// Zero-based byte offset where replacement begins.
+    /// Byte ranges, all relative to the original file. Applied ascending.
+    edits: Vec<BeditRange>,
+
+    /// Optional lowercase hex SHA-256 of the current file content. A mismatch
+    /// writes nothing.
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BeditRange {
+    /// Zero-based byte offset in the original file.
     offset: usize,
 
-    /// Number of existing bytes to replace. Defaults to the decoded payload length.
-    /// Use 0 to insert. Use empty data with a positive length to delete.
+    /// Number of existing bytes to replace. Defaults to the decoded payload
+    /// length. Use 0 to insert; empty data with a positive length deletes.
     #[serde(default)]
     length: Option<usize>,
 
     /// Replacement bytes encoded as base64 or hex. May be empty.
+    #[serde(default)]
     data: String,
 
     /// Encoding of data.
@@ -3498,10 +3511,117 @@ impl LocalMachine {
         }
     }
 
+    /// Multi-range binary edit against original-file offsets. Ranges are
+    /// decoded and validated before the file is rewritten; nothing is written
+    /// when any range is invalid or the optional sha256 precondition fails.
+    async fn bedit_impl(&self, args: BeditArgs) -> Result<String> {
+        let total = args.edits.len();
+        if total == 0 {
+            bail!("bedit: edits must not be empty");
+        }
+        if total > MAX_BEDIT_RANGES {
+            bail!("bedit: {total} ranges, above the {MAX_BEDIT_RANGES} range limit");
+        }
+        let path = self
+            .resolve_existing(&args.path, AccessNeed::ReadWrite)
+            .await?;
+        let display = self.config.access.relative_display(&path);
+        let mut file = self.open_edit_file(&path).await?;
+        let metadata = file.metadata().await?;
+        if metadata.len() > MAX_PATCH_FILE_BYTES as u64 {
+            bail!(
+                "bedit target is {} bytes; maximum patchable file size is {MAX_PATCH_FILE_BYTES} bytes",
+                metadata.len()
+            );
+        }
+        let original = Self::read_bounded(&mut file, MAX_PATCH_FILE_BYTES).await?;
+        let size_before = original.len();
+
+        if let Some(expected) = args.sha256.as_deref() {
+            let found = hex::encode(sha256(&original));
+            if !expected.eq_ignore_ascii_case(&found) {
+                bail!("bedit: sha256 mismatch (expected {expected}, found {found})");
+            }
+        }
+
+        let mut ranges = Vec::with_capacity(total);
+        for (index, range) in args.edits.iter().enumerate() {
+            let position = index + 1;
+            if range.offset > size_before {
+                bail!(
+                    "bedit {position}/{total}: offset {} is beyond end of file ({size_before} bytes)",
+                    range.offset
+                );
+            }
+            let data = decode_binary(&range.data, range.encoding, MAX_PATCH_FILE_BYTES)
+                .with_context(|| format!("bedit {position}/{total}"))?;
+            let length = range.length.unwrap_or(data.len());
+            let end = range
+                .offset
+                .checked_add(length)
+                .filter(|end| *end <= size_before);
+            let Some(end) = end else {
+                bail!(
+                    "bedit {position}/{total}: range extends beyond end of file ({size_before} bytes)"
+                );
+            };
+            ranges.push((range.offset, end, data, position, length));
+        }
+
+        ranges.sort_by_key(|(offset, _, _, _, _)| *offset);
+        for (index, (offset, _, _, position, _)) in ranges.iter().enumerate() {
+            if index == 0 {
+                continue;
+            }
+            let (previous_offset, previous_end, _, previous_position, previous_length) =
+                &ranges[index - 1];
+            if *offset < *previous_end {
+                bail!(
+                    "bedit {position}/{total}: range overlaps range {previous_position} (offset {previous_offset}, length {previous_length})"
+                );
+            }
+        }
+
+        let bytes_written = ranges
+            .iter()
+            .map(|(_, _, data, _, _)| data.len())
+            .sum::<usize>();
+        let bytes_removed = ranges.iter().map(|(_, end, _, _, _)| end).sum::<usize>()
+            - ranges
+                .iter()
+                .map(|(offset, _, _, _, _)| offset)
+                .sum::<usize>();
+        let size_after = size_before - bytes_removed + bytes_written;
+        if size_after > MAX_PATCH_FILE_BYTES {
+            bail!("bedit: patched file would exceed the {MAX_PATCH_FILE_BYTES} byte limit");
+        }
+
+        let mut edited = Vec::with_capacity(size_after);
+        let mut cursor = 0_usize;
+        for (offset, end, data, _, _) in &ranges {
+            edited.extend_from_slice(&original[cursor..*offset]);
+            edited.extend_from_slice(data);
+            cursor = *end;
+        }
+        edited.extend_from_slice(&original[cursor..]);
+
+        file.rewind().await?;
+        file.set_len(0).await?;
+        Self::write_complete(&mut file, &edited).await?;
+        Ok(serde_json::json!({
+            "path": display,
+            "ranges": total,
+            "bytes_written": bytes_written,
+            "size_before": size_before,
+            "size_after": size_after,
+        })
+        .to_string())
+    }
+
     #[tool(
-        description = "Patch an existing binary file by replacing a byte range.",
+        description = "Edit byte ranges in an existing binary file, all or nothing. `edits` is an array of {offset, length?, data, encoding}; offsets are relative to the original file, ranges are applied ascending, and overlaps are rejected. `length` defaults to the decoded payload size, 0 inserts, and empty data with a positive length deletes. An optional lowercase-hex `sha256` precondition is checked before writing. Returns a receipt with path, ranges, bytes_written, size_before and size_after.",
         annotations(
-            title = "Patch binary file",
+            title = "Edit binary file",
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
@@ -3509,66 +3629,8 @@ impl LocalMachine {
         )
     )]
     async fn bedit(&self, Parameters(args): Parameters<BeditArgs>) -> CallToolResult {
-        let replacement =
-            match decode_binary(&args.data, args.encoding, self.config.max_write_bytes) {
-                Ok(bytes) => bytes,
-                Err(error) => return tool_error(error),
-            };
-        let path = match self
-            .resolve_existing(&args.path, AccessNeed::ReadWrite)
-            .await
-        {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let mut file = match self.open_edit_file(&path).await {
-            Ok(file) => file,
-            Err(error) => return tool_error(error),
-        };
-        let metadata = match file.metadata().await {
-            Ok(metadata) => metadata,
-            Err(error) => return tool_error(error),
-        };
-        if metadata.len() > MAX_PATCH_FILE_BYTES as u64 {
-            return tool_error(format!(
-                "patch target is {} bytes; maximum patchable file size is {} bytes",
-                metadata.len(),
-                MAX_PATCH_FILE_BYTES
-            ));
-        }
-
-        let mut bytes = match Self::read_bounded(&mut file, MAX_PATCH_FILE_BYTES).await {
-            Ok(bytes) => bytes,
-            Err(error) => return tool_error(error),
-        };
-        if args.offset > bytes.len() {
-            return tool_error("offset is beyond end of file");
-        }
-        let length = args.length.unwrap_or(replacement.len());
-        let end = match args.offset.checked_add(length) {
-            Some(end) if end <= bytes.len() => end,
-            _ => return tool_error("patch range extends beyond end of file"),
-        };
-        let resulting_size = bytes.len() - length + replacement.len();
-        if resulting_size > MAX_PATCH_FILE_BYTES {
-            return tool_error(format!(
-                "patched file would exceed the {} byte limit",
-                MAX_PATCH_FILE_BYTES
-            ));
-        }
-
-        bytes.splice(args.offset..end, replacement);
-        if let Err(error) = file.rewind().await {
-            return tool_error(error);
-        }
-        if let Err(error) = file.set_len(0).await {
-            return tool_error(error);
-        }
-        match Self::write_complete(&mut file, &bytes).await {
-            Ok(()) => ok_text(format!(
-                "patched {} at offset {} (replaced {} bytes)",
-                args.path, args.offset, length
-            )),
+        match self.bedit_impl(args).await {
+            Ok(receipt) => ok_text(receipt),
             Err(error) => tool_error(error),
         }
     }
@@ -4765,6 +4827,146 @@ mod tests {
         assert_eq!(parse_patch_anchor(" -12,3 +12,4"), None);
         assert_eq!(parse_patch_anchor(" +12,4"), None);
         assert_eq!(parse_patch_anchor(""), None);
+    }
+
+    fn bedit_range(offset: usize, length: Option<usize>, data: &str) -> BeditRange {
+        BeditRange {
+            offset,
+            length,
+            data: BASE64.encode(data.as_bytes()),
+            encoding: BinaryEncoding::Base64,
+        }
+    }
+
+    #[tokio::test]
+    async fn bedit_applies_multi_range_edits_against_original_offsets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("data.bin"), b"0123456789").unwrap();
+        let machine = test_machine(root.clone());
+
+        let receipt = machine
+            .bedit_impl(BeditArgs {
+                path: "data.bin".to_owned(),
+                // Out of order on purpose: ranges apply ascending by offset
+                // while every offset stays relative to the original file.
+                edits: vec![
+                    bedit_range(6, Some(2), "ab"),
+                    bedit_range(1, Some(2), ""),
+                    bedit_range(9, Some(1), "XYZ"),
+                ],
+                sha256: None,
+            })
+            .await
+            .unwrap();
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["path"], "data.bin");
+        assert_eq!(receipt["ranges"], serde_json::json!(3));
+        assert_eq!(receipt["bytes_written"], serde_json::json!(5));
+        assert_eq!(receipt["size_before"], serde_json::json!(10));
+        assert_eq!(receipt["size_after"], serde_json::json!(10));
+        assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), b"0345ab8XYZ");
+    }
+
+    #[tokio::test]
+    async fn bedit_insert_delete_and_sha256_precondition() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("data.bin"), b"abcdef").unwrap();
+        let machine = test_machine(root.clone());
+        let digest = hex::encode(sha256(b"abcdef"));
+
+        machine
+            .bedit_impl(BeditArgs {
+                path: "data.bin".to_owned(),
+                edits: vec![bedit_range(0, Some(0), ">>"), bedit_range(2, Some(2), "")],
+                sha256: Some(digest.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), b">>abef");
+
+        let error = machine
+            .bedit_impl(BeditArgs {
+                path: "data.bin".to_owned(),
+                edits: vec![bedit_range(0, Some(0), "x")],
+                sha256: Some(digest),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("bedit: sha256 mismatch (expected "),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), b">>abef");
+    }
+
+    #[tokio::test]
+    async fn bedit_rejects_overlaps_and_out_of_bounds_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("data.bin"), vec![b'x'; 512]).unwrap();
+        let machine = test_machine(root.clone());
+
+        let error = machine
+            .bedit_impl(BeditArgs {
+                path: "data.bin".to_owned(),
+                edits: vec![bedit_range(0, Some(16), "a"), bedit_range(8, Some(16), "b")],
+                sha256: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "bedit 2/2: range overlaps range 1 (offset 0, length 16)"
+        );
+
+        let error = machine
+            .bedit_impl(BeditArgs {
+                path: "data.bin".to_owned(),
+                edits: vec![bedit_range(999, Some(1), "a")],
+                sha256: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "bedit 1/1: offset 999 is beyond end of file (512 bytes)"
+        );
+
+        let error = machine
+            .bedit_impl(BeditArgs {
+                path: "data.bin".to_owned(),
+                edits: vec![bedit_range(510, Some(16), "a")],
+                sha256: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("beyond end of file"), "{error}");
+
+        let too_many = (0..=MAX_BEDIT_RANGES)
+            .map(|offset| bedit_range(offset, Some(0), ""))
+            .collect::<Vec<_>>();
+        let error = machine
+            .bedit_impl(BeditArgs {
+                path: "data.bin".to_owned(),
+                edits: too_many,
+                sha256: None,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("range limit"), "{error}");
+
+        // Nothing was written by any rejected plan.
+        assert_eq!(
+            std::fs::read(root.join("data.bin")).unwrap(),
+            vec![b'x'; 512]
+        );
     }
 
     #[test]

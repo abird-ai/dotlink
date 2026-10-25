@@ -322,6 +322,10 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 - `patch` accepts a bare `*** Update File` with no hunks as an error, and a repeated path across sections as an error (`appears in more than one section`) in both modes.
 - `best_effort` returns the receipt with an extra `failures: [{path, error}]` array when anything failed; `mode` says which contract applied. Atomic mode returns the first failure as a tool error with nothing written.
 - `Add File` content is the concatenation of `+` lines plus one trailing newline; an empty section creates an empty file.
+- `bedit` reports the offending range by its position in the request array, even after sorting by offset; the overlap message names the preceding range by its request position and its own offset/length.
+- `bedit` also accepts a whole-file bound (`MAX_PATCH_FILE_BYTES`) for the source and the result; the source bound keeps the read in memory bounded.
+- `sha256` comparison is case-insensitive, and the mismatch message prints the expected and found digests.
+- `bedit` decodes every range before checking overlap, so an invalid payload is reported before any overlap or size decision.
 
 ## Validation
 
