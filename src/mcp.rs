@@ -13,6 +13,7 @@ use std::{
 use crate::logging::{LogConfig, truncate};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rmcp::{
     ErrorData as McpError,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -40,6 +41,14 @@ const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_READ_LINES: usize = 4 * 1024;
 const DEFAULT_MAX_LIST_ENTRIES: usize = 4 * 1024;
 const MAX_LIST_ENTRIES: usize = 16 * 1024;
+const MAX_GREP_HITS: usize = 200;
+const MAX_GREP_FILE_BYTES: usize = 1_048_576;
+const MAX_GREP_PATTERN: usize = 1024;
+const MAX_GREP_PER_FILE: usize = 50;
+const MAX_GREP_CONTEXT: usize = 8;
+const MAX_GREP_FILES: usize = 65_536;
+const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
+const GITIGNORE_MAX_LINES: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct AccessSpec {
@@ -197,6 +206,69 @@ struct ReadArgs {
     /// Set false to return the file text exactly.
     #[serde(default)]
     numbered: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum GrepOutputMode {
+    #[default]
+    Content,
+    Files,
+    Count,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GrepArgs {
+    /// Regular expression, or literal text when `literal` is set. Maximum 1024 printable characters.
+    pattern: String,
+
+    /// Directory to search. Relative paths resolve from the directory where dotlink was launched.
+    #[serde(default = "dot")]
+    path: String,
+
+    /// Glob filter over entry paths and names. Same grammar as `ls`.
+    #[serde(default)]
+    glob: Option<String>,
+
+    /// Treat `pattern` as literal text instead of a regular expression.
+    #[serde(default)]
+    literal: bool,
+
+    /// Case-insensitive matching.
+    #[serde(default)]
+    ignore_case: bool,
+
+    /// `content` returns matching lines, `files` returns paths, `count` returns per-file counts.
+    #[serde(default)]
+    output_mode: GrepOutputMode,
+
+    /// Context lines before each hit. Maximum 8.
+    #[serde(default)]
+    before: Option<usize>,
+
+    /// Context lines after each hit. Maximum 8.
+    #[serde(default)]
+    after: Option<usize>,
+
+    /// Prefix content lines with `path:line:`. Defaults to true.
+    #[serde(default)]
+    numbered: Option<bool>,
+
+    /// Hits, or files, to skip before `limit`.
+    #[serde(default)]
+    offset: Option<usize>,
+
+    /// Maximum hits, or files. Defaults to 200 and is capped at 200.
+    #[serde(default)]
+    limit: Option<usize>,
+
+    /// Honour `.gitignore` files below `path`. Off by default.
+    #[serde(default)]
+    respect_gitignore: bool,
+
+    /// Skip entries whose name starts with `.`. Off by default.
+    #[serde(default)]
+    skip_hidden: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -437,10 +509,50 @@ impl GlobFilter {
     }
 }
 
+/// Filters applied before an entry reaches the tool: opt-in hidden skipping and
+/// opt-in `.gitignore` handling.
+#[derive(Default, Clone, Copy)]
+struct WalkFilter {
+    skip_hidden: bool,
+    respect_gitignore: bool,
+}
+
+fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
+}
+
+/// Deepest matcher first; the first decisive rule wins, which is git's order.
+fn is_gitignored(ignores: &[Arc<Gitignore>], path: &Path, is_dir: bool) -> bool {
+    for ignore in ignores.iter().rev() {
+        match ignore.matched(path, is_dir) {
+            ignore::Match::Ignore(_) => return true,
+            ignore::Match::Whitelist(_) => return false,
+            ignore::Match::None => {}
+        }
+    }
+    false
+}
+
 fn list_entry_limit(requested: Option<usize>) -> usize {
     requested
         .unwrap_or(DEFAULT_MAX_LIST_ENTRIES)
         .clamp(1, MAX_LIST_ENTRIES)
+}
+
+/// Trim rendered text at the policy byte ceiling without splitting a character,
+/// appending one marker so the caller knows the result is short.
+fn cap_text(text: String, limit: usize, marker: &str) -> (String, bool) {
+    if text.len() <= limit {
+        return (text, false);
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = text;
+    capped.truncate(end);
+    capped.push_str(marker);
+    (capped, true)
 }
 
 /// Explicit `depth` always wins. A pattern that addresses more than one path
@@ -1175,7 +1287,7 @@ impl LocalMachine {
         let mut router = Self::tool_router();
 
         if !any_read {
-            for name in ["ls", "read", "bread"] {
+            for name in ["ls", "grep", "read", "bread"] {
                 router.disable_route(name.to_owned());
             }
         }
@@ -1342,20 +1454,60 @@ impl LocalMachine {
         }
     }
 
+    /// Read one `.gitignore` through the descriptor-rooted reader and turn it
+    /// into a matcher rooted at its own directory. Bounded at 64 KiB and 1024
+    /// lines per file; an invalid pattern fails the whole call (fail closed).
+    async fn load_gitignore(&self, dir: &Path) -> Result<Option<Gitignore>> {
+        let path = dir.join(".gitignore");
+        let file = match self.open_read_file(&path).await {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        let mut bytes = Vec::new();
+        file.take(GITIGNORE_MAX_BYTES as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .with_context(|| format!("failed reading {}", path.display()))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut builder = GitignoreBuilder::new(dir);
+        for (index, line) in text.lines().take(GITIGNORE_MAX_LINES).enumerate() {
+            builder
+                .add_line(Some(path.clone()), line)
+                .map_err(|error| {
+                    anyhow!(
+                        "invalid .gitignore pattern in {} at line {}: {error}",
+                        path.display(),
+                        index + 1
+                    )
+                })?;
+        }
+        Ok(Some(builder.build().with_context(|| {
+            format!("invalid .gitignore in {}", path.display())
+        })?))
+    }
+
     /// Descriptor-rooted directory walk shared by `ls` and `grep`. Denies and
     /// protected paths are dropped before the caller sees an entry, and only
     /// the already-open directory is enumerated: no path is reopened by name
-    /// after authorization. Returning `false` stops the walk.
+    /// after authorization. Returning `false` from `on_entry` stops the walk.
     async fn walk_entries(
         &self,
         root: &Path,
         depth: usize,
+        filter: WalkFilter,
         mut on_entry: impl FnMut(WalkedEntry) -> bool,
     ) -> Result<()> {
-        // (directory, remaining levels below it)
-        let mut pending = vec![(root.to_path_buf(), depth.max(1))];
+        // (directory, remaining levels below it, gitignore chain root..dir)
+        let mut pending: Vec<(PathBuf, usize, Vec<Arc<Gitignore>>)> =
+            vec![(root.to_path_buf(), depth.max(1), Vec::new())];
 
-        while let Some((dir, remaining)) = pending.pop() {
+        while let Some((dir, remaining, mut ignores)) = pending.pop() {
+            if filter.respect_gitignore
+                && let Some(ignore) = self.load_gitignore(&dir).await?
+            {
+                ignores.push(Arc::new(ignore));
+            }
+
             #[cfg(target_os = "linux")]
             let directory_handle = self.secure_fs.open_directory(&dir)?;
             #[cfg(target_os = "linux")]
@@ -1375,6 +1527,10 @@ impl LocalMachine {
 
                 if self.config.access.denied_read(&path)
                     || self.ensure_not_protected(&path).is_err()
+                {
+                    continue;
+                }
+                if filter.skip_hidden && path != root && starts_with_dot(entry.file_name().as_ref())
                 {
                     continue;
                 }
@@ -1399,6 +1555,12 @@ impl LocalMachine {
                     "other"
                 };
 
+                // Deeper `.gitignore` files win, and a whitelist stops the
+                // search: that is git's precedence order.
+                if !ignores.is_empty() && is_gitignored(&ignores, &path, file_type.is_dir()) {
+                    continue;
+                }
+
                 let walked = WalkedEntry {
                     relative: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
                     path,
@@ -1414,7 +1576,7 @@ impl LocalMachine {
                     return Ok(());
                 }
                 if next.0 {
-                    pending.push((next.1, remaining - 1));
+                    pending.push((next.1, remaining - 1, ignores.clone()));
                 }
             }
         }
@@ -1439,7 +1601,7 @@ impl LocalMachine {
         let mut output: Vec<FsEntry> = Vec::new();
         let mut truncated = false;
 
-        self.walk_entries(&root, depth, |entry| {
+        self.walk_entries(&root, depth, WalkFilter::default(), |entry| {
             if pattern.as_ref().is_some_and(|pattern| {
                 // Entry names keep `*.rs` useful below the root; relative
                 // paths let `src/**/*.rs` address the same listing.
@@ -1484,6 +1646,211 @@ impl LocalMachine {
 
     fn output_limit(&self, requested: Option<usize>) -> usize {
         resolve_capped(requested, self.config.max_output_bytes)
+    }
+
+    /// Read one UTF-8 file for search: bounded at the per-file cap, and skipped
+    /// (rather than failing) when it is not text or grew while being read.
+    async fn read_search_file(&self, path: &Path) -> Option<String> {
+        let mut file = self.open_read_file(path).await.ok()?;
+        let bytes = Self::read_bounded(&mut file, MAX_GREP_FILE_BYTES)
+            .await
+            .ok()?;
+        String::from_utf8(bytes).ok()
+    }
+
+    async fn grep_impl(&self, args: GrepArgs) -> Result<String> {
+        if args.pattern.is_empty() {
+            bail!("pattern must not be empty");
+        }
+        if args.pattern.chars().count() > MAX_GREP_PATTERN {
+            bail!("pattern is longer than {MAX_GREP_PATTERN} characters");
+        }
+        if args.pattern.chars().any(char::is_control) {
+            bail!("pattern must be printable text");
+        }
+
+        let source = if args.literal {
+            regex::escape(&args.pattern)
+        } else {
+            args.pattern.clone()
+        };
+        let regex = regex::RegexBuilder::new(&source)
+            .case_insensitive(args.ignore_case)
+            .size_limit(MAX_GREP_FILE_BYTES)
+            .dfa_size_limit(MAX_GREP_FILE_BYTES)
+            .build()
+            .with_context(|| format!("invalid regex: {}", args.pattern))?;
+
+        let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
+        if !fs::metadata(&root).await?.is_dir() {
+            bail!("not a directory: {}", args.path);
+        }
+
+        let glob = args
+            .glob
+            .as_deref()
+            .filter(|glob| !glob.is_empty())
+            .map(GlobFilter::new)
+            .transpose()?;
+        let before = args.before.unwrap_or(0).min(MAX_GREP_CONTEXT);
+        let after = args.after.unwrap_or(0).min(MAX_GREP_CONTEXT);
+        let limit = args.limit.unwrap_or(MAX_GREP_HITS).clamp(1, MAX_GREP_HITS);
+        let offset = args.offset.unwrap_or(0);
+        let numbered = args.numbered.unwrap_or(true);
+
+        // Candidate files first, so paging and output are path-ordered rather
+        // than dependent on directory enumeration order.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        let mut truncated = false;
+        self.walk_entries(
+            &root,
+            usize::MAX,
+            WalkFilter {
+                skip_hidden: args.skip_hidden,
+                respect_gitignore: args.respect_gitignore,
+            },
+            |entry| {
+                if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
+                    return true;
+                }
+                if glob.as_ref().is_some_and(|glob| {
+                    !(glob.matches(&entry.relative)
+                        || entry
+                            .relative
+                            .file_name()
+                            .is_some_and(|name| glob.matches(Path::new(name))))
+                }) {
+                    return true;
+                }
+                if candidates.len() >= MAX_GREP_FILES {
+                    truncated = true;
+                    return false;
+                }
+                candidates.push(entry.path);
+                true
+            },
+        )
+        .await?;
+        candidates.sort();
+
+        let mut hits_skipped = 0_usize;
+        let mut hits_emitted = 0_usize;
+        let mut files: Vec<String> = Vec::new();
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        let mut content = String::new();
+        let mut stopped = false;
+
+        for path in &candidates {
+            if stopped {
+                break;
+            }
+            let Some(text) = self.read_search_file(path).await else {
+                continue;
+            };
+            let display = self.config.access.relative_display(path);
+            let lines = text.lines().collect::<Vec<_>>();
+            let mut file_hits: Vec<usize> = Vec::new();
+            for (index, line) in lines.iter().enumerate() {
+                if !regex.is_match(line) {
+                    continue;
+                }
+                if file_hits.len() >= MAX_GREP_PER_FILE {
+                    truncated = true;
+                    break;
+                }
+                file_hits.push(index);
+            }
+            if file_hits.is_empty() {
+                continue;
+            }
+
+            match args.output_mode {
+                GrepOutputMode::Content => {
+                    // Context windows are per file: a new file starts a new group.
+                    let mut last_context_line: Option<usize> = None;
+                    for hit in file_hits {
+                        if hits_skipped < offset {
+                            hits_skipped += 1;
+                            continue;
+                        }
+                        if hits_emitted >= limit {
+                            truncated = true;
+                            stopped = true;
+                            break;
+                        }
+                        let start = hit
+                            .saturating_sub(before)
+                            .max(last_context_line.map_or(0, |line| line + 1));
+                        let end = hit.saturating_add(after).min(lines.len() - 1);
+                        // Context windows that do not touch start a new group.
+                        // Without context there is no gap to mark.
+                        if (before > 0 || after > 0)
+                            && last_context_line.is_some_and(|line| start > line + 1)
+                        {
+                            content.push_str("--\n");
+                        }
+                        for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+                            match numbered {
+                                true => {
+                                    content.push_str(&format!("{display}:{}: {line}\n", index + 1))
+                                }
+                                false => content.push_str(&format!("{display}: {line}\n")),
+                            }
+                        }
+                        last_context_line = Some(end);
+                        hits_emitted += 1;
+                    }
+                }
+                GrepOutputMode::Files | GrepOutputMode::Count => {
+                    if hits_skipped < offset {
+                        hits_skipped += 1;
+                    } else if hits_emitted >= limit {
+                        truncated = true;
+                        stopped = true;
+                    } else {
+                        hits_emitted += 1;
+                        match args.output_mode {
+                            GrepOutputMode::Files => files.push(display),
+                            _ => counts.push((display, file_hits.len())),
+                        }
+                    }
+                }
+            }
+        }
+
+        match args.output_mode {
+            GrepOutputMode::Content => {
+                while content.ends_with('\n') {
+                    content.pop();
+                }
+                if truncated {
+                    content.push_str(&format!("\n… truncated at {hits_emitted} hits"));
+                }
+                let (capped, _) = cap_text(
+                    content,
+                    self.config.max_output_bytes,
+                    &format!("\n… truncated at {} bytes", self.config.max_output_bytes),
+                );
+                Ok(capped)
+            }
+            GrepOutputMode::Files => Ok(serde_json::json!({
+                "files": files,
+                "truncated": truncated,
+            })
+            .to_string()),
+            GrepOutputMode::Count => {
+                let total = counts.iter().map(|(_, count)| count).sum::<usize>();
+                Ok(serde_json::json!({
+                    "counts": counts
+                        .iter()
+                        .map(|(path, count)| serde_json::json!({"path": path, "count": count}))
+                        .collect::<Vec<_>>(),
+                    "total": total,
+                    "truncated": truncated,
+                })
+                .to_string())
+            }
+        }
     }
 
     async fn terminate_child(child: &mut tokio::process::Child) {
@@ -2026,7 +2393,7 @@ fn direct_shell_command(
 
 #[cfg(any(test, not(target_os = "linux")))]
 fn is_concurrent_read_tool(name: &str) -> bool {
-    matches!(name, "ls" | "read" | "bread")
+    matches!(name, "ls" | "grep" | "read" | "bread")
 }
 
 fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Value>>) -> String {
@@ -2105,6 +2472,23 @@ impl LocalMachine {
                     Err(error) => tool_error(error),
                 }
             }
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Search UTF-8 text files with a regular expression. output_mode=content returns matching lines as `path:line: text` (or `path: text` when numbered=false), with context windows separated by `--`; files returns {\"files\":[\"path\"],\"truncated\":bool}; count returns {\"counts\":[{\"path\",\"count\"}],\"total\":n,\"truncated\":bool}. Scans at most 1 MiB per file and 50 matches per file; hit groups and files are paged by offset/limit (limit defaults to 200).",
+        annotations(
+            title = "Search text files",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn grep(&self, Parameters(args): Parameters<GrepArgs>) -> CallToolResult {
+        match self.grep_impl(args).await {
+            Ok(text) => ok_text(text),
             Err(error) => tool_error(error),
         }
     }
@@ -2933,6 +3317,283 @@ mod tests {
         assert_eq!(text.matches("truncated at line").count(), 1);
     }
 
+    fn grep_args(pattern: &str) -> GrepArgs {
+        GrepArgs {
+            pattern: pattern.to_owned(),
+            path: dot(),
+            glob: None,
+            literal: false,
+            ignore_case: false,
+            output_mode: GrepOutputMode::Content,
+            before: None,
+            after: None,
+            numbered: None,
+            offset: None,
+            limit: None,
+            respect_gitignore: false,
+            skip_hidden: false,
+        }
+    }
+
+    fn grep_tree() -> (tempfile::TempDir, LocalMachine) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("top.txt"), "alpha\nneedle one\nomega\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "needle two\nplain\nneedle three\n").unwrap();
+        std::fs::write(root.join("src/nested/deep.rs"), "deep needle\n").unwrap();
+        std::fs::write(root.join("notes.md"), "needle notes\n").unwrap();
+        std::fs::write(root.join("binary.bin"), [0xff_u8, 0xfe, 0x00]).unwrap();
+        std::fs::write(root.join(".hidden.txt"), "needle hidden\n").unwrap();
+        let machine = test_machine(root);
+        (temp, machine)
+    }
+
+    #[tokio::test]
+    async fn grep_content_mode_renders_numbered_hits_in_path_order() {
+        let (_temp, machine) = grep_tree();
+        let content = machine.grep_impl(grep_args("needle")).await.unwrap();
+        assert_eq!(
+            content,
+            ".hidden.txt:1: needle hidden\n\
+             notes.md:1: needle notes\n\
+             src/lib.rs:1: needle two\n\
+             src/lib.rs:3: needle three\n\
+             src/nested/deep.rs:1: deep needle\n\
+             top.txt:2: needle one"
+        );
+
+        let mut args = grep_args("needle");
+        args.numbered = Some(false);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert_eq!(
+            content,
+            ".hidden.txt: needle hidden\n\
+             notes.md: needle notes\n\
+             src/lib.rs: needle two\n\
+             src/lib.rs: needle three\n\
+             src/nested/deep.rs: deep needle\n\
+             top.txt: needle one"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_context_windows_group_and_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("a.txt"),
+            "l1\nl2\nhit\nl4\nl5\nl6\nl7\nl8\nhit2\nl10\n",
+        )
+        .unwrap();
+        let machine = test_machine(root);
+
+        let mut args = grep_args("hit");
+        args.before = Some(1);
+        args.after = Some(1);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert_eq!(
+            content,
+            "a.txt:2: l2\n\
+             a.txt:3: hit\n\
+             a.txt:4: l4\n\
+             --\n\
+             a.txt:8: l8\n\
+             a.txt:9: hit2\n\
+             a.txt:10: l10"
+        );
+
+        // Context is capped at 8 lines per side.
+        let mut args = grep_args("hit");
+        args.before = Some(100);
+        args.after = Some(100);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert!(content.starts_with("a.txt:1: l1\n"), "{content}");
+        assert!(content.ends_with("a.txt:10: l10"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn grep_files_and_count_modes_page_files() {
+        let (_temp, machine) = grep_tree();
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!([
+                ".hidden.txt",
+                "notes.md",
+                "src/lib.rs",
+                "src/nested/deep.rs",
+                "top.txt"
+            ])
+        );
+        assert_eq!(files["truncated"], Value::Bool(false));
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        args.offset = Some(1);
+        args.limit = Some(2);
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!(["notes.md", "src/lib.rs"])
+        );
+        assert_eq!(files["truncated"], Value::Bool(true));
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Count;
+        let counts: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(counts["total"], serde_json::json!(6));
+        assert_eq!(
+            counts["counts"][2],
+            serde_json::json!({"path": "src/lib.rs", "count": 2})
+        );
+
+        // Hit paging in content mode skips hits, not lines.
+        let mut args = grep_args("needle");
+        args.offset = Some(1);
+        args.limit = Some(2);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert_eq!(
+            content,
+            "notes.md:1: needle notes\n\
+             src/lib.rs:1: needle two\n\
+             … truncated at 2 hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_pattern_options_and_glob_filter() {
+        let (_temp, machine) = grep_tree();
+
+        let mut args = grep_args("NEEDLE");
+        args.ignore_case = true;
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(files["files"].as_array().unwrap().len(), 5);
+
+        // `literal` escapes regex metacharacters.
+        let mut args = grep_args("needle .*");
+        args.literal = true;
+        assert!(machine.grep_impl(args).await.unwrap().is_empty());
+
+        let mut args = grep_args("needle .*");
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(files["files"].as_array().unwrap().len(), 4);
+
+        let mut args = grep_args("needle");
+        args.glob = Some("*.rs".to_owned());
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!(["src/lib.rs", "src/nested/deep.rs"])
+        );
+
+        let mut args = grep_args("needle");
+        args.glob = Some("src/**/*.rs".to_owned());
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!(["src/lib.rs", "src/nested/deep.rs"])
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_per_file_cap_and_invalid_patterns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let many = (0..120)
+            .map(|line| format!("hit {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("many.txt"), many).unwrap();
+        let machine = test_machine(root);
+
+        let mut args = grep_args("hit");
+        args.output_mode = GrepOutputMode::Count;
+        let counts: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(counts["counts"][0]["count"], serde_json::json!(50));
+        assert_eq!(counts["truncated"], Value::Bool(true));
+
+        // Pattern bounds and regex errors are tool failures.
+        let mut args = grep_args("");
+        args.literal = true;
+        assert!(machine.grep_impl(args).await.is_err());
+        let args = grep_args(&"a".repeat(MAX_GREP_PATTERN + 1));
+        assert!(machine.grep_impl(args).await.is_err());
+        let args = grep_args("[unclosed");
+        assert!(machine.grep_impl(args).await.is_err());
+        let args = grep_args("a\tb");
+        assert!(
+            machine
+                .grep_impl(args)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("printable")
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_gitignore_and_hidden_are_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("build/nested")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "build/\n*.log\n!keep.log\n").unwrap();
+        std::fs::write(root.join("build/nested/out.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("debug.log"), "needle\n").unwrap();
+        std::fs::write(root.join("keep.log"), "needle\n").unwrap();
+        std::fs::write(root.join(".secret.rs"), "needle\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(files["files"].as_array().unwrap().len(), 5, "{files}");
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        args.respect_gitignore = true;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!([".secret.rs", "keep.log", "src/lib.rs"])
+        );
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        args.skip_hidden = true;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!(["build/nested/out.rs", "debug.log", "keep.log", "src/lib.rs"])
+        );
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        args.skip_hidden = true;
+        args.respect_gitignore = true;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!(["keep.log", "src/lib.rs"])
+        );
+
+        // An invalid gitignore pattern fails closed.
+        std::fs::write(root.join(".gitignore"), "{unclosed\n").unwrap();
+        let mut args = grep_args("needle");
+        args.respect_gitignore = true;
+        let error = machine.grep_impl(args).await.unwrap_err().to_string();
+        assert!(error.contains("invalid .gitignore pattern"), "{error}");
+    }
+
     #[test]
     fn list_entry_limit_defaults_to_4096_and_caps_at_16384() {
         assert_eq!(list_entry_limit(None), 4 * 1024);
@@ -3346,7 +4007,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names, ["bread", "ls", "read"]);
+        assert_eq!(names, ["bread", "grep", "ls", "read"]);
     }
 
     #[test]
@@ -3358,7 +4019,9 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["bedit", "bread", "bwrite", "edit", "ls", "read", "write"]
+            [
+                "bedit", "bread", "bwrite", "edit", "grep", "ls", "read", "write"
+            ]
         );
     }
 
@@ -3379,7 +4042,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names, ["bread", "bwrite", "ls", "read", "write"]);
+        assert_eq!(names, ["bread", "bwrite", "grep", "ls", "read", "write"]);
     }
 
     #[test]
@@ -3390,9 +4053,9 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         if cfg!(windows) {
-            assert_eq!(names, ["bread", "ls", "powershell", "read"]);
+            assert_eq!(names, ["bread", "grep", "ls", "powershell", "read"]);
         } else {
-            assert_eq!(names, ["bash", "bread", "ls", "read"]);
+            assert_eq!(names, ["bash", "bread", "grep", "ls", "read"]);
         }
     }
 

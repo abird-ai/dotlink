@@ -301,6 +301,14 @@ No open questions remain. If an implementation detail is not covered here, prefe
 Details this design leaves implicit, resolved the smaller way that keeps the invariants, recorded here rather than deviated from silently.
 
 - Glob candidates: `ls` and `grep` test the pattern against the entry path relative to the tool's `path` root **and** against the bare entry name, so `*.rs` stays useful at any depth while `src/**/*.rs` addresses a subtree. `literal_separator(true)` means a bare `*` never crosses `/`. An invalid pattern is a tool error, not an empty result.
+- `grep` requires an existing directory at `path`; searching one file is `read`.
+- `grep` collects candidate files first and sorts them by path, so paging and output order do not depend on directory enumeration order. Candidate files are bounded at 65536, after which `truncated` is set.
+- Files above 1 MiB and files that are not valid UTF-8 are skipped silently rather than reported; text tools stay UTF-8-only.
+- The `--` group separator is only emitted when `before`/`after` requested context, because without context there is no gap to mark. Context windows are per file.
+- A file that exceeds the 50-match cap sets `truncated`; there is no per-file marker line.
+- `count.total` is the sum of the returned per-file counts (the current page), not the whole tree.
+- `.gitignore` handling builds one matcher per directory (loaded through the descriptor-rooted reader, never by ambient path), evaluates deepest-first, and lets a whitelist stop the search — git's precedence. A file over 64 KiB or 1024 lines is truncated rather than fatal; an invalid pattern fails the whole call.
+- `grep` output is capped at `max_output_bytes` with a trailing `… truncated at N bytes` marker, in addition to the hit-limit marker.
 
 ## Validation
 

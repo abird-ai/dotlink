@@ -1158,6 +1158,23 @@ mod tests {
             fs::read_to_string(root.join("nested/test.txt")).unwrap(),
             "second"
         );
+        let grepped = call("grep", json!({"pattern":"seco", "path":"nested"})).await;
+        assert_ne!(grepped["result"]["isError"], true, "{grepped}");
+        assert!(
+            grepped.to_string().contains("nested/test.txt:1: second"),
+            "{grepped}"
+        );
+        let grep_count = call(
+            "grep",
+            json!({"pattern":"seco", "path":"nested", "output_mode":"count"}),
+        )
+        .await;
+        assert_ne!(grep_count["result"]["isError"], true, "{grep_count}");
+        let counted: Value =
+            serde_json::from_str(grep_count["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(counted["total"], serde_json::json!(1));
+
         // Preserve existing in-grant symlink alias behavior while rejecting
         // aliases whose canonical target lies in an explicitly denied tree.
         std::os::unix::fs::symlink(root.join("nested/test.txt"), root.join("alias")).unwrap();
