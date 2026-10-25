@@ -4819,6 +4819,17 @@ mod tests {
     }
 
     #[test]
+    fn patch_reports_a_snapshot_that_changed_during_planning() {
+        let error = verify_snapshot("crates/y/src/lib.rs", b"changed", b"planned", "patching")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "crates/y/src/lib.rs changed while patching; nothing was written"
+        );
+    }
+
+    #[test]
     fn patch_anchor_text_is_kept_and_line_numbers_are_ignored() {
         assert_eq!(
             parse_patch_anchor(" fn main() {"),
