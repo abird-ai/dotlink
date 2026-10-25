@@ -980,7 +980,7 @@ fn summarize_tool_arguments(arguments: &Value) -> String {
         "numbered",
         "literal",
         "ignore_case",
-        "respect_gitignore",
+        "gitignore",
         "skip_hidden",
         "replace_all",
         "best_effort",

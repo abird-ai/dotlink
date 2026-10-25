@@ -302,7 +302,7 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 
 - Glob candidates: `ls` and `grep` test the pattern against the entry path relative to the tool's `path` root **and** against the bare entry name, so `*.rs` stays useful at any depth while `src/**/*.rs` addresses a subtree. `literal_separator(true)` means a bare `*` never crosses `/`. An invalid pattern is a tool error, not an empty result.
 - `grep` requires an existing directory at `path`; searching one file is `read`.
-- The grep filter is `gitignore` (renamed from `respect_gitignore`); `src/transports/openai.rs` keeps a test-only request-argument key list that still spells it the old way at the time of the rename, because that file carried another agent's in-flight work — the one-word update belongs with that change.
+- The grep filter is `gitignore` (renamed from `respect_gitignore`), including the test-only request-argument key list in `src/transports/openai.rs`.
 - `grep` collects candidate files first and sorts them by path, so paging and output order do not depend on directory enumeration order. Candidate files are bounded at 65536, after which `truncated` is set.
 - Files above 1 MiB and files that are not valid UTF-8 are skipped silently rather than reported; text tools stay UTF-8-only.
 - The `--` group separator is only emitted when `before`/`after` requested context, because without context there is no gap to mark. Context windows are per file.
