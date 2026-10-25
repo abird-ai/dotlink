@@ -128,7 +128,8 @@ struct ListArgs {
     #[serde(default = "dot")]
     path: String,
 
-    /// Glob on the entry name, matched against every listed entry. Supports `*` and `?`.
+    /// Glob over entry paths relative to `path`, and over the bare entry name.
+    /// `*`, `?`, `[...]`, `{a,b}` stay within one path segment; `**` recurses.
     #[serde(default)]
     pattern: Option<String>,
 
@@ -362,39 +363,27 @@ async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
     }
 }
 
-/// Minimal glob for entry names: `*` matches any run of characters, `?` one.
-/// Case-sensitive, and it never crosses a separator because names have none.
-fn glob_matches(pattern: &str, name: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let name: Vec<char> = name.chars().collect();
-    let (mut p, mut n) = (0_usize, 0_usize);
-    let mut backtrack: Option<(usize, usize)> = None;
+/// One glob grammar for every tool: `globset` with `literal_separator`, so
+/// `*`/`?`/`[...]` never cross `/` and `**` is the only recursive form.
+/// `{a,b}` alternation comes from the same builder. Candidates are always a
+/// path already held in memory; nothing here touches the filesystem.
+struct GlobFilter {
+    matcher: globset::GlobMatcher,
+}
 
-    while n < name.len() {
-        match pattern.get(p) {
-            Some('*') => {
-                backtrack = Some((p, n));
-                p += 1;
-            }
-            Some('?') => {
-                p += 1;
-                n += 1;
-            }
-            Some(expected) if *expected == name[n] => {
-                p += 1;
-                n += 1;
-            }
-            _ => match backtrack {
-                Some((star, start)) => {
-                    p = star + 1;
-                    n = start + 1;
-                    backtrack = Some((star, start + 1));
-                }
-                None => return false,
-            },
-        }
+impl GlobFilter {
+    fn new(pattern: &str) -> Result<Self> {
+        let matcher = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .with_context(|| format!("invalid glob pattern: {pattern}"))?
+            .compile_matcher();
+        Ok(Self { matcher })
     }
-    pattern[p..].iter().all(|ch| *ch == '*')
+
+    fn matches(&self, candidate: &Path) -> bool {
+        self.matcher.is_match(candidate)
+    }
 }
 
 fn list_entry_limit(requested: Option<usize>) -> usize {
@@ -1300,12 +1289,14 @@ impl LocalMachine {
         let pattern = args
             .pattern
             .as_deref()
-            .filter(|pattern| !pattern.is_empty());
+            .filter(|pattern| !pattern.is_empty())
+            .map(GlobFilter::new)
+            .transpose()?;
         let max_entries = list_entry_limit(args.max_entries);
         let mut output = Vec::new();
         let mut truncated = false;
         // (directory, remaining levels below it)
-        let mut pending = vec![(root, depth)];
+        let mut pending = vec![(root.clone(), depth)];
 
         while let Some((dir, remaining)) = pending.pop() {
             #[cfg(target_os = "linux")]
@@ -1351,8 +1342,11 @@ impl LocalMachine {
                     "other"
                 };
 
-                if pattern.is_none_or(|pattern| {
-                    glob_matches(pattern, &entry.file_name().to_string_lossy())
+                let relative = path.strip_prefix(&root).unwrap_or(&path);
+                if pattern.as_ref().is_none_or(|pattern| {
+                    // Entry names keep `*.rs` useful below the root; relative
+                    // paths let `src/**/*.rs` address the same listing.
+                    pattern.matches(relative) || pattern.matches(Path::new(&entry.file_name()))
                 }) {
                     output.push(FsEntry {
                         path: self.config.access.relative_display(&path),
@@ -2509,17 +2503,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glob_matcher_handles_names_without_crossing_separators() {
-        assert!(glob_matches("*.rs", "lib.rs"));
-        assert!(glob_matches("*", "anything"));
-        assert!(glob_matches("test_?.rs", "test_a.rs"));
-        assert!(!glob_matches("test_?.rs", "test_ab.rs"));
-        assert!(glob_matches("a*b*c", "axxbyyc"));
-        assert!(glob_matches("a*c", "ac"));
-        assert!(!glob_matches("*.rs", "lib.rs.bak"));
-        assert!(!glob_matches("lib.rs", "src/lib.rs"));
-        assert!(!glob_matches("", "lib.rs"));
-        assert!(glob_matches("**", "x"));
+    fn glob_grammar_covers_stars_classes_alternation_and_separators() {
+        let matches = |pattern: &str, candidate: &str| {
+            GlobFilter::new(pattern)
+                .unwrap()
+                .matches(Path::new(candidate))
+        };
+
+        assert!(matches("*.rs", "lib.rs"));
+        assert!(matches("*", "anything"));
+        assert!(matches("test_?.rs", "test_a.rs"));
+        assert!(!matches("test_?.rs", "test_ab.rs"));
+        assert!(matches("a*b*c", "axxbyyc"));
+        assert!(matches("a*c", "ac"));
+        assert!(!matches("*.rs", "lib.rs.bak"));
+        assert!(matches("lib.rs", "lib.rs"));
+        assert!(matches("[abc].rs", "b.rs"));
+        assert!(!matches("[!abc].rs", "b.rs"));
+        assert!(matches("*.{rs,md}", "notes.md"));
+        assert!(!matches("*.{rs,md}", "notes.txt"));
+        assert!(matches("**/*.rs", "src/nested/deep.rs"));
+        assert!(matches("src/**", "src/nested/deep.rs"));
+        // `literal_separator`: a bare `*` never crosses a separator.
+        assert!(!matches("*.rs", "src/lib.rs"));
+        assert!(!matches("src/*.rs", "src/nested/deep.rs"));
+        assert!(GlobFilter::new("[unclosed").is_err());
     }
 
     fn test_machine(root: PathBuf) -> LocalMachine {

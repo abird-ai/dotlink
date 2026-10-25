@@ -296,6 +296,12 @@ Never added: `walkdir`, `ignore::Walk`/`WalkParallel`, `grep-*` searcher crates.
 
 No open questions remain. If an implementation detail is not covered here, prefer the smaller behaviour that preserves the invariants and record the choice in this file.
 
+## Implementation notes
+
+Details this design leaves implicit, resolved the smaller way that keeps the invariants, recorded here rather than deviated from silently.
+
+- Glob candidates: `ls` and `grep` test the pattern against the entry path relative to the tool's `path` root **and** against the bare entry name, so `*.rs` stays useful at any depth while `src/**/*.rs` addresses a subtree. `literal_separator(true)` means a bare `*` never crosses `/`. An invalid pattern is a tool error, not an empty result.
+
 ## Validation
 
 - Unit: glob grammar; `depth` default rule; `kind`/`sort`; grep modes, context, pagination, ignore/hidden; edit ordering, uniqueness, substring guard, rollback; patch parse/apply, add-file, ambiguity, delete/move rejection; bedit range math, overlap, `sha256`.
