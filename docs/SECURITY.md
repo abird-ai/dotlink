@@ -7,7 +7,7 @@ Without write or shell flags, the visible tools are:
 ~~~text
 ls
 read
-read_binary
+bread
 ~~~
 
 and the launch directory is the only implicit readable directory. `--no-default-allow` removes even that grant.
@@ -69,9 +69,9 @@ targets must be regular files; special files are rejected.
 
 Tool requirements:
 
-- read, read_binary, ls require read;
-- write, write_binary require write;
-- edit, patch_binary require read+write.
+- read, bread, ls require read;
+- write, bwrite require write;
+- edit, bedit require read+write.
 
 ## Opt-in host developer services
 
@@ -307,11 +307,11 @@ For Windows, WSL2 is the recommended secure shell workflow: run dotlink inside W
 
 ## Binary data
 
-read_binary supports MCP typed media/blob content plus explicit base64 and hex.
+bread supports MCP typed media/blob content plus explicit base64 and hex.
 
-write_binary and patch_binary enforce write limits.
+bwrite and bedit enforce write limits.
 
-patch_binary also caps total file size processed in memory.
+bedit also caps total file size processed in memory.
 
 ## Terminal state safety
 

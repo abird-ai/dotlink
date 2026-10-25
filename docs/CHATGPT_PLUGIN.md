@@ -31,8 +31,8 @@ If **Create MCP App** is unavailable, enable **Developer mode** under **Settings
 The tool list is permission-dependent:
 
 ```text
-default       ls, read, read_binary
-write grant   + edit, patch_binary, write, write_binary
+default       ls, read, bread
+write grant   + edit, bedit, write, bwrite
 shell         + bash (Unix) / powershell (Windows)
 ```
 

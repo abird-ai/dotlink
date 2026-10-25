@@ -293,9 +293,9 @@ read
 write
 edit
 ls
-read_binary
-write_binary
-patch_binary
+bread
+bwrite
+bedit
 bash
 powershell
 ~~~
@@ -307,7 +307,7 @@ Default:
 ~~~text
 ls
 read
-read_binary
+bread
 ~~~
 
 Write tools are hidden if no write capability exists.
@@ -459,7 +459,7 @@ Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases
 
 ## Binary MCP content
 
-read_binary(format=mcp) maps bytes to MCP typed content:
+bread(format=mcp) maps bytes to MCP typed content:
 
 - image MIME -> image content;
 - audio MIME -> audio content;
@@ -467,6 +467,6 @@ read_binary(format=mcp) maps bytes to MCP typed content:
 
 base64 and hex modes return encoded text.
 
-write_binary decodes base64 or hex.
+bwrite decodes base64 or hex.
 
-patch_binary edits a bounded byte range in a bounded file.
+bedit edits bounded byte ranges in a bounded file.

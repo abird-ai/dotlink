@@ -1152,19 +1152,19 @@ mod tests {
         assert_eq!(refused_alias["result"]["isError"], true);
 
         let binary = call(
-            "read_binary",
+            "bread",
             json!({"path":"nested/test.txt", "format":"base64"}),
         )
         .await;
         assert!(binary.to_string().contains("c2Vjb25k"));
-        let write_binary = call(
-            "write_binary",
+        let bwrite = call(
+            "bwrite",
             json!({"path":"nested/data.bin", "data":"YWJjZA=="}),
         )
         .await;
-        assert_ne!(write_binary["result"]["isError"], true, "{write_binary}");
+        assert_ne!(bwrite["result"]["isError"], true, "{bwrite}");
         let patched = call(
-            "patch_binary",
+            "bedit",
             json!({"path":"nested/data.bin", "offset":1, "length":2, "data":"WFk="}),
         )
         .await;

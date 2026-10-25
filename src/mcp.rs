@@ -187,7 +187,7 @@ struct EditArgs {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum ReadBinaryFormat {
+enum BreadFormat {
     #[default]
     Mcp,
     Base64,
@@ -203,13 +203,13 @@ enum BinaryEncoding {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ReadBinaryArgs {
+struct BreadArgs {
     /// Binary file path.
     path: String,
 
     /// "mcp" returns typed MCP image/audio/blob content; base64/hex return encoded text.
     #[serde(default)]
-    format: ReadBinaryFormat,
+    format: BreadFormat,
 
     /// Byte offset for base64/hex reads. MCP format requires offset 0.
     #[serde(default)]
@@ -221,7 +221,7 @@ struct ReadBinaryArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct WriteBinaryArgs {
+struct BwriteArgs {
     /// File path.
     path: String,
 
@@ -234,7 +234,7 @@ struct WriteBinaryArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct PatchBinaryArgs {
+struct BeditArgs {
     /// Existing binary file path.
     path: String,
 
@@ -1112,17 +1112,17 @@ impl LocalMachine {
         let mut router = Self::tool_router();
 
         if !any_read {
-            for name in ["ls", "read", "read_binary"] {
+            for name in ["ls", "read", "bread"] {
                 router.disable_route(name.to_owned());
             }
         }
         if !any_write {
-            for name in ["write", "write_binary"] {
+            for name in ["write", "bwrite"] {
                 router.disable_route(name.to_owned());
             }
         }
         if !any_read_write {
-            for name in ["edit", "patch_binary"] {
+            for name in ["edit", "bedit"] {
                 router.disable_route(name.to_owned());
             }
         }
@@ -1915,7 +1915,7 @@ fn direct_shell_command(
 
 #[cfg(any(test, not(target_os = "linux")))]
 fn is_concurrent_read_tool(name: &str) -> bool {
-    matches!(name, "ls" | "read" | "read_binary")
+    matches!(name, "ls" | "read" | "bread")
 }
 
 fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Value>>) -> String {
@@ -1994,7 +1994,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Read a UTF-8 text file. Use read_binary for non-text files.",
+        description = "Read a UTF-8 text file. Use bread for non-text files.",
         annotations(
             title = "Read text file",
             read_only_hint = true,
@@ -2030,7 +2030,7 @@ impl LocalMachine {
         };
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
-            Err(_) => return tool_error("binary file; use read_binary"),
+            Err(_) => return tool_error("binary file; use bread"),
         };
 
         let offset = args.offset.unwrap_or(1).max(1);
@@ -2117,7 +2117,7 @@ impl LocalMachine {
         };
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
-            Err(_) => return tool_error("binary file; use patch_binary"),
+            Err(_) => return tool_error("binary file; use bedit"),
         };
         let matches = text.match_indices(&args.old_text).count();
         if matches == 0 {
@@ -2164,7 +2164,7 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn read_binary(&self, Parameters(args): Parameters<ReadBinaryArgs>) -> CallToolResult {
+    async fn bread(&self, Parameters(args): Parameters<BreadArgs>) -> CallToolResult {
         let path = match self.resolve_existing(&args.path, AccessNeed::Read).await {
             Ok(path) => path,
             Err(error) => return tool_error(error),
@@ -2180,7 +2180,7 @@ impl LocalMachine {
         let total_size = metadata.len();
 
         match args.format {
-            ReadBinaryFormat::Mcp => {
+            BreadFormat::Mcp => {
                 if args.offset.unwrap_or(0) != 0 {
                     return tool_error("format=mcp requires offset=0");
                 }
@@ -2219,7 +2219,7 @@ impl LocalMachine {
                 };
                 CallToolResult::success(vec![content])
             }
-            ReadBinaryFormat::Base64 | ReadBinaryFormat::Hex => {
+            BreadFormat::Base64 | BreadFormat::Hex => {
                 let offset = args.offset.unwrap_or(0);
                 if offset > total_size {
                     return tool_error("offset is beyond end of file");
@@ -2236,9 +2236,9 @@ impl LocalMachine {
                     return tool_error(error);
                 }
                 let (format, encoded) = match args.format {
-                    ReadBinaryFormat::Base64 => ("base64", BASE64.encode(&bytes)),
-                    ReadBinaryFormat::Hex => ("hex", hex::encode(&bytes)),
-                    ReadBinaryFormat::Mcp => unreachable!(),
+                    BreadFormat::Base64 => ("base64", BASE64.encode(&bytes)),
+                    BreadFormat::Hex => ("hex", hex::encode(&bytes)),
+                    BreadFormat::Mcp => unreachable!(),
                 };
                 let truncated = offset + (bytes.len() as u64) < total_size;
                 ok_text(
@@ -2267,7 +2267,7 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn write_binary(&self, Parameters(args): Parameters<WriteBinaryArgs>) -> CallToolResult {
+    async fn bwrite(&self, Parameters(args): Parameters<BwriteArgs>) -> CallToolResult {
         let bytes = match decode_binary(&args.data, args.encoding, self.config.max_write_bytes) {
             Ok(bytes) => bytes,
             Err(error) => return tool_error(error),
@@ -2296,7 +2296,7 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn patch_binary(&self, Parameters(args): Parameters<PatchBinaryArgs>) -> CallToolResult {
+    async fn bedit(&self, Parameters(args): Parameters<BeditArgs>) -> CallToolResult {
         let replacement =
             match decode_binary(&args.data, args.encoding, self.config.max_write_bytes) {
                 Ok(bytes) => bytes,
@@ -2776,14 +2776,14 @@ mod tests {
 
     #[test]
     fn only_explicit_pure_reads_share_the_operation_gate() {
-        for name in ["ls", "read", "read_binary"] {
+        for name in ["ls", "read", "bread"] {
             assert!(is_concurrent_read_tool(name), "{name}");
         }
         for name in [
             "write",
             "edit",
-            "write_binary",
-            "patch_binary",
+            "bwrite",
+            "bedit",
             "bash",
             "powershell",
             "future_tool",
@@ -3103,7 +3103,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names, ["ls", "read", "read_binary"]);
+        assert_eq!(names, ["bread", "ls", "read"]);
     }
 
     #[test]
@@ -3115,15 +3115,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [
-                "edit",
-                "ls",
-                "patch_binary",
-                "read",
-                "read_binary",
-                "write",
-                "write_binary",
-            ]
+            ["bedit", "bread", "bwrite", "edit", "ls", "read", "write"]
         );
     }
 
@@ -3134,7 +3126,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names, ["write", "write_binary"]);
+        assert_eq!(names, ["bwrite", "write"]);
     }
 
     #[test]
@@ -3144,10 +3136,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(
-            names,
-            ["ls", "read", "read_binary", "write", "write_binary"]
-        );
+        assert_eq!(names, ["bread", "bwrite", "ls", "read", "write"]);
     }
 
     #[test]
@@ -3158,9 +3147,9 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         if cfg!(windows) {
-            assert_eq!(names, ["ls", "powershell", "read", "read_binary"]);
+            assert_eq!(names, ["bread", "ls", "powershell", "read"]);
         } else {
-            assert_eq!(names, ["bash", "ls", "read", "read_binary"]);
+            assert_eq!(names, ["bash", "bread", "ls", "read"]);
         }
     }
 

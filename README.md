@@ -144,8 +144,8 @@ If **Create MCP App** is unavailable, enable **Developer mode** under **Settings
 The tools ChatGPT discovers follow dotlink's local permissions:
 
 ~~~text
-read-only     ls, read, read_binary
-write        + write, edit, write_binary, patch_binary
+read-only     ls, read, bread
+write        + write, edit, bwrite, bedit
 shell        + bash (Unix) / powershell (Windows)
 ~~~
 
@@ -313,9 +313,9 @@ Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--
 ### Filesystem policy
 
 ~~~text
-read / read_binary / ls       require read
-write / write_binary          require write
-edit / patch_binary           require read + write
+read / bread / ls             require read
+write / bwrite                require write
+edit / bedit                  require read + write
 ~~~
 
 Targets are canonicalized before checks; create targets canonicalize their nearest existing ancestor, preventing symlink escapes. The advertised MCP tool list is permission-aware, so unavailable write/shell tools are omitted rather than merely rejected later.
