@@ -99,7 +99,7 @@ For OpenAI Tunnel setup, either create/manage the tunnel yourself at <https://pl
   "tunnel_id": null,
   "organization_id": null,
   "base_url": "https://api.openai.com",
-  "max_shell_timeout_secs": 120,
+  "max_shell_timeout_secs": 3600,
   "max_output_bytes": 1048576,
   "max_read_bytes": 4194304,
   "max_write_bytes": 4194304
@@ -107,6 +107,8 @@ For OpenAI Tunnel setup, either create/manage the tunnel yourself at <https://pl
 ```
 
 Relative permission paths resolve from the launch directory. `default_allow=true` adds read access to that directory; `--no-default-allow` suppresses it for one run.
+
+`max_shell_timeout_secs` and `max_output_bytes` are policy ceilings, not the values themselves. Per-call arguments are caller-controlled, clamped to `1..=ceiling`, and fall back to the ceiling when omitted. On the OpenAI tunnel the client owns the delivery window, so an omitted `timeout_secs` defaults to that window minus a 5 s delivery reserve instead of the ceiling; an explicit value larger than the window is shortened so dotlink can still return a real tool result. The default shell ceiling is 3600 s (60 min) and the default output ceiling is 1 MiB per stream; lower them in config to bound runaway commands or oversized results. The advertised `bash`/`powershell` schema reports those ceilings as concrete numbers, and a shell call emits bare `notifications/progress` heartbeats (monotonic counter, no total, no message) while it runs when the client supplies a progress token.
 
 `ngrok_domain` is a hostname only (no scheme/path/port). `oauth.public_url` is a canonical HTTPS origin for a reverse proxy; loopback HTTP is allowed for local testing. dotlink never derives OAuth issuer/resource identity from untrusted Host/forwarded headers.
 

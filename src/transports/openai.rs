@@ -531,13 +531,16 @@ impl TunnelClient {
     async fn process_command(
         &self,
         mcp: EmbeddedMcp,
-        command: TunnelCommand,
+        mut command: TunnelCommand,
         received_at: Instant,
     ) -> Result<()> {
         let deadline = parse_response_timeout(command.response_timeout.as_ref())
             .and_then(|duration| received_at.checked_add(duration));
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            debug!(request_id = %command.request_id, "dropping command that was already expired");
+            warn!(
+                request_id = %command.request_id,
+                "dropping command the client had already expired; no response is deliverable"
+            );
             return Ok(());
         }
 
@@ -545,6 +548,21 @@ impl TunnelClient {
         if channel != "main" {
             warn!(request_id = %command.request_id, %channel, "ignoring unsupported tunnel channel");
             return Ok(());
+        }
+
+        // The client owns the delivery window, so shell deadlines default to it
+        // (less a delivery reserve) instead of to the policy ceiling.
+        if let Some(remaining) =
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            && let Some(jsonrpc) = command.jsonrpc.as_mut()
+            && let Some(secs) = apply_response_window(jsonrpc, remaining)
+        {
+            debug!(
+                request_id = %command.request_id,
+                window_secs = remaining.as_secs_f32(),
+                timeout_secs = secs,
+                "bounded shell timeout to the client response window"
+            );
         }
 
         match command.command_type.as_str() {
@@ -592,7 +610,14 @@ impl TunnelClient {
                             return Ok(());
                         }
                     },
-                    Ok(None) => return Ok(()),
+                    Ok(None) => {
+                        warn!(
+                            request_id = %command.request_id,
+                            request = %request_label,
+                            "client response window expired mid-call; result was not deliverable"
+                        );
+                        return Ok(());
+                    }
                     Err(error) => return Err(error),
                 };
 
@@ -698,6 +723,10 @@ impl TunnelClient {
         let mut attempt = 0_u32;
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                warn!(
+                    request_id = %command.request_id,
+                    "client response window expired before the response could be posted"
+                );
                 return Ok(());
             }
             match self.post_once(command, &response, deadline).await {
@@ -852,6 +881,43 @@ fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
     let nanos = (total_nanos % 1_000_000_000) as u32;
     let secs: u64 = secs.try_into().ok()?;
     Some(Duration::new(secs, nanos))
+}
+
+/// Kept out of the shell deadline so the terminal response can still be posted
+/// before the client considers the request expired.
+const RESPONSE_DELIVERY_RESERVE: Duration = Duration::from_secs(5);
+
+/// Tools whose runtime is long enough to collide with the client's window.
+const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
+
+fn shell_timeout_within(window: Duration) -> u64 {
+    window
+        .saturating_sub(RESPONSE_DELIVERY_RESERVE)
+        .as_secs()
+        .max(1)
+}
+
+/// Thread the client-owned response window into a shell `tools/call`.
+///
+/// The caller's `timeout_secs` is client-controlled and preserved when it fits;
+/// otherwise it is shortened so dotlink can return a real tool result instead of
+/// being dropped at the window boundary. The policy ceiling still applies later.
+fn apply_response_window(jsonrpc: &mut Value, window: Duration) -> Option<u64> {
+    if jsonrpc.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let name = jsonrpc.pointer("/params/name").and_then(Value::as_str)?;
+    if !SHELL_TOOLS.contains(&name) {
+        return None;
+    }
+    let object = jsonrpc.pointer_mut("/params/arguments")?.as_object_mut()?;
+    let budget = shell_timeout_within(window);
+    let applied = match object.get("timeout_secs") {
+        Some(value) => value.as_u64()?.min(budget),
+        None => budget,
+    };
+    object.insert("timeout_secs".to_owned(), Value::from(applied));
+    Some(applied)
 }
 
 fn verbose_request_label(jsonrpc: &Value) -> String {
@@ -1106,10 +1172,13 @@ mod tests {
         assert_eq!(fs::read(root.join("nested/data.bin")).unwrap(), b"aXYd");
         fs::create_dir(root.join("nested/deeper")).unwrap();
         fs::write(root.join("nested/deeper/child.txt"), b"child").unwrap();
-        let listed = call("ls", json!({"path":"nested", "recursive":true})).await;
-        let listing: Vec<Value> =
+        let listed = call("ls", json!({"path":"nested", "depth":5})).await;
+        let listing: Value =
             serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        let listed_paths: Vec<&str> = listing
+        assert_eq!(listing["truncated"], Value::Bool(false));
+        let listed_paths: Vec<&str> = listing["entries"]
+            .as_array()
+            .unwrap()
             .iter()
             .map(|entry| entry["path"].as_str().unwrap())
             .collect();
@@ -1131,22 +1200,25 @@ mod tests {
                 .all(|path| !path.starts_with("/proc/self/fd/"))
         );
         let limited = call("ls", json!({"path":"nested", "max_entries":2})).await;
-        let limited_entries: Vec<Value> =
+        let limited_payload: Value =
             serde_json::from_str(limited["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
+        assert_eq!(limited_payload["truncated"], Value::Bool(true));
+        let limited_entries = limited_payload["entries"].as_array().unwrap();
         assert_eq!(limited_entries.len(), 2);
         assert!(
             limited_entries[0]["path"].as_str().unwrap()
                 <= limited_entries[1]["path"].as_str().unwrap()
         );
 
-        let root_listing = call("ls", json!({"path":".", "recursive":true})).await;
-        let entries: Vec<Value> = serde_json::from_str(
+        let root_listing = call("ls", json!({"path":".", "depth":10})).await;
+        let root_payload: Value = serde_json::from_str(
             root_listing["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap(),
         )
         .unwrap();
+        let entries = root_payload["entries"].as_array().unwrap();
         assert!(
             entries
                 .iter()
@@ -1346,6 +1418,190 @@ mod tests {
         ] {
             assert_eq!(parse_response_timeout(Some(&value)), None);
         }
+    }
+
+    #[test]
+    fn client_window_bounds_shell_timeouts_only() {
+        let window = Duration::from_secs(120);
+        assert_eq!(shell_timeout_within(window), 115);
+        assert_eq!(shell_timeout_within(Duration::from_secs(3)), 1);
+
+        let shell = |arguments: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":arguments}});
+
+        // Omitted -> derived from the client window.
+        let mut call = shell(json!({"command":"cargo build --release"}));
+        assert_eq!(apply_response_window(&mut call, window), Some(115));
+        assert_eq!(
+            call.pointer("/params/arguments/timeout_secs"),
+            Some(&json!(115))
+        );
+
+        // Caller value is preserved when it fits.
+        let mut call = shell(json!({"command":"true","timeout_secs":30}));
+        assert_eq!(apply_response_window(&mut call, window), Some(30));
+        assert_eq!(
+            call.pointer("/params/arguments/timeout_secs"),
+            Some(&json!(30))
+        );
+
+        // Caller value is shortened to keep the response deliverable.
+        let mut call = shell(json!({"command":"true","timeout_secs":600}));
+        assert_eq!(apply_response_window(&mut call, window), Some(115));
+        assert_eq!(
+            call.pointer("/params/arguments/timeout_secs"),
+            Some(&json!(115))
+        );
+
+        // Wrong types are left to schema validation instead of being rewritten.
+        let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
+        assert_eq!(apply_response_window(&mut call, window), None);
+        assert_eq!(
+            call.pointer("/params/arguments/timeout_secs"),
+            Some(&json!("600"))
+        );
+
+        // Non-shell tools and non-call methods are untouched.
+        let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"a"}}});
+        let original = call.clone();
+        assert_eq!(apply_response_window(&mut call, window), None);
+        assert_eq!(call, original);
+
+        let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let original = call.clone();
+        assert_eq!(apply_response_window(&mut call, window), None);
+        assert_eq!(call, original);
+    }
+
+    #[tokio::test]
+    async fn shell_progress_heartbeat_is_forwarded_and_carries_no_message() {
+        if crate::mcp::resolve_executable("bash").is_none() {
+            return;
+        }
+        use crate::mcp::{AccessSpec, MachineConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 60,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "bash",
+                "arguments": {"command": "sleep 1"},
+                "_meta": {"progressToken": "beat"}
+            }
+        });
+        let result = mcp.dispatch(&BTreeMap::new(), &call).await.unwrap();
+        assert_eq!(result.status, 200);
+
+        let progress: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str) == Some("notifications/progress")
+            })
+            .collect();
+        assert!(!progress.is_empty(), "{:?}", result.messages);
+        for message in &progress {
+            assert_eq!(message["params"]["progressToken"], "beat");
+            assert!(message["params"].get("message").is_none(), "{message}");
+            assert!(message["params"].get("total").is_none(), "{message}");
+        }
+        let numbers: Vec<f64> = progress
+            .iter()
+            .map(|message| message["params"]["progress"].as_f64().unwrap())
+            .collect();
+        assert!(
+            numbers.windows(2).all(|pair| pair[0] < pair[1]),
+            "{numbers:?}"
+        );
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(crate::transports::openai::is_terminal_jsonrpc),
+            "{:?}",
+            result.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn client_window_reaches_the_shell_deadline_end_to_end() {
+        use crate::mcp::{AccessSpec, MachineConfig};
+
+        if crate::mcp::resolve_executable("bash").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 600,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let mut call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "bash", "arguments": {"command": "sleep 30"}}
+        });
+        assert_eq!(
+            apply_response_window(&mut call, Duration::from_millis(2_000)),
+            Some(1)
+        );
+
+        let started = Instant::now();
+        let result = mcp.dispatch(&BTreeMap::new(), &call).await.unwrap();
+        assert_eq!(result.status, 200);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let body = result.messages.first().unwrap().to_string();
+        assert!(body.contains("timed out after 1 seconds"), "{body}");
     }
 
     #[test]

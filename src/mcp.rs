@@ -3,7 +3,10 @@ use std::{
     env,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -14,10 +17,12 @@ use rmcp::{
     ErrorData as McpError,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ResourceContents,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+        ProtocolVersion, ResourceContents, ResultType, Tool,
     },
     schemars,
-    service::{RequestContext, RoleServer},
+    service::{Peer, RequestContext, RoleServer},
     tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
@@ -32,6 +37,8 @@ use tokio::{
 };
 
 const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_LIST_ENTRIES: usize = 4 * 1024;
+const MAX_LIST_ENTRIES: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AccessSpec {
@@ -117,15 +124,19 @@ enum AccessNeed {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListArgs {
-    /// Directory path. Relative paths resolve from the directory where dotlink was launched; absolute paths are allowed only when permitted.
+    /// Directory path. Relative paths resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]
     path: String,
 
-    /// Recurse into subdirectories. Symlinked directories are never traversed.
+    /// Glob on the entry name, matched against every listed entry. Supports `*` and `?`.
     #[serde(default)]
-    recursive: bool,
+    pattern: Option<String>,
 
-    /// Maximum number of entries to return. Defaults to 500 and is capped at 5000.
+    /// Directory levels to descend. 1 (default) lists this directory only. Symlinked directories are never traversed.
+    #[serde(default)]
+    depth: Option<usize>,
+
+    /// Maximum number of entries to return. Defaults to 4096 and is capped at 16384.
     #[serde(default)]
     max_entries: Option<usize>,
 }
@@ -142,6 +153,10 @@ struct ReadArgs {
     /// Maximum number of lines to return. Omit to return all remaining lines.
     #[serde(default)]
     limit: Option<usize>,
+
+    /// Prefix each line with its 1-based line number and a tab. Defaults to true.
+    #[serde(default)]
+    numbered: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -251,11 +266,11 @@ struct ShellArgs {
     #[serde(default)]
     stdin: Option<String>,
 
-    /// Timeout for this command in seconds. Defaults to 30 and is capped by server policy.
+    /// Timeout in seconds. Defaults to the client's response window when the transport provides one, else the profile ceiling (max_shell_timeout_secs); clamped to that ceiling.
     #[serde(default)]
     timeout_secs: Option<u64>,
 
-    /// Optional output byte limit per stream, capped by server policy.
+    /// Output byte limit per stream. Defaults to the profile ceiling (max_output_bytes); clamped to it.
     #[serde(default)]
     max_output_bytes: Option<usize>,
 }
@@ -288,6 +303,138 @@ fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
+/// Client-controlled shell timeout. The caller picks it; the profile ceiling
+/// (`max_shell_timeout_secs`) only bounds it, and is the fallback when omitted.
+fn resolve_shell_timeout(requested: Option<u64>, ceiling: u64) -> u64 {
+    resolve_capped(requested, ceiling)
+}
+
+/// Client-controlled limit under a policy ceiling. Both the shell timeout and
+/// the per-stream output limit follow this shape: the caller picks any value up
+/// to the configured ceiling, which is also the fallback when omitted.
+fn resolve_capped<T>(requested: Option<T>, ceiling: T) -> T
+where
+    T: Ord + From<u8> + Copy,
+{
+    let ceiling = ceiling.max(T::from(1));
+    requested.unwrap_or(ceiling).clamp(T::from(1), ceiling)
+}
+
+/// Shell progress is a bare heartbeat: the caller cannot know how much of an
+/// arbitrary command is done, so no percentages or messages are reported.
+#[cfg(not(test))]
+const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Salvage window for partial output after a killed child.
+const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+
+/// Heartbeat sink for one `tools/call` that carried a progress token.
+struct ProgressHeartbeat {
+    peer: Peer<RoleServer>,
+    token: ProgressToken,
+    ticks: AtomicU64,
+}
+
+impl ProgressHeartbeat {
+    fn for_request(context: &RequestContext<RoleServer>) -> Option<Self> {
+        let token = context.meta.get_progress_token()?;
+        Some(Self {
+            peer: context.peer.clone(),
+            token,
+            ticks: AtomicU64::new(0),
+        })
+    }
+
+    /// Monotonic progress counter with no total and no message.
+    async fn report(&self) {
+        let progress = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        let param = ProgressNotificationParam::new(self.token.clone(), progress as f64);
+        let _ = self.peer.notify_progress(param).await;
+    }
+}
+
+async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
+    match heartbeat {
+        Some(_) => tokio::time::sleep(SHELL_HEARTBEAT_INTERVAL).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Minimal glob for entry names: `*` matches any run of characters, `?` one.
+/// Case-sensitive, and it never crosses a separator because names have none.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0_usize, 0_usize);
+    let mut backtrack: Option<(usize, usize)> = None;
+
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                backtrack = Some((p, n));
+                p += 1;
+            }
+            Some('?') => {
+                p += 1;
+                n += 1;
+            }
+            Some(expected) if *expected == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match backtrack {
+                Some((star, start)) => {
+                    p = star + 1;
+                    n = start + 1;
+                    backtrack = Some((star, start + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|ch| *ch == '*')
+}
+
+fn list_entry_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_MAX_LIST_ENTRIES)
+        .clamp(1, MAX_LIST_ENTRIES)
+}
+
+fn shell_timeout_description(max_secs: u64) -> String {
+    format!(
+        "Timeout in seconds. Defaults to the client's response window when the transport provides one, else {max_secs}; capped at {max_secs}."
+    )
+}
+
+fn shell_output_description(max_bytes: usize) -> String {
+    format!("Output byte limit per stream. Defaults to {max_bytes} and is capped there.")
+}
+
+/// Tool schemas are static, the policy ceilings are not. Replace the limit
+/// arguments' descriptions with the numbers this profile actually enforces.
+fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usize) -> Tool {
+    if !matches!(tool.name.as_ref(), "bash" | "powershell") {
+        return tool;
+    }
+    let mut schema = (*tool.input_schema).clone();
+    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return tool;
+    };
+    for (key, description) in [
+        ("timeout_secs", shell_timeout_description(max_secs)),
+        ("max_output_bytes", shell_output_description(max_bytes)),
+    ] {
+        if let Some(Value::Object(property)) = properties.get_mut(key) {
+            property.insert("description".to_owned(), Value::String(description));
+        }
+    }
+    tool.input_schema = Arc::new(schema);
+    tool
+}
+
 async fn drain_capped<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
 where
     R: AsyncRead + Unpin,
@@ -315,7 +462,7 @@ where
     Ok((kept, truncated))
 }
 
-fn resolve_executable(name: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_executable(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
     let found = if candidate.components().count() > 1 {
         candidate.exists().then(|| candidate.to_path_buf())
@@ -1143,17 +1290,24 @@ impl LocalMachine {
         }
     }
 
-    async fn list_impl(&self, args: ListArgs) -> Result<Vec<FsEntry>> {
+    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool)> {
         let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         if !fs::metadata(&root).await?.is_dir() {
             bail!("not a directory: {}", args.path);
         }
 
-        let max_entries = args.max_entries.unwrap_or(500).clamp(1, 5000);
+        let depth = args.depth.unwrap_or(1).max(1);
+        let pattern = args
+            .pattern
+            .as_deref()
+            .filter(|pattern| !pattern.is_empty());
+        let max_entries = list_entry_limit(args.max_entries);
         let mut output = Vec::new();
-        let mut pending = vec![root];
+        let mut truncated = false;
+        // (directory, remaining levels below it)
+        let mut pending = vec![(root, depth)];
 
-        while let Some(dir) = pending.pop() {
+        while let Some((dir, remaining)) = pending.pop() {
             #[cfg(target_os = "linux")]
             let directory_handle = self.secure_fs.open_directory(&dir)?;
             #[cfg(target_os = "linux")]
@@ -1197,31 +1351,34 @@ impl LocalMachine {
                     "other"
                 };
 
-                output.push(FsEntry {
-                    path: self.config.access.relative_display(&path),
-                    kind,
-                    size: metadata.len(),
-                });
+                if pattern.is_none_or(|pattern| {
+                    glob_matches(pattern, &entry.file_name().to_string_lossy())
+                }) {
+                    output.push(FsEntry {
+                        path: self.config.access.relative_display(&path),
+                        kind,
+                        size: metadata.len(),
+                    });
+                }
                 if output.len() >= max_entries {
                     // Keep the output ordering stable even when a listing is
                     // capped partway through a directory enumeration.
+                    truncated = true;
                     output.sort_by(|a, b| a.path.cmp(&b.path));
-                    return Ok(output);
+                    return Ok((output, truncated));
                 }
-                if args.recursive && file_type.is_dir() && self.config.access.can_read(&path) {
-                    pending.push(path);
+                if remaining > 1 && file_type.is_dir() && self.config.access.can_read(&path) {
+                    pending.push((path, remaining - 1));
                 }
             }
         }
 
         output.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(output)
+        Ok((output, truncated))
     }
 
     fn output_limit(&self, requested: Option<usize>) -> usize {
-        requested
-            .unwrap_or(self.config.max_output_bytes)
-            .clamp(1, self.config.max_output_bytes)
+        resolve_capped(requested, self.config.max_output_bytes)
     }
 
     async fn terminate_child(child: &mut tokio::process::Child) {
@@ -1233,6 +1390,7 @@ impl LocalMachine {
         &self,
         args: ShellArgs,
         powershell: bool,
+        heartbeat: Option<ProgressHeartbeat>,
     ) -> Result<CallToolResult, McpError> {
         if args.command.trim().is_empty() {
             return Err(McpError::invalid_params("command must not be empty", None));
@@ -1259,10 +1417,8 @@ impl LocalMachine {
             return Ok(tool_error("dir is not a directory"));
         }
 
-        let timeout_secs = args
-            .timeout_secs
-            .unwrap_or(30)
-            .clamp(1, self.config.max_shell_timeout_secs);
+        let timeout_secs =
+            resolve_shell_timeout(args.timeout_secs, self.config.max_shell_timeout_secs);
         let shell_program = match &self.config.shell_program {
             Some(path) => path,
             None => return Ok(tool_error("shell execution is disabled")),
@@ -1341,8 +1497,23 @@ impl LocalMachine {
         let stdout_task = tokio::spawn(drain_capped(stdout, output_limit));
         let stderr_task = tokio::spawn(drain_capped(stderr, output_limit));
 
-        let status = match timeout_at(deadline, child.wait()).await {
-            Ok(Ok(status)) => status,
+        let status = {
+            let wait = timeout_at(deadline, child.wait());
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    result = &mut wait => break result,
+                    () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
+                        if let Some(heartbeat) = heartbeat.as_ref() {
+                            heartbeat.report().await;
+                        }
+                    }
+                }
+            }
+        };
+
+        let status = match status {
+            Ok(Ok(status)) => Some(status),
             Ok(Err(error)) => {
                 Self::terminate_child(&mut child).await;
                 stdout_task.abort();
@@ -1351,58 +1522,92 @@ impl LocalMachine {
             }
             Err(_) => {
                 Self::terminate_child(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                return Ok(tool_error(format!(
-                    "command timed out after {timeout_secs} seconds and was terminated"
-                )));
+                None
             }
         };
+        let timed_out = status.is_none();
 
+        // A killed child closes its pipes; descendants may still hold them, so a
+        // timed-out call gets a short grace to salvage partial output.
+        let collect_deadline = match timed_out {
+            false => deadline,
+            true => Instant::now() + TIMEOUT_OUTPUT_GRACE,
+        };
         let mut stdout_task = stdout_task;
         let mut stderr_task = stderr_task;
-        let collected = timeout_at(deadline, async {
+        let collected = timeout_at(collect_deadline, async {
             let stdout = (&mut stdout_task).await;
             let stderr = (&mut stderr_task).await;
             (stdout, stderr)
         })
         .await;
-        let (stdout_result, stderr_result) = match collected {
-            Ok(results) => results,
+        let collected = match collected {
+            Ok(results) => Some(results),
             Err(_) => {
                 stdout_task.abort();
                 stderr_task.abort();
+                None
+            }
+        };
+
+        let (stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated) = match collected {
+            Some((stdout_result, stderr_result)) => {
+                let (stdout_bytes, stdout_truncated) = match stdout_result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        return Ok(tool_error(format!("failed reading stdout: {error}")));
+                    }
+                    Err(error) => {
+                        return Ok(tool_error(format!("stdout reader task failed: {error}")));
+                    }
+                };
+                let (stderr_bytes, stderr_truncated) = match stderr_result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        return Ok(tool_error(format!("failed reading stderr: {error}")));
+                    }
+                    Err(error) => {
+                        return Ok(tool_error(format!("stderr reader task failed: {error}")));
+                    }
+                };
+                (
+                    stdout_bytes,
+                    stdout_truncated,
+                    stderr_bytes,
+                    stderr_truncated,
+                )
+            }
+            None if timed_out => (Vec::new(), false, Vec::new(), false),
+            None => {
                 return Ok(tool_error(format!(
                     "collecting command output timed out after {timeout_secs} seconds"
                 )));
             }
         };
 
-        let (stdout_bytes, stdout_truncated) = match stdout_result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => return Ok(tool_error(format!("failed reading stdout: {error}"))),
-            Err(error) => return Ok(tool_error(format!("stdout reader task failed: {error}"))),
-        };
-        let (stderr_bytes, stderr_truncated) = match stderr_result {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => return Ok(tool_error(format!("failed reading stderr: {error}"))),
-            Err(error) => return Ok(tool_error(format!("stderr reader task failed: {error}"))),
-        };
-
-        Ok(ok_text(
-            serde_json::json!({
-                "exit_code": status.code(),
-                "success": status.success(),
-                "dir": self.config.access.relative_display(&working_dir),
-                "sandboxed": self.config.sandbox_shell,
-                "network": self.config.allow_network,
-                "stdout": String::from_utf8_lossy(&stdout_bytes),
-                "stderr": String::from_utf8_lossy(&stderr_bytes),
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
-            })
-            .to_string(),
-        ))
+        let mut payload = serde_json::json!({
+            "exit_code": status.as_ref().and_then(|status| status.code()),
+            "success": status.as_ref().is_some_and(|status| status.success()),
+            "timed_out": timed_out,
+            "dir": self.config.access.relative_display(&working_dir),
+            "sandboxed": self.config.sandbox_shell,
+            "network": self.config.allow_network,
+            "stdout": String::from_utf8_lossy(&stdout_bytes),
+            "stderr": String::from_utf8_lossy(&stderr_bytes),
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        });
+        if timed_out {
+            // Report a real MCP error so the model knows why it has no result,
+            // and keep whatever output arrived before the deadline.
+            payload["error"] = Value::String(format!(
+                "command timed out after {timeout_secs} seconds and was terminated; retry with a larger timeout_secs or run it in the background"
+            ));
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                payload.to_string(),
+            )]));
+        }
+        Ok(ok_text(payload.to_string()))
     }
 
     #[cfg(target_os = "linux")]
@@ -1731,7 +1936,8 @@ fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Valu
         "command",
         "format",
         "encoding",
-        "recursive",
+        "pattern",
+        "depth",
         "replace_all",
         "offset",
         "limit",
@@ -1771,7 +1977,7 @@ fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Valu
 #[tool_router(vis = "pub")]
 impl LocalMachine {
     #[tool(
-        description = "List files and directories allowed by the active read policy.",
+        description = "List files and directories.",
         annotations(
             title = "List files",
             read_only_hint = true,
@@ -1782,16 +1988,19 @@ impl LocalMachine {
     )]
     async fn ls(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
         match self.list_impl(args).await {
-            Ok(entries) => match serde_json::to_string_pretty(&entries) {
-                Ok(json) => ok_text(json),
-                Err(error) => tool_error(error),
-            },
+            Ok((entries, truncated)) => {
+                let payload = serde_json::json!({ "entries": entries, "truncated": truncated });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(json) => ok_text(json),
+                    Err(error) => tool_error(error),
+                }
+            }
             Err(error) => tool_error(error),
         }
     }
 
     #[tool(
-        description = "Read an allowed UTF-8 text file. Use read_binary for non-text files.",
+        description = "Read a UTF-8 text file. Use read_binary for non-text files.",
         annotations(
             title = "Read text file",
             read_only_hint = true,
@@ -1832,17 +2041,23 @@ impl LocalMachine {
 
         let offset = args.offset.unwrap_or(1).max(1);
         let limit = args.limit.unwrap_or(usize::MAX);
-        ok_text(
-            text.lines()
-                .skip(offset - 1)
-                .take(limit)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        let numbered = args.numbered.unwrap_or(true);
+        let lines = text
+            .lines()
+            .skip(offset - 1)
+            .take(limit)
+            .enumerate()
+            .map(|(index, line)| match numbered {
+                true => format!("{}\t{line}", offset + index),
+                false => line.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ok_text(lines)
     }
 
     #[tool(
-        description = "Create or replace an allowed UTF-8 text file. Missing parent directories are created automatically.",
+        description = "Create or replace a UTF-8 text file. Missing parent directories are created automatically.",
         annotations(
             title = "Write text file",
             read_only_hint = false,
@@ -1878,7 +2093,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Replace exact text inside an existing file. Requires both read and write permission.",
+        description = "Replace exact text inside an existing file.",
         annotations(
             title = "Edit text file",
             read_only_hint = false,
@@ -1946,7 +2161,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Read an allowed binary file. format=mcp returns typed MCP image/audio/blob content; base64 or hex returns encoded bytes.",
+        description = "Read a binary file. format=mcp returns typed MCP image/audio/blob content; base64 or hex returns encoded bytes.",
         annotations(
             title = "Read binary file",
             read_only_hint = true,
@@ -2049,7 +2264,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Create or replace an allowed binary file using base64 or hex data.",
+        description = "Create or replace a binary file using base64 or hex data.",
         annotations(
             title = "Write binary file",
             read_only_hint = false,
@@ -2078,7 +2293,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Patch an existing binary file by replacing a byte range. Requires read+write permission.",
+        description = "Patch an existing binary file by replacing a byte range.",
         annotations(
             title = "Patch binary file",
             read_only_hint = false,
@@ -2153,7 +2368,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Run Bash. On Linux it is Bubblewrap-sandboxed unless --no-sandbox --allow-all was explicitly selected.",
+        description = "Run a Bash command.",
         annotations(
             title = "Run Bash command",
             read_only_hint = false,
@@ -2165,12 +2380,14 @@ impl LocalMachine {
     async fn bash(
         &self,
         Parameters(args): Parameters<ShellArgs>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.execute_shell(args, false).await
+        self.execute_shell(args, false, ProgressHeartbeat::for_request(&context))
+            .await
     }
 
     #[tool(
-        description = "Run PowerShell on Windows. Unsandboxed shell access requires --no-sandbox --allow-all.",
+        description = "Run a PowerShell command.",
         annotations(
             title = "Run PowerShell command",
             read_only_hint = false,
@@ -2182,8 +2399,10 @@ impl LocalMachine {
     async fn powershell(
         &self,
         Parameters(args): Parameters<ShellArgs>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.execute_shell(args, true).await
+        self.execute_shell(args, true, ProgressHeartbeat::for_request(&context))
+            .await
     }
 }
 
@@ -2193,6 +2412,45 @@ impl LocalMachine {
     instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
 )]
 impl rmcp::ServerHandler for LocalMachine {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self
+                .policy_tool_router()
+                .list_all()
+                .into_iter()
+                .map(|tool| {
+                    with_profile_limits(
+                        tool,
+                        self.config.max_shell_timeout_secs,
+                        self.config.max_output_bytes,
+                    )
+                })
+                .collect(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.policy_tool_router().get(name).cloned().map(|tool| {
+            with_profile_limits(
+                tool,
+                self.config.max_shell_timeout_secs,
+                self.config.max_output_bytes,
+            )
+        })
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -2249,6 +2507,233 @@ impl rmcp::ServerHandler for LocalMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_matcher_handles_names_without_crossing_separators() {
+        assert!(glob_matches("*.rs", "lib.rs"));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("test_?.rs", "test_a.rs"));
+        assert!(!glob_matches("test_?.rs", "test_ab.rs"));
+        assert!(glob_matches("a*b*c", "axxbyyc"));
+        assert!(glob_matches("a*c", "ac"));
+        assert!(!glob_matches("*.rs", "lib.rs.bak"));
+        assert!(!glob_matches("lib.rs", "src/lib.rs"));
+        assert!(!glob_matches("", "lib.rs"));
+        assert!(glob_matches("**", "x"));
+    }
+
+    fn test_machine(root: PathBuf) -> LocalMachine {
+        #[cfg(target_os = "linux")]
+        let root_for_secure_fs = root.clone();
+        LocalMachine {
+            config: RuntimeConfig {
+                access: AccessPolicy::from_spec(AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: vec![root.clone()],
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                })
+                .unwrap(),
+                cache_mounts: Vec::new(),
+                shell_env: Vec::new(),
+                #[cfg(target_os = "linux")]
+                host_shell: crate::host_services::HostShell::default(),
+                log: LogConfig::default(),
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                shell_program: None,
+                bwrap_program: None,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 65536,
+                max_read_bytes: 65536,
+                max_write_bytes: 65536,
+                protected_paths: Vec::new(),
+            },
+            operation_gate: Arc::new(RwLock::new(())),
+            serialize: false,
+            #[cfg(target_os = "linux")]
+            secure_fs: Arc::new(
+                crate::secure_fs::SecureFs::new(
+                    std::slice::from_ref(&root_for_secure_fs),
+                    std::slice::from_ref(&root_for_secure_fs),
+                )
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn ls_globs_and_limits_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("top.rs"), "x").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "x").unwrap();
+        std::fs::write(root.join("src/nested/deep.rs"), "x").unwrap();
+        std::fs::write(root.join("README.md"), "x").unwrap();
+        let machine = test_machine(root);
+
+        // Default depth 1: this directory only.
+        let (entries, truncated) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                pattern: None,
+                depth: None,
+                max_entries: None,
+            })
+            .await
+            .unwrap();
+        assert!(!truncated);
+        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(names, ["README.md", "src", "top.rs"]);
+
+        // Depth 2 descends one more level.
+        let (entries, _) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                pattern: None,
+                depth: Some(2),
+                max_entries: None,
+            })
+            .await
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert!(names.contains(&"src/lib.rs"), "{names:?}");
+        assert!(!names.contains(&"src/nested/deep.rs"), "{names:?}");
+
+        // Pattern filters every level it descends into.
+        let (entries, _) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                pattern: Some("*.rs".to_owned()),
+                depth: Some(3),
+                max_entries: None,
+            })
+            .await
+            .unwrap();
+        let mut names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["src/lib.rs", "src/nested/deep.rs", "top.rs"]);
+
+        // A capped listing reports truncation instead of silently dropping entries.
+        let (entries, truncated) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                pattern: Some("*.rs".to_owned()),
+                depth: Some(3),
+                max_entries: Some(2),
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn read_numbers_lines_and_respects_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let machine = test_machine(root);
+
+        let result = machine
+            .read(Parameters(ReadArgs {
+                path: "a.txt".to_owned(),
+                offset: None,
+                limit: None,
+                numbered: None,
+            }))
+            .await;
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            serialized["content"][0]["text"].as_str().unwrap(),
+            "1\talpha\n2\tbeta\n3\tgamma"
+        );
+
+        let result = machine
+            .read(Parameters(ReadArgs {
+                path: "a.txt".to_owned(),
+                offset: Some(2),
+                limit: Some(1),
+                numbered: None,
+            }))
+            .await;
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            serialized["content"][0]["text"].as_str().unwrap(),
+            "2\tbeta"
+        );
+
+        let result = machine
+            .read(Parameters(ReadArgs {
+                path: "a.txt".to_owned(),
+                offset: Some(2),
+                limit: None,
+                numbered: Some(false),
+            }))
+            .await;
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            serialized["content"][0]["text"].as_str().unwrap(),
+            "beta\ngamma"
+        );
+    }
+
+    #[test]
+    fn list_entry_limit_defaults_to_4096_and_caps_at_16384() {
+        assert_eq!(list_entry_limit(None), 4 * 1024);
+        assert_eq!(list_entry_limit(Some(10)), 10);
+        assert_eq!(list_entry_limit(Some(1_000_000)), 16 * 1024);
+        assert_eq!(list_entry_limit(Some(0)), 1);
+    }
+
+    #[test]
+    fn shell_tool_schema_reports_configured_ceilings() {
+        let bash = LocalMachine::tool_router().get("bash").cloned().unwrap();
+        let patched = with_profile_limits(bash.clone(), 42, 2048);
+        let properties = patched.input_schema["properties"].as_object().unwrap();
+        let timeout = properties["timeout_secs"]["description"].as_str().unwrap();
+        let output = properties["max_output_bytes"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(timeout.contains("42"), "{timeout}");
+        assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
+        assert!(output.contains("2048"), "{output}");
+        // Non-shell tools keep their static schemas.
+        let read = LocalMachine::tool_router().get("read").cloned().unwrap();
+        assert_eq!(
+            with_profile_limits(read.clone(), 42, 2048).input_schema,
+            read.input_schema
+        );
+    }
+
+    #[test]
+    fn output_limits_are_client_controlled_under_a_policy_ceiling() {
+        // Omitted -> the profile ceiling.
+        assert_eq!(resolve_capped(None, 1_048_576_usize), 1_048_576);
+        // Caller lowers it freely.
+        assert_eq!(resolve_capped(Some(4_096_usize), 1_048_576), 4_096);
+        // Caller cannot exceed the ceiling.
+        assert_eq!(resolve_capped(Some(8_388_608_usize), 1_048_576), 1_048_576);
+        assert_eq!(resolve_capped(Some(0_usize), 1_048_576), 1);
+    }
+
+    #[test]
+    fn shell_timeout_is_client_controlled_under_a_policy_ceiling() {
+        // Omitted -> the profile ceiling, not a hidden 30 s default.
+        assert_eq!(resolve_shell_timeout(None, 3_600), 3_600);
+        // Explicit caller values are honored inside the ceiling.
+        assert_eq!(resolve_shell_timeout(Some(600), 3_600), 600);
+        assert_eq!(resolve_shell_timeout(Some(1), 3_600), 1);
+        // The caller cannot exceed the ceiling.
+        assert_eq!(resolve_shell_timeout(Some(7_200), 3_600), 3_600);
+        // Zero is clamped up; a degenerate ceiling still yields a positive deadline.
+        assert_eq!(resolve_shell_timeout(Some(0), 3_600), 1);
+        assert_eq!(resolve_shell_timeout(None, 0), 1);
+    }
 
     #[tokio::test]
     async fn bounded_read_enforces_real_io_limit() {
@@ -3152,6 +3637,7 @@ mod tests {
                     max_output_bytes: Some(4096),
                 },
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3161,6 +3647,86 @@ mod tests {
         assert!(
             serialized.contains("collecting command output timed out after 1 seconds"),
             "unexpected shell result: {serialized}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_returns_tool_error_with_partial_output() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = LocalMachine {
+            config: RuntimeConfig {
+                access: AccessPolicy::from_spec(AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                })
+                .unwrap(),
+                cache_mounts: Vec::new(),
+                shell_env: Vec::new(),
+                #[cfg(target_os = "linux")]
+                host_shell: crate::host_services::HostShell::default(),
+                log: LogConfig::default(),
+                allow_shell: true,
+                sandbox_shell: false,
+                allow_network: true,
+                shell_program: Some(bash),
+                bwrap_program: None,
+                max_shell_timeout_secs: 2,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                protected_paths: Vec::new(),
+            },
+            operation_gate: Arc::new(RwLock::new(())),
+            serialize: false,
+            #[cfg(target_os = "linux")]
+            secure_fs: Arc::new(crate::secure_fs::SecureFs::new(&[], &[]).unwrap()),
+        };
+
+        let result = machine
+            .execute_shell(
+                ShellArgs {
+                    command: "printf 'partial output\\n'; sleep 30".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(1),
+                    max_output_bytes: Some(4096),
+                },
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let serialized = serde_json::to_value(&result).unwrap();
+        let text = serialized["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["timed_out"], Value::Bool(true));
+        assert_eq!(payload["success"], Value::Bool(false));
+        assert_eq!(payload["exit_code"], Value::Null);
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("timed out after 1 seconds"),
+            "{payload}"
+        );
+        assert!(
+            payload["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("partial output"),
+            "{payload}"
         );
     }
 
@@ -3245,8 +3811,7 @@ mod tests {
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
                 },
-                false,
-            )
+                false, None)
             .await
             .unwrap();
 
@@ -3420,6 +3985,7 @@ mod tests {
                     max_output_bytes: None,
                 },
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3502,8 +4068,7 @@ mod tests {
                         timeout_secs: Some(8),
                         max_output_bytes: None,
                     },
-                    false,
-                )
+                    false, None)
                 .await
                 .unwrap();
             let json = serde_json::to_string(&result).unwrap();
@@ -3689,7 +4254,7 @@ mod tests {
             ),
             dir: ".".into(), stdin: None,
             timeout_secs: Some(15), max_output_bytes: None,
-        }, false).await.unwrap();
+        }, false, None).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(
             json.contains("BEGIN SSH SIGNATURE"),
@@ -3744,7 +4309,7 @@ mod tests {
             ).into(),
             dir: "/".into(), stdin: None,
             timeout_secs: Some(8), max_output_bytes: None,
-        }, false).await.unwrap();
+        }, false, None).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(
             json.contains("isolated") && json.contains(r#"\"exit_code\":0"#),
@@ -3886,6 +4451,7 @@ mod tests {
                     max_output_bytes: None,
                 },
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -3981,6 +4547,7 @@ mod tests {
                         max_output_bytes: None,
                     },
                     false,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4064,6 +4631,7 @@ mod tests {
                     max_output_bytes: None,
                 },
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -4154,8 +4722,7 @@ mod tests {
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
                 },
-                false,
-            )
+                false, None)
             .await
             .unwrap();
 
@@ -4178,6 +4745,7 @@ mod tests {
                     max_output_bytes: Some(16 * 1024),
                 },
                 false,
+                None,
             )
             .await
             .unwrap();

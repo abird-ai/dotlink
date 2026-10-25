@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `ls` takes `pattern` (glob `*`/`?`, matched per entry) and `depth` (default 1) in place of the old `recursive` flag, and returns `{entries, truncated}` instead of a bare array, so discovery no longer needs `find`/`rg --files` through the shell; `max_entries` now defaults to 4096 with a 16384 ceiling.
+- `read` prefixes each line with its 1-based number and a tab by default (`numbered: false` opts out), matching how line ranges are edited and making `nl`/`sed -n` round trips unnecessary.
+- Shell calls emit `notifications/progress` heartbeats while running when the client supplies a progress token: a monotonic counter with no total and no message, so long commands stay visibly alive on streamed transports.
+
+### Fixed
+
+- Shell timeouts return a real MCP tool error (`isError`) carrying `timed_out: true`, the failure reason, and any partial stdout/stderr salvaged within a 250 ms grace, instead of a message-only error that discarded the output collected before the deadline.
+- Undeliverable tunnel responses are logged at warn instead of debug when the client's `response_timeout` window has already expired.
+
+### Changed
+
+- Tool descriptions describe only tool behavior: access boilerplate was dropped because unavailable tools are already hidden, and the `bash`/`powershell` arguments advertise the configured ceilings as concrete numbers instead of naming config keys.
+- `max_shell_timeout_secs` and `max_output_bytes` are now pure policy ceilings, defaulting to 3600 s and 1 MiB per stream. The `shell` timeout is caller-controlled via `timeout_secs`, clamped to the ceiling, and defaults to the ceiling when omitted instead of a hidden 30 s.
+- The OpenAI tunnel threads the client-supplied `response_timeout` into shell calls: an omitted `timeout_secs` defaults to that window minus a 5 s delivery reserve, and a larger explicit value is shortened, so a long command returns a real tool result instead of being dropped at the client window boundary.
+
 ## [0.9.1] - 2026-10-16
 
 ### Fixed

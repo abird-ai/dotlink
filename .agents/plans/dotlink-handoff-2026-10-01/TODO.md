@@ -27,3 +27,7 @@ and is appended here in one atomic write when finished.
 
 The authoritative list is `11-VALIDATION-AND-KNOWN-LIMITATIONS.md`. These are
 accepted boundaries of the current design, not unfinished work.
+
+## Maintenance (in repository)
+
+- [ ] Client-controlled limits: `max_shell_timeout_secs` (default 3600 s) and `max_output_bytes` (default 1 MiB) are pure policy ceilings; per-call values come from the client and fall back to the ceiling, the tunnel's `response_timeout` supplies the shell default within a 5 s delivery reserve, the advertised schema reports the real ceilings, shell calls emit progress heartbeats, timed-out shells return an `isError` result with partial output, and tool descriptions carry behavior only — since `v0.9.1`

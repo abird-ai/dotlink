@@ -159,12 +159,14 @@ Representative JSONC:
   "organization_id": null,
   "base_url": "https://api.openai.com",
 
-  "max_shell_timeout_secs": 120,
+  "max_shell_timeout_secs": 3600,
   "max_output_bytes": 1048576,
   "max_read_bytes": 4194304,
   "max_write_bytes": 4194304,
 }
 ```
+
+`max_shell_timeout_secs` is the ceiling for the `shell` tool's caller-supplied `timeout_secs`, which defaults to the ceiling when omitted.
 
 Runtime API key is not in this JSON.
 

@@ -53,8 +53,9 @@ Rules:
 
 - path defaults to `.`;
 - read permission;
-- recursive optional;
-- max entries bounded;
+- `pattern` glob (`*`, `?`) filters entries at every level;
+- `depth` bounds descent (default 1);
+- max entries bounded; output is `{entries, truncated}`;
 - does not recurse through symlinked directories;
 - skips denied/protected entries.
 
@@ -63,7 +64,8 @@ Rules:
 - UTF-8 regular file;
 - read permission;
 - bounded total file size;
-- line-based offset/limit.
+- line-based offset/limit;
+- line numbers by default (`numbered: false` for exact text).
 
 ### write
 

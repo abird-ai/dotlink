@@ -330,7 +330,7 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - tunnel concurrency is bounded;
 - shell stdout/stderr are drained continuously with bounded retained output;
 - text/binary reads and writes are bounded;
-- shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants);
+- shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants), chosen per call by the client, bounded by the tunnel client's own `response_timeout` window when present, and clamped to the profile `max_shell_timeout_secs` ceiling; a timeout still returns a bounded, non-secret error result with any partial output;
 - HTTP and transport lifecycles share cancellation;
 - OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded;
 - recovery teardown waits at most 5 seconds before aborting unresponsive peer transport tasks;
