@@ -435,8 +435,11 @@ struct ShellArgs {
 
 /// One directory entry produced by the shared walk.
 struct WalkedEntry {
+    /// Logical, policy-checked path.
     path: PathBuf,
+    /// `path` relative to the walk root; the candidate for glob matching.
     relative: PathBuf,
+    /// `file`, `dir`, `symlink` or `other`.
     kind: &'static str,
     size: u64,
     mtime: Option<std::time::SystemTime>,
@@ -553,6 +556,16 @@ impl GlobFilter {
     fn matches(&self, candidate: &Path) -> bool {
         self.matcher.is_match(candidate)
     }
+
+    /// Match an entry by its path relative to the search root, or by its bare
+    /// name: `*.rs` stays useful below the root, `src/**/*.rs` addresses a
+    /// subtree. One rule, so `ls` and `grep` cannot drift.
+    fn matches_entry(&self, relative: &Path) -> bool {
+        self.matches(relative)
+            || relative
+                .file_name()
+                .is_some_and(|name| self.matches(Path::new(name)))
+    }
 }
 
 /// Filters applied before an entry reaches the tool: opt-in hidden skipping and
@@ -565,6 +578,23 @@ struct WalkFilter {
 
 fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().starts_with('.')
+}
+
+/// Directories that cannot be enumerated are skipped, like `rg`: a permission
+/// wall or a directory that vanished mid-walk is not a tool failure. Policy
+/// denies never reach here — they are applied before a directory is queued.
+fn skippable_io_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+fn skippable_directory_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(skippable_io_error)
 }
 
 /// Deepest matcher first; the first decisive rule wins, which is git's order.
@@ -861,6 +891,16 @@ fn join_patch_path(dir: &str, path: &str) -> String {
     Path::new(dir).join(path).to_string_lossy().into_owned()
 }
 
+/// One validated byte range, kept in request order for messages until sorted.
+struct RangePlan {
+    offset: usize,
+    end: usize,
+    length: usize,
+    /// 1-based position in the request, used for error text.
+    position: usize,
+    data: Vec<u8>,
+}
+
 /// Byte offsets of every occurrence of `needle` in `haystack`.
 fn match_indices(haystack: &str, needle: &str) -> Vec<usize> {
     haystack.match_indices(needle).map(|(at, _)| at).collect()
@@ -884,13 +924,20 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-/// Every mutating text tool plans against a read snapshot and re-checks the
-/// content before writing, so a concurrent change fails the whole call.
+/// Why a planned write is no longer safe, if the file moved on since planning.
+/// Callers decide the consequence: atomic tools fail the call, `best_effort`
+/// reports the file and keeps the rest.
+fn snapshot_changed(display: &str, current: &[u8], snapshot: &[u8], verb: &str) -> Option<String> {
+    (sha256(current) != sha256(snapshot)).then(|| format!("{display} changed while {verb}"))
+}
+
+/// All-or-nothing text tools plan against a read snapshot and re-check every
+/// file before the first write.
 fn verify_snapshot(display: &str, current: &[u8], snapshot: &[u8], verb: &str) -> Result<()> {
-    if sha256(current) != sha256(snapshot) {
-        bail!("{display} changed while {verb}; nothing was written");
+    match snapshot_changed(display, current, snapshot, verb) {
+        Some(reason) => bail!("{reason}; nothing was written"),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// `read` numbers lines as `N\tline`; an `old_text` copied from that output
@@ -906,7 +953,8 @@ fn cap_text(text: String, limit: usize, marker: &str) -> (String, bool) {
     if text.len() <= limit {
         return (text, false);
     }
-    let mut end = limit;
+    // Reserve room for the marker so the result stays within the ceiling.
+    let mut end = limit.saturating_sub(marker.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -1820,6 +1868,11 @@ impl LocalMachine {
     /// lines per file; an invalid pattern fails the whole call (fail closed).
     async fn load_gitignore(&self, dir: &Path) -> Result<Option<Gitignore>> {
         let path = dir.join(".gitignore");
+        // The walk drops denied entries, but this open is separate: a deny rule
+        // or protected path on the ignore file itself must still win.
+        if self.config.access.denied_read(&path) || self.ensure_not_protected(&path).is_err() {
+            return Ok(None);
+        }
         let file = match self.open_read_file(&path).await {
             Ok(file) => file,
             Err(_) => return Ok(None),
@@ -1869,8 +1922,15 @@ impl LocalMachine {
                 ignores.push(Arc::new(ignore));
             }
 
+            // One unreadable or vanished subdirectory must not abort a search
+            // over the rest of the tree; policy denies are separate and already
+            // applied before a directory is queued.
             #[cfg(target_os = "linux")]
-            let directory_handle = self.secure_fs.open_directory(&dir)?;
+            let directory_handle = match self.secure_fs.open_directory(&dir) {
+                Ok(handle) => handle,
+                Err(error) if dir != root && skippable_directory_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
             #[cfg(target_os = "linux")]
             let read_path = PathBuf::from(format!(
                 "/proc/self/fd/{}",
@@ -1878,8 +1938,19 @@ impl LocalMachine {
             ));
             #[cfg(not(target_os = "linux"))]
             let read_path = dir.clone();
-            let mut reader = fs::read_dir(&read_path).await?;
-            while let Some(entry) = reader.next_entry().await? {
+            let mut reader = match fs::read_dir(&read_path).await {
+                Ok(reader) => reader,
+                Err(error) if dir != root && skippable_io_error(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            loop {
+                let entry = match reader.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    // Stop this directory, keep the rest of the walk.
+                    Err(error) if skippable_io_error(&error) => break,
+                    Err(error) => return Err(error.into()),
+                };
                 // The Linux enumerator reads via /proc/self/fd/<pinned-dir>.
                 // Its DirEntry.path() is therefore an *internal* FD path,
                 // not the logical authorized path. Use the original name for
@@ -1891,8 +1962,7 @@ impl LocalMachine {
                 {
                     continue;
                 }
-                if filter.skip_hidden && path != root && starts_with_dot(entry.file_name().as_ref())
-                {
+                if filter.skip_hidden && starts_with_dot(entry.file_name().as_ref()) {
                     continue;
                 }
 
@@ -1945,6 +2015,28 @@ impl LocalMachine {
         Ok(())
     }
 
+    /// Create-only write. On Linux this is `O_EXCL` beneath the pinned root, so
+    /// a path that appears between policy check and open is refused rather than
+    /// truncated.
+    async fn open_create_file(&self, path: &Path) -> Result<fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(fs::File::from_std(self.secure_fs.open_create(path)?))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.require_regular_or_missing(path).await?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            Ok(fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .await?)
+        }
+    }
+
     async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool)> {
         let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         if !fs::metadata(&root).await?.is_dir() {
@@ -1963,15 +2055,10 @@ impl LocalMachine {
         let mut truncated = false;
 
         self.walk_entries(&root, depth, WalkFilter::default(), |entry| {
-            if pattern.as_ref().is_some_and(|pattern| {
-                // Entry names keep `*.rs` useful below the root; relative
-                // paths let `src/**/*.rs` address the same listing.
-                !(pattern.matches(&entry.relative)
-                    || entry
-                        .relative
-                        .file_name()
-                        .is_some_and(|name| pattern.matches(Path::new(name))))
-            }) {
+            if pattern
+                .as_ref()
+                .is_some_and(|pattern| !pattern.matches_entry(&entry.relative))
+            {
                 return true;
             }
             if !args.kind.accepts(entry.kind) {
@@ -2044,7 +2131,10 @@ impl LocalMachine {
 
         let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         if !fs::metadata(&root).await?.is_dir() {
-            bail!("not a directory: {}", args.path);
+            bail!(
+                "not a directory: {} (use read for a single file)",
+                args.path
+            );
         }
 
         let glob = args
@@ -2074,13 +2164,10 @@ impl LocalMachine {
                 if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
                     return true;
                 }
-                if glob.as_ref().is_some_and(|glob| {
-                    !(glob.matches(&entry.relative)
-                        || entry
-                            .relative
-                            .file_name()
-                            .is_some_and(|name| glob.matches(Path::new(name))))
-                }) {
+                if glob
+                    .as_ref()
+                    .is_some_and(|glob| !glob.matches_entry(&entry.relative))
+                {
                     return true;
                 }
                 if candidates.len() >= MAX_GREP_FILES {
@@ -2895,7 +2982,8 @@ impl LocalMachine {
         };
 
         let offset = args.offset.unwrap_or(1).max(1);
-        let limit = args.limit.unwrap_or(DEFAULT_READ_LINES);
+        // A zero window would render a nonsense marker ("truncated at line 0").
+        let limit = args.limit.unwrap_or(DEFAULT_READ_LINES).max(1);
         let numbered = args.numbered.unwrap_or(true);
         let all = text.lines().collect::<Vec<_>>();
         let total = all.len();
@@ -3122,9 +3210,9 @@ impl LocalMachine {
                 serde_json::json!({
                     "path": file.display,
                     "edits": file.edits,
-                    "line_delta": line_count(&file.text).wrapping_sub(line_count(
-                        &String::from_utf8_lossy(&file.snapshot),
-                    )),
+                    // Signed: a shrinking file is a negative delta.
+                    "line_delta": line_count(&file.text) as i64
+                        - line_count(&String::from_utf8_lossy(&file.snapshot)) as i64,
                 })
             })
             .collect::<Vec<_>>();
@@ -3147,12 +3235,6 @@ impl LocalMachine {
         )
     )]
     async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> CallToolResult {
-        if args.edits.len() > MAX_EDIT_OPS {
-            return tool_error(format!(
-                "edit: {} edits, above the {MAX_EDIT_OPS} edit limit",
-                args.edits.len()
-            ));
-        }
         match self.edit_impl(args).await {
             Ok(receipt) => ok_text(receipt),
             Err(error) => tool_error(error),
@@ -3179,10 +3261,17 @@ impl LocalMachine {
             })
             .sum::<usize>();
 
+        // Update and create are different plans with different write rules;
+        // keep them distinct instead of overloading `Option<snapshot>`.
+        enum PlanKind {
+            Update { snapshot: Vec<u8> },
+            Create,
+        }
+
         struct PlannedFile {
             path: PathBuf,
             display: String,
-            snapshot: Option<Vec<u8>>,
+            kind: PlanKind,
             text: String,
             hunks: usize,
             added: usize,
@@ -3191,9 +3280,9 @@ impl LocalMachine {
 
         let mut planned: Vec<PlannedFile> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut seen: Vec<PathBuf> = Vec::new();
+        let mut planned_paths: Vec<PathBuf> = Vec::new();
         let mut hunk_index = 0_usize;
-        let dir = args.dir.clone();
+        let dir = args.dir.as_str();
 
         for op in &ops {
             match op {
@@ -3201,7 +3290,7 @@ impl LocalMachine {
                     let first_hunk = hunk_index;
                     hunk_index += hunks.len();
                     let resolved = match self
-                        .resolve_existing(&join_patch_path(&dir, path), AccessNeed::ReadWrite)
+                        .resolve_existing(&join_patch_path(dir, path), AccessNeed::ReadWrite)
                         .await
                     {
                         Ok(resolved) => resolved,
@@ -3214,7 +3303,7 @@ impl LocalMachine {
                         }
                     };
                     let display = self.config.access.relative_display(&resolved);
-                    if seen.contains(&resolved) {
+                    if planned_paths.contains(&resolved) {
                         let error = format!("patch: {display} appears in more than one section");
                         if !args.best_effort {
                             bail!("{error}");
@@ -3222,6 +3311,7 @@ impl LocalMachine {
                         failures.push((display, error));
                         continue;
                     }
+                    planned_paths.push(resolved.clone());
                     let outcome = async {
                         let mut handle = self.open_edit_file(&resolved).await?;
                         let snapshot =
@@ -3240,7 +3330,7 @@ impl LocalMachine {
                         Ok(PlannedFile {
                             path: resolved.clone(),
                             display: display.clone(),
-                            snapshot: Some(snapshot),
+                            kind: PlanKind::Update { snapshot },
                             text: edited,
                             hunks: hunks.len(),
                             added,
@@ -3257,11 +3347,10 @@ impl LocalMachine {
                             failures.push((display, error.to_string()));
                         }
                     }
-                    seen.push(resolved);
                 }
                 PatchOp::Add { path, lines } => {
                     let resolved = match self
-                        .resolve_for_create(&join_patch_path(&dir, path), AccessNeed::Write)
+                        .resolve_for_create(&join_patch_path(dir, path), AccessNeed::Write)
                         .await
                     {
                         Ok(resolved) => resolved,
@@ -3274,13 +3363,16 @@ impl LocalMachine {
                         }
                     };
                     let display = self.config.access.relative_display(&resolved);
+                    // Create-only: checked here so an atomic call fails before
+                    // any write, and again by the exclusive open below, so a
+                    // file created in between cannot be clobbered.
                     if fs::symlink_metadata(&resolved).await.is_ok() {
                         let error = format!("{display}: '*** Add File' target already exists");
                         if !args.best_effort {
                             bail!("{error}");
                         }
-                        failures.push((display.clone(), error));
-                        seen.push(resolved);
+                        failures.push((display, error));
+                        planned_paths.push(resolved);
                         continue;
                     }
                     let text = if lines.is_empty() {
@@ -3298,13 +3390,14 @@ impl LocalMachine {
                             bail!("{error}");
                         }
                         failures.push((display, error));
-                        seen.push(resolved);
+                        planned_paths.push(resolved);
                         continue;
                     }
+                    planned_paths.push(resolved.clone());
                     planned.push(PlannedFile {
                         path: resolved,
                         display,
-                        snapshot: None,
+                        kind: PlanKind::Create,
                         text,
                         hunks: 0,
                         added: lines.len(),
@@ -3314,24 +3407,57 @@ impl LocalMachine {
             }
         }
 
-        // Verify every update snapshot before the first write.
-        for file in &planned {
-            if let Some(snapshot) = &file.snapshot {
+        // Verify every update snapshot before the first write. Atomic fails the
+        // whole call; `best_effort` reports the file and keeps the rest.
+        let mut ready: Vec<PlannedFile> = Vec::with_capacity(planned.len());
+        for file in planned {
+            if let PlanKind::Update { snapshot } = &file.kind {
                 let mut handle = self.open_edit_file(&file.path).await?;
                 let current = Self::read_bounded(&mut handle, self.config.max_read_bytes).await?;
-                verify_snapshot(&file.display, &current, snapshot, "patching")?;
+                if let Some(reason) =
+                    snapshot_changed(&file.display, &current, snapshot, "patching")
+                {
+                    if !args.best_effort {
+                        bail!("{reason}; nothing was written");
+                    }
+                    failures.push((file.display.clone(), format!("{reason}; skipped")));
+                    continue;
+                }
             }
+            ready.push(file);
         }
-        for file in &planned {
-            let mut handle = match file.snapshot {
-                Some(_) => self.open_edit_file(&file.path).await?,
-                None => self.open_write_file(&file.path).await?,
-            };
-            if file.snapshot.is_some() {
-                handle.rewind().await?;
-                handle.set_len(0).await?;
+
+        let mut written: Vec<PlannedFile> = Vec::with_capacity(ready.len());
+        for file in ready {
+            // A patch that reproduces the file byte for byte touches nothing.
+            if let PlanKind::Update { snapshot } = &file.kind
+                && file.text.as_bytes() == snapshot.as_slice()
+            {
+                written.push(file);
+                continue;
             }
-            Self::write_complete(&mut handle, file.text.as_bytes()).await?;
+            let outcome = async {
+                let mut handle = match file.kind {
+                    PlanKind::Update { .. } => {
+                        let mut handle = self.open_edit_file(&file.path).await?;
+                        handle.rewind().await?;
+                        handle.set_len(0).await?;
+                        handle
+                    }
+                    // Exclusive create: create-only is enforced by the open, not
+                    // just by the planning-time existence check.
+                    PlanKind::Create => self.open_create_file(&file.path).await?,
+                };
+                Self::write_complete(&mut handle, file.text.as_bytes()).await
+            }
+            .await;
+            match outcome {
+                Ok(()) => written.push(file),
+                Err(error) if args.best_effort => {
+                    failures.push((file.display.clone(), error.to_string()))
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let mode = if args.best_effort {
@@ -3340,7 +3466,7 @@ impl LocalMachine {
             "atomic"
         };
         let mut receipt = serde_json::json!({
-            "files": planned
+            "files": written
                 .iter()
                 .map(|file| serde_json::json!({
                     "path": file.display,
@@ -3544,6 +3670,10 @@ impl LocalMachine {
             }
         }
 
+        // Decoded payloads are held until the plan is valid, so the running
+        // total is bounded: no request can pin more than one patchable file
+        // worth of bytes in memory while its ranges are validated.
+        let mut decoded_bytes = 0_usize;
         let mut ranges = Vec::with_capacity(total);
         for (index, range) in args.edits.iter().enumerate() {
             let position = index + 1;
@@ -3555,6 +3685,12 @@ impl LocalMachine {
             }
             let data = decode_binary(&range.data, range.encoding, MAX_PATCH_FILE_BYTES)
                 .with_context(|| format!("bedit {position}/{total}"))?;
+            decoded_bytes = decoded_bytes.saturating_add(data.len());
+            if decoded_bytes > MAX_PATCH_FILE_BYTES {
+                bail!(
+                    "bedit: replacement payloads total {decoded_bytes} bytes, above the {MAX_PATCH_FILE_BYTES} byte limit"
+                );
+            }
             let length = range.length.unwrap_or(data.len());
             let end = range
                 .offset
@@ -3565,32 +3701,36 @@ impl LocalMachine {
                     "bedit {position}/{total}: range extends beyond end of file ({size_before} bytes)"
                 );
             };
-            ranges.push((range.offset, end, data, position, length));
+            ranges.push(RangePlan {
+                offset: range.offset,
+                end,
+                length,
+                position,
+                data,
+            });
         }
 
-        ranges.sort_by_key(|(offset, _, _, _, _)| *offset);
-        for (index, (offset, _, _, position, _)) in ranges.iter().enumerate() {
-            if index == 0 {
+        ranges.sort_by_key(|range| range.offset);
+        for (index, range) in ranges.iter().enumerate() {
+            let Some(previous) = index.checked_sub(1).map(|index| &ranges[index]) else {
                 continue;
-            }
-            let (previous_offset, previous_end, _, previous_position, previous_length) =
-                &ranges[index - 1];
-            if *offset < *previous_end {
+            };
+            if range.offset < previous.end {
                 bail!(
-                    "bedit {position}/{total}: range overlaps range {previous_position} (offset {previous_offset}, length {previous_length})"
+                    "bedit {}/{total}: range overlaps range {} (offset {}, length {})",
+                    range.position,
+                    previous.position,
+                    previous.offset,
+                    previous.length
                 );
             }
         }
 
-        let bytes_written = ranges
+        let bytes_written = ranges.iter().map(|range| range.data.len()).sum::<usize>();
+        let bytes_removed = ranges
             .iter()
-            .map(|(_, _, data, _, _)| data.len())
+            .map(|range| range.end - range.offset)
             .sum::<usize>();
-        let bytes_removed = ranges.iter().map(|(_, end, _, _, _)| end).sum::<usize>()
-            - ranges
-                .iter()
-                .map(|(offset, _, _, _, _)| offset)
-                .sum::<usize>();
         let size_after = size_before - bytes_removed + bytes_written;
         if size_after > MAX_PATCH_FILE_BYTES {
             bail!("bedit: patched file would exceed the {MAX_PATCH_FILE_BYTES} byte limit");
@@ -3598,12 +3738,13 @@ impl LocalMachine {
 
         let mut edited = Vec::with_capacity(size_after);
         let mut cursor = 0_usize;
-        for (offset, end, data, _, _) in &ranges {
-            edited.extend_from_slice(&original[cursor..*offset]);
-            edited.extend_from_slice(data);
-            cursor = *end;
+        for range in &ranges {
+            edited.extend_from_slice(&original[cursor..range.offset]);
+            edited.extend_from_slice(&range.data);
+            cursor = range.end;
         }
         edited.extend_from_slice(&original[cursor..]);
+        debug_assert_eq!(edited.len(), size_after);
 
         file.rewind().await?;
         file.set_len(0).await?;
@@ -4977,6 +5118,243 @@ mod tests {
         assert_eq!(
             std::fs::read(root.join("data.bin")).unwrap(),
             vec![b'x'; 512]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_line_delta_is_signed_when_a_file_shrinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let receipt = machine
+            .edit_impl(edit_args(Some("a.txt"), vec![edit_op(None, "two\n", "")]))
+            .await
+            .unwrap();
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["files"][0]["line_delta"], serde_json::json!(-1));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\nthree\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_zero_limit_never_renders_a_nonsense_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\nbeta\n").unwrap();
+        let machine = test_machine(root);
+
+        let result = machine
+            .read(Parameters(ReadArgs {
+                path: "a.txt".to_owned(),
+                offset: None,
+                limit: Some(0),
+                numbered: None,
+            }))
+            .await;
+        let serialized = serde_json::to_value(&result).unwrap();
+        let text = serialized["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "1\talpha\n… truncated at line 1 of 2");
+        assert!(!text.contains("line 0"));
+    }
+
+    #[test]
+    fn snapshot_changed_returns_the_reason_without_deciding_the_outcome() {
+        assert_eq!(
+            snapshot_changed("a.txt", b"changed", b"planned", "patching").as_deref(),
+            Some("a.txt changed while patching")
+        );
+        assert_eq!(snapshot_changed("a.txt", b"same", b"same", "editing"), None);
+        assert_eq!(
+            verify_snapshot("a.txt", b"changed", b"planned", "editing")
+                .unwrap_err()
+                .to_string(),
+            "a.txt changed while editing; nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_best_effort_reports_a_create_failure_and_keeps_the_rest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("present.txt"), "present\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let mut args = patch_args(
+            "*** Begin Patch\n\
+             *** Add File: present.txt\n\
+             +nope\n\
+             *** Add File: fresh.txt\n\
+             +yes\n\
+             *** End Patch",
+        );
+        args.best_effort = true;
+        let receipt: Value =
+            serde_json::from_str(&machine.patch_impl(args).await.unwrap()).unwrap();
+        assert_eq!(receipt["files"][0]["path"], "fresh.txt");
+        assert_eq!(receipt["failures"][0]["path"], "present.txt");
+        assert_eq!(
+            std::fs::read_to_string(root.join("fresh.txt")).unwrap(),
+            "yes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("present.txt")).unwrap(),
+            "present\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_create_only_write_refuses_an_existing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("present.txt"), "present\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        let error = machine
+            .open_create_file(&root.join("present.txt"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("present.txt")).unwrap(),
+            "present\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_does_not_read_a_denied_gitignore() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(root.join("build/out.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("src.rs"), "needle\n").unwrap();
+        let mut machine = test_machine(root.clone());
+        // A deny on the ignore file itself must win over `respect_gitignore`.
+        machine.config.access.deny_read_roots = vec![root.join(".gitignore")];
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        args.respect_gitignore = true;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(
+            files["files"],
+            serde_json::json!(["build/out.rs", "src.rs"])
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_named_root_is_an_error_but_unreadable_children_are_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("locked")).unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let locked_readable = std::fs::read_dir(root.join("locked")).is_ok();
+        let machine = test_machine(root.clone());
+
+        let listed = machine
+            .list_impl(ListArgs {
+                path: "locked".to_owned(),
+                ..ListArgs::default()
+            })
+            .await;
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        // A privileged user can read it; everyone else gets a real error.
+        assert_eq!(listed.is_err(), !locked_readable, "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn walk_skips_an_unreadable_directory_instead_of_failing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("locked")).unwrap();
+        std::fs::write(root.join("locked/secret.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("open.rs"), "needle\n").unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        // Root (or a privileged CI user) can still enumerate it; the point is
+        // that an unreadable directory never fails the search.
+        let locked_readable = std::fs::read_dir(root.join("locked")).is_ok();
+        let machine = test_machine(root.clone());
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        let outcome = machine.grep_impl(args).await;
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let files: Value = serde_json::from_str(&outcome.unwrap()).unwrap();
+        let expected = match locked_readable {
+            true => serde_json::json!(["locked/secret.rs", "open.rs"]),
+            false => serde_json::json!(["open.rs"]),
+        };
+        assert_eq!(files["files"], expected);
+    }
+
+    #[tokio::test]
+    async fn patch_rewrites_nothing_when_a_hunk_reproduces_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("a.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let machine = test_machine(root);
+
+        let receipt: Value = serde_json::from_str(
+            &machine
+                .patch_impl(patch_args(
+                    "*** Begin Patch\n*** Update File: a.txt\n@@\n same\n*** End Patch",
+                ))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["files"][0]["added"], serde_json::json!(0));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "same\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "an unchanged patch must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_skips_writing_a_file_whose_text_did_not_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("a.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let machine = test_machine(root);
+
+        let receipt: Value = serde_json::from_str(
+            &machine
+                .edit_impl(edit_args(
+                    Some("a.txt"),
+                    vec![edit_op(None, "same", "same")],
+                ))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["edits_applied"], serde_json::json!(1));
+        assert_eq!(receipt["changed_files"], serde_json::json!(0));
+        assert_eq!(receipt["files"], serde_json::json!([]));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "a no-op edit must not touch the file"
         );
     }
 

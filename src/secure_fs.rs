@@ -204,6 +204,16 @@ impl SecureFs {
     }
 
     pub fn open_write(&self, path: &Path) -> Result<File> {
+        self.open_write_mode(path, false)
+    }
+
+    /// Create-only write: refuses an existing path, including one that appeared
+    /// between the policy check and this open (O_EXCL, or `create_new` elsewhere).
+    pub fn open_create(&self, path: &Path) -> Result<File> {
+        self.open_write_mode(path, true)
+    }
+
+    fn open_write_mode(&self, path: &Path, exclusive: bool) -> Result<File> {
         let (root, rel) = self.root(path, true)?;
         let Some(file_name) = rel.file_name() else {
             bail!("cannot replace an authorized root directory");
@@ -247,19 +257,27 @@ impl SecureFs {
                 }
             }
         }
-        let fd = openat2(
-            &current,
-            Path::new(file_name),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK,
-            0o666,
-            root.resolve,
-        )
-        .with_context(|| format!("refused unsafe write target {}", path.display()))?;
+        let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK;
+        if exclusive {
+            flags |= libc::O_EXCL;
+        }
+        let fd = match openat2(&current, Path::new(file_name), flags, 0o666, root.resolve) {
+            Ok(fd) => fd,
+            Err(error) if exclusive && error.kind() == io::ErrorKind::AlreadyExists => {
+                bail!("path already exists: {}", path.display())
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("refused unsafe write target {}", path.display()));
+            }
+        };
         let file = File::from(fd);
         if !file.metadata()?.is_file() {
             bail!("path is not a regular file: {}", path.display());
         }
-        file.set_len(0)?;
+        if !exclusive {
+            file.set_len(0)?;
+        }
         Ok(file)
     }
 
@@ -435,6 +453,32 @@ mod tests {
             // root grants intentionally retain the ability to traverse it.
             assert!(secure.open_directory(Path::new("/proc")).is_ok());
         }
+    }
+
+    #[test]
+    fn create_only_write_refuses_existing_and_symlinked_targets() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+        let sandbox =
+            SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
+
+        fs::write(root.join("present"), b"present").unwrap();
+        assert!(sandbox.open_create(&root.join("present")).is_err());
+        assert_eq!(fs::read(root.join("present")).unwrap(), b"present");
+
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("alias")).unwrap();
+        assert!(sandbox.open_create(&root.join("alias")).is_err());
+        assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
+
+        let mut file = sandbox.open_create(&root.join("nested/new.txt")).unwrap();
+        file.write_all(b"hello").unwrap();
+        assert_eq!(fs::read(root.join("nested/new.txt")).unwrap(), b"hello");
     }
 
     #[test]

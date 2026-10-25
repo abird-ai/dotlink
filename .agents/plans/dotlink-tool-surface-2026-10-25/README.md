@@ -326,6 +326,37 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 - `bedit` also accepts a whole-file bound (`MAX_PATCH_FILE_BYTES`) for the source and the result; the source bound keeps the read in memory bounded.
 - `sha256` comparison is case-insensitive, and the mismatch message prints the expected and found digests.
 - `bedit` decodes every range before checking overlap, so an invalid payload is reported before any overlap or size decision.
+- `patch` receipts list only the files actually written; `best_effort` also drops a file whose snapshot moved on (reported as `… changed while patching; skipped`) and reports per-file write failures instead of aborting.
+- `Add File` is create-only twice over: a planning-time existence check (so atomic mode fails before any write) and an exclusive create (`O_EXCL` beneath the pinned root) at write time, so a file that appears in between cannot be clobbered.
+- `patch` and `edit` skip the write when the planned text is byte-identical, so a no-op never churns mtime.
+
+## Review pass (post-landing)
+
+Findings from a fresh read of the landed code, fixed in the follow-up commit, plus the deliberate trade-offs that remain.
+
+Fixed:
+
+- `edit.line_delta` underflowed (`wrapping_sub`) and reported ~1.8e19 for a shrinking file; it is signed now.
+- `read` with `limit: 0` rendered `… truncated at line 0 of N`; the window is clamped to one line.
+- `bedit` bounded each decoded payload at `MAX_PATCH_FILE_BYTES` but not their sum, so 32 ranges could pin ~2 GiB while validating; the running total is now bounded by the same ceiling.
+- `load_gitignore` opened `<dir>/.gitignore` without re-checking deny/protected policy, so a deny rule on the ignore file itself did not win; the walk's policy filter now applies to that open too.
+- `patch.best_effort` still hard-failed on a snapshot conflict or a write error, contradicting the mode; conflicts are skipped and reported, write errors are collected per file.
+- `patch` overloaded `Option<snapshot>` as both the update/create discriminant and the write mode; an explicit `PlanKind` replaces it.
+- `Add File` relied on a separate existence check followed by a truncating open; the write now uses an exclusive create.
+- `walk_entries` aborted the whole walk on an unreadable or vanished subdirectory, which made a repo-wide `grep` fragile; those directories are skipped, while the root the caller named still fails loudly (policy denies already apply before a directory is queued).
+- `grep`'s "not a directory" error and description did not point at `read`; the message now does.
+- The glob candidate rule existed twice (entry name or relative path); it is one `GlobFilter::matches_entry` shared by `ls` and `grep`.
+- `cap_text` appended its marker beyond `max_output_bytes`; the marker is now inside the ceiling.
+- `edit`'s handler duplicated a bound that `edit_impl` already enforces.
+
+Accepted trade-offs (not bugs):
+
+- `grep` is directory-only; a single file is `read`'s job. Adding a file mode would branch the candidate walk for little gain.
+- `ls` collects up to `MAX_LIST_ENTRIES` matching entries before sorting, so a small `limit` on a huge tree walks further than v1 did. The bound is explicit, the ordering is correct, and the walk cost is linear either way.
+- `.gitignore` read errors other than policy denies are treated as "no ignore file" (like `rg`), so an unreadable ignore file widens the search rather than failing it.
+- `patch` reports `context matches N locations (lines …)` and the `near line N` hint against the working buffer, so after earlier hunks those numbers reflect the patched file, not the original.
+- `mcp.rs` is now ~5.6k lines. A future change should split it into `src/tools/{ls,grep,read,write,edit,patch,binary}.rs` behind the existing `#[tool_router]` impl; nothing in the current design blocks that split, and `LocalMachine` already holds every dependency the handlers need.
+- `src/transports/openai.rs` keeps a `#[cfg(test)]` argument summarizer that mirrors the production TOOL-log key list in `mcp.rs`; it is test-only, but the two lists should be unified if REQ logging ever gains arguments.
 
 ## Validation
 

@@ -18,6 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `edit` reports a signed `line_delta`; a file that shrinks no longer returns an underflowed count.
+- `read` clamps `limit` to at least one line, so `limit: 0` cannot produce a `truncated at line 0` marker.
+- `bedit` bounds the total decoded payload size, not just each range, so a multi-range call cannot pin more than one patchable file in memory.
+- `grep`/`ls` skip directories they cannot enumerate instead of failing the whole search, and `grep` refuses to read a `.gitignore` that policy denies.
+- `patch` with `best_effort` now skips and reports a file whose snapshot changed and continues past per-file write failures instead of aborting the call.
+- `*** Add File` uses an exclusive create, so a target that appears between planning and writing is refused rather than truncated.
+- `patch` and `edit` no longer rewrite a file whose planned text is byte-identical.
 - Shell timeouts return a real MCP tool error (`isError`) carrying `timed_out: true`, the failure reason, and any partial stdout/stderr salvaged within a 250 ms grace, instead of a message-only error that discarded the output collected before the deadline.
 - Undeliverable tunnel responses are logged at warn instead of debug when the client's `response_timeout` window has already expired.
 
