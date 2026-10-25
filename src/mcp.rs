@@ -37,6 +37,7 @@ use tokio::{
 };
 
 const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_READ_LINES: usize = 4 * 1024;
 const DEFAULT_MAX_LIST_ENTRIES: usize = 4 * 1024;
 const MAX_LIST_ENTRIES: usize = 16 * 1024;
 
@@ -133,13 +134,49 @@ struct ListArgs {
     #[serde(default)]
     pattern: Option<String>,
 
-    /// Directory levels to descend. 1 (default) lists this directory only. Symlinked directories are never traversed.
+    /// Directory levels to descend: 1, or 4 when `pattern` contains `/` or `**`.
+    /// An explicit value always wins. Symlinked directories are never traversed.
     #[serde(default)]
     depth: Option<usize>,
 
+    /// Entry kind filter.
+    #[serde(default)]
+    kind: ListKind,
+
+    /// Entry ordering. `mtime` is newest first; undated entries sort last.
+    #[serde(default)]
+    sort: ListSort,
+
     /// Maximum number of entries to return. Defaults to 4096 and is capped at 16384.
     #[serde(default)]
-    max_entries: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ListKind {
+    #[default]
+    Any,
+    File,
+    Dir,
+}
+
+impl ListKind {
+    fn accepts(self, kind: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::File => kind == "file",
+            Self::Dir => kind == "dir",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ListSort {
+    #[default]
+    Path,
+    Mtime,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -151,11 +188,13 @@ struct ReadArgs {
     #[serde(default)]
     offset: Option<usize>,
 
-    /// Maximum number of lines to return. Omit to return all remaining lines.
+    /// Maximum number of lines to return. Defaults to 4096, bounded by the profile read limit.
+    /// A capped result ends with one `… truncated at line N of M` marker.
     #[serde(default)]
     limit: Option<usize>,
 
     /// Prefix each line with its 1-based line number and a tab. Defaults to true.
+    /// Set false to return the file text exactly.
     #[serde(default)]
     numbered: Option<bool>,
 }
@@ -276,11 +315,23 @@ struct ShellArgs {
     max_output_bytes: Option<usize>,
 }
 
+/// One directory entry produced by the shared walk.
+struct WalkedEntry {
+    path: PathBuf,
+    relative: PathBuf,
+    kind: &'static str,
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
 #[derive(Debug, Serialize)]
 struct FsEntry {
     path: String,
     kind: &'static str,
     size: u64,
+    /// Ordering input only; never serialized.
+    #[serde(skip)]
+    mtime: Option<std::time::SystemTime>,
 }
 
 fn dot() -> String {
@@ -390,6 +441,18 @@ fn list_entry_limit(requested: Option<usize>) -> usize {
     requested
         .unwrap_or(DEFAULT_MAX_LIST_ENTRIES)
         .clamp(1, MAX_LIST_ENTRIES)
+}
+
+/// Explicit `depth` always wins. A pattern that addresses more than one path
+/// segment implies recursion, so it defaults to 4 levels instead of 1.
+fn list_depth(requested: Option<usize>, pattern: Option<&str>) -> usize {
+    if let Some(depth) = requested {
+        return depth.max(1);
+    }
+    match pattern {
+        Some(pattern) if pattern.contains('/') || pattern.contains("**") => 4,
+        _ => 1,
+    }
 }
 
 fn shell_timeout_description(max_secs: u64) -> String {
@@ -1279,24 +1342,18 @@ impl LocalMachine {
         }
     }
 
-    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool)> {
-        let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
-        if !fs::metadata(&root).await?.is_dir() {
-            bail!("not a directory: {}", args.path);
-        }
-
-        let depth = args.depth.unwrap_or(1).max(1);
-        let pattern = args
-            .pattern
-            .as_deref()
-            .filter(|pattern| !pattern.is_empty())
-            .map(GlobFilter::new)
-            .transpose()?;
-        let max_entries = list_entry_limit(args.max_entries);
-        let mut output = Vec::new();
-        let mut truncated = false;
+    /// Descriptor-rooted directory walk shared by `ls` and `grep`. Denies and
+    /// protected paths are dropped before the caller sees an entry, and only
+    /// the already-open directory is enumerated: no path is reopened by name
+    /// after authorization. Returning `false` stops the walk.
+    async fn walk_entries(
+        &self,
+        root: &Path,
+        depth: usize,
+        mut on_entry: impl FnMut(WalkedEntry) -> bool,
+    ) -> Result<()> {
         // (directory, remaining levels below it)
-        let mut pending = vec![(root.clone(), depth)];
+        let mut pending = vec![(root.to_path_buf(), depth.max(1))];
 
         while let Some((dir, remaining)) = pending.pop() {
             #[cfg(target_os = "linux")]
@@ -1342,32 +1399,86 @@ impl LocalMachine {
                     "other"
                 };
 
-                let relative = path.strip_prefix(&root).unwrap_or(&path);
-                if pattern.as_ref().is_none_or(|pattern| {
-                    // Entry names keep `*.rs` useful below the root; relative
-                    // paths let `src/**/*.rs` address the same listing.
-                    pattern.matches(relative) || pattern.matches(Path::new(&entry.file_name()))
-                }) {
-                    output.push(FsEntry {
-                        path: self.config.access.relative_display(&path),
-                        kind,
-                        size: metadata.len(),
-                    });
+                let walked = WalkedEntry {
+                    relative: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                    path,
+                    kind,
+                    size: metadata.len(),
+                    mtime: metadata.modified().ok(),
+                };
+                let descend = remaining > 1
+                    && file_type.is_dir()
+                    && self.config.access.can_read(&walked.path);
+                let next = (descend, walked.path.clone());
+                if !on_entry(walked) {
+                    return Ok(());
                 }
-                if output.len() >= max_entries {
-                    // Keep the output ordering stable even when a listing is
-                    // capped partway through a directory enumeration.
-                    truncated = true;
-                    output.sort_by(|a, b| a.path.cmp(&b.path));
-                    return Ok((output, truncated));
-                }
-                if remaining > 1 && file_type.is_dir() && self.config.access.can_read(&path) {
-                    pending.push((path, remaining - 1));
+                if next.0 {
+                    pending.push((next.1, remaining - 1));
                 }
             }
         }
 
-        output.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(())
+    }
+
+    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool)> {
+        let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
+        if !fs::metadata(&root).await?.is_dir() {
+            bail!("not a directory: {}", args.path);
+        }
+
+        let depth = list_depth(args.depth, args.pattern.as_deref());
+        let pattern = args
+            .pattern
+            .as_deref()
+            .filter(|pattern| !pattern.is_empty())
+            .map(GlobFilter::new)
+            .transpose()?;
+        let limit = list_entry_limit(args.limit);
+        let mut output: Vec<FsEntry> = Vec::new();
+        let mut truncated = false;
+
+        self.walk_entries(&root, depth, |entry| {
+            if pattern.as_ref().is_some_and(|pattern| {
+                // Entry names keep `*.rs` useful below the root; relative
+                // paths let `src/**/*.rs` address the same listing.
+                !(pattern.matches(&entry.relative)
+                    || entry
+                        .relative
+                        .file_name()
+                        .is_some_and(|name| pattern.matches(Path::new(name))))
+            }) {
+                return true;
+            }
+            if !args.kind.accepts(entry.kind) {
+                return true;
+            }
+            if output.len() >= MAX_LIST_ENTRIES {
+                truncated = true;
+                return false;
+            }
+            output.push(FsEntry {
+                path: self.config.access.relative_display(&entry.path),
+                kind: entry.kind,
+                size: entry.size,
+                mtime: entry.mtime,
+            });
+            true
+        })
+        .await?;
+
+        match args.sort {
+            ListSort::Path => output.sort_by(|a, b| a.path.cmp(&b.path)),
+            // Newest first; entries without a timestamp sort after dated ones.
+            ListSort::Mtime => {
+                output.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)))
+            }
+        }
+        if output.len() > limit {
+            output.truncate(limit);
+            truncated = true;
+        }
         Ok((output, truncated))
     }
 
@@ -1932,12 +2043,13 @@ fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Valu
         "encoding",
         "pattern",
         "depth",
+        "kind",
+        "sort",
         "replace_all",
         "offset",
         "limit",
         "length",
         "timeout_secs",
-        "max_entries",
         "max_output_bytes",
     ] {
         let Some(value) = arguments.get(key) else {
@@ -1959,10 +2071,14 @@ fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Valu
         ("data", "encoded_chars"),
         ("old_text", "old_bytes"),
         ("new_text", "new_bytes"),
+        ("patch", "patch_bytes"),
     ] {
         if let Some(Value::String(value)) = arguments.get(key) {
             parts.push(format!("{label}={}", value.len()));
         }
+    }
+    if let Some(Value::Array(edits)) = arguments.get("edits") {
+        parts.push(format!("edits={}", edits.len()));
     }
 
     parts.join(" ")
@@ -1971,7 +2087,7 @@ fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Valu
 #[tool_router(vis = "pub")]
 impl LocalMachine {
     #[tool(
-        description = "List files and directories.",
+        description = "List files and directories. `depth` defaults to 1, or 4 when `pattern` contains `/` or `**`; an explicit `depth` wins. Symlinked directories are never traversed. Returns {\"entries\":[{\"path\",\"kind\",\"size\"}],\"truncated\":bool}.",
         annotations(
             title = "List files",
             read_only_hint = true,
@@ -2034,20 +2150,26 @@ impl LocalMachine {
         };
 
         let offset = args.offset.unwrap_or(1).max(1);
-        let limit = args.limit.unwrap_or(usize::MAX);
+        let limit = args.limit.unwrap_or(DEFAULT_READ_LINES);
         let numbered = args.numbered.unwrap_or(true);
-        let lines = text
-            .lines()
+        let all = text.lines().collect::<Vec<_>>();
+        let total = all.len();
+        let mut lines = all
+            .iter()
             .skip(offset - 1)
             .take(limit)
             .enumerate()
             .map(|(index, line)| match numbered {
                 true => format!("{}\t{line}", offset + index),
-                false => line.to_owned(),
+                false => (*line).to_owned(),
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        ok_text(lines)
+            .collect::<Vec<_>>();
+        // A single trailing marker, only when the window really is capped.
+        let last = offset.saturating_sub(1).saturating_add(lines.len());
+        if last < total {
+            lines.push(format!("… truncated at line {last} of {total}"));
+        }
+        ok_text(lines.join("\n"))
     }
 
     #[tool(
@@ -2530,6 +2652,19 @@ mod tests {
         assert!(GlobFilter::new("[unclosed").is_err());
     }
 
+    impl Default for ListArgs {
+        fn default() -> Self {
+            Self {
+                path: dot(),
+                pattern: None,
+                depth: None,
+                kind: ListKind::Any,
+                sort: ListSort::Path,
+                limit: None,
+            }
+        }
+    }
+
     fn test_machine(root: PathBuf) -> LocalMachine {
         #[cfg(target_os = "linux")]
         let root_for_secure_fs = root.clone();
@@ -2590,7 +2725,7 @@ mod tests {
                 path: ".".to_owned(),
                 pattern: None,
                 depth: None,
-                max_entries: None,
+                ..ListArgs::default()
             })
             .await
             .unwrap();
@@ -2604,7 +2739,7 @@ mod tests {
                 path: ".".to_owned(),
                 pattern: None,
                 depth: Some(2),
-                max_entries: None,
+                ..ListArgs::default()
             })
             .await
             .unwrap();
@@ -2618,7 +2753,7 @@ mod tests {
                 path: ".".to_owned(),
                 pattern: Some("*.rs".to_owned()),
                 depth: Some(3),
-                max_entries: None,
+                ..ListArgs::default()
             })
             .await
             .unwrap();
@@ -2632,12 +2767,98 @@ mod tests {
                 path: ".".to_owned(),
                 pattern: Some("*.rs".to_owned()),
                 depth: Some(3),
-                max_entries: Some(2),
+                limit: Some(2),
+                ..ListArgs::default()
             })
             .await
             .unwrap();
         assert_eq!(entries.len(), 2);
         assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn ls_depth_follows_patterns_kind_and_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "x").unwrap();
+        std::fs::write(root.join("src/nested/deep.rs"), "x").unwrap();
+        std::fs::write(root.join("top.rs"), "x").unwrap();
+        let machine = test_machine(root.clone());
+
+        // A pattern addressing a nested path implies depth 4.
+        let (entries, _) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                pattern: Some("src/**/*.rs".to_owned()),
+                ..ListArgs::default()
+            })
+            .await
+            .unwrap();
+        let mut names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["src/lib.rs", "src/nested/deep.rs"]);
+
+        // An explicit depth still wins over the implied default.
+        let (entries, _) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                pattern: Some("src/**/*.rs".to_owned()),
+                depth: Some(1),
+                ..ListArgs::default()
+            })
+            .await
+            .unwrap();
+        assert!(entries.is_empty(), "{entries:?}");
+
+        // `kind` filters entries without stopping the descent.
+        let (entries, _) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                kind: ListKind::File,
+                depth: Some(3),
+                ..ListArgs::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            entries.iter().all(|entry| entry.kind == "file"),
+            "{entries:?}"
+        );
+        assert_eq!(entries.len(), 3, "{entries:?}");
+
+        // `sort=mtime` returns newest first; `path` is alphabetical.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("newest.rs"), "x").unwrap();
+        let (entries, _) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                sort: ListSort::Mtime,
+                ..ListArgs::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.first().unwrap().path, "newest.rs", "{entries:?}");
+        let (entries, _) = machine
+            .list_impl(ListArgs {
+                path: ".".to_owned(),
+                sort: ListSort::Path,
+                ..ListArgs::default()
+            })
+            .await
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(names, ["newest.rs", "src", "top.rs"]);
+    }
+
+    #[test]
+    fn depth_defaults_to_one_or_four_for_nested_patterns() {
+        assert_eq!(list_depth(None, None), 1);
+        assert_eq!(list_depth(None, Some("*.rs")), 1);
+        assert_eq!(list_depth(None, Some("**/*.rs")), 4);
+        assert_eq!(list_depth(None, Some("src/lib.rs")), 4);
+        assert_eq!(list_depth(Some(2), Some("src/**")), 2);
+        assert_eq!(list_depth(Some(0), None), 1);
     }
 
     #[tokio::test]
@@ -2672,7 +2893,7 @@ mod tests {
         let serialized = serde_json::to_value(&result).unwrap();
         assert_eq!(
             serialized["content"][0]["text"].as_str().unwrap(),
-            "2\tbeta"
+            "2\tbeta\n… truncated at line 2 of 3"
         );
 
         let result = machine
@@ -2688,6 +2909,28 @@ mod tests {
             serialized["content"][0]["text"].as_str().unwrap(),
             "beta\ngamma"
         );
+
+        // The default window is 4096 lines and ends with exactly one marker.
+        let total = DEFAULT_READ_LINES + 5;
+        let big = (1..=total)
+            .map(|line| format!("line{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(machine.config.access.base_dir.join("big.txt"), &big).unwrap();
+        let result = machine
+            .read(Parameters(ReadArgs {
+                path: "big.txt".to_owned(),
+                offset: None,
+                limit: None,
+                numbered: Some(false),
+            }))
+            .await;
+        let serialized = serde_json::to_value(&result).unwrap();
+        let text = serialized["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with(&format!(
+            "line{DEFAULT_READ_LINES}\n\u{2026} truncated at line {DEFAULT_READ_LINES} of {total}"
+        )));
+        assert_eq!(text.matches("truncated at line").count(), 1);
     }
 
     #[test]

@@ -967,13 +967,27 @@ fn summarize_tool_arguments(arguments: &Value) -> String {
         "path",
         "dir",
         "command",
-        "mode",
-        "recursive",
-        "parents",
-        "create_parents",
+        "pattern",
+        "glob",
+        "depth",
+        "kind",
+        "sort",
+        "output_mode",
+        "offset",
+        "limit",
+        "before",
+        "after",
+        "numbered",
+        "literal",
+        "ignore_case",
+        "respect_gitignore",
+        "skip_hidden",
+        "replace_all",
+        "best_effort",
+        "format",
+        "encoding",
+        "sha256",
         "timeout_secs",
-        "max_entries",
-        "max_bytes",
         "max_output_bytes",
     ] {
         let Some(value) = object.get(key) else {
@@ -981,10 +995,13 @@ fn summarize_tool_arguments(arguments: &Value) -> String {
         };
         parts.push(format!("{key}={}", summarize_value(value)));
     }
-    for key in ["content", "stdin"] {
+    for key in ["content", "stdin", "data", "old_text", "new_text", "patch"] {
         if let Some(Value::String(value)) = object.get(key) {
             parts.push(format!("{key}=<{} bytes>", value.len()));
         }
+    }
+    if let Some(Value::Array(edits)) = object.get("edits") {
+        parts.push(format!("edits={}", edits.len()));
     }
     parts.join(" ")
 }
@@ -1199,7 +1216,7 @@ mod tests {
                 .iter()
                 .all(|path| !path.starts_with("/proc/self/fd/"))
         );
-        let limited = call("ls", json!({"path":"nested", "max_entries":2})).await;
+        let limited = call("ls", json!({"path":"nested", "limit":2})).await;
         let limited_payload: Value =
             serde_json::from_str(limited["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
