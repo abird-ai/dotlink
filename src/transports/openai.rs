@@ -19,12 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{logging::LogConfig, mcp::LocalMachine};
+use crate::{backoff::Backoff, logging::LogConfig, mcp::LocalMachine};
 
-const POLL_LIMIT: u8 = 25;
-const POLL_TIMEOUT_MS: u64 = 15_000;
-const MAX_IN_FLIGHT: usize = 8;
-const POLL_FAILURES_BEFORE_RUNTIME_RESTART: u32 = 10;
+/// Headroom over the poll hold for the HTTP request timeout, so an idle
+/// long-poll is never cut short by the client timeout.
+const REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
 const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
 const SERVER_INFO: &str =
     r#"{"version":2,"channels":[{"name":"main","stateless":true,"proc_affinity":true}]}"#;
@@ -48,6 +47,125 @@ const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
     "www-authenticate",
 ];
 
+/// Timing, retry and concurrency parameters of one tunnel runtime.
+///
+/// Built once, validated against its invariants, and shared behind an `Arc`.
+/// The one thing kept outside is the client's own response window, which
+/// arrives per command and can only be bounded from here by
+/// `delivery_reserve`.
+#[derive(Debug, Clone)]
+pub(crate) struct TunnelTuning {
+    /// Long-poll hold; the server releases it as soon as a command is ready.
+    pub poll_hold: Duration,
+    /// Commands requested per poll, kept in `max_in_flight ..= 3 * max_in_flight`:
+    /// a batch drains into tasks that queue on one semaphore while their client
+    /// window keeps running, so a limit far above the capacity expires the tail.
+    pub poll_limit: usize,
+    /// Command tasks allowed to run concurrently.
+    pub max_in_flight: usize,
+    pub connect_timeout: Duration,
+    /// Derived as `poll_hold + REQUEST_TIMEOUT_MARGIN`; must exceed `poll_hold`.
+    pub request_timeout: Duration,
+    /// Window in which a poll `404`/`403` only means "not activated yet".
+    pub activation_grace: Duration,
+    /// Pause between activation checks inside that window.
+    pub activation_retry: Duration,
+    /// Activation checks tolerated before the wait is treated as failed.
+    pub activation_checks: u32,
+    /// Consecutive transient poll failures before the runtime restarts.
+    pub restart_after: u32,
+    /// Failed response sends tolerated before the terminal response is dropped.
+    pub response_attempts: u32,
+    /// Retry schedule for poll failures and response posts.
+    pub backoff: Backoff,
+    /// Client window held back so the terminal response can still be posted.
+    /// The window is client-supplied, so validation only rejects a reserve
+    /// that would swallow the whole `request_timeout`.
+    pub delivery_reserve: Duration,
+}
+
+impl TunnelTuning {
+    /// Rejects combinations that break a load-bearing relation.
+    pub(crate) fn validated(self) -> Result<Self> {
+        if self.poll_hold.is_zero() {
+            bail!("tunnel tuning: poll_hold must be non-zero");
+        }
+        if self.request_timeout <= self.poll_hold {
+            bail!(
+                "tunnel tuning: request_timeout ({:?}) must exceed poll_hold ({:?})",
+                self.request_timeout,
+                self.poll_hold
+            );
+        }
+        if self.connect_timeout.is_zero() {
+            bail!("tunnel tuning: connect_timeout must be non-zero");
+        }
+        if self.max_in_flight == 0 {
+            bail!("tunnel tuning: max_in_flight must be non-zero");
+        }
+        if self.poll_limit < self.max_in_flight {
+            bail!(
+                "tunnel tuning: poll_limit ({}) must be at least max_in_flight ({})",
+                self.poll_limit,
+                self.max_in_flight
+            );
+        }
+        if self.poll_limit > 3 * self.max_in_flight {
+            bail!(
+                "tunnel tuning: poll_limit ({}) must be at most 3 * max_in_flight ({})",
+                self.poll_limit,
+                3 * self.max_in_flight
+            );
+        }
+        if self.activation_retry.is_zero() {
+            bail!("tunnel tuning: activation_retry must be non-zero");
+        }
+        if self.activation_checks == 0 {
+            bail!("tunnel tuning: activation_checks must be non-zero");
+        }
+        if self.restart_after == 0 {
+            bail!("tunnel tuning: restart_after must be non-zero");
+        }
+        if self.response_attempts == 0 {
+            bail!("tunnel tuning: response_attempts must be non-zero");
+        }
+        if self.backoff.base.is_zero() {
+            bail!("tunnel tuning: backoff.base must be non-zero");
+        }
+        if self.backoff.cap < self.backoff.base {
+            bail!("tunnel tuning: backoff.cap must be at least backoff.base");
+        }
+        if self.delivery_reserve >= self.request_timeout {
+            bail!("tunnel tuning: delivery_reserve must stay below request_timeout");
+        }
+        Ok(self)
+    }
+}
+
+impl Default for TunnelTuning {
+    fn default() -> Self {
+        let poll_hold = Duration::from_secs(15);
+        Self {
+            poll_hold,
+            poll_limit: 32,
+            max_in_flight: 16,
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: poll_hold + REQUEST_TIMEOUT_MARGIN,
+            activation_grace: Duration::from_secs(45),
+            activation_retry: Duration::from_secs(2),
+            activation_checks: 30,
+            restart_after: 10,
+            response_attempts: 6,
+            backoff: Backoff {
+                base: Duration::from_millis(250),
+                cap: Duration::from_secs(5),
+                jitter: Duration::from_millis(250),
+            },
+            delivery_reserve: Duration::from_secs(5),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub base_url: String,
@@ -64,22 +182,16 @@ pub async fn run(
     cancellation: CancellationToken,
 ) -> Result<()> {
     let embedded = EmbeddedMcp::new(machine, cancellation.child_token());
-    let tunnel = TunnelClient::new(
-        config.base_url,
-        config.tunnel_id,
-        config.runtime_api_key,
-        config.organization_id,
-        config.new_tunnel,
-        config.log,
-        cancellation,
-    )?;
+    let tuning = TunnelTuning::default();
+    let restart_after = tuning.restart_after;
+    let tunnel = TunnelClient::new(config, tuning, cancellation)?;
 
     match tunnel.run(embedded).await? {
         TunnelRunOutcome::Cancelled => Ok(()),
         TunnelRunOutcome::RestartRuntime { error, had_success } => {
             Err(anyhow::Error::new(super::RuntimeRestartRequested::new(
                 format!(
-                    "OpenAI tunnel hit {POLL_FAILURES_BEFORE_RUNTIME_RESTART} consecutive transient poll failures: {error:#}"
+                    "OpenAI tunnel hit {restart_after} consecutive transient poll failures: {error:#}"
                 ),
                 had_success,
             )))
@@ -88,7 +200,7 @@ pub async fn run(
 }
 
 #[derive(Clone)]
-pub struct EmbeddedMcp {
+pub(crate) struct EmbeddedMcp {
     service: StreamableHttpService<LocalMachine, NeverSessionManager>,
 }
 
@@ -100,7 +212,7 @@ struct LocalResponse {
 }
 
 impl EmbeddedMcp {
-    pub fn new(machine: LocalMachine, cancellation: CancellationToken) -> Self {
+    pub(crate) fn new(machine: LocalMachine, cancellation: CancellationToken) -> Self {
         let config = StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
             .with_json_response(true)
@@ -268,7 +380,7 @@ fn parse_sse_messages(bytes: &[u8]) -> Result<Vec<Value>> {
 }
 
 #[derive(Clone)]
-pub struct TunnelClient {
+pub(crate) struct TunnelClient {
     http: Client,
     base_url: Arc<str>,
     tunnel_id: Arc<str>,
@@ -279,6 +391,7 @@ pub struct TunnelClient {
     log: LogConfig,
     cancellation: CancellationToken,
     concurrency: Arc<Semaphore>,
+    tuning: Arc<TunnelTuning>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,22 +449,27 @@ enum TunnelRunOutcome {
 }
 
 impl TunnelClient {
-    pub fn new(
-        base_url: String,
-        tunnel_id: String,
-        api_key: String,
-        organization_id: Option<String>,
-        newly_created: bool,
-        log: LogConfig,
+    pub(crate) fn new(
+        config: Config,
+        tuning: TunnelTuning,
         cancellation: CancellationToken,
     ) -> Result<Self> {
+        let Config {
+            base_url,
+            tunnel_id,
+            runtime_api_key: api_key,
+            organization_id,
+            new_tunnel,
+            log,
+        } = config;
         if tunnel_id.trim().is_empty() || api_key.trim().is_empty() {
             bail!("tunnel id and runtime API key are required");
         }
+        let tuning = Arc::new(tuning.validated()?);
         let http = Client::builder()
             .user_agent(format!("dotlink/{}", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(25))
+            .connect_timeout(tuning.connect_timeout)
+            .timeout(tuning.request_timeout)
             .build()?;
         Ok(Self {
             http,
@@ -360,14 +478,16 @@ impl TunnelClient {
             api_key: Arc::from(api_key),
             organization_id: organization_id.map(Arc::from),
             instance_id: Arc::from(Uuid::new_v4().to_string()),
-            activation_grace_until: newly_created.then(|| Instant::now() + Duration::from_secs(45)),
+            activation_grace_until: new_tunnel.then(|| Instant::now() + tuning.activation_grace),
             log,
             cancellation,
-            concurrency: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            concurrency: Arc::new(Semaphore::new(tuning.max_in_flight)),
+            tuning,
         })
     }
 
     async fn run(self, mcp: EmbeddedMcp) -> Result<TunnelRunOutcome> {
+        debug!(?self.tuning, "tunnel tuning");
         let mut tasks = JoinSet::new();
         let mut failures = 0_u32;
         let mut not_ready_failures = 0_u32;
@@ -399,7 +519,10 @@ impl TunnelClient {
                         Err(PollFailure::Transient(error)) => {
                             failures = failures.saturating_add(1);
 
-                            if should_restart_runtime_after_poll_failures(failures) {
+                            if should_restart_runtime_after_poll_failures(
+                                failures,
+                                self.tuning.restart_after,
+                            ) {
                                 warn!(
                                     attempt = failures,
                                     "tunnel poll failure threshold reached; restarting dotlink runtime"
@@ -427,12 +550,12 @@ impl TunnelClient {
                             if not_ready_failures == 1 {
                                 eprintln!("Waiting      tunnel activation…");
                             }
-                            if not_ready_failures > 30 {
+                            if not_ready_failures > self.tuning.activation_checks {
                                 return Err(error.context("tunnel was not available after repeated activation checks"));
                             }
                             tokio::select! {
                                 _ = self.cancellation.cancelled() => break,
-                                _ = time::sleep(Duration::from_secs(2)) => {}
+                                _ = time::sleep(self.tuning.activation_retry) => {}
                             }
                             continue;
                         }
@@ -475,13 +598,17 @@ impl TunnelClient {
         }
     }
 
+    fn poll_query(&self) -> [(&'static str, String); 2] {
+        [
+            ("limit", self.tuning.poll_limit.to_string()),
+            ("timeout_ms", self.tuning.poll_hold.as_millis().to_string()),
+        ]
+    }
+
     async fn poll_once(&self) -> std::result::Result<PolledBatch, PollFailure> {
         let url = format!("{}/v1/tunnels/{}/poll", self.base_url, self.tunnel_id);
         let response = self
-            .common_headers(self.http.get(url).query(&[
-                ("limit", POLL_LIMIT.to_string()),
-                ("timeout_ms", POLL_TIMEOUT_MS.to_string()),
-            ]))
+            .common_headers(self.http.get(url).query(&self.poll_query()))
             .send()
             .await
             .map_err(|error| PollFailure::Transient(anyhow!(error)))?;
@@ -555,7 +682,8 @@ impl TunnelClient {
         if let Some(remaining) =
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
             && let Some(jsonrpc) = command.jsonrpc.as_mut()
-            && let Some(secs) = apply_response_window(jsonrpc, remaining)
+            && let Some(secs) =
+                apply_response_window(jsonrpc, remaining, self.tuning.delivery_reserve)
         {
             debug!(
                 request_id = %command.request_id,
@@ -734,10 +862,10 @@ impl TunnelClient {
                 Ok(PostOutcome::Fatal(error)) => return Err(error),
                 Ok(PostOutcome::Retry(error)) | Err(error) => {
                     attempt = attempt.saturating_add(1);
-                    if attempt >= 6 {
+                    if attempt >= self.tuning.response_attempts {
                         return Err(error.context("exhausted tunnel response retries"));
                     }
-                    let delay = retry_delay(attempt);
+                    let delay = self.tuning.backoff.delay(attempt);
                     if let Some(deadline) = deadline
                         && Instant::now()
                             .checked_add(delay)
@@ -819,7 +947,7 @@ impl TunnelClient {
         #[cfg(test)]
         let delay = Duration::from_millis(1);
         #[cfg(not(test))]
-        let delay = retry_delay(attempt);
+        let delay = self.tuning.backoff.delay(attempt);
 
         tokio::select! {
             _ = self.cancellation.cancelled() => {}
@@ -883,18 +1011,11 @@ fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
     Some(Duration::new(secs, nanos))
 }
 
-/// Kept out of the shell deadline so the terminal response can still be posted
-/// before the client considers the request expired.
-const RESPONSE_DELIVERY_RESERVE: Duration = Duration::from_secs(5);
-
 /// Tools whose runtime is long enough to collide with the client's window.
 const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
 
-fn shell_timeout_within(window: Duration) -> u64 {
-    window
-        .saturating_sub(RESPONSE_DELIVERY_RESERVE)
-        .as_secs()
-        .max(1)
+fn shell_timeout_within(window: Duration, reserve: Duration) -> u64 {
+    window.saturating_sub(reserve).as_secs().max(1)
 }
 
 /// Thread the client-owned response window into a shell `tools/call`.
@@ -902,7 +1023,7 @@ fn shell_timeout_within(window: Duration) -> u64 {
 /// The caller's `timeout_secs` is client-controlled and preserved when it fits;
 /// otherwise it is shortened so dotlink can return a real tool result instead of
 /// being dropped at the window boundary. The policy ceiling still applies later.
-fn apply_response_window(jsonrpc: &mut Value, window: Duration) -> Option<u64> {
+fn apply_response_window(jsonrpc: &mut Value, window: Duration, reserve: Duration) -> Option<u64> {
     if jsonrpc.get("method").and_then(Value::as_str) != Some("tools/call") {
         return None;
     }
@@ -911,7 +1032,7 @@ fn apply_response_window(jsonrpc: &mut Value, window: Duration) -> Option<u64> {
         return None;
     }
     let object = jsonrpc.pointer_mut("/params/arguments")?.as_object_mut()?;
-    let budget = shell_timeout_within(window);
+    let budget = shell_timeout_within(window, reserve);
     let applied = match object.get("timeout_secs") {
         Some(value) => value.as_u64()?.min(budget),
         None => budget,
@@ -1050,14 +1171,8 @@ fn synthesized_jsonrpc_error(request: &Value, source: &str) -> Value {
     })
 }
 
-fn retry_delay(attempt: u32) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(5);
-    let base_ms = 250_u64.saturating_mul(1_u64 << exponent).min(5_000);
-    Duration::from_millis(base_ms + fastrand::u64(0..=250))
-}
-
-fn should_restart_runtime_after_poll_failures(failures: u32) -> bool {
-    failures >= POLL_FAILURES_BEFORE_RUNTIME_RESTART
+fn should_restart_runtime_after_poll_failures(failures: u32, restart_after: u32) -> bool {
+    failures >= restart_after
 }
 
 async fn response_error_text(response: reqwest::Response) -> String {
@@ -1079,6 +1194,17 @@ fn bounded(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            base_url: "https://example.invalid".to_owned(),
+            tunnel_id: "tunnel".to_owned(),
+            runtime_api_key: "key".to_owned(),
+            organization_id: None,
+            new_tunnel: false,
+            log: LogConfig::default(),
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -1400,10 +1526,23 @@ mod tests {
 
     #[test]
     fn poll_failure_threshold_restarts_runtime_on_tenth_failure() {
-        assert!(!should_restart_runtime_after_poll_failures(0));
-        assert!(!should_restart_runtime_after_poll_failures(9));
-        assert!(should_restart_runtime_after_poll_failures(10));
-        assert!(should_restart_runtime_after_poll_failures(11));
+        let restart_after = TunnelTuning::default().restart_after;
+        assert!(!should_restart_runtime_after_poll_failures(
+            0,
+            restart_after
+        ));
+        assert!(!should_restart_runtime_after_poll_failures(
+            9,
+            restart_after
+        ));
+        assert!(should_restart_runtime_after_poll_failures(
+            10,
+            restart_after
+        ));
+        assert!(should_restart_runtime_after_poll_failures(
+            11,
+            restart_after
+        ));
     }
 
     #[tokio::test]
@@ -1500,16 +1639,154 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_tuning_defaults_are_valid() {
+        assert!(TunnelTuning::default().validated().is_ok());
+        let tuning = TunnelTuning::default();
+        assert_eq!(tuning.poll_hold, Duration::from_secs(15));
+        assert_eq!(tuning.request_timeout, Duration::from_secs(25));
+        assert_eq!(tuning.poll_limit, 32);
+        assert_eq!(tuning.max_in_flight, 16);
+        // The validated band: 16 <= 32 <= 3 * 16.
+        assert!(tuning.poll_limit <= 3 * tuning.max_in_flight);
+        assert_eq!(tuning.activation_retry, Duration::from_secs(2));
+        assert_eq!(tuning.activation_checks, 30);
+        assert_eq!(tuning.response_attempts, 6);
+        assert_eq!(tuning.backoff.base, Duration::from_millis(250));
+        assert_eq!(tuning.backoff.cap, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn invalid_tuning_is_rejected() {
+        let base = TunnelTuning::default;
+        for (label, tuning) in [
+            (
+                "request_timeout at the poll hold",
+                TunnelTuning {
+                    request_timeout: Duration::from_secs(15),
+                    ..base()
+                },
+            ),
+            (
+                "poll_limit below max_in_flight",
+                TunnelTuning {
+                    poll_limit: 8,
+                    ..base()
+                },
+            ),
+            (
+                "poll_limit above 3 * max_in_flight",
+                TunnelTuning {
+                    poll_limit: 49,
+                    ..base()
+                },
+            ),
+            (
+                "max_in_flight zero",
+                TunnelTuning {
+                    max_in_flight: 0,
+                    ..base()
+                },
+            ),
+            (
+                "activation_retry zero",
+                TunnelTuning {
+                    activation_retry: Duration::ZERO,
+                    ..base()
+                },
+            ),
+            (
+                "activation_checks zero",
+                TunnelTuning {
+                    activation_checks: 0,
+                    ..base()
+                },
+            ),
+            (
+                "restart_after zero",
+                TunnelTuning {
+                    restart_after: 0,
+                    ..base()
+                },
+            ),
+            (
+                "response_attempts zero",
+                TunnelTuning {
+                    response_attempts: 0,
+                    ..base()
+                },
+            ),
+            (
+                "backoff cap below base",
+                TunnelTuning {
+                    backoff: Backoff {
+                        cap: Duration::from_millis(100),
+                        ..base().backoff
+                    },
+                    ..base()
+                },
+            ),
+            (
+                "delivery reserve at the request timeout",
+                TunnelTuning {
+                    delivery_reserve: Duration::from_secs(25),
+                    ..base()
+                },
+            ),
+        ] {
+            assert!(tuning.validated().is_err(), "{label} was accepted");
+        }
+    }
+
+    #[test]
+    fn poll_query_carries_tuning() {
+        let tuning = TunnelTuning {
+            poll_hold: Duration::from_secs(20),
+            request_timeout: Duration::from_secs(30),
+            poll_limit: 24,
+            ..TunnelTuning::default()
+        };
+        let client = TunnelClient::new(test_config(), tuning, CancellationToken::new()).unwrap();
+        assert_eq!(
+            client.poll_query(),
+            [
+                ("limit", "24".to_owned()),
+                ("timeout_ms", "20000".to_owned())
+            ]
+        );
+
+        // The pairs reach the wire as these exact parameters.
+        let request = Client::new()
+            .get("https://example.invalid/poll")
+            .query(&client.poll_query())
+            .build()
+            .unwrap();
+        assert_eq!(request.url().query(), Some("limit=24&timeout_ms=20000"));
+    }
+
+    #[test]
+    fn client_semaphore_matches_max_in_flight() {
+        let tuning = TunnelTuning {
+            max_in_flight: 12,
+            poll_limit: 20,
+            ..TunnelTuning::default()
+        };
+        let client = TunnelClient::new(test_config(), tuning, CancellationToken::new()).unwrap();
+        assert_eq!(client.concurrency.available_permits(), 12);
+    }
+
+    #[test]
     fn client_window_bounds_shell_timeouts_only() {
         let window = Duration::from_secs(120);
-        assert_eq!(shell_timeout_within(window), 115);
-        assert_eq!(shell_timeout_within(Duration::from_secs(3)), 1);
+        let reserve = TunnelTuning::default().delivery_reserve;
+        assert_eq!(reserve, Duration::from_secs(5));
+        assert_eq!(shell_timeout_within(window, reserve), 115);
+        assert_eq!(shell_timeout_within(Duration::from_secs(3), reserve), 1);
 
         let shell = |arguments: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":arguments}});
 
         // Omitted -> derived from the client window.
         let mut call = shell(json!({"command":"cargo build --release"}));
-        assert_eq!(apply_response_window(&mut call, window), Some(115));
+        assert_eq!(apply_response_window(&mut call, window, reserve), Some(115));
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!(115))
@@ -1517,7 +1794,7 @@ mod tests {
 
         // Caller value is preserved when it fits.
         let mut call = shell(json!({"command":"true","timeout_secs":30}));
-        assert_eq!(apply_response_window(&mut call, window), Some(30));
+        assert_eq!(apply_response_window(&mut call, window, reserve), Some(30));
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!(30))
@@ -1525,7 +1802,7 @@ mod tests {
 
         // Caller value is shortened to keep the response deliverable.
         let mut call = shell(json!({"command":"true","timeout_secs":600}));
-        assert_eq!(apply_response_window(&mut call, window), Some(115));
+        assert_eq!(apply_response_window(&mut call, window, reserve), Some(115));
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!(115))
@@ -1533,7 +1810,7 @@ mod tests {
 
         // Wrong types are left to schema validation instead of being rewritten.
         let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
-        assert_eq!(apply_response_window(&mut call, window), None);
+        assert_eq!(apply_response_window(&mut call, window, reserve), None);
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!("600"))
@@ -1542,12 +1819,12 @@ mod tests {
         // Non-shell tools and non-call methods are untouched.
         let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"a"}}});
         let original = call.clone();
-        assert_eq!(apply_response_window(&mut call, window), None);
+        assert_eq!(apply_response_window(&mut call, window, reserve), None);
         assert_eq!(call, original);
 
         let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
         let original = call.clone();
-        assert_eq!(apply_response_window(&mut call, window), None);
+        assert_eq!(apply_response_window(&mut call, window, reserve), None);
         assert_eq!(call, original);
     }
 
@@ -1670,8 +1947,9 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "bash", "arguments": {"command": "sleep 30"}}
         });
+        let reserve = TunnelTuning::default().delivery_reserve;
         assert_eq!(
-            apply_response_window(&mut call, Duration::from_millis(2_000)),
+            apply_response_window(&mut call, Duration::from_millis(2_000), reserve),
             Some(1)
         );
 

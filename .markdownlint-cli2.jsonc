@@ -1,6 +1,13 @@
 {
   "globs": ["**/*.md", ".agents/**/*.md"],
-  "ignores": ["target/**", ".kilo/**", "node_modules/**", "dist/**"],
+  "ignores": [
+    "target/**",
+    ".kilo/**",
+    "node_modules/**",
+    "dist/**",
+    // Agent scratch under .agents/runs/ is gitignored, not repository docs.
+    ".agents/runs/*/**"
+  ],
   "config": {
     // Prose uses editor soft wrapping; changelog sections repeat standard headings.
     "MD013": false,

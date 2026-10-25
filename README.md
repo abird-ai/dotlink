@@ -644,7 +644,7 @@ See [.agents/docs/nixos-service.md](.agents/docs/nixos-service.md).
 
 ## Parallel tool execution
 
-A single tunnel can dispatch up to eight in-flight MCP requests. On Linux,
+A single tunnel can dispatch up to sixteen in-flight MCP requests. On Linux,
 file tools use descriptor-rooted `openat2` access and Bubblewrap shells run
 independently; **tools execute concurrently by default**. Choose
 `dotlink -s` or `dotlink --serialize` if you want one MCP call at a time

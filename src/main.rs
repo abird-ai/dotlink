@@ -1,3 +1,4 @@
+mod backoff;
 mod controls;
 mod credentials;
 #[cfg(target_os = "linux")]
@@ -16,6 +17,7 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -27,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    backoff::Backoff,
     controls::{RuntimeControl, RuntimeControls, StdioInterruptGuard},
     logging::{ColorMode, LogConfig},
     mcp::{AccessSpec, LocalMachine, MachineConfig, SandboxCacheMount},
@@ -807,11 +810,12 @@ fn next_runtime_restart_attempt(current: u32, reset_backoff: bool) -> u32 {
     }
 }
 
-fn runtime_restart_delay(attempt: u32) -> std::time::Duration {
-    let exponent = attempt.saturating_sub(1).min(5);
-    let seconds = (1_u64 << exponent).min(30);
-    std::time::Duration::from_secs(seconds)
-}
+/// Runtime restart schedule: 1 s doubling to a 30 s cap, no jitter.
+const RUNTIME_RESTART_BACKOFF: Backoff = Backoff {
+    base: Duration::from_secs(1),
+    cap: Duration::from_secs(30),
+    jitter: Duration::ZERO,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeOutcome {
@@ -910,7 +914,7 @@ async fn main() -> Result<()> {
 
                 runtime_restarts =
                     next_runtime_restart_attempt(runtime_restarts, restart.reset_backoff());
-                let delay = runtime_restart_delay(runtime_restarts);
+                let delay = RUNTIME_RESTART_BACKOFF.delay(runtime_restarts);
 
                 tracing::warn!(
                     restart = runtime_restarts,
@@ -1632,14 +1636,12 @@ mod tests {
 
     #[test]
     fn runtime_restart_backoff_is_bounded() {
-        assert_eq!(runtime_restart_delay(1), std::time::Duration::from_secs(1));
-        assert_eq!(runtime_restart_delay(2), std::time::Duration::from_secs(2));
-        assert_eq!(runtime_restart_delay(5), std::time::Duration::from_secs(16));
-        assert_eq!(runtime_restart_delay(6), std::time::Duration::from_secs(30));
-        assert_eq!(
-            runtime_restart_delay(100),
-            std::time::Duration::from_secs(30)
-        );
+        let delay = |attempt| RUNTIME_RESTART_BACKOFF.delay(attempt);
+        assert_eq!(delay(1), Duration::from_secs(1));
+        assert_eq!(delay(2), Duration::from_secs(2));
+        assert_eq!(delay(5), Duration::from_secs(16));
+        assert_eq!(delay(6), Duration::from_secs(30));
+        assert_eq!(delay(100), Duration::from_secs(30));
     }
 
     #[test]
