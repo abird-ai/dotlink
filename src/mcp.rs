@@ -874,6 +874,19 @@ impl LocalMachine {
             .saturating_add(MAX_REQUEST_FRAMING_BYTES)
     }
 
+    /// Bound the embedded MCP response at the *same* configured read/output
+    /// ceilings as stdio and HTTP. Serialized JSON can expand a source byte to
+    /// six ASCII bytes (`\\u00XX`), so the ceiling must include that expansion
+    /// as well as protocol framing. There is no hidden 16 MiB tunnel limit:
+    /// users choosing larger read limits intentionally allow larger responses.
+    pub(crate) fn max_response_body_bytes(&self) -> usize {
+        self.config
+            .max_read_bytes
+            .max(self.config.max_output_bytes)
+            .saturating_mul(MAX_JSON_ESCAPE)
+            .saturating_add(MAX_REQUEST_FRAMING_BYTES)
+    }
+
     pub fn access_summary(&self) -> String {
         if self.config.access.unrestricted_fs {
             return "unrestricted read+write".to_owned();

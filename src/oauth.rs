@@ -1,10 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashMap},
-    fs, io,
+    collections::{BTreeMap, HashMap, VecDeque},
+    env, fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,6 +34,7 @@ use tokio::sync::Semaphore;
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
+use crate::bounded;
 use crate::setup::{
     atomic_write_private, set_private_dir_permissions, set_private_file_permissions,
 };
@@ -51,6 +52,45 @@ const MAX_AUTHORIZATION_CODES: usize = 256;
 const MAX_ACCESS_TOKENS: usize = 512;
 const MAX_REFRESH_GRANTS: usize = 256;
 const MAX_CLIENT_METADATA_BYTES: usize = 64 * 1024;
+// Public authorize requests may ask us to fetch a URL. Reject rather than
+// queueing unbounded outbound work, and limit sustained anonymous traffic.
+const MAX_CONCURRENT_CIMD_FETCHES: usize = 4;
+const MAX_CIMD_FETCHES_PER_MINUTE: usize = 24;
+const CIMD_RATE_WINDOW: Duration = Duration::from_secs(60);
+const CIMD_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+static CIMD_FETCH_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CIMD_FETCHES);
+static CIMD_FETCH_WINDOW: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
+
+fn reserve_cimd_budget(window: &mut VecDeque<Instant>, now: Instant) -> bool {
+    while window
+        .front()
+        .is_some_and(|start| now.duration_since(*start) >= CIMD_RATE_WINDOW)
+    {
+        window.pop_front();
+    }
+    if window.len() >= MAX_CIMD_FETCHES_PER_MINUTE {
+        return false;
+    }
+    window.push_back(now);
+    true
+}
+
+fn admit_cimd_fetch() -> Result<tokio::sync::SemaphorePermit<'static>> {
+    let permit = CIMD_FETCH_SLOTS
+        .try_acquire()
+        .map_err(|_| anyhow!("OAuth client metadata fetches are busy; retry later"))?;
+    let now = Instant::now();
+    let mut window = CIMD_FETCH_WINDOW
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow!("OAuth metadata admission lock is unavailable"))?;
+    if !reserve_cimd_budget(&mut window, now) {
+        bail!("OAuth client metadata fetch rate limit exceeded; retry later");
+    }
+    drop(window);
+    Ok(permit)
+}
+
 const OWNER_PASSWORD_MIN_LEN: usize = 12;
 const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 2;
 const PASSWORD_CHECK_WAIT: Duration = Duration::from_secs(2);
@@ -1482,11 +1522,16 @@ async fn fetch_cimd(client_id: &str) -> Result<ClientMetadata> {
         .host_str()
         .ok_or_else(|| anyhow!("CIMD URL has no host"))?
         .to_owned();
+    let _admission = admit_cimd_fetch()?;
     let port = url.port_or_known_default().unwrap_or(443);
-    let mut addresses = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .context("failed to resolve CIMD host")?
-        .collect::<Vec<_>>();
+    let mut addresses = tokio::time::timeout(
+        CIMD_DNS_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .context("CIMD DNS lookup timed out")?
+    .context("failed to resolve CIMD host")?
+    .collect::<Vec<_>>();
     addresses.sort();
     addresses.dedup();
     if addresses.is_empty() || addresses.iter().any(|addr| !is_public_ip(addr.ip())) {
@@ -1494,6 +1539,8 @@ async fn fetch_cimd(client_id: &str) -> Result<ClientMetadata> {
     }
 
     let client = reqwest::Client::builder()
+        // Never allow proxy environment variables to bypass DNS pinning.
+        .no_proxy()
         .redirect(Policy::none())
         .timeout(Duration::from_secs(5))
         .https_only(true)
@@ -1501,7 +1548,7 @@ async fn fetch_cimd(client_id: &str) -> Result<ClientMetadata> {
         .user_agent(format!("dotlink-oauth/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to build CIMD HTTP client")?;
-    let mut response = client
+    let response = client
         .get(url.clone())
         .send()
         .await
@@ -1516,17 +1563,9 @@ async fn fetch_cimd(client_id: &str) -> Result<ClientMetadata> {
         bail!("CIMD metadata exceeds size limit");
     }
 
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    let body = bounded::reqwest_response(response, MAX_CLIENT_METADATA_BYTES, "CIMD metadata")
         .await
-        .context("failed to read CIMD metadata")?
-    {
-        if body.len() + chunk.len() > MAX_CLIENT_METADATA_BYTES {
-            bail!("CIMD metadata exceeds size limit");
-        }
-        body.extend_from_slice(&chunk);
-    }
+        .context("failed to read CIMD metadata")?;
 
     let metadata: ClientMetadata =
         serde_json::from_slice(&body).context("CIMD metadata is invalid JSON")?;
@@ -1960,6 +1999,19 @@ mod tests {
         .unwrap();
         assert_eq!(server.issuer(), "https://example.com");
         assert_eq!(server.resource(), "https://example.com/mcp");
+    }
+
+    #[test]
+    fn cimd_admission_window_bounds_anonymous_fetches() {
+        let now = Instant::now();
+        let mut timestamps = VecDeque::new();
+        for _ in 0..MAX_CIMD_FETCHES_PER_MINUTE {
+            assert!(reserve_cimd_budget(&mut timestamps, now));
+        }
+        assert!(!reserve_cimd_budget(&mut timestamps, now));
+        assert_eq!(timestamps.len(), MAX_CIMD_FETCHES_PER_MINUTE);
+        assert!(reserve_cimd_budget(&mut timestamps, now + CIMD_RATE_WINDOW));
+        assert_eq!(timestamps.len(), 1);
     }
 
     #[test]

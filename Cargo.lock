@@ -599,6 +599,7 @@ dependencies = [
  "hex",
  "hostname 0.4.2",
  "http",
+ "http-body",
  "http-body-util",
  "ignore",
  "libc",

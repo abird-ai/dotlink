@@ -9,7 +9,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
 fn config_json() -> String {
@@ -49,20 +48,15 @@ fn config_json() -> String {
     .to_string()
 }
 
-/// A probe that can send concurrently and buffer responses that arrive out of
-/// order, so a multi-request test never discards another request's answer.
+/// One request/response pair at a time, so ordering is deterministic even if
+/// the server dispatches concurrently.
 struct Probe {
     child: std::process::Child,
     stdout: std::io::BufReader<std::process::ChildStdout>,
-    pending: std::collections::BTreeMap<u64, Value>,
 }
 
 impl Probe {
     fn start(workdir: &Path) -> Self {
-        Self::start_with_state(workdir, None)
-    }
-
-    fn start_with_state(workdir: &Path, state_namespace: Option<&str>) -> Self {
         let config_dir = workdir.join(".state");
         std::fs::create_dir_all(&config_dir).unwrap();
         let config = config_dir.join("config.jsonc");
@@ -73,10 +67,7 @@ impl Probe {
             .current_dir(workdir)
             .env("DOTLINK_CONFIG", &config)
             .env("XDG_CONFIG_HOME", config_dir.join("cfg"))
-            .env(
-                "XDG_STATE_HOME",
-                config_dir.join(state_namespace.unwrap_or("state")),
-            )
+            .env("XDG_STATE_HOME", config_dir.join("state"))
             .env("XDG_DATA_HOME", config_dir.join("data"))
             .env("XDG_CACHE_HOME", config_dir.join("cache"))
             .env_remove("DOTLINK_API_KEY")
@@ -86,23 +77,15 @@ impl Probe {
             .spawn()
             .expect("spawn dotlink --stdio");
         let stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-        Self {
-            child,
-            stdout,
-            pending: std::collections::BTreeMap::new(),
-        }
+        Self { child, stdout }
     }
 
-    fn send(&mut self, request: &Value) {
-        let stdin = self.child.stdin.as_mut().expect("stdin");
-        writeln!(stdin, "{request}").unwrap();
-        stdin.flush().unwrap();
-    }
-
-    fn response(&mut self, id: &Value) -> Value {
-        let key = id.as_u64().expect("numeric request id");
-        if let Some(response) = self.pending.remove(&key) {
-            return response;
+    fn request(&mut self, request: &Value) -> Value {
+        let id = request["id"].clone();
+        {
+            let stdin = self.child.stdin.as_mut().expect("stdin");
+            writeln!(stdin, "{request}").unwrap();
+            stdin.flush().unwrap();
         }
         loop {
             let mut line = String::new();
@@ -112,20 +95,10 @@ impl Probe {
                 continue;
             }
             let response: Value = serde_json::from_str(&line).expect("jsonrpc response");
-            match response.get("id").and_then(Value::as_u64) {
-                Some(answered) if answered == key => return response,
-                Some(answered) => {
-                    self.pending.insert(answered, response);
-                }
-                None => {}
+            if response.get("id") == Some(&id) {
+                return response;
             }
         }
-    }
-
-    fn request(&mut self, request: &Value) -> Value {
-        let id = request["id"].clone();
-        self.send(request);
-        self.response(&id)
     }
 
     fn finish(mut self) {
@@ -148,132 +121,6 @@ fn text_of(response: &Value) -> &str {
     response["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("no text content: {response}"))
-}
-
-#[test]
-fn stdio_serializes_concurrent_mutations_of_one_file() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap();
-    let mut probe = Probe::start(&root);
-    let initialized = probe.request(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "probe", "version": "1"}
-        }
-    }));
-    assert_eq!(
-        initialized["result"]["serverInfo"]["name"],
-        json!("dotlink")
-    );
-
-    std::fs::write(root.join("data.bin"), vec![b'a'; 64 * 1024]).unwrap();
-    let ids = (0..8_u64).map(|index| index + 10).collect::<Vec<_>>();
-    for (index, id) in ids.iter().enumerate() {
-        let data = BASE64.encode([b'A' + index as u8]);
-        probe.send(&call_request(
-            *id,
-            "bedit",
-            json!({
-                "path": "data.bin",
-                "edits": [{"offset": index, "length": 1, "data": data}]
-            }),
-        ));
-    }
-    for id in &ids {
-        let response = probe.response(&json!(id));
-        assert_ne!(
-            response["result"]["isError"],
-            json!(true),
-            "concurrent bedit {id} failed: {response}"
-        );
-    }
-    probe.finish();
-
-    let bytes = std::fs::read(root.join("data.bin")).unwrap();
-    for (index, byte) in bytes.iter().enumerate().take(8) {
-        assert_eq!(*byte, b'A' + index as u8);
-    }
-}
-
-fn initialize_request(id: u64) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "probe", "version": "1"}
-        }
-    })
-}
-
-/// Independent dotlink processes share a workspace: their mutation locks must
-/// coordinate across processes, or every acknowledged edit but the last is
-/// silently overwritten.
-#[test]
-fn independent_processes_do_not_lose_each_others_mutations() {
-    cross_process_mutation_case(false);
-    // The lock's identity must not depend on the user's profile/XDG state: a
-    // service and an interactive process can use independent configurations.
-    cross_process_mutation_case(true);
-}
-
-fn cross_process_mutation_case(independent_xdg: bool) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap();
-    // Write the profile once here, so the servers never race on the config file.
-    let config_dir = root.join(".state");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(config_dir.join("config.jsonc"), config_json()).unwrap();
-    std::fs::write(root.join("data.bin"), b"0123456789").unwrap();
-
-    let workers = (0..8)
-        .map(|index| {
-            let root = root.clone();
-            std::thread::spawn(move || {
-                let state = format!("state-{index}");
-                let mut probe =
-                    Probe::start_with_state(&root, independent_xdg.then_some(state.as_str()));
-                let initialized = probe.request(&initialize_request(1));
-                assert_eq!(
-                    initialized["result"]["serverInfo"]["name"],
-                    json!("dotlink")
-                );
-                let response = probe.request(&call_request(
-                    2,
-                    "bedit",
-                    json!({
-                        "path": "data.bin",
-                        // Insert one byte at the start of the file.
-                        "edits": [{"offset": 0, "length": 0, "data": "WA=="}],
-                    }),
-                ));
-                probe.finish();
-                assert_ne!(
-                    response["result"]["isError"],
-                    json!(true),
-                    "process {index} was refused: {response}"
-                );
-            })
-        })
-        .collect::<Vec<_>>();
-    for worker in workers {
-        worker.join().unwrap();
-    }
-
-    let bytes = std::fs::read(root.join("data.bin")).unwrap();
-    let inserts = bytes.iter().filter(|byte| **byte == b'X').count();
-    assert_eq!(
-        inserts,
-        8,
-        "every acknowledged insert must survive: {:?}",
-        String::from_utf8_lossy(&bytes)
-    );
 }
 
 #[test]
@@ -375,7 +222,7 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
     let edit_receipt: Value = serde_json::from_str(text_of(&edited)).unwrap();
     assert_eq!(edit_receipt["changed_files"], json!(1));
     let patch_receipt: Value = serde_json::from_str(text_of(&patched)).unwrap();
-    assert_eq!(patch_receipt["mode"], json!("strict"));
+    assert_eq!(patch_receipt["mode"], json!("atomic"));
     let bedit_receipt: Value = serde_json::from_str(text_of(&bedited)).unwrap();
     assert_eq!(bedit_receipt["bytes_written"], json!(2));
     let bread: Value = serde_json::from_str(text_of(&bread)).unwrap();

@@ -7,10 +7,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use http::{Request, header::HeaderName};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use reqwest::{Client, StatusCode};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
+    StreamableHttpService, session::never::NeverSessionManager,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{backoff::Backoff, logging::LogConfig, mcp::LocalMachine};
+use crate::{backoff::Backoff, bounded, logging::LogConfig, mcp::LocalMachine};
 
 /// Headroom over the poll hold for the HTTP request timeout, so an idle
 /// long-poll is never cut short by the client timeout.
@@ -28,7 +28,9 @@ const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
 const SERVER_INFO: &str =
     r#"{"version":2,"channels":[{"name":"main","stateless":true,"proc_affinity":true}]}"#;
 const MAX_CONTROL_PLANE_ERROR_BYTES: usize = 2_000;
-const MAX_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+// A poll may contain multiple commands; limit the whole external envelope
+// before serde deserializes it. Large transfers can use later polls.
+const MAX_POLL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 const REQUEST_HEADER_ALLOWLIST: &[&str] = &[
     "mcp-session-id",
@@ -76,7 +78,9 @@ pub(crate) struct TunnelTuning {
     pub restart_after: u32,
     /// Failed response sends tolerated before the terminal response is dropped.
     pub response_attempts: u32,
-    /// Retry schedule for poll failures and response posts.
+    /// Retry schedule for poll failures and response posts. `cap + jitter`
+    /// must stay within `request_timeout` so a retry cannot hold a task permit
+    /// for an unbounded time.
     pub backoff: Backoff,
     /// Client window held back so the terminal response can still be posted.
     /// The window is client-supplied, so validation only rejects a reserve
@@ -90,11 +94,18 @@ impl TunnelTuning {
         if self.poll_hold.is_zero() {
             bail!("tunnel tuning: poll_hold must be non-zero");
         }
-        if self.request_timeout <= self.poll_hold {
+        // The margin is what keeps an idle long-poll from being cut short by the
+        // HTTP timeout. Reqwest's request timeout also covers the connect
+        // phase, so the margin must cover whichever is larger.
+        let margin = self.connect_timeout.max(REQUEST_TIMEOUT_MARGIN);
+        let required = self
+            .poll_hold
+            .checked_add(margin)
+            .ok_or_else(|| anyhow!("tunnel tuning: poll_hold + margin overflows Duration"))?;
+        if self.request_timeout < required {
             bail!(
-                "tunnel tuning: request_timeout ({:?}) must exceed poll_hold ({:?})",
-                self.request_timeout,
-                self.poll_hold
+                "tunnel tuning: request_timeout ({:?}) must be at least poll_hold + max(connect_timeout, {REQUEST_TIMEOUT_MARGIN:?}) ({required:?})",
+                self.request_timeout
             );
         }
         if self.connect_timeout.is_zero() {
@@ -110,11 +121,11 @@ impl TunnelTuning {
                 self.max_in_flight
             );
         }
-        if self.poll_limit > 3 * self.max_in_flight {
+        let batch_ceiling = self.max_in_flight.saturating_mul(3);
+        if self.poll_limit > batch_ceiling {
             bail!(
-                "tunnel tuning: poll_limit ({}) must be at most 3 * max_in_flight ({})",
-                self.poll_limit,
-                3 * self.max_in_flight
+                "tunnel tuning: poll_limit ({}) must be at most 3 * max_in_flight ({batch_ceiling})",
+                self.poll_limit
             );
         }
         if self.activation_retry.is_zero() {
@@ -122,6 +133,13 @@ impl TunnelTuning {
         }
         if self.activation_checks == 0 {
             bail!("tunnel tuning: activation_checks must be non-zero");
+        }
+        let activation_window = self.activation_retry.saturating_mul(self.activation_checks);
+        if self.activation_grace < activation_window {
+            bail!(
+                "tunnel tuning: activation_grace ({:?}) must cover activation_retry * activation_checks ({activation_window:?})",
+                self.activation_grace
+            );
         }
         if self.restart_after == 0 {
             bail!("tunnel tuning: restart_after must be non-zero");
@@ -135,6 +153,13 @@ impl TunnelTuning {
         if self.backoff.cap < self.backoff.base {
             bail!("tunnel tuning: backoff.cap must be at least backoff.base");
         }
+        let max_retry = self.backoff.cap.saturating_add(self.backoff.jitter);
+        if max_retry > self.request_timeout {
+            bail!(
+                "tunnel tuning: backoff.cap + jitter ({max_retry:?}) must not exceed request_timeout ({:?})",
+                self.request_timeout
+            );
+        }
         if self.delivery_reserve >= self.request_timeout {
             bail!("tunnel tuning: delivery_reserve must stay below request_timeout");
         }
@@ -145,15 +170,19 @@ impl TunnelTuning {
 impl Default for TunnelTuning {
     fn default() -> Self {
         let poll_hold = Duration::from_secs(15);
+        let activation_retry = Duration::from_secs(2);
+        let activation_checks: u32 = 30;
         Self {
             poll_hold,
             poll_limit: 32,
             max_in_flight: 16,
             connect_timeout: Duration::from_secs(10),
             request_timeout: poll_hold + REQUEST_TIMEOUT_MARGIN,
-            activation_grace: Duration::from_secs(45),
-            activation_retry: Duration::from_secs(2),
-            activation_checks: 30,
+            // One extra interval so the last check is not raced by the grace
+            // deadline expiring before it is attempted.
+            activation_grace: activation_retry.saturating_mul(activation_checks + 1),
+            activation_retry,
+            activation_checks,
             restart_after: 10,
             response_attempts: 6,
             backoff: Backoff {
@@ -181,27 +210,35 @@ pub async fn run(
     config: Config,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    run_with_tuning(machine, config, TunnelTuning::default(), cancellation).await
+}
+
+async fn run_with_tuning(
+    machine: LocalMachine,
+    config: Config,
+    tuning: TunnelTuning,
+    cancellation: CancellationToken,
+) -> Result<()> {
     let embedded = EmbeddedMcp::new(machine, cancellation.child_token());
-    let tuning = TunnelTuning::default();
-    let restart_after = tuning.restart_after;
     let tunnel = TunnelClient::new(config, tuning, cancellation)?;
 
     match tunnel.run(embedded).await? {
         TunnelRunOutcome::Cancelled => Ok(()),
-        TunnelRunOutcome::RestartRuntime { error, had_success } => {
-            Err(anyhow::Error::new(super::RuntimeRestartRequested::new(
-                format!(
-                    "OpenAI tunnel hit {restart_after} consecutive transient poll failures: {error:#}"
-                ),
-                had_success,
-            )))
-        }
+        TunnelRunOutcome::RestartRuntime {
+            error,
+            had_success,
+            threshold,
+        } => Err(anyhow::Error::new(super::RuntimeRestartRequested::new(
+            format!("OpenAI tunnel hit {threshold} consecutive transient poll failures: {error:#}"),
+            had_success,
+        ))),
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct EmbeddedMcp {
     service: StreamableHttpService<LocalMachine, NeverSessionManager>,
+    max_response_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -213,19 +250,17 @@ struct LocalResponse {
 
 impl EmbeddedMcp {
     pub(crate) fn new(machine: LocalMachine, cancellation: CancellationToken) -> Self {
-        let config = StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_json_response(true)
-            .with_sse_keep_alive(None)
-            .with_sse_retry(None)
-            .with_cancellation_token(cancellation);
-
+        let max_response_bytes = machine.max_response_body_bytes();
+        let config = super::streamable_config(&machine, cancellation);
         let service = StreamableHttpService::new(
             move || Ok(machine.clone()),
             NeverSessionManager::default().into(),
             config,
         );
-        Self { service }
+        Self {
+            service,
+            max_response_bytes,
+        }
     }
 
     async fn dispatch(
@@ -267,18 +302,12 @@ impl EmbeddedMcp {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        let collected = response
-            .into_body()
-            .collect()
-            .await
-            .expect("rmcp StreamableHttpService response body is infallible");
-        let bytes = collected.to_bytes();
-        if bytes.len() > MAX_MCP_RESPONSE_BYTES {
-            bail!(
-                "local MCP response exceeded {} bytes",
-                MAX_MCP_RESPONSE_BYTES
-            );
-        }
+        let bytes = bounded::local_response(
+            response.into_body(),
+            self.max_response_bytes,
+            "local MCP response",
+        )
+        .await?;
 
         let messages = if bytes.is_empty() {
             Vec::new()
@@ -445,6 +474,8 @@ enum TunnelRunOutcome {
     RestartRuntime {
         error: anyhow::Error,
         had_success: bool,
+        /// The configured threshold, reported verbatim.
+        threshold: u32,
     },
 }
 
@@ -466,6 +497,16 @@ impl TunnelClient {
             bail!("tunnel id and runtime API key are required");
         }
         let tuning = Arc::new(tuning.validated()?);
+        let activation_grace_until = match new_tunnel {
+            true => Some(
+                Instant::now()
+                    .checked_add(tuning.activation_grace)
+                    .ok_or_else(|| {
+                        anyhow!("tunnel tuning: activation_grace overflows the clock")
+                    })?,
+            ),
+            false => None,
+        };
         let http = Client::builder()
             .user_agent(format!("dotlink/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(tuning.connect_timeout)
@@ -478,7 +519,7 @@ impl TunnelClient {
             api_key: Arc::from(api_key),
             organization_id: organization_id.map(Arc::from),
             instance_id: Arc::from(Uuid::new_v4().to_string()),
-            activation_grace_until: new_tunnel.then(|| Instant::now() + tuning.activation_grace),
+            activation_grace_until,
             log,
             cancellation,
             concurrency: Arc::new(Semaphore::new(tuning.max_in_flight)),
@@ -494,7 +535,7 @@ impl TunnelClient {
         let mut announced = false;
         let mut reconnect_reason = None;
 
-        loop {
+        'run: loop {
             while let Some(result) = tasks.try_join_next() {
                 if let Err(join_error) = result {
                     error!(%join_error, "tunnel command task failed");
@@ -564,20 +605,34 @@ impl TunnelClient {
                 }
             };
 
+            let outstanding_limit = self.tuning.poll_limit.saturating_mul(OUTSTANDING_BATCHES);
             for command in batch.commands {
-                let permit = tokio::select! {
-                    _ = self.cancellation.cancelled() => break,
-                    permit = self.concurrency.clone().acquire_owned() => permit,
-                };
-                let permit = match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                };
+                // Bound the number of outstanding command tasks, but leave
+                // room for several batches to queue. A single full batch must
+                // not stop polling; a sustained backlog applies backpressure.
+                while tasks.len() >= outstanding_limit {
+                    tokio::select! {
+                        _ = self.cancellation.cancelled() => break 'run,
+                        result = tasks.join_next() => {
+                            if let Some(result) = result
+                                && let Err(join_error) = result
+                            {
+                                error!(%join_error, "tunnel command task failed");
+                            }
+                        }
+                    }
+                }
                 let client = self.clone();
                 let mcp = mcp.clone();
                 let received_at = batch.received_at;
                 tasks.spawn(async move {
-                    let _permit = permit;
+                    let permit = tokio::select! {
+                        _ = client.cancellation.cancelled() => return,
+                        permit = client.concurrency.clone().acquire_owned() => permit,
+                    };
+                    let Ok(_permit) = permit else {
+                        return;
+                    };
                     if let Err(error) = client.process_command(mcp, command, received_at).await {
                         warn!(%error, "tunnel command failed");
                     }
@@ -592,6 +647,7 @@ impl TunnelClient {
             Ok(TunnelRunOutcome::RestartRuntime {
                 error,
                 had_success: announced,
+                threshold: self.tuning.restart_after,
             })
         } else {
             Ok(TunnelRunOutcome::Cancelled)
@@ -622,9 +678,25 @@ impl TunnelClient {
             });
         }
         if status == StatusCode::OK {
-            let envelope: PollEnvelope = response.json().await.map_err(|error| {
+            let bytes = bounded::reqwest_response(
+                response,
+                MAX_POLL_RESPONSE_BYTES,
+                "tunnel poll response",
+            )
+            .await
+            .map_err(|error| {
+                PollFailure::Transient(error.context("failed reading poll response"))
+            })?;
+            let envelope: PollEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
                 PollFailure::Transient(anyhow!(error).context("invalid poll response"))
             })?;
+            if envelope.commands.len() > self.tuning.poll_limit {
+                return Err(PollFailure::Transient(anyhow!(
+                    "tunnel returned {} commands, above the {} command poll limit",
+                    envelope.commands.len(),
+                    self.tuning.poll_limit
+                )));
+            }
             return Ok(PolledBatch {
                 received_at,
                 commands: envelope.commands,
@@ -677,8 +749,14 @@ impl TunnelClient {
             return Ok(());
         }
 
-        // The client owns the delivery window, so shell deadlines default to it
-        // (less a delivery reserve) instead of to the policy ceiling.
+        // Keep the delivery reserve for the terminal response. Shell timeouts
+        // are shortened explicitly; every other dispatch is bounded by the
+        // same effective deadline.
+        let dispatch_deadline = deadline.map(|deadline| {
+            deadline
+                .checked_sub(self.tuning.delivery_reserve)
+                .unwrap_or_else(Instant::now)
+        });
         if let Some(remaining) =
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
             && let Some(jsonrpc) = command.jsonrpc.as_mut()
@@ -703,7 +781,7 @@ impl TunnelClient {
                 let request_label = verbose_request_label(jsonrpc);
                 let started = self.log.request("openai", &request_label);
                 let dispatch = mcp.dispatch(&command.headers, jsonrpc);
-                let local = match await_before_deadline(deadline, dispatch).await {
+                let local = match await_before_deadline(dispatch_deadline, dispatch).await {
                     Ok(Some(result)) => match result {
                         Ok(response) => response,
                         Err(error) => {
@@ -780,8 +858,9 @@ impl TunnelClient {
                                 resp_code: 200,
                                 resp_type: "jsonrpc_notify".to_owned(),
                             };
-                            notifications_deliverable =
-                                self.post_notification(&command, response, deadline).await;
+                            notifications_deliverable = self
+                                .post_notification(&command, response, dispatch_deadline)
+                                .await;
                         }
                     } else {
                         debug!(request_id = %command.request_id, "ignoring unsupported nonterminal MCP stream message");
@@ -910,14 +989,7 @@ impl TunnelClient {
         }
         let message = response_error_text(response).await;
         let error = anyhow!("OpenAI tunnel response failed ({status}): {message}");
-        if matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT
-                | StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        ) {
+        if retryable_response_status(status) {
             Ok(PostOutcome::Retry(error))
         } else {
             Ok(PostOutcome::Fatal(error))
@@ -942,13 +1014,7 @@ impl TunnelClient {
     }
 
     async fn sleep_backoff(&self, attempt: u32) {
-        #[cfg(test)]
-        let _ = attempt;
-        #[cfg(test)]
-        let delay = Duration::from_millis(1);
-        #[cfg(not(test))]
         let delay = self.tuning.backoff.delay(attempt);
-
         tokio::select! {
             _ = self.cancellation.cancelled() => {}
             _ = time::sleep(delay) => {}
@@ -1011,8 +1077,10 @@ fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
     Some(Duration::new(secs, nanos))
 }
 
-/// Tools whose runtime is long enough to collide with the client's window.
-const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
+/// Keep polling through a bounded backlog of command tasks. Three poll batches
+/// fit in the queue; beyond that, pausing the poll loop is deliberate
+/// backpressure rather than an accidental stall.
+const OUTSTANDING_BATCHES: usize = 3;
 
 fn shell_timeout_within(window: Duration, reserve: Duration) -> u64 {
     window.saturating_sub(reserve).as_secs().max(1)
@@ -1028,7 +1096,9 @@ fn apply_response_window(jsonrpc: &mut Value, window: Duration, reserve: Duratio
         return None;
     }
     let name = jsonrpc.pointer("/params/name").and_then(Value::as_str)?;
-    if !SHELL_TOOLS.contains(&name) {
+    // The capability table is the only list of shell tools; a renamed or added
+    // shell variant is bounded by the delivery reserve without a second edit.
+    if !crate::mcp::is_shell_tool(name) {
         return None;
     }
     let object = jsonrpc.pointer_mut("/params/arguments")?.as_object_mut()?;
@@ -1079,66 +1149,13 @@ fn verbose_request_summary(jsonrpc: &Value) -> String {
 
 #[cfg(test)]
 fn summarize_tool_arguments(arguments: &Value) -> String {
-    let Some(object) = arguments.as_object() else {
-        return String::new();
-    };
-
-    let mut parts = Vec::new();
-    for key in [
-        "path",
-        "dir",
-        "command",
-        "pattern",
-        "glob",
-        "depth",
-        "kind",
-        "sort",
-        "output_mode",
-        "offset",
-        "limit",
-        "before",
-        "after",
-        "numbered",
-        "literal",
-        "ignore_case",
-        "gitignore",
-        "skip_hidden",
-        "replace_all",
-        "best_effort",
-        "format",
-        "encoding",
-        "sha256",
-        "timeout_secs",
-        "max_output_bytes",
-    ] {
-        let Some(value) = object.get(key) else {
-            continue;
-        };
-        parts.push(format!("{key}={}", summarize_value(value)));
-    }
-    for key in ["content", "stdin", "data", "old_text", "new_text", "patch"] {
-        if let Some(Value::String(value)) = object.get(key) {
-            parts.push(format!("{key}=<{} bytes>", value.len()));
+    // One summarizer, shared with the TOOL log: argument order comes from the
+    // object itself here because a test has no tool schema to read.
+    match arguments.as_object() {
+        Some(object) => {
+            crate::logging::summarize_arguments(object, object.keys().map(String::as_str))
         }
-    }
-    if let Some(Value::Array(edits)) = object.get("edits") {
-        parts.push(format!("edits={}", edits.len()));
-    }
-    parts.join(" ")
-}
-
-#[cfg(test)]
-fn summarize_value(value: &Value) -> String {
-    match value {
-        Value::String(value) => {
-            let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-            let mut preview: String = compact.chars().take(120).collect();
-            if compact.chars().count() > 120 {
-                preview.push('…');
-            }
-            format!("{preview:?}")
-        }
-        other => other.to_string(),
+        None => String::new(),
     }
 }
 
@@ -1175,9 +1192,28 @@ fn should_restart_runtime_after_poll_failures(failures: u32, restart_after: u32)
     failures >= restart_after
 }
 
+fn retryable_response_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
 async fn response_error_text(response: reqwest::Response) -> String {
-    let text = response.text().await.unwrap_or_default();
-    bounded(&text, MAX_CONTROL_PLANE_ERROR_BYTES)
+    match bounded::reqwest_response(
+        response,
+        MAX_CONTROL_PLANE_ERROR_BYTES,
+        "control-plane error",
+    )
+    .await
+    {
+        Ok(bytes) => bounded(
+            &String::from_utf8_lossy(&bytes),
+            MAX_CONTROL_PLANE_ERROR_BYTES,
+        ),
+        Err(error) => error.to_string(),
+    }
 }
 
 fn bounded(text: &str, max_bytes: usize) -> String {
@@ -1490,11 +1526,25 @@ mod tests {
                 .unwrap();
                 let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
                 let request = |id: i64, name: &str| {
-                    let command = format!(
-                        "printf 'start-{name}\\n' >> '{}' ; sleep 0.3 ; printf 'end-{name}\\n' >> '{}'",
-                        events.display(),
-                        events.display(),
-                    );
+                    let command = if serialize {
+                        format!(
+                            "printf 'start-{name}\\n' >> '{}' ; sleep 0.3 ; printf 'end-{name}\\n' >> '{}'",
+                            events.display(),
+                            events.display(),
+                        )
+                    } else {
+                        // Make both starts observable before either end. A
+                        // fixed sleep is flaky when a loaded host delays the
+                        // second spawn past it.
+                        let other = if name == "a" { "b" } else { "a" };
+                        format!(
+                            "printf 'start-{name}\\n' >> '{}'; touch '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; printf 'end-{name}\\n' >> '{}'",
+                            events.display(),
+                            root.join(format!("ready-{name}")).display(),
+                            root.join(format!("ready-{other}")).display(),
+                            events.display(),
+                        )
+                    };
                     json!({
                         "jsonrpc": "2.0", "id": id, "method": "tools/call",
                         "params": {"name": "bash", "arguments": {"command": command}}
@@ -1521,6 +1571,103 @@ mod tests {
                     assert!(entries[1].starts_with("start-"), "{log}");
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_binary_read_respects_configured_read_ceiling_not_fixed_16mib() {
+        use crate::mcp::{AccessSpec, MachineConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let size = 13 * 1024 * 1024;
+        std::fs::write(root.join("large.bin"), vec![b'z'; size]).unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 10,
+            max_output_bytes: 1024 * 1024,
+            max_read_bytes: 20 * 1024 * 1024,
+            max_write_bytes: 1024 * 1024,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let embedded = EmbeddedMcp::new(machine, CancellationToken::new());
+        assert!(embedded.max_response_bytes > 16 * 1024 * 1024);
+        let response = embedded
+            .dispatch(
+                &BTreeMap::new(),
+                &json!({
+                    "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+                    "params": {"name": "bread", "arguments": {
+                        "path": "large.bin", "format": "base64"}}
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let result = response
+            .messages
+            .iter()
+            .find(|value| value.get("id") == Some(&json!(42)))
+            .expect("large binary MCP response");
+        assert_ne!(result["result"]["isError"], true);
+        let receipt = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(receipt.len() > 16 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn local_response_collection_stops_at_the_byte_limit() {
+        let small = Full::new(Bytes::from_static(b"ok"));
+        assert_eq!(
+            bounded::local_response(small, 2, "local MCP response")
+                .await
+                .unwrap(),
+            Bytes::from_static(b"ok")
+        );
+
+        let large = Full::new(Bytes::from(vec![b'x'; 1024]));
+        let error = bounded::local_response(large, 16, "local MCP response")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("16 bytes"), "{error}");
+    }
+
+    #[test]
+    fn response_retry_classifier_covers_all_server_errors() {
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(retryable_response_status(status), "{status}");
+        }
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
+        ] {
+            assert!(!retryable_response_status(status), "{status}");
         }
     }
 
@@ -1582,7 +1729,15 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let error = run(
+        let tuning = TunnelTuning {
+            backoff: Backoff {
+                base: Duration::from_millis(1),
+                cap: Duration::from_millis(2),
+                jitter: Duration::ZERO,
+            },
+            ..TunnelTuning::default()
+        };
+        let error = run_with_tuning(
             machine,
             Config {
                 base_url: format!("http://{addr}"),
@@ -1592,6 +1747,7 @@ mod tests {
                 new_tunnel: false,
                 log: LogConfig::default(),
             },
+            tuning,
             CancellationToken::new(),
         )
         .await
@@ -1650,6 +1806,7 @@ mod tests {
         assert!(tuning.poll_limit <= 3 * tuning.max_in_flight);
         assert_eq!(tuning.activation_retry, Duration::from_secs(2));
         assert_eq!(tuning.activation_checks, 30);
+        assert_eq!(tuning.activation_grace, Duration::from_secs(62));
         assert_eq!(tuning.response_attempts, 6);
         assert_eq!(tuning.backoff.base, Duration::from_millis(250));
         assert_eq!(tuning.backoff.cap, Duration::from_secs(5));
@@ -1663,6 +1820,27 @@ mod tests {
                 "request_timeout at the poll hold",
                 TunnelTuning {
                     request_timeout: Duration::from_secs(15),
+                    ..base()
+                },
+            ),
+            (
+                "request_timeout without the margin",
+                TunnelTuning {
+                    request_timeout: Duration::from_secs(20),
+                    ..base()
+                },
+            ),
+            (
+                "connect_timeout larger than the request margin",
+                TunnelTuning {
+                    connect_timeout: Duration::from_secs(30),
+                    ..base()
+                },
+            ),
+            (
+                "activation grace shorter than the check budget",
+                TunnelTuning {
+                    activation_grace: Duration::from_secs(30),
                     ..base()
                 },
             ),
@@ -1726,6 +1904,24 @@ mod tests {
                 },
             ),
             (
+                "backoff cap plus jitter exceeds the request timeout",
+                TunnelTuning {
+                    backoff: Backoff {
+                        cap: Duration::from_secs(30),
+                        jitter: Duration::ZERO,
+                        ..base().backoff
+                    },
+                    ..base()
+                },
+            ),
+            (
+                "poll_hold overflow",
+                TunnelTuning {
+                    poll_hold: Duration::MAX,
+                    ..base()
+                },
+            ),
+            (
                 "delivery reserve at the request timeout",
                 TunnelTuning {
                     delivery_reserve: Duration::from_secs(25),
@@ -1761,6 +1957,24 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(request.url().query(), Some("limit=24&timeout_ms=20000"));
+    }
+
+    #[test]
+    fn activation_grace_overflow_returns_an_error() {
+        let mut config = test_config();
+        config.new_tunnel = true;
+        let error = match TunnelClient::new(
+            config,
+            TunnelTuning {
+                activation_grace: Duration::MAX,
+                ..TunnelTuning::default()
+            },
+            CancellationToken::new(),
+        ) {
+            Ok(_) => panic!("oversized activation_grace was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("activation_grace overflows"), "{error}");
     }
 
     #[test]
@@ -1987,7 +2201,7 @@ mod tests {
         let summary = verbose_request_summary(&request);
         assert!(summary.contains("tools/call write"));
         assert!(summary.contains("path=\"src/main.rs\""));
-        assert!(summary.contains("content=<18 bytes>"));
+        assert!(summary.contains("content_bytes=18"), "{summary}");
         assert!(!summary.contains("secret-ish payload"));
     }
 }
