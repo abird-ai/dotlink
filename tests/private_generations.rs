@@ -58,3 +58,55 @@ fn persisted_key_generation_is_required_and_never_falls_back() {
         String::from_utf8_lossy(&local_only.stderr)
     );
 }
+
+#[test]
+fn dormant_key_selector_survives_profile_cli_mutations() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_home = temp.path().join("xdg");
+    let private = config_home.join("abird/dotlink");
+    fs::create_dir_all(&private).unwrap();
+    let config = private.join("config.jsonc");
+    let revision = "11223344556677889900aabbccddeeff";
+    fs::write(
+        &config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":false,"stdio":true}},"runtime_key_revision":"{revision}"}}"#
+        ),
+    )
+    .unwrap();
+
+    // A dormant OpenAI key can be missing without blocking unrelated profile
+    // management; saving a different rule must never lose its selector.
+    for name in ["first", "second"] {
+        let path = temp.path().join(name);
+        fs::create_dir(&path).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+            .args(["profile", "allow", "default", "read"])
+            .arg(&path)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_STATE_HOME", temp.path().join("state"))
+            .env_remove("DOTLINK_CONFIG")
+            .env_remove("DOTLINK_API_KEY")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let text = fs::read_to_string(&config).unwrap();
+    let json = text
+        .lines()
+        .filter(|line| !line.starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let saved: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(saved["runtime_key_revision"], revision);
+    assert_eq!(
+        saved["permissions"]["allow_read"].as_array().unwrap().len(),
+        2
+    );
+    assert!(run_with_profile(&config_home, &config).status.success());
+}
