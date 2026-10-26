@@ -154,7 +154,7 @@ fn list_depth(requested: Option<usize>, pattern: Option<&str>) -> usize {
 }
 
 impl LocalMachine {
-    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool)> {
+    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool, bool)> {
         let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         if !fs::metadata(&root).await?.is_dir() {
             anyhow::bail!("not a directory: {}", args.path);
@@ -168,32 +168,39 @@ impl LocalMachine {
 
         // Scanning completes before sorting, so any cap selects the actual
         // global path/newest prefix rather than the first entries enumerated.
-        self.walk_entries(&root, depth, WalkFilter::default(), |entry| {
-            if pattern
-                .as_ref()
-                .is_some_and(|pattern| !pattern.matches_entry(&entry.relative))
-            {
-                return true;
-            }
-            if !args.kind.accepts(entry.kind) {
-                return true;
-            }
-            truncated |= retain_best(
-                &mut selected,
-                RankedEntry {
-                    entry: FsEntry {
-                        path: self.config.access.relative_display(&entry.path),
-                        kind: entry.kind,
-                        size: entry.size,
-                        mtime: entry.mtime,
-                    },
-                    sort: args.sort,
+        let progress = self
+            .walk_entries_bounded(
+                &root,
+                depth,
+                WalkFilter::default(),
+                super::MAX_WALK_VISITS,
+                |entry| {
+                    if pattern
+                        .as_ref()
+                        .is_some_and(|pattern| !pattern.matches_entry(&entry.relative))
+                    {
+                        return true;
+                    }
+                    if !args.kind.accepts(entry.kind) {
+                        return true;
+                    }
+                    truncated |= retain_best(
+                        &mut selected,
+                        RankedEntry {
+                            entry: FsEntry {
+                                path: self.config.access.relative_display(&entry.path),
+                                kind: entry.kind,
+                                size: entry.size,
+                                mtime: entry.mtime,
+                            },
+                            sort: args.sort,
+                        },
+                        limit,
+                    );
+                    true
                 },
-                limit,
-            );
-            true
-        })
-        .await?;
+            )
+            .await?;
 
         let mut output: Vec<FsEntry> = selected.into_iter().map(|item| item.entry).collect();
         match args.sort {
@@ -206,18 +213,26 @@ impl LocalMachine {
         // count. The renderer is the exact handler shape so the measured and
         // returned JSON cannot drift.
         let render = |entries: &[FsEntry], truncated: bool| {
-            serde_json::json!({ "entries": entries, "truncated": truncated }).to_string()
+            serde_json::json!({
+                "entries": entries, "truncated": truncated,
+                "scan_incomplete": progress.incomplete
+            })
+            .to_string()
         };
-        let (output, truncated) =
-            trim_to_ceiling(output, self.config.max_output_bytes, truncated, render);
-        Ok((output, truncated))
+        let (output, truncated) = trim_to_ceiling(
+            output,
+            self.config.max_output_bytes,
+            truncated || progress.incomplete,
+            render,
+        );
+        Ok((output, truncated, progress.incomplete))
     }
 }
 
 #[tool_router(router = "discovery_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "List files and directories. `depth` defaults to 1, to the pattern's own path-segment count, or to unbounded when the pattern contains `**`; an explicit `depth` always wins. Symlinked directories are never traversed, and in-flight `.dotlink-*.tmp` staging files are hidden. Returns {\"entries\":[{\"path\",\"kind\",\"size\"}],\"truncated\":bool}; the rendered reply also respects `max_output_bytes`.",
+        description = "List files and directories. `depth` defaults to 1, to the pattern's own path-segment count, or to unbounded when the pattern contains `**`; an explicit `depth` always wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Returns {\"entries\":[{\"path\",\"kind\",\"size\"}],\"truncated\":bool,\"scan_incomplete\":bool}. A traversal over 100000 entries ends with scan_incomplete=true: results are sorted among scanned entries, not claimed globally sorted; narrow path/pattern. The reply also respects `max_output_bytes`.",
         annotations(
             title = "List files",
             read_only_hint = true,
@@ -228,8 +243,12 @@ impl LocalMachine {
     )]
     pub(super) async fn ls(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
         match self.list_impl(args).await {
-            Ok((entries, truncated)) => {
-                let payload = serde_json::json!({ "entries": entries, "truncated": truncated });
+            Ok((entries, truncated, scan_incomplete)) => {
+                let payload = serde_json::json!({
+                    "entries": entries,
+                    "truncated": truncated,
+                    "scan_incomplete": scan_incomplete,
+                });
                 ok_text(payload.to_string())
             }
             Err(error) => tool_error(error),
@@ -254,7 +273,7 @@ mod tests {
         let machine = test_machine(root);
 
         // Default depth 1: this directory only.
-        let (entries, truncated) = machine
+        let (entries, truncated, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 pattern: None,
@@ -268,7 +287,7 @@ mod tests {
         assert_eq!(names, ["README.md", "src", "top.rs"]);
 
         // Depth 2 descends one more level.
-        let (entries, _) = machine
+        let (entries, _, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 pattern: None,
@@ -282,7 +301,7 @@ mod tests {
         assert!(!names.contains(&"src/nested/deep.rs"), "{names:?}");
 
         // Pattern filters every level it descends into.
-        let (entries, _) = machine
+        let (entries, _, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 pattern: Some("*.rs".to_owned()),
@@ -296,7 +315,7 @@ mod tests {
         assert_eq!(names, ["src/lib.rs", "src/nested/deep.rs", "top.rs"]);
 
         // A capped listing reports truncation instead of silently dropping entries.
-        let (entries, truncated) = machine
+        let (entries, truncated, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 pattern: Some("*.rs".to_owned()),
@@ -318,7 +337,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(25));
         std::fs::write(root.join("new.txt"), "newer").unwrap();
         let machine = test_machine(root);
-        let (entries, truncated) = machine
+        let (entries, truncated, _) = machine
             .list_impl(ListArgs {
                 path: ".".into(),
                 sort: ListSort::Mtime,
@@ -342,7 +361,7 @@ mod tests {
         let machine = test_machine(root.clone());
 
         // A pattern addressing a nested path implies the depth it spans.
-        let (entries, _) = machine
+        let (entries, _, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 pattern: Some("src/**/*.rs".to_owned()),
@@ -355,7 +374,7 @@ mod tests {
         assert_eq!(names, ["src/lib.rs", "src/nested/deep.rs"]);
 
         // An explicit depth still wins over the implied default.
-        let (entries, _) = machine
+        let (entries, _, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 pattern: Some("src/**/*.rs".to_owned()),
@@ -367,7 +386,7 @@ mod tests {
         assert!(entries.is_empty(), "{entries:?}");
 
         // `kind` filters entries without stopping the descent.
-        let (entries, _) = machine
+        let (entries, _, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 kind: ListKind::File,
@@ -385,7 +404,7 @@ mod tests {
         // `sort=mtime` returns newest first; `path` is alphabetical.
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(root.join("newest.rs"), "x").unwrap();
-        let (entries, _) = machine
+        let (entries, _, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 sort: ListSort::Mtime,
@@ -394,7 +413,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries.first().unwrap().path, "newest.rs", "{entries:?}");
-        let (entries, _) = machine
+        let (entries, _, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 sort: ListSort::Path,
@@ -428,7 +447,7 @@ mod tests {
         std::fs::write(root.join("a/b/c/d/e/leaf.rs"), "x").unwrap();
         let machine = test_machine(root);
 
-        let (entries, truncated) = machine
+        let (entries, truncated, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 pattern: Some("a/b/c/d/e/*.rs".to_owned()),
@@ -450,7 +469,7 @@ mod tests {
         let machine = crate::mcp::tools::test_support::test_machine_with(root, |config| {
             config.max_output_bytes = 1024
         });
-        let (entries, truncated) = machine
+        let (entries, truncated, _) = machine
             .list_impl(ListArgs {
                 path: ".".to_owned(),
                 ..ListArgs::default()

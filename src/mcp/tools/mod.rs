@@ -34,6 +34,16 @@ use super::LocalMachine;
 /// Shared bounds. Per-tool bounds live with the tool that owns them.
 pub(crate) const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const GITIGNORE_MAX_LINES: usize = 1024;
+/// Per-call discovery work, not a cap on model-directed concurrency.
+/// A truncated traversal is explicitly marked partial: top-K ordering is
+/// global only when the walk completes.
+pub(crate) const MAX_WALK_VISITS: usize = 100_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WalkProgress {
+    pub visited: usize,
+    pub incomplete: bool,
+}
 
 fn dot() -> String {
     ".".to_owned()
@@ -361,13 +371,32 @@ impl LocalMachine {
     /// that path names, but never escapes the grant. Denies and protected paths
     /// are dropped before the caller sees an entry. Returning `false` from
     /// `on_entry` stops the walk.
+    #[cfg(test)]
     pub(crate) async fn walk_entries(
         &self,
         root: &Path,
         depth: usize,
         filter: WalkFilter,
-        mut on_entry: impl FnMut(WalkedEntry) -> bool,
+        on_entry: impl FnMut(WalkedEntry) -> bool,
     ) -> Result<()> {
+        self.walk_entries_bounded(root, depth, filter, usize::MAX, on_entry)
+            .await?;
+        Ok(())
+    }
+
+    /// One shared visitor budget across listing/searching. The limit is counted
+    /// *before* entry filters so a tree full of denied or hidden files still
+    /// cannot force an unbounded scan. No false claim of global order on a
+    /// partial traversal.
+    pub(crate) async fn walk_entries_bounded(
+        &self,
+        root: &Path,
+        depth: usize,
+        filter: WalkFilter,
+        max_visits: usize,
+        mut on_entry: impl FnMut(WalkedEntry) -> bool,
+    ) -> Result<WalkProgress> {
+        let mut progress = WalkProgress::default();
         let mut pending: Vec<PendingDir> = vec![PendingDir {
             parent: None,
             name: OsString::new(),
@@ -411,6 +440,11 @@ impl LocalMachine {
                     Err(error) if skippable_io_error(&error) => break,
                     Err(error) => return Err(error.into()),
                 };
+                if progress.visited >= max_visits {
+                    progress.incomplete = true;
+                    return Ok(progress);
+                }
+                progress.visited += 1;
                 let name = entry.file_name();
                 // In-flight staged bytes are not a file the caller can see.
                 if crate::staging::is_staging_temporary(&name) {
@@ -462,7 +496,7 @@ impl LocalMachine {
                     mtime: metadata.modified().ok(),
                 };
                 if !on_entry(walked) {
-                    return Ok(());
+                    return Ok(progress);
                 }
                 if descend {
                     pending.push(PendingDir {
@@ -476,7 +510,7 @@ impl LocalMachine {
             }
         }
 
-        Ok(())
+        Ok(progress)
     }
 }
 
@@ -694,6 +728,27 @@ impl Verified {
 mod tests {
     use super::*;
     use crate::mcp::tools::test_support::test_machine;
+
+    #[tokio::test]
+    async fn discovery_scan_budget_is_enforced_before_candidate_filters() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for index in 0..12 {
+            std::fs::write(root.join(format!("{index:02}.txt")), "").unwrap();
+        }
+        let machine = test_machine(root.clone());
+        let mut reported = 0;
+        let progress = machine
+            .walk_entries_bounded(&root, 1, WalkFilter::default(), 3, |_| {
+                reported += 1;
+                true
+            })
+            .await
+            .unwrap();
+        assert!(progress.incomplete);
+        assert_eq!(progress.visited, 3);
+        assert_eq!(reported, 3);
+    }
 
     #[test]
     fn top_k_remains_globally_sorted_with_arbitrary_discovery_order() {

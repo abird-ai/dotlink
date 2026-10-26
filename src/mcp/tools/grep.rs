@@ -34,6 +34,7 @@ enum StopReason {
     ByteBudget,
     PerFileCap,
     CandidateCap,
+    ScanBudget,
 }
 
 /// Suffix that names the per-file cap as the reason a content page stopped, so a
@@ -48,6 +49,7 @@ fn marker_reserve() -> usize {
         .max(marker_files(usize::MAX).len())
         .max(marker_hits(usize::MAX).len() + PER_FILE_CAP_SUFFIX.len())
         .max(format!("… no hits at offset {}", usize::MAX).len())
+        .max("… discovery scan incomplete; narrow path or glob".len())
         + 1 // the newline that separates the marker from the last hit
 }
 
@@ -198,28 +200,30 @@ impl LocalMachine {
         // are retained; files are opened individually after the walk.
         let mut candidates = BinaryHeap::<PathBuf>::new();
         let mut candidates_capped = false;
-        self.walk_entries(
-            &root,
-            usize::MAX,
-            WalkFilter {
-                skip_hidden: args.skip_hidden,
-                gitignore: args.gitignore,
-            },
-            |entry| {
-                if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
-                    return true;
-                }
-                if glob
-                    .as_ref()
-                    .is_some_and(|glob| !glob.matches_entry(&entry.relative))
-                {
-                    return true;
-                }
-                candidates_capped |= retain_best(&mut candidates, entry.path, MAX_GREP_FILES);
-                true
-            },
-        )
-        .await?;
+        let progress = self
+            .walk_entries_bounded(
+                &root,
+                usize::MAX,
+                WalkFilter {
+                    skip_hidden: args.skip_hidden,
+                    gitignore: args.gitignore,
+                },
+                super::MAX_WALK_VISITS,
+                |entry| {
+                    if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
+                        return true;
+                    }
+                    if glob
+                        .as_ref()
+                        .is_some_and(|glob| !glob.matches_entry(&entry.relative))
+                    {
+                        return true;
+                    }
+                    candidates_capped |= retain_best(&mut candidates, entry.path, MAX_GREP_FILES);
+                    true
+                },
+            )
+            .await?;
         let candidates = candidates.into_sorted_vec();
 
         let mut paging = Paging {
@@ -348,7 +352,11 @@ impl LocalMachine {
                 }
             }
         }
-        if stop.is_none() && candidates_capped {
+        if progress.incomplete {
+            // In text mode there is no separate metadata field: incomplete
+            // discovery takes precedence over a page-full marker.
+            stop = Some(StopReason::ScanBudget);
+        } else if stop.is_none() && candidates_capped {
             stop = Some(StopReason::CandidateCap);
         }
 
@@ -362,6 +370,9 @@ impl LocalMachine {
                 let marker = match stop {
                     Some(StopReason::ByteBudget) => Some(marker_bytes(ceiling)),
                     Some(StopReason::CandidateCap) => Some(marker_files(MAX_GREP_FILES)),
+                    Some(StopReason::ScanBudget) => {
+                        Some("… discovery scan incomplete; narrow path or glob".to_owned())
+                    }
                     Some(StopReason::PerFileCap) => Some(format!(
                         "{}{PER_FILE_CAP_SUFFIX}",
                         marker_hits(paging.emitted)
@@ -384,10 +395,18 @@ impl LocalMachine {
             }
             GrepOutputMode::Files => {
                 let render = |files: &[String], truncated: bool| {
-                    serde_json::json!({ "files": files, "truncated": truncated }).to_string()
+                    serde_json::json!({
+                        "files": files, "truncated": truncated,
+                        "scan_incomplete": progress.incomplete,
+                    })
+                    .to_string()
                 };
                 let (files, truncated) = trim_to_ceiling(files, ceiling, stop.is_some(), render);
-                Ok(serde_json::json!({ "files": files, "truncated": truncated }).to_string())
+                Ok(serde_json::json!({
+                    "files": files, "truncated": truncated,
+                    "scan_incomplete": progress.incomplete,
+                })
+                .to_string())
             }
             GrepOutputMode::Count => {
                 let render = |counts: &[(String, usize)], truncated: bool| {
@@ -399,6 +418,7 @@ impl LocalMachine {
                             .collect::<Vec<_>>(),
                         "page_total": page_total,
                         "truncated": truncated,
+                        "scan_incomplete": progress.incomplete,
                     })
                     .to_string()
                 };
@@ -504,7 +524,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 text files recursively. `pattern` is a regular expression unless `literal` is set; `glob` filters entries with the same grammar as `ls`; `output_mode` is content (matching lines, optional context), files, or count (exact per-file matches; `page_total` is the returned-page sum). Paging uses `offset`/`limit` over hits or files (200 by default), `gitignore`/`skip_hidden` are opt-in, and output stops at the profile byte ceiling with a marker naming hits (including the 50-hit per-file cap), bytes, or candidate files; a `content` page always ends with whole matching lines, and an offset past the last hit returns an explicit marker. Files above 1 MiB, non-text files, symlink entries, and unreadable subdirectories are skipped.",
+        description = "Search UTF-8 files recursively. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. A discovery scan visits up to 100000 entries, then reports partial results: JSON replies contain `scan_incomplete`, text replies an explicit marker; narrow `path`/`glob` for complete results. Hits and JSON replies obey the byte ceiling; a content page uses whole matching lines. Files over 1 MiB, non-text and symlink entries are skipped.",
         annotations(
             title = "Search files",
             read_only_hint = true,
