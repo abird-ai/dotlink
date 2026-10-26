@@ -29,6 +29,7 @@ use tokio::{
     process::Command,
     time::{Instant, timeout_at},
 };
+use tokio_util::task::AbortOnDropHandle;
 
 use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
 use crate::mcp::{AccessNeed, AccessPolicy};
@@ -348,17 +349,19 @@ impl LocalMachine {
         // Start draining before stdin: a child that writes before reading its
         // stdin must never be able to fill the stdout pipe and deadlock the
         // writer.
-        let stdout_task = tokio::spawn(drain_capped(stdout, output_limit));
-        let stderr_task = tokio::spawn(drain_capped(stderr, output_limit));
+        // Spawning pipe workers is safe only when their handles are owned by
+        // the request: dropping a cancelled tool call must abort all readers.
+        let stdout_task = AbortOnDropHandle::new(tokio::spawn(drain_capped(stdout, output_limit)));
+        let stderr_task = AbortOnDropHandle::new(tokio::spawn(drain_capped(stderr, output_limit)));
 
         let (mut stdin_task, mut stdin_rx) = match args.stdin {
             Some(stdin_text) => match child.stdin.take() {
                 Some(mut stdin) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    let task = tokio::spawn(async move {
+                    let task = AbortOnDropHandle::new(tokio::spawn(async move {
                         let result = stdin.write_all(stdin_text.as_bytes()).await;
                         let _ = tx.send(result);
-                    });
+                    }));
                     (Some(task), Some(rx))
                 }
                 None => {
@@ -704,8 +707,7 @@ impl LocalMachine {
         }
 
         for protected in &self.config.protected_paths {
-            if self.config.access.grant_read(protected)
-                && !self.config.access.denied_read(protected)
+            if self.config.access.grant_read(protected) || self.config.access.grant_write(protected)
             {
                 mask_path(&mut command, protected);
             }
@@ -791,21 +793,24 @@ impl LocalMachine {
 
 #[cfg(target_os = "linux")]
 fn mask_path(command: &mut Command, path: &Path) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-
+    let metadata = std::fs::symlink_metadata(path);
     prepare_mount_target_dirs(command, path);
 
-    if metadata.is_dir() {
+    // A protected path need not exist on the host yet. Reserve an inaccessible
+    // directory in the sandbox so even a writable parent cannot create it.
+    // Existing non-directories retain the /dev/null file mask.
+    if metadata.as_ref().is_ok_and(|metadata| !metadata.is_dir()) {
+        command.arg("--ro-bind").arg("/dev/null").arg(path);
+    } else {
+        if metadata.is_err() {
+            command.arg("--dir").arg(path);
+        }
         command
             .arg("--tmpfs")
             .arg(path)
             .arg("--chmod")
             .arg("000")
             .arg(path);
-    } else {
-        command.arg("--ro-bind").arg("/dev/null").arg(path);
     }
 }
 
@@ -1087,6 +1092,27 @@ mod tests {
             }),
             "non-directories should be hidden behind /dev/null"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_protected_path_is_masked_without_creating_it_on_host() {
+        use std::ffi::OsStr;
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("private-state");
+        let mut command = Command::new("true");
+        mask_path(&mut command, &absent);
+        assert!(!absent.exists());
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        for op in ["--dir", "--tmpfs", "--chmod"] {
+            assert!(args.windows(2).any(|pair| pair[0] == OsStr::new(op)
+                && pair[1]
+                    == (if op == "--chmod" {
+                        OsStr::new("000")
+                    } else {
+                        absent.as_os_str()
+                    })));
+        }
     }
 
     #[cfg(target_os = "linux")]
