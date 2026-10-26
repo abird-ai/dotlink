@@ -31,7 +31,7 @@ Out of scope, deliberately:
 - `POLL_TIMEOUT_MS` stays at **15 s**. Delivery latency does not depend on it (the server releases a held poll as soon as a command is available), and a longer hold only delays detection of a dead link and of recovery.
 - No config schema change. These stay internal defaults; making them profile-tunable would require a v11 schema and is a separate plan.
 - No change to the runtime restart policy: the threshold (10) and the schedule (1 s doubling, 30 s cap) stay exactly as they are, though that schedule now reuses the same `Backoff` type. No fairness/per-project queueing, no per-command start-deadline check.
-- `src/mcp.rs` timings (`SHELL_HEARTBEAT_INTERVAL`, `TIMEOUT_OUTPUT_GRACE`) are untouched.
+- Shell timings (`SHELL_HEARTBEAT_INTERVAL`, `TIMEOUT_OUTPUT_GRACE`, now in `src/mcp/tools/shell.rs`) are untouched.
 - `delivery_reserve` stays a flat 5 s. Deriving it from the client window is noted as a follow-up, not implemented here.
 
 ## Design

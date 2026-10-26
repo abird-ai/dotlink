@@ -16,7 +16,7 @@ Read in this order before touching code:
 2. `README.md` (this document) — design, semantics, failure texts, decisions.
 3. `.agents/plans/TODO.md` — queue line `DL-080`.
 4. `docs/SECURITY.md` and `.agents/docs/configuration.md` — resource-limit and config semantics.
-5. `src/mcp.rs` tool section and `src/transports/openai.rs` runtime loop.
+5. `src/mcp/tools/` (one module per tool family) and the `src/transports/openai.rs` runtime loop.
 
 Environment:
 
@@ -71,11 +71,11 @@ Renames: `read_binary` → `bread`, `write_binary` → `bwrite`, `patch_binary` 
 
 ### Shared conventions
 
-- `path` optional everywhere, defaults `.`, resolves from the launch directory.
+- `path` defaults to `.` (and resolves from the launch directory) for the directory tools `ls`, `grep` and `patch.dir`; per-file tools (`read`, `write`, `bread`, `bwrite`, `bedit`) require it, and `edit` inherits a top-level `path` for entries that omit one.
 - One glob grammar: `globset` with `literal_separator(true)` — `*`, `?`, `[...]`, `**`, `{a,b}`.
 - Every list/search tool has `limit` with a documented default and hard maximum.
 - JSON tools return `truncated`; `read` appends one marker line instead.
-- `offset` exists only on `grep` (hits/files) and `read` (lines).
+- `offset` exists on `grep` (hits/files), `read` (lines), `bread` (bytes) and each `bedit` range (bytes).
 - `edit` and `bedit` are all-or-nothing; `patch` is atomic unless `best_effort`.
 
 ### ls
@@ -84,14 +84,14 @@ Renames: `read_binary` → `bread`, `write_binary` → `bwrite`, `patch_binary` 
 | --- | --- | --- |
 | `path` | `.` | |
 | `pattern` | — | globset grammar over entry paths |
-| `depth` | 1, or 4 when `pattern` contains `/` or `**` | explicit `depth` always wins |
+| `depth` | 1, or 4 when `pattern` contains `/` (unbounded for `**` since DL-100) | explicit `depth` always wins |
 | `kind` | `any` | `any` / `file` / `dir` |
 | `sort` | `path` | `path` / `mtime` (newest first) |
 | `limit` | 4096 | hard maximum 16384 |
 
 Output `{"entries":[{"path","kind","size"}],"truncated":bool}`. `mtime` sort needs `fs::metadata(...).modified()`; on error keep the entry with a zero timestamp ordering after dated ones. Symlinked directories are never traversed; denied and protected entries are dropped before the limit.
 
-Depth rule must be visible in the description: "Defaults to 1, or 4 when `pattern` contains `/` or `**`."
+Depth rule must be visible in the description: "Defaults to 1, or 4 when `pattern` contains `/` or `**`." DL-100 changed the `**` case to unbounded, matching `grep`.
 
 ### grep
 
@@ -116,7 +116,7 @@ Output shapes:
 
 - `content` → lines `path:line: text` (or `path: text` when `numbered: false`) with `-`/`+`-free context lines, hit groups separated by `--`, `{"matches":…}` wrapper not used — return plain text plus a trailing `… truncated at 200 hits` style marker for consistency with `read`;
 - `files` → `{"files":[…],"truncated":bool}`;
-- `count` → `{"counts":[{"path","count"}],"total":n,"truncated":bool}`.
+- `count` → `{"counts":[{"path","count"}],"page_total":n,"truncated":bool}`.
 
 Gitignore handling: when `gitignore` is set, load `.gitignore` files through `secure_fs` (never the ambient path namespace) with 64 KiB / 1024-line bounds per file, reject invalid patterns, and honour nested files relative to the search root, including negation. `skip_hidden` drops entries whose name starts with `.` from both listing and descent (except the search root itself).
 
@@ -126,10 +126,10 @@ Gitignore handling: when `gitignore` is set, load `.gitignore` files through `se
 | --- | --- | --- |
 | `path` | required | |
 | `offset` | 1 | 1-based first line |
-| `limit` | 4096 | lines; still bounded by `max_read_bytes` |
+| `limit` | 4096 | lines; the returned window and each line are bounded by `max_read_bytes` |
 | `numbered` | true | `{n}\t{line}`; one tab separator; `false` returns exact text |
 
-Trailing marker only when a cap is hit: `… truncated at line 4096 of 12044`.
+Trailing marker only when a cap is hit: `… truncated at line 4096`.
 
 Numbering is on by default: it is the addressing scheme for follow-up reads and edits; Claude Code (`cat -n`) and aw (`{n}: {line}`) both number by default. The hazard is an edit anchor copied with the prefix, so `edit` states the rule and reports it when a failed `old_text` starts with `digits + tab`.
 
@@ -214,7 +214,7 @@ crates/x/src/lib.rs: '*** Add File' target already exists
 crates/y/src/lib.rs changed while patching; nothing was written
 ```
 
-Receipt: `{"files":[{"path","hunks","added","removed"}],"mode":"atomic"|"best_effort"}`.
+Receipt: `{"files":[{"path","hunks","added","removed"}],"mode":"strict"|"best_effort"}`. Strict mode preflights every section before any commit; each file replacement is atomic, but the commit sequence is not a multi-file transaction. `best_effort` writes the clean plans and reports the rest.
 
 ### bread / bwrite / bedit
 
@@ -222,7 +222,7 @@ Receipt: `{"files":[{"path","hunks","added","removed"}],"mode":"atomic"|"best_ef
 - `bwrite`: `path`, `data`, `encoding` (`base64` / `hex`); creates or replaces.
 - `bedit`: `path`, `edits:[{offset, length?, data, encoding}], sha256?`; `length` defaults to the decoded size; `0` inserts; empty `data` with positive `length` deletes.
 
-`bedit` rules: offsets are relative to the original file — sort ascending and track the applied delta; overlap is an error; `offset > len` is an error; ≤32 ranges; result ≤ `MAX_PATCH_FILE_BYTES`; all-or-nothing; optional `sha256` precondition (lowercase hex of the current content) checked before writing.
+`bedit` rules: offsets are relative to the original file — sort ascending and track the applied delta; overlap is an error; `offset > len` is an error; ≤32 ranges; result ≤ `min(max_write_bytes, MAX_PATCH_FILE_BYTES)`; all-or-nothing; optional `sha256` precondition (lowercase hex of the current content) checked before writing.
 
 Failure texts:
 
@@ -286,7 +286,7 @@ Never added: `walkdir`, `ignore::Walk`/`WalkParallel`, `grep-*` searcher crates.
 
 - `grep.output_mode` defaults to `content`.
 - `read.limit` defaults to 4096 lines.
-- `ls.depth` defaults to 4 when the pattern implies recursion, else 1.
+- `ls.depth` defaults to 4 for a `/` pattern and is unbounded for `**` (DL-100), else 1.
 - `numbered` is an option on `read` and `grep`, default true, one tab separator.
 - `gitignore` and `skip_hidden` are opt-in.
 - `patch` uses the Codex grammar; delete/move are rejected in v1.
@@ -307,9 +307,9 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 - Files above 1 MiB and files that are not valid UTF-8 are skipped silently rather than reported; text tools stay UTF-8-only.
 - The `--` group separator is only emitted when `before`/`after` requested context, because without context there is no gap to mark. Context windows are per file.
 - A file that exceeds the 50-match cap sets `truncated`; there is no per-file marker line.
-- `count.total` is the sum of the returned per-file counts (the current page), not the whole tree.
+- `count.page_total` is the sum of the returned per-file counts (the current page), not the whole tree.
 - `.gitignore` handling builds one matcher per directory (loaded through the descriptor-rooted reader, never by ambient path), evaluates deepest-first, and lets a whitelist stop the search — git's precedence. A file over 64 KiB or 1024 lines is truncated rather than fatal; an invalid pattern fails the whole call.
-- `grep` output is capped at `max_output_bytes` with a trailing `… truncated at N bytes` marker, in addition to the hit-limit marker.
+- `grep` output is capped at `max_output_bytes` with a trailing marker naming the real stop reason (`hits`, `bytes`, or candidate files), and the `files`/`count` JSON is measured after every field is added.
 - `edit` numbering in failure text is the 1-based position of the entry in the whole `edits` array; the parenthesised name is the resolved file displayed relative to the launch directory.
 - The ambiguity message lists at most 10 matching line numbers, then stops, so a pathological `old_text` cannot produce an unbounded error string.
 - Empty `old_text`, too many edits, too many files and combined-size overruns are attributed to the entry position as `edit i/n (path): …` or `edit i/n: …` when the file is not yet known.
@@ -324,11 +324,11 @@ Details this design leaves implicit, resolved the smaller way that keeps the inv
 - `best_effort` returns the receipt with an extra `failures: [{path, error}]` array when anything failed; `mode` says which contract applied. Atomic mode returns the first failure as a tool error with nothing written.
 - `Add File` content is the concatenation of `+` lines plus one trailing newline; an empty section creates an empty file.
 - `bedit` reports the offending range by its position in the request array, even after sorting by offset; the overlap message names the preceding range by its request position and its own offset/length.
-- `bedit` also accepts a whole-file bound (`MAX_PATCH_FILE_BYTES`) for the source and the result; the source bound keeps the read in memory bounded.
+- `bedit` also accepts a whole-file bound (`min(max_write_bytes, MAX_PATCH_FILE_BYTES)`) for the source and the result; the source bound keeps the read in memory bounded.
 - `sha256` comparison is case-insensitive, and the mismatch message prints the expected and found digests.
 - `bedit` decodes every range before checking overlap, so an invalid payload is reported before any overlap or size decision.
 - `patch` receipts list only the files actually written; `best_effort` also drops a file whose snapshot moved on (reported as `… changed while patching; skipped`) and reports per-file write failures instead of aborting.
-- `Add File` is create-only twice over: a planning-time existence check (so atomic mode fails before any write) and an exclusive create (`O_EXCL` beneath the pinned root) at write time, so a file that appears in between cannot be clobbered.
+- `Add File` is create-only twice over: a planning-time existence check (so strict mode fails before any write) and a staged create-only link at commit, so a file that appears in between cannot be clobbered.
 - `patch` and `edit` skip the write when the planned text is byte-identical, so a no-op never churns mtime.
 
 ## Review pass (post-landing)
@@ -338,7 +338,7 @@ Findings from a fresh read of the landed code, fixed in the follow-up commit, pl
 Fixed:
 
 - `edit.line_delta` underflowed (`wrapping_sub`) and reported ~1.8e19 for a shrinking file; it is signed now.
-- `read` with `limit: 0` rendered `… truncated at line 0 of N`; the window is clamped to one line.
+- `read` with `limit: 0` rendered `… truncated at line 0`; the window is clamped to one line.
 - `bedit` bounded each decoded payload at `MAX_PATCH_FILE_BYTES` but not their sum, so 32 ranges could pin ~2 GiB while validating; the running total is now bounded by the same ceiling.
 - `load_gitignore` opened `<dir>/.gitignore` without re-checking deny/protected policy, so a deny rule on the ignore file itself did not win; the walk's policy filter now applies to that open too.
 - `patch.best_effort` still hard-failed on a snapshot conflict or a write error, contradicting the mode; conflicts are skipped and reported, write errors are collected per file.
@@ -379,4 +379,4 @@ Accepted trade-offs (not bugs):
 - `../aw/crates/aw-tools/src/lib.rs` — exact-match `read`/`write`/`edit`, always-numbered reads.
 - Codex 0.162.1 binary strings — `apply_patch_tool_type: "freeform"`, `update_plan`, `view_image`.
 - Claude Code 2.1.300 binary strings — `Edit`/`MultiEdit` `old_string`/`new_string`/`replace_all`, `Grep` `output_mode`, `Read` `cat -n`.
-- `src/mcp.rs`, `src/transports/openai.rs` — current implementation surface.
+- `src/mcp/tools/`, `src/transports/openai.rs` — current implementation surface (this plan's `src/mcp.rs` tool section now lives in `src/mcp/tools/`).

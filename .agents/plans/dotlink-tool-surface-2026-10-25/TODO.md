@@ -61,7 +61,7 @@ Landed commits: `4d07303` (0 v1 set), `ffed785` (1 deps/glob), `751e42e` (2 rena
 - [x] `edits[]` ranges against the original file, ascending with delta tracking, overlap and bounds rejection
 - [x] Optional `sha256` precondition; receipt with before/after sizes
 
-### Commit 8 — docs and closeout — this commit
+### Commit 8 — docs and closeout — `9c4a65e`
 
 - [x] `CHANGELOG.md` under Unreleased (Added/Changed/Fixed)
 - [x] Tool tables in `README.md`, `docs/ARCHITECTURE.md`, `docs/CHATGPT_PLUGIN.md`
@@ -70,21 +70,24 @@ Landed commits: `4d07303` (0 v1 set), `ffed785` (1 deps/glob), `751e42e` (2 rena
 ## Tests and verification
 
 Landed with the commits above; the stdio probe lives in `tests/stdio_tools.rs`.
+Tests moved with their modules into `src/mcp/tools/*` and are ticked below with
+the commit that carries them; the post-landing review sweep is tracked in
+`../dotlink-tool-review-2026-10-26/` and re-verified the same surface.
 
-- [ ] Glob grammar: `*`, `?`, classes, alternation, `**`, no separator crossing
-- [ ] `ls`: depth 1 vs pattern-implied 4 vs explicit, `kind`, `sort=mtime`, limit/truncation, deny filtering
-- [ ] `read`: numbering, `numbered: false`, offset/limit, truncation marker
-- [ ] `grep`: three output modes, before/after, `offset`, `limit`, `literal`, `ignore_case`, `glob`, gitignore and hidden opt-ins, per-file cap
-- [ ] `edit`: ordering, uniqueness, substring guard, prefix hint, rollback on failure, per-entry `replace_all`, path inheritance
-- [ ] `patch`: parse, apply, add-file, ambiguity failure, delete/move rejection, atomic rollback, `best_effort`
-- [ ] `bedit`: multi-range math, overlap rejection, `sha256` mismatch, bounds
-- [ ] Rename sweep: no `read_binary`/`write_binary`/`patch_binary` left in source, live docs, or tests
-- [ ] stdio `tools/list` probe plus one `tools/call` smoke per new tool
-- [ ] Tunnel `EmbeddedMcp` dispatch for `grep`, `edit`, `patch`, `bedit`
-- [ ] `cargo fmt --check`
-- [ ] `cargo test --locked --all-features`
-- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings`
-- [ ] `git diff --check`
-- [ ] `markdownlint-cli2`
-- [ ] `DOTLINK_TEST_BWRAP=1 cargo test --locked --all-features`
-- [ ] `nix flake check`
+- [x] Glob grammar: `*`, `?`, classes, alternation, `**`, no separator crossing — `ffed785`
+- [x] `ls`: depth 1 vs pattern-implied 4 vs explicit, `kind`, `sort=mtime`, limit/truncation, deny filtering — `716ab2b`
+- [x] `read`: numbering, `numbered: false`, offset/limit, truncation marker — `716ab2b`
+- [x] `grep`: three output modes, before/after, `offset`, `limit`, `literal`, `ignore_case`, `glob`, gitignore and hidden opt-ins, per-file cap — `15dab52`
+- [x] `edit`: ordering, uniqueness, substring guard, prefix hint, rollback on failure, per-entry `replace_all`, path inheritance — `7a68e72`
+- [x] `patch`: parse, apply, add-file, ambiguity failure, delete/move rejection, atomic rollback, `best_effort` — `fd2f3b3`
+- [x] `bedit`: multi-range math, overlap rejection, `sha256` mismatch, bounds — `2f79f22`
+- [x] Rename sweep: no `read_binary`/`write_binary`/`patch_binary` left in source, live docs, or tests — `751e42e`
+- [x] stdio `tools/list` probe plus one `tools/call` smoke per new tool — `9c4a65e`
+- [x] Tunnel `EmbeddedMcp` dispatch for `grep`, `edit`, `patch`, `bedit` — `9c4a65e`
+- [x] `cargo fmt --check` — `9c4a65e`
+- [x] `cargo test --locked --all-features` — `9c4a65e`
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings` — `9c4a65e`
+- [x] `git diff --check` — `9c4a65e`
+- [x] `markdownlint-cli2` — `9c4a65e`
+- [x] `DOTLINK_TEST_BWRAP=1 cargo test --locked --all-features` — `9c4a65e`
+- [x] `nix flake check` — `9c4a65e`

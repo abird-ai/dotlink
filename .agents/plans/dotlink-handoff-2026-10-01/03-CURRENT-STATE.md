@@ -66,10 +66,14 @@ src/setup.rs
 src/mcp.rs
   LocalMachine
   AccessPolicy
-  MCP tool router
-  text/binary tools
-  shell execution
-  Bubblewrap composition
+  MCP tool router + TOOL_SPECS capability table
+  pinned descriptors (write_atomic, open_child_*)
+
+src/mcp/tools/{ls,grep,text,edit,patch,binary,shell}.rs
+  one family per module, each with its own #[tool_router]
+  tool names and behaviour: see ./dotlink-tool-surface-2026-10-25 and
+  ./dotlink-tool-review-2026-10-26; the tool surface section later in this
+  document is a dated 2026-10-01 snapshot
   cache mounts
   filesystem operation gate
 

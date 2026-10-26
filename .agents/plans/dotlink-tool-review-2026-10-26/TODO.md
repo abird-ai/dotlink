@@ -4,9 +4,9 @@ Base: `fc53fc9`
 
 Design and decisions: [README.md](README.md).
 
-## Uncommitted
+## Landed
 
-Implemented and green; grouped under its landing commit when it lands.
+Landed in signed commits `716ad06` (core), `5a3c0b8` (transport), `8afe8d0` (final core reconciliation), `8a95d4d` (integration tests), and `dc7f59b` (user docs).
 
 - [x] `patch`: one claimed-path set per call; a path named by two sections is
   refused while planning, before any write, in both modes
@@ -111,6 +111,64 @@ Implemented and green; grouped under its landing commit when it lands.
   collected results, not traversal; `Verified` is update-only; atomic-replace
   trade-offs documented
 
+### Fifth review pass
+
+- [x] Staging: temporary created at the target's mode (never broader), shared by
+  the Linux and non-Linux backends in `src/staging.rs`; regression test observes
+  the temporary during an 8 MiB replacement of a `0600` file
+- [x] `grep content`: marker space reserved before a hit is accepted; whole-hit
+  pages; `cap_text` removed; per-file-cap marker names the cause; out-of-range
+  offset reports itself
+- [x] Limits: `MIN_BYTE_LIMIT`/`MIN_SHELL_TIMEOUT_SECS` validated in `setup` and
+  rejected (not widened) at runtime; test asserts the error names the value and
+  that an accepted value is used exactly
+- [x] Reply trimming: binary-search prefix; render-count test plus a pathological
+  case (211 s -> ~140 ms)
+- [x] Walk: descriptor-rooted enumeration fails closed without procfs; staging
+  temporaries hidden from `ls`/`grep`
+- [x] `read`: reply fits `max_read_bytes` by dropping whole lines, never cutting
+  one
+- [x] `ls`: default depth derived from the pattern's path segments
+- [x] `patch`: `*** End of File` enforced, hunk-after-marker refused
+- [x] Shell: deny-write roots (file or directory) rebound read-only by the
+  dedicated pass; checked deadline; shell predicate derived from `TOOL_SPECS`
+- [x] `bedit`: request position breaks same-offset/same-span ties
+- [x] Router cached once per machine; `edit`/`patch`/`bedit` descriptions
+  advertise their limits with drift tests
+- [x] Docs: SECURITY (logging decision, staging mode, hard ceilings, procfs),
+  ARCHITECTURE (staging module, trimming rule, whole-hit pages, `ls` depth),
+  README, configuration, CHANGELOG
+
+### Sixth review pass
+
+- [x] Cross-process mutations: advisory directory lock held from snapshot through
+  commit, shared within the process, sorted acquisition, 30 s bounded wait;
+  eight-process regression test asserts every acknowledged insert survives
+- [x] `read` builds its page in one buffer (no per-line `Vec`) and skips
+  preceding lines by scanning, so a skipped oversized line cannot block a later
+  window; only returned lines are decoded
+- [x] Streamable-HTTP body ceiling derived from `max_write_bytes` in one shared
+  config for the HTTP server and the tunnel; drift test pins the derivation
+- [x] Non-Linux staging test compiles on Windows (Unix assertions gated)
+- [x] Windows ACL inheritance documented with mitigation; open Windows
+  validation item recorded rather than adding unverifiable Win32 code
+- [x] Docs: SECURITY (coordination scope, advisory/wait semantics, Windows ACL
+  caveat, transport ceiling, read skip), ARCHITECTURE (lock layers, shared
+  config, read buffer), configuration, README, CHANGELOG
+
+### Seventh review pass
+
+- [x] Lock mode is decided by the locked directory, not the call's path list;
+  regression test fails with the old logic
+- [x] Record capability cached per lock root, fail closed if it regresses;
+  fast path covered by tests through an injectable root
+- [x] Timeout names the blocked path
+- [x] Non-Linux commit re-check streams the target instead of buffering it
+- [x] Fast path validated end-to-end across processes on a `1777` lock root
+  (8/8 inserts on one file, sibling files independent)
+- [x] Docs: fast-path precondition, per-directory mode, and the separate-lock-root
+  topology that loses coordination
+
 ## Tests and verification
 
 - [x] `patch`: duplicate section (Add+Add, Add+Update) refused with nothing
@@ -148,3 +206,14 @@ extra hits; every mode stops at `max_output_bytes`
 - [x] `nix flake check` — build, clippy, fmt, alejandra, markdownlint, tests
 - [x] Release integration: `src/mcp/tools/` and the plan record are staged so
   Nix's Git source snapshot includes them; plain `nix flake check` passes
+- [x] Fifth pass: staging mode never broader than the target (fails without the
+  fix); whole-hit byte-limited pages; per-file-cap marker; out-of-range offset;
+  staging temporaries hidden; deep `ls` pattern; `*** End of File` enforced and
+  contradicted; same-span `bedit` ties; limit rejection naming the value; shell
+  predicate vs `TOOL_SPECS`; JSON trim render count
+- [x] Sixth pass: eight-process mutation test (fails without the directory
+  lock), read page buffer and skipped-line cases, transport ceiling derivation,
+  Windows-safe staging test
+- [x] `cargo fmt --check`, `cargo test --locked --all-features` (316 + 3),
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+  `git diff --check`, `markdownlint-cli2`

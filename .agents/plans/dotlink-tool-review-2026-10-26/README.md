@@ -6,7 +6,7 @@ Co-authors: pi agent
 
 Owner: @pvl
 
-Status: implemented, pending commit.
+Status: implemented and committed; native checks green, cross-platform validation outstanding.
 
 ## Why
 
@@ -104,6 +104,66 @@ covered.
 | Tunnel | MCP response body was fully collected before the 16 MiB check | Frame-by-frame collection rejects an oversized body while streaming |
 | `grep` | A 50-hit batch larger than the remaining byte budget produced an empty page | The page shrinks to the largest contiguous hit prefix that fits the budget |
 
+## Fifth review pass
+
+An independent review of the same tree reproduced the earlier scenarios and
+found four defects plus three contract gaps; all are fixed and covered.
+
+| Area | Finding | Resolution |
+| --- | --- | --- |
+| Staging | The temporary was created `0666` (umask) and narrowed to the target's mode only after the payload was written, so replacing a `0600` file left a `0644` sibling holding the new content for the whole write. Reproduced with an 8 MiB payload (scanner observed `0644` from 49 KiB to the full size, target `0600` afterwards). A regression of the atomic-write work. | `src/staging.rs` owns the mode policy: the temporary is created at `existing_mode` (or `0666` for a create), so it is never broader than the target. Both backends and the regression test are covered. |
+| `grep` | The byte-limited page appended its marker after budgeting and then trimmed the content, cutting an accepted hit line and gluing the marker into it; the page reported more hits than it returned whole. | The content budget reserves the longest marker before a hit is accepted, and `cap_text` is gone: a page now ends with whole hit lines, and a test asserts every returned line is complete. |
+| Limits | `LocalMachine::new` raised `max_output_bytes`/`max_read_bytes`/`max_write_bytes` to 1024, so `max_write_bytes: 32` still wrote 500 bytes. | `MIN_BYTE_LIMIT`/`MIN_SHELL_TIMEOUT_SECS` are validated in `setup` with the value the user wrote, and the runtime rejects rather than widens. |
+| Reply trimming | `trim_to_ceiling` re-serialized the whole array per dropped entry: 16 000 escaped names at a 1 MiB ceiling took 211 s. | One binary search over the kept prefix: identical result in ~140 ms; a render-count test pins the complexity. |
+| Walk | `/proc/self/fd` unavailability fell back to a pathname `read_dir`, silently weakening the pinned-directory guarantee. | Enumeration fails closed with an explicit procfs error. |
+| `read` | The marker was appended after budgeting, so the reply exceeded `max_read_bytes` by its length. | Whole lines are dropped to make room for the marker; the reply, marker included, fits. |
+| `ls` | A non-`**` pattern implied a fixed depth of 4, so a deeper pattern returned an empty listing with `truncated: false`. | Depth derives from the pattern's path-segment count. |
+| Shell | A `deny-write` naming a file was passed to the directory-mount path, making every sandboxed shell call fail (`ENOTDIR`). Also `Instant + Duration` was unchecked. | Deny-write roots are enforced by the ro-bind pass only (files included); the deadline uses `checked_add`. |
+| Composability | Tool names were repeated in `with_profile_limits` and the tunnel's `SHELL_TOOLS`; the router was rebuilt per call; the two staging backends were written twice. | `is_shell_tool` derives from `TOOL_SPECS`, the router is cached once per machine, and the staging policy is single-sourced. `edit`/`patch`/`bedit` descriptions advertise their limits, with drift tests. |
+
+## Sixth review pass
+
+A cross-platform review found that the mutation lock only coordinated threads of
+one process. All six findings are resolved or explicitly scoped.
+
+| Area | Finding | Resolution |
+| --- | --- | --- |
+| Concurrency | Per-path locks were process-local. Eight independent servers editing one file either lost seven acknowledged inserts or failed with a digest mismatch; the pre-commit re-hash also left a check→rename window. | The guard now also takes an exclusive advisory `flock` on each target's directory for snapshot → commit. The directory is the identity because the commit rename replaces the inode; locks are shared by concurrent calls in one process through a weak device/inode registry, taken in sorted order, released by the descriptor on exit, and bounded by a 30 s wait with an explicit error. `tests/stdio_tools.rs` runs eight servers against one file and asserts every acknowledged insert survives (fails without the lock). |
+| `read` memory | The page retained a `Vec` per returned line: 1 MiB of empty lines cost ~55 MiB resident. | One output buffer with whole lines; making room for the marker truncates at a line start. Measured peak RSS growth is now 1.5–3.4 MiB for 100 KiB–1 MiB inputs, independent of input size (was 6.2/28.1/55.3 MiB). |
+| `read` skip | `offset` skipping buffered each skipped line, so a line larger than the ceiling failed the call before the requested window. | Skipping scans for newlines in constant memory and never decodes what it skips; only returned lines are decoded and length-checked. |
+| Transports | rmcp's fixed 4 MiB request body refused over HTTP a write the tool accepted over stdio. | `transports::streamable_config` builds both HTTP entry points and derives the ceiling from `max_write_bytes` (6× worst-case JSON escaping + 64 KiB framing). Verified live: a 5 MiB and an 8 MiB write now succeed over HTTP; 9 MiB is refused by the tool, not the transport. |
+| Windows build | The non-Linux staging test module imported `std::os::unix` unconditionally. | Unix permission assertions are `#[cfg(unix)]`-gated and the body is platform-neutral. Compiled by inspection only: no Windows toolchain is available here. |
+| Windows ACLs | Replacing a file inherits the parent directory's ACL instead of the target's. | Documented in `SECURITY.md` and beside the backend, with the mitigation (scope the restrictive ACL to the directory). Not coded: `ReplaceFileW` would need Win32 security APIs that cannot be compiled or tested in this environment, and the Windows backend is unit-tested only. Open item for a Windows validation pass. |
+
+Not reproducible here: `nix flake check` (package build passes), NixOS module
+evaluation, live ngrok/OpenAI connectivity, Windows/macOS runtime behaviour.
+
+## Seventh review pass
+
+Review of the extracted `src/mutation.rs` coordinator and the Windows staging
+backend.
+
+| Area | Finding | Resolution |
+| --- | --- | --- |
+| Lock mode | SH/EX was chosen from the call's whole path list, so a call spanning a shared and a private directory took EX on both, and a concurrent call in the private directory alone (SH) waited on it for the 30 s timeout. Reproduced in the fast path. | The mode now comes from the directory actually locked (its owner and mode), so every caller of one inode agrees. Regression test enables the fast path on a temporary sticky root and fails with the old logic. |
+| Capability probe | `PathRecords::open()` ran per call, so a transient failure produced SH and EX locks on one inode from two calls. | Probed once per lock root and cached (first answer wins); a later failure fails closed instead of degrading to a directory SH lock alone. |
+| Testability | The Linux fast path was unreachable on this host (`/run/lock` is `0755`), so nothing exercised SH locks plus records. | The lock root is a parameter (`lock_with`); tests cover the fast path, sibling independence, and the per-directory mode. End-to-end: 8 processes on a `1777` bind-mounted root keep every acknowledged insert, and sibling files stay independent. |
+| Timeout text | The 30 s bail named `paths[0]` even when another path's record was blocked. | Names the blocked path. |
+| Docs | The fast path's precondition and its failure mode across lock roots were under-specified. | `SECURITY.md` names the container topology (separate `/run`, bind-mounted checkout) where per-UID record files cannot see each other, and requires a shared lock root or a non-shared workspace. |
+| Non-Linux staging | The commit re-check read the whole target into memory to hash it. | Streamed with a 64 KiB buffer, matching the Linux backend. |
+
+Verified but documented, not changed: a container pair with separate `/run/lock`
+and a shared workspace loses coordination (measured 5/8 acknowledged inserts
+surviving, the rest refused by the snapshot re-hash). The Windows DACL path
+(`GetFileSecurityW` → `SetFileSecurityW` on the empty temporary → `ReplaceFileW`)
+was reviewed against the vendored `windows-sys` signatures and enabled features;
+it cannot be compiled or run here.
+
+Deliberate, documented behaviour: TOOL logging prints a shell command as a
+≤120-character excerpt (or `command_bytes`), because the command is the audited
+operation. Payload arguments stay byte counts. `docs/SECURITY.md` states the
+exception and its journal consequence.
+
 Left as documented trade-offs, not defects: `ls`/`grep` collect up to
 `MAX_LIST_ENTRIES`/`MAX_GREP_FILES` matches before sorting (a correct but
 arbitrary subset on a huge tree, and the bound applies to collected results, not
@@ -195,6 +255,8 @@ loudly.
 
 ## Follow-ups (not this plan)
 
+- A Linux OFD-per-file fast-path experiment was removed in favor of simpler hierarchical directory locking; no /run/lock service or per-profile lock namespace remains.
+- Windows/macOS native runtime and the full cross-build still require separate host validation.
 - `grep`'s candidate list and `ls`'s entry list still stop at their `MAX_*`
   bound before sorting, so a very large tree returns a correct-but-partial
   prefix. A bounded top-N selection would fix that at the cost of walking the
@@ -207,5 +269,5 @@ loudly.
 - `.agents/plans/dotlink-tool-surface-2026-10-25/` — the surface this reviews.
 - `.agents/plans/dotlink-tunnel-tuning-2026-10-25/` — tunnel tuning.
 - `src/secure_fs.rs` — `stage`, `stage_update`, `stage_create`, `StagedWrite::commit`, `open_child_read`, `open_child_dir`.
-- `src/mcp.rs` — `lock_mutations` sharded per-resolved-path mutation guard.
+- `src/mutation.rs` — hierarchical directory intention/exclusive locks, with process-local shards.
 - `src/mcp/tools/mod.rs` — walk, glob, markers, `Snapshot`/`Verified`.
