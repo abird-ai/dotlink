@@ -570,7 +570,9 @@ fn load_profile_for_edit(profile: Option<&str>) -> Result<Option<AppConfig>> {
     let Some(mut config) = read_profile_config_migrated(profile)? else {
         return Ok(None);
     };
-    config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
+    // Management remains usable when the selected Runtime key is missing.
+    // The editor can prompt for a replacement; actual execution stays strict.
+    config.runtime_api_key = read_selected_runtime_key(profile, false)?.unwrap_or_default();
     Ok(Some(config))
 }
 
@@ -2036,7 +2038,9 @@ fn save_config_locked(
     owner_changed: bool,
 ) -> Result<()> {
     let previous = read_profile_config(profile)?;
-    let existing_key = try_read_saved_runtime_key(profile)?;
+    // Permit repair of a missing selected key while preserving the atomic
+    // commit point for the new immutable credential generation.
+    let existing_key = read_selected_runtime_key(profile, false)?;
     let desired_key = config.runtime_api_key.trim();
     let mut next = config.clone();
     next.runtime_key_revision = previous
@@ -2068,11 +2072,46 @@ fn save_config_locked(
         next.runtime_key_revision = Some(revision);
     }
     let bytes = serialize_jsonc(&next)?.into_bytes();
-    atomic_write_private(
-        &config_path(profile)?,
-        &bytes,
-        config_parent_is_dotlink_owned(),
-    )
+    let path = config_path(profile)?;
+    atomic_write_private(&path, &bytes, config_parent_is_dotlink_owned())?;
+
+    // Retire old material after a *credential selection change*, not an
+    // unrelated profile edit. A still-running process may be using the
+    // preceding selector until it is restarted. Never prune before the new
+    // profile's directory entry is durable; never fail after the commit.
+    let selected_runtime = previous
+        .as_ref()
+        .and_then(|config| config.runtime_key_revision.as_deref());
+    let selected_owner = previous
+        .as_ref()
+        .and_then(|config| config.owner_password_revision.as_deref());
+    let key_changed = next.runtime_key_revision.as_deref() != selected_runtime;
+    let owner_changed = next.owner_password_revision.as_deref() != selected_owner;
+    if key_changed || owner_changed {
+        match sync_parent_directory(&path) {
+            Ok(()) => {
+                if key_changed
+                    && let Err(error) =
+                        prune_runtime_key_generations(profile, &next, previous.as_ref())
+                {
+                    tracing::warn!(%error, "profile saved; stale Runtime key cleanup deferred");
+                }
+                if owner_changed
+                    && let Err(error) = oauth::prune_owner_password_generations(
+                        profile,
+                        next.owner_password_revision.as_deref(),
+                        selected_owner,
+                    )
+                {
+                    tracing::warn!(%error, "profile saved; stale OAuth owner hash cleanup deferred");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "profile saved but durability is unconfirmed; credential cleanup deferred");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_jsonc<T: DeserializeOwned>(text: &str) -> Result<T> {
@@ -2231,14 +2270,13 @@ fn profiled_path(base: &Path, profile: Option<&str>) -> Result<PathBuf> {
     Ok(parent.join(filename))
 }
 
-fn dotlink_config_dir() -> Result<PathBuf> {
+pub(crate) fn dotlink_config_dir() -> Result<PathBuf> {
     Ok(crate::xdg::config_home()?.join("abird/dotlink"))
 }
 
 fn ensure_dotlink_config_dir() -> Result<PathBuf> {
     let dir = dotlink_config_dir()?;
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    set_private_dir_permissions(&dir)?;
+    crate::private_state::prepare_owned_dir(&dir)?;
     Ok(dir)
 }
 
@@ -2372,12 +2410,14 @@ pub fn list_profiles() -> Result<Vec<String>> {
 pub fn show_profile(name: &str) -> Result<String> {
     let (target, config) = require_profile(name)?;
     let path = config_path(target)?;
-    let has_key = try_read_saved_runtime_key(target)?.is_some();
+    let has_key = read_selected_runtime_key(target, false)?.is_some();
     let mut output = String::new();
     output.push_str(&format!("// Profile: {name}\n"));
     output.push_str(&format!("// Config: {}\n", path.display()));
     if has_key {
         output.push_str("// Runtime API key: [existing key]\n");
+    } else if config.transports.openai {
+        output.push_str("// Runtime API key: [missing — run profile edit to replace]\n");
     }
     if oauth::owner_configured(target, config.owner_password_revision.as_deref())? {
         output.push_str("// OAuth owner credential: [existing credential]\n");
@@ -2436,10 +2476,14 @@ pub fn delete_profile(name: &str) -> Result<()> {
     let key = credential_path(target)?;
     let oauth_state = oauth::state_path(target)?;
 
-    if !config.exists() && !key.exists() && !oauth_state.exists() {
+    let _profile_lock = profile_lock(target)?;
+    // An interrupted deletion may have removed JSONC before its generated
+    // keys. The existence check must include every independently durable
+    // artifact so retry is sufficient to finish cleanup.
+    let generations = runtime_key_generation_paths(target)?;
+    if !config.exists() && !key.exists() && !oauth_state.exists() && generations.is_empty() {
         bail!("profile {name:?} does not exist");
     }
-    let _profile_lock = profile_lock(target)?;
     if config.exists() || key.exists() {
         delete_profile_artifacts(name, &config, &key)?;
     }
@@ -2623,14 +2667,14 @@ fn credential_revision_path(profile: Option<&str>, revision: &str) -> Result<Pat
     Ok(dir.join(format!("{prefix}.{revision}.key")))
 }
 
-/// Delete only generated keys for this named profile; never touch other
-/// profiles or unrelated files in the private credential directory.
-fn delete_runtime_key_generations(profile: Option<&str>) -> Result<()> {
+/// Enumerate only this profile's opaque generations, never adjacent names.
+fn runtime_key_generation_paths(profile: Option<&str>) -> Result<Vec<(String, PathBuf)>> {
     let dir = dotlink_config_dir()?;
     if !dir.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let prefix = profile.map_or_else(|| "runtime.".to_owned(), |name| format!("runtime.{name}."));
+    let mut result = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -2641,25 +2685,72 @@ fn delete_runtime_key_generations(profile: Option<&str>) -> Result<()> {
             && revision.len() == 32
             && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
-            fs::remove_file(entry.path())
-                .with_context(|| format!("cannot remove private runtime key {}", name))?;
+            result.push((revision.to_owned(), entry.path()));
+        }
+    }
+    Ok(result)
+}
+
+fn prune_runtime_key_paths(
+    generations: Vec<(String, PathBuf)>,
+    selected: Option<&str>,
+    previous: Option<&str>,
+) -> Result<()> {
+    for (revision, path) in generations {
+        if Some(revision.as_str()) == selected || Some(revision.as_str()) == previous {
+            continue;
+        }
+        fs::remove_file(&path)
+            .with_context(|| format!("cannot prune obsolete Runtime key {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn prune_runtime_key_generations(
+    profile: Option<&str>,
+    selected: &AppConfig,
+    previous: Option<&AppConfig>,
+) -> Result<()> {
+    let old = previous.and_then(|config| config.runtime_key_revision.as_deref());
+    let current = selected.runtime_key_revision.as_deref();
+    prune_runtime_key_paths(runtime_key_generation_paths(profile)?, current, old)?;
+    // Once neither the committed selector nor its immediate predecessor uses
+    // the unversioned key, the legacy plaintext credential is obsolete too.
+    if current.is_some() && old.is_some() {
+        match fs::remove_file(credential_path(profile)?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
 }
 
+fn delete_runtime_key_generations(profile: Option<&str>) -> Result<()> {
+    for (_, path) in runtime_key_generation_paths(profile)? {
+        fs::remove_file(&path)
+            .with_context(|| format!("cannot remove private runtime key {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn try_read_saved_runtime_key(profile: Option<&str>) -> Result<Option<String>> {
+    read_selected_runtime_key(profile, true)
+}
+
+fn read_selected_runtime_key(profile: Option<&str>, for_execution: bool) -> Result<Option<String>> {
     let config = read_profile_config(profile)?;
-    let requires_key = config
-        .as_ref()
-        .is_some_and(|config| config.transports.openai);
+    let required = for_execution
+        && config
+            .as_ref()
+            .is_some_and(|config| config.transports.openai);
     let path = match config.and_then(|config| config.runtime_key_revision) {
         Some(revision) => credential_revision_path(profile, &revision)?,
         None => credential_path(profile)?,
     };
-    // A disabled OpenAI transport does not need its saved credential to
-    // exist. Re-enabling it validates the selected generation strictly.
-    read_runtime_key_file(&path, requires_key && path != credential_path(profile)?)
+    // Only execution of an enabled OpenAI transport fails closed for a
+    // missing selected key. Management can inspect and repair it.
+    read_runtime_key_file(&path, required && path != credential_path(profile)?)
 }
 
 fn read_runtime_key_file(path: &Path, versioned: bool) -> Result<Option<String>> {
@@ -3399,6 +3490,24 @@ mod tests {
         validate_config_structure(&decoded).unwrap();
         config.runtime_key_revision = Some("../../escape".to_owned());
         assert!(validate_config_structure(&config).is_err());
+    }
+
+    #[test]
+    fn key_generation_cleanup_keeps_active_and_predecessor_but_removes_older_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = "00112233445566778899aabbccddeeff";
+        let previous = "11223344556677889900aabbccddeeff";
+        let retired = "fedcba9876543210fedcba9876543210";
+        let mut generations = Vec::new();
+        for name in [current, previous, retired] {
+            let path = temp.path().join(format!("runtime.{name}.key"));
+            fs::write(&path, "fixture\n").unwrap();
+            generations.push((name.to_owned(), path));
+        }
+        prune_runtime_key_paths(generations, Some(current), Some(previous)).unwrap();
+        assert!(temp.path().join(format!("runtime.{current}.key")).exists());
+        assert!(temp.path().join(format!("runtime.{previous}.key")).exists());
+        assert!(!temp.path().join(format!("runtime.{retired}.key")).exists());
     }
 
     #[test]

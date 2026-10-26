@@ -10,12 +10,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// All owned XDG control-plane directories are initialized through this
+/// private-mode boundary before a shell can mount a writable ancestor.
+pub(crate) fn prepare_owned_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
+    crate::setup::set_private_dir_permissions(path)
+}
+
 pub(crate) fn acquire(path: &Path, timeout: Duration) -> Result<File> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("lock path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    crate::setup::set_private_dir_permissions(parent)?;
+    prepare_owned_dir(parent)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)

@@ -195,7 +195,7 @@ struct RuntimeState {
     access_tokens: Mutex<HashMap<String, AccessGrant>>,
     authorization_codes: Mutex<HashMap<String, AuthorizationCode>>,
     pending: Mutex<HashMap<String, PendingAuthorization>>,
-    password_checks: Semaphore,
+    password_checks: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -338,7 +338,7 @@ impl Runtime {
                 access_tokens: Mutex::new(HashMap::new()),
                 authorization_codes: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
-                password_checks: Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS),
+                password_checks: Arc::new(Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS)),
             }),
         })
     }
@@ -392,13 +392,17 @@ impl Runtime {
                 .ok_or_else(|| anyhow!("OAuth owner password is not configured"))?
         };
 
-        let permit =
-            tokio::time::timeout(PASSWORD_CHECK_WAIT, self.inner.password_checks.acquire())
-                .await
-                .map_err(|_| anyhow!("OAuth password verifier is busy; retry shortly"))?
-                .map_err(|_| anyhow!("OAuth password verifier is unavailable"))?;
+        let permit = tokio::time::timeout(
+            PASSWORD_CHECK_WAIT,
+            self.inner.password_checks.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("OAuth password verifier is busy; retry shortly"))?
+        .map_err(|_| anyhow!("OAuth password verifier is unavailable"))?;
         let password = Zeroizing::new(password.as_bytes().to_vec());
-        let valid = tokio::task::spawn_blocking(move || -> Result<bool> {
+        // The OS worker, not this cancellable HTTP request, owns the permit.
+        // An aborted request cannot start more Argon2 computations than allowed.
+        let valid = crate::blocking::spawn_with_permit(permit, move || -> Result<bool> {
             let parsed = PasswordHash::new(&hash)
                 .map_err(|error| anyhow!("stored OAuth owner hash is invalid: {error}"))?;
             Ok(Argon2::default()
@@ -410,7 +414,6 @@ impl Runtime {
         if !valid {
             tokio::time::sleep(FAILED_PASSWORD_DELAY).await;
         }
-        drop(permit);
         Ok(valid)
     }
 
@@ -608,9 +611,11 @@ impl Runtime {
         let hash = token_hash(raw);
         let current = now();
         let rotated = self.update_persistent(|state| {
-            let Some(grant) = state.refresh_tokens.remove(&hash) else {
+            let Some(grant) = state.refresh_tokens.get(&hash) else {
                 return Ok(None);
             };
+            // A malformed or incorrectly bound request never consumes an
+            // otherwise-valid grant. Validation and rotation share this lock.
             if grant.expires_at <= current
                 || grant.client_id != client_id
                 || grant.issuer != issuer
@@ -618,12 +623,13 @@ impl Runtime {
             {
                 return Ok(None);
             }
-
+            let grant = grant.clone();
             let new_refresh = random_token()?;
             let new_grant = RefreshGrant {
                 expires_at: current + REFRESH_TOKEN_TTL_SECS,
                 ..grant.clone()
             };
+            state.refresh_tokens.remove(&hash);
             make_room_for_refresh_grant(state);
             state
                 .refresh_tokens
@@ -781,19 +787,6 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(crate::xdg::state_home()?.join("abird/dotlink"))
 }
 
-/// Reserve the privately owned OAuth state directory before an unrestricted
-/// writable Bubblewrap bind can create an unprotected placeholder for it.
-#[cfg(target_os = "linux")]
-fn prepare_private_state_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    set_private_dir_permissions(dir)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn ensure_private_state_dir() -> Result<()> {
-    prepare_private_state_dir(&state_dir()?)
-}
-
 pub fn state_path(profile: Option<&str>) -> Result<PathBuf> {
     let dir = state_dir()?;
     Ok(match profile {
@@ -901,6 +894,39 @@ impl OwnerPasswordChange {
         }
         Ok(())
     }
+}
+
+fn retain_owner_password_generations(
+    state: &mut PersistentState,
+    selected: Option<&str>,
+    previous: Option<&str>,
+) {
+    state.owner_password_generations.retain(|revision, _| {
+        Some(revision.as_str()) == selected || Some(revision.as_str()) == previous
+    });
+    if selected.is_some() && previous.is_some() {
+        state.owner_password_hash = None;
+    }
+}
+
+/// Retire superseded credential hashes only after the profile's selector
+/// rename is durable. At most the active and immediately prior generation
+/// remain; refresh grants and registered clients are untouched.
+pub(crate) fn prune_owner_password_generations(
+    profile: Option<&str>,
+    selected: Option<&str>,
+    previous: Option<&str>,
+) -> Result<()> {
+    let path = state_path(profile)?;
+    // Avoid allocating a new OAuth state file for profiles that never used it.
+    if !path.exists() {
+        return Ok(());
+    }
+    update_state(&path, |state| {
+        retain_owner_password_generations(state, selected, previous);
+        Ok(())
+    })?;
+    Ok(())
 }
 
 pub fn delete_profile_state(profile: Option<&str>) -> Result<()> {
@@ -1303,24 +1329,30 @@ fn exchange_authorization_code(server: &Server, form: TokenForm) -> Result<Value
     }
     validate_code_verifier(&verifier)?;
 
-    let record = server
-        .runtime
-        .inner
-        .authorization_codes
-        .lock()
-        .map_err(|_| anyhow!("OAuth authorization-code lock poisoned"))?
-        .remove(&token_hash(&code))
-        .ok_or_else(|| anyhow!("authorization code is invalid or already used"))?;
-
-    if record.expires_at <= now()
-        || record.client_id != client_id
-        || record.redirect_uri != redirect_uri
-        || record.issuer != server.issuer
-        || record.resource != server.resource
-        || pkce_challenge(&verifier) != record.code_challenge
-    {
-        bail!("authorization code validation failed");
-    }
+    let record = {
+        let mut codes = server
+            .runtime
+            .inner
+            .authorization_codes
+            .lock()
+            .map_err(|_| anyhow!("OAuth authorization-code lock poisoned"))?;
+        let key = token_hash(&code);
+        let record = codes
+            .get(&key)
+            .ok_or_else(|| anyhow!("authorization code is invalid or already used"))?;
+        if record.expires_at <= now()
+            || record.client_id != client_id
+            || record.redirect_uri != redirect_uri
+            || record.issuer != server.issuer
+            || record.resource != server.resource
+            || pkce_challenge(&verifier) != record.code_challenge
+        {
+            bail!("authorization code validation failed");
+        }
+        codes
+            .remove(&key)
+            .ok_or_else(|| anyhow!("authorization code is invalid or already used"))?
+    };
 
     let (access, refresh) = server.runtime.issue_access_and_refresh(
         &client_id,
@@ -2015,7 +2047,7 @@ mod tests {
                     access_tokens: Mutex::new(HashMap::new()),
                     authorization_codes: Mutex::new(HashMap::new()),
                     pending: Mutex::new(HashMap::new()),
-                    password_checks: Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS),
+                    password_checks: Arc::new(Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS)),
                 }),
             },
             Url::parse("https://example.com").unwrap(),
@@ -2147,17 +2179,63 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("nested/state");
-        prepare_private_state_dir(&dir).unwrap();
+        crate::private_state::prepare_owned_dir(&dir).unwrap();
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
         // Repeated preparation must not widen an existing directory.
-        prepare_private_state_dir(&dir).unwrap();
+        crate::private_state::prepare_owned_dir(&dir).unwrap();
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn retiring_owner_generations_preserves_selected_and_recent_predecessor() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("oauth.json");
+        let mut state = PersistentState {
+            owner_password_hash: Some("legacy-hash".into()),
+            ..PersistentState::default()
+        };
+        for (revision, hash) in [
+            ("00000000000000000000000000000001", "hash-one"),
+            ("00000000000000000000000000000002", "hash-two"),
+            ("00000000000000000000000000000003", "hash-three"),
+        ] {
+            state
+                .owner_password_generations
+                .insert(revision.into(), hash.into());
+        }
+        write_state(&path, &state).unwrap();
+        // Pure transaction logic: verify an independent file path without
+        // overriding global XDG state for unrelated concurrent tests.
+        let active = "00000000000000000000000000000003";
+        let previous = "00000000000000000000000000000002";
+        update_state(&path, |state| {
+            retain_owner_password_generations(state, Some(active), Some(previous));
+            Ok(())
+        })
+        .unwrap();
+        let stored = read_state(&path).unwrap();
+        assert_eq!(stored.owner_password_generations.len(), 2);
+        assert_eq!(
+            stored
+                .owner_password_generations
+                .get(active)
+                .map(String::as_str),
+            Some("hash-three")
+        );
+        assert_eq!(
+            stored
+                .owner_password_generations
+                .get(previous)
+                .map(String::as_str),
+            Some("hash-two")
+        );
+        assert!(stored.owner_password_hash.is_none());
     }
 
     #[test]
@@ -2342,7 +2420,7 @@ mod tests {
                 access_tokens: Mutex::new(HashMap::new()),
                 authorization_codes: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
-                password_checks: Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS),
+                password_checks: Arc::new(Semaphore::new(MAX_CONCURRENT_PASSWORD_CHECKS)),
             }),
         };
         (runtime, temp)
@@ -2464,6 +2542,50 @@ mod tests {
                 .unwrap()
                 .refresh_tokens
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn wrong_refresh_client_or_resource_cannot_consume_valid_grant() {
+        let (runtime, _temp) = test_runtime("long-enough-owner-password");
+        let client = "https://client.example/oauth.json";
+        let issuer = "https://mcp.example.com";
+        let resource = "https://mcp.example.com/mcp";
+        let (_, token) = runtime
+            .issue_access_and_refresh(client, issuer, resource, SCOPE_MCP, true)
+            .unwrap();
+        let token = token.unwrap();
+        let hash = token_hash(&token);
+
+        for (client_id, authority, target) in [
+            ("https://wrong.example/oauth.json", issuer, resource),
+            (client, "https://wrong.example", resource),
+            (client, issuer, "https://wrong.example/mcp"),
+        ] {
+            assert!(
+                runtime
+                    .rotate_refresh(&token, client_id, authority, target)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                read_state(&runtime.inner.state_path)
+                    .unwrap()
+                    .refresh_tokens
+                    .contains_key(&hash)
+            );
+        }
+        assert!(
+            runtime
+                .rotate_refresh(&token, client, issuer, resource)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !read_state(&runtime.inner.state_path)
+                .unwrap()
+                .refresh_tokens
+                .contains_key(&hash)
         );
     }
 
@@ -2620,6 +2742,34 @@ mod tests {
             Some("https://mcp.example.com")
         );
         let code = params.get("code").unwrap().clone();
+
+        // A wrong verifier/client binding must not invalidate the valid code.
+        assert!(
+            exchange_authorization_code(
+                &server,
+                TokenForm {
+                    grant_type: "authorization_code".to_owned(),
+                    code: Some(code.clone()),
+                    redirect_uri: Some(redirect_uri.clone()),
+                    client_id: Some(client.client_id.clone()),
+                    code_verifier: Some(
+                        "XabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abc"
+                            .to_owned()
+                    ),
+                    refresh_token: None,
+                    resource: Some(server.resource().to_owned()),
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            runtime
+                .inner
+                .authorization_codes
+                .lock()
+                .unwrap()
+                .contains_key(&token_hash(&code))
+        );
 
         let token_json = exchange_authorization_code(
             &server,

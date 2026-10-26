@@ -684,19 +684,24 @@ impl LocalMachine {
             );
         }
 
-        // Reserve dotlink's own OAuth state directory with private permissions
-        // before mounting a writable ancestor. A generic absent protected
-        // path instead fails closed; Bubblewrap may create its mount target
-        // on the host when the containing directory is a writable bind.
+        // Writable sandbox ancestors must not cause Bubblewrap to create
+        // unprotected host mount targets. Reserve only *our* XDG directories,
+        // with private permissions; other absent protected paths fail closed.
         #[cfg(target_os = "linux")]
         if args.allow_shell && args.sandbox_shell {
-            let state_dir = crate::oauth::state_dir()?;
-            let state_path = canonicalize_deny(&access.base_dir, &state_dir).await?;
-            if access.grant_write(&state_path)
-                && !access.denied_write(&state_path)
-                && protected_paths.contains(&state_path)
-            {
-                crate::oauth::ensure_private_state_dir()?;
+            for owned_dir in [
+                crate::setup::dotlink_config_dir()?,
+                crate::oauth::state_dir()?,
+            ] {
+                let resolved = canonicalize_deny(&access.base_dir, &owned_dir).await?;
+                if access.grant_write(&resolved)
+                    && !access.denied_write(&resolved)
+                    && protected_paths
+                        .iter()
+                        .any(|protected| resolved.starts_with(protected))
+                {
+                    crate::private_state::prepare_owned_dir(&owned_dir)?;
+                }
             }
         }
 
