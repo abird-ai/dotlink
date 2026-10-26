@@ -66,11 +66,11 @@ are pinned with file descriptors rather than reopened by pathname; CLOEXEC
 is cleared for those FDs only in the forked child, avoiding cross-request FD
 inheritance.
 
-On Linux, requests can execute in parallel by default; `--serialize` opts in
-to one-at-a-time MCP calls as a user scheduling preference, not a security
-control. On macOS and Windows the legacy global reader/writer gate remains
-until their native file operations are made equally race-resistant. Parallel
-shells retain the configured Bubblewrap restrictions (or the explicitly
+On Linux and macOS, pinned-descriptor native filesystem operations execute
+in parallel by default. The -s/--serialize option explicitly schedules calls
+one at a time; it is not an access-control boundary. Windows keeps an
+in-process gate and uses named kernel mutexes to coordinate mutations across
+processes. Parallel shells retain the configured Bubblewrap restrictions (or the explicitly
 unsandboxed host-user authority), and simultaneous writes to the same file
 are not protected from application-level lost updates. Existing write/edit
 targets must be regular files; special files are rejected.
@@ -397,7 +397,14 @@ For unrestricted filesystem access while keeping Linux sandboxing, use `--allow-
 
 ## Windows and macOS
 
-Rust filesystem tools still enforce allow/deny policy on Windows and macOS.
+Rust filesystem tools enforce allow/deny policy on Windows and macOS.
+On macOS the pinned-root Unix backend uses a component-wise openat/O_NOFOLLOW
+walk where Linux openat2 is unavailable. Windows pins ancestor directories
+against rename, refuses reparse points during file opens, and coordinates
+same-path writers across processes with a named Global kernel mutex. The
+acquiring thread releases the mutex when its guard drops; a process crash
+abandons it automatically. Failure to pin a directory or open the mutex fails
+closed. Native Windows/macOS behavior still requires target-host validation.
 
 Bubblewrap is Linux-only. Native Windows/macOS shell execution therefore requires `--allow-all --no-sandbox`.
 
@@ -427,11 +434,12 @@ Proxy environment settings are disabled for the metadata HTTP client, so DNS
 pinning cannot silently be bypassed by a proxy resolving the target itself.
 Only public resolved addresses are allowed, and redirects are disabled.
 
-OpenAI tunnel polls are collected with a 64 MiB streaming ceiling before JSON
-deserialization; command count is also checked against the requested poll
-limit. Embedded MCP responses and HTTP error bodies use the same bounded-body
-primitive. A batch exceeding its ceiling is rejected rather than buffered
-without limit.
+OpenAI tunnel polls use a streaming ceiling of at least 64 MiB, raised to
+fit the configured maximum single JSON request plus command-wrapper headroom.
+The explicit safety maximum is 256 MiB; oversized write configurations fail at
+tunnel startup and can use local HTTP/stdio instead. Poll command count remains
+bounded independently. The shared byte-ceiling primitive applies before
+deserialization rather than after buffering a response.
 
 ## Logging privacy
 

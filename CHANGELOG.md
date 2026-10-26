@@ -18,6 +18,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Consolidated the signed stale-index correction into the preceding transport commit, preserving the tree and removing the broken intermediate commit.
+- OpenAI tunnel poll bodies now fit a configured largest single write plus framing, subject to a 256 MiB safety limit and explicit oversized-profile startup errors.
+- macOS native files use pinned-root, component-wise openat/O_NOFOLLOW for authorization, writes and walks instead of unchecked pathname reopens.
+- Windows native files pin ancestor directory handles and refuse reparse points; named cross-process kernel mutexes coordinate same-path writers with crash-abandonment recovery.
+
 - Mutations take ordered intention locks on existing ancestor directories and an exclusive lock on their deepest existing parent. This fixes execute-only-directory lock bypasses without breaking automatic nested parent creation or cross-process concurrency in separate subdirectories.
 - The OpenAI tunnel's embedded MCP response ceiling is derived from `max_read_bytes`/`max_output_bytes`, including JSON escaping and framing, instead of silently rejecting valid reads over 16 MiB.
 - Non-Linux staging now owns each temporary from the moment of creation through async writes and sync. RAII cleanup runs on cancellation, and the platform-neutral path-backend tests run under Linux CI too.

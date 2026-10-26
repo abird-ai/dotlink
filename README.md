@@ -684,10 +684,12 @@ unless the user has explicitly authorized filesystem root `/`. It requires
 Linux `openat2` (kernel 5.6+); if unavailable, native tool startup fails
 closed rather than falling back to unsafe pathname I/O. Existing safe symlink
 aliases are canonicalized before the final descriptor-relative access.
-On macOS and Windows the previous conservative reader/writer gate remains in
-place until equivalent handle-based operations are available; `-s` serializes
-all tools on those platforms too. Concurrent writers can still overwrite each
-other's work: enabling serialization coordinates calls only within dotlink.
+On macOS, the pinned Unix directory model uses a component-wise
+openat/O_NOFOLLOW walk. On Windows, native tools pin directory handles and
+reject reparse points, while named cross-process mutexes coordinate writers
+to the same path across services and CLI instances. Windows also retains
+its in-process gate; -s opts into global serial execution. External applications
+do not participate in these advisory locks.
 
 ## FAQ
 

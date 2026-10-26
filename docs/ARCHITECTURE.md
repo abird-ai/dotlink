@@ -296,14 +296,17 @@ External writers and shells remain outside advisory coordination.
 The tunnel polls, OAuth metadata fetches, and local MCP responses all use the
 same streaming byte-ceiling primitive (`src/bounded.rs`) before deserialization;
 OAuth metadata requests additionally use per-process admission and no proxies.
+OpenAI tunnel poll bodies are bounded dynamically by the configured largest
+accepted single request plus framing (64 MiB minimum, 256 MiB maximum);
+profiles exceeding this safe capacity fail when starting the tunnel.
 
-Only the explicitly requested `-s/--serialize` runs all tool handlers through
-one exclusive gate. The non-Linux implementations retain the previous
-shared-read/exclusive-mutator gate by default while platform-specific
-descriptor-relative operations remain unimplemented. Serialization is not a
-security requirement on Linux and the per-path locks are not an OS-level
-transaction or cross-process coordinator; external writers are outside their
-scope.
+Only -s/--serialize runs all handlers through one exclusive gate. Linux
+uses openat2; macOS uses pinned-root, component-wise openat with O_NOFOLLOW.
+Both permit independent native requests to run concurrently. Windows retains
+its operation gate and uses named cross-process mutation mutexes with
+thread-affine release and automatic crash abandonment. Ancestor directory
+handles are pinned against rename and reparse points refused. External
+writers remain outside these advisory locks.
 
 Developer caches are modeled separately from filesystem grants. A cache record stores its tool family, host source path, and RO/RW mode. At runtime the source is canonicalized and mounted only into the shell sandbox, typically below `/tmp/home` at the tool's expected path. Cache mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical cache sources before mounting.
 
