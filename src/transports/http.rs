@@ -13,7 +13,7 @@ use ngrok::{
     prelude::EndpointInfo,
 };
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    StreamableHttpService, session::local::LocalSessionManager,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -262,12 +262,7 @@ fn mcp_router(
     oauth_server: Option<oauth::Server>,
     cancellation: CancellationToken,
 ) -> Router {
-    let server_config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
-        .with_json_response(true)
-        .with_sse_keep_alive(None)
-        .with_sse_retry(None)
-        .with_cancellation_token(cancellation);
+    let server_config = super::streamable_config(&machine, cancellation);
 
     let service: StreamableHttpService<LocalMachine, LocalSessionManager> =
         StreamableHttpService::new(

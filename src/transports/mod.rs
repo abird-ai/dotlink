@@ -1,6 +1,7 @@
 use std::{error::Error, fmt};
 
 use anyhow::{Context, Result, anyhow};
+use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 use tokio::{task::JoinSet, time};
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +36,23 @@ impl Error for RuntimeRestartRequested {}
 
 pub fn runtime_restart_request(error: &anyhow::Error) -> Option<&RuntimeRestartRequested> {
     error.downcast_ref::<RuntimeRestartRequested>()
+}
+
+/// The streamable-HTTP settings shared by both HTTP entry points (the local
+/// HTTP server and the in-process tunnel service). One place owns the request
+/// body ceiling, derived from the machine's write ceiling: rmcp's 4 MiB default
+/// would otherwise refuse writes the tools accept.
+pub(crate) fn streamable_config(
+    machine: &LocalMachine,
+    cancellation: CancellationToken,
+) -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_sse_retry(None)
+        .with_cancellation_token(cancellation)
+        .with_max_request_body_bytes(machine.max_request_body_bytes())
 }
 
 pub mod http;

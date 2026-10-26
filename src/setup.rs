@@ -716,9 +716,7 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
     let Ok(home) = home_dir() else {
         return Vec::new();
     };
-    let xdg_cache = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".cache"));
+    let xdg_cache = crate::xdg::cache_home().unwrap_or_else(|_| home.join(".cache"));
 
     let mut found = BTreeMap::new();
 
@@ -2168,11 +2166,7 @@ fn profiled_path(base: &Path, profile: Option<&str>) -> Result<PathBuf> {
 }
 
 fn dotlink_config_dir() -> Result<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        Ok(PathBuf::from(xdg).join("abird/dotlink"))
-    } else {
-        Ok(home_dir()?.join(".config/abird/dotlink"))
-    }
+    Ok(crate::xdg::config_home()?.join("abird/dotlink"))
 }
 
 fn ensure_dotlink_config_dir() -> Result<PathBuf> {
@@ -2711,12 +2705,27 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
         validate_tunnel_id(tunnel_id)?;
     }
     validate_control_plane_base_url(&config.base_url)?;
-    if config.max_shell_timeout_secs == 0
-        || config.max_output_bytes == 0
-        || config.max_read_bytes == 0
-        || config.max_write_bytes == 0
-    {
-        bail!("resource limits must all be greater than zero");
+    // A configured limit is a hard ceiling: reject a value the runtime cannot
+    // honour here, with the number the user wrote, rather than widening it at
+    // startup. Below the minimum the fixed reply framing and a truncation
+    // marker no longer fit.
+    if config.max_shell_timeout_secs < crate::mcp::MIN_SHELL_TIMEOUT_SECS {
+        bail!(
+            "max_shell_timeout_secs must be at least {} second",
+            crate::mcp::MIN_SHELL_TIMEOUT_SECS
+        );
+    }
+    for (name, value) in [
+        ("max_output_bytes", config.max_output_bytes),
+        ("max_read_bytes", config.max_read_bytes),
+        ("max_write_bytes", config.max_write_bytes),
+    ] {
+        if value < crate::mcp::MIN_BYTE_LIMIT {
+            bail!(
+                "{name} must be at least {} bytes, got {value}",
+                crate::mcp::MIN_BYTE_LIMIT
+            );
+        }
     }
 
     Ok(())

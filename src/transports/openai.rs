@@ -1299,7 +1299,7 @@ mod tests {
         let counted: Value =
             serde_json::from_str(grep_count["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(counted["total"], serde_json::json!(1));
+        assert_eq!(counted["page_total"], serde_json::json!(1));
 
         // Multi-file edit in one call, with the top-level default path unused
         // because every entry names its own file.
@@ -1340,7 +1340,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(patch_receipt["mode"], "atomic");
+        assert_eq!(patch_receipt["mode"], "strict");
         assert_eq!(
             fs::read_to_string(root.join("nested/test.txt")).unwrap(),
             "second! patched"

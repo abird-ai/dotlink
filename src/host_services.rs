@@ -78,11 +78,7 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn xdg_config(home: &Path) -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".config"))
+    crate::xdg::config_home().unwrap_or_else(|_| home.join(".config"))
 }
 
 fn file(path: PathBuf) -> Option<PathBuf> {

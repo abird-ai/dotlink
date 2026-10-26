@@ -7,11 +7,14 @@ mod hardware;
 mod host_services;
 mod logging;
 mod mcp;
+mod mutation;
 mod oauth;
 #[cfg(target_os = "linux")]
 mod secure_fs;
 mod setup;
+mod staging;
 mod transports;
+mod xdg;
 
 use std::{
     collections::BTreeMap,

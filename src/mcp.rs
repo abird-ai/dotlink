@@ -1,59 +1,36 @@
+//! The local machine: access policy, pinned descriptors, and the tool surface.
+//!
+//! Tool implementations live in [`tools`], one module per family. This module
+//! owns what they share: who may read or write what, the descriptor-rooted file
+//! primitives, the advertised-tool table and the MCP server handler.
+
+mod tools;
+
 use std::{
     collections::BTreeSet,
-    env,
     path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+    sync::{Arc, OnceLock},
 };
 
-use crate::logging::{LogConfig, truncate};
 use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use rmcp::{
     ErrorData as McpError,
-    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    handler::server::router::tool::ToolRouter,
+    handler::server::tool::ToolCallContext,
     model::{
-        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
-        ProtocolVersion, ResourceContents, ResultType, Tool,
+        CacheScope, CallToolRequestParams, CallToolResponse, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ResultType, Tool,
     },
-    schemars,
-    service::{Peer, RequestContext, RoleServer},
-    tool, tool_router,
+    service::{RequestContext, RoleServer},
+    tool_handler,
 };
-use serde::{Deserialize, Serialize};
+
 use serde_json::Value;
+use tokio::{fs, io::AsyncReadExt, sync::RwLock};
 
-use tokio::{
-    fs,
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    process::Command,
-    sync::RwLock,
-    time::{Instant, timeout_at},
-};
+use crate::logging::LogConfig;
 
-const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_READ_LINES: usize = 4 * 1024;
-const DEFAULT_MAX_LIST_ENTRIES: usize = 4 * 1024;
-const MAX_LIST_ENTRIES: usize = 16 * 1024;
-const MAX_GREP_HITS: usize = 200;
-const MAX_GREP_FILE_BYTES: usize = 1_048_576;
-const MAX_GREP_PATTERN: usize = 1024;
-const MAX_GREP_PER_FILE: usize = 50;
-const MAX_GREP_CONTEXT: usize = 8;
-const MAX_GREP_FILES: usize = 65_536;
-const MAX_EDIT_OPS: usize = 64;
-const MAX_EDIT_FILES: usize = 16;
-const MAX_PATCH_FILES: usize = 32;
-const MAX_PATCH_HUNKS: usize = 64;
-const MAX_BEDIT_RANGES: usize = 32;
-const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
-const GITIGNORE_MAX_LINES: usize = 1024;
+pub(crate) use tools::shell::{resolve_executable, with_profile_limits};
 
 #[derive(Clone, Debug)]
 pub struct AccessSpec {
@@ -126,8 +103,60 @@ pub struct LocalMachine {
     config: RuntimeConfig,
     operation_gate: Arc<RwLock<()>>,
     serialize: bool,
+    /// The advertised surface, built once. Visibility depends only on the
+    /// immutable access policy, so every request can share one router instead
+    /// of merging the per-family routers again.
+    router: OnceLock<Arc<ToolRouter<Self>>>,
     #[cfg(target_os = "linux")]
     secure_fs: Arc<crate::secure_fs::SecureFs>,
+}
+
+/// A write that is staged but not yet visible; see `LocalMachine::stage_write`.
+/// Both backends stage beside the target and install in one step; the shared
+/// mode and naming policy lives in [`crate::staging`].
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct PendingWrite(crate::secure_fs::StagedWrite);
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) struct PendingWrite(crate::staging::StagedWrite);
+
+/// Smallest accepted profile byte limit. Below this the fixed JSON reply framing
+/// and a truncation marker no longer fit, so a configured ceiling could not be
+/// honoured; the value is rejected rather than silently widened.
+pub const MIN_BYTE_LIMIT: usize = 1024;
+
+/// Smallest accepted shell timeout.
+pub const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
+
+/// Worst-case JSON escaping of one payload byte: a control byte becomes
+/// `\u00XX`. Payloads bounded by `max_write_bytes` therefore never need a body
+/// larger than this multiple of it.
+const MAX_JSON_ESCAPE: usize = 6;
+/// Room for what surrounds a payload: paths, patterns, edit anchors, framing.
+const MAX_REQUEST_FRAMING_BYTES: usize = 64 * 1024;
+
+/// A configured limit is a hard ceiling: reject a value the runtime cannot
+/// honour instead of quietly raising it.
+fn checked_limit<T: PartialOrd + std::fmt::Display>(name: &str, value: T, minimum: T) -> Result<T> {
+    if value < minimum {
+        bail!("{name} must be at least {minimum}, got {value}; raise it in the profile or CLI");
+    }
+    Ok(value)
+}
+
+/// True for the shell tool this platform advertises. Tool visibility, the
+/// schema-limit rewrite, the tunnel's delivery reserve and the TOOL log all ask
+/// this one question, so a new shell variant cannot be missed in one of them.
+pub fn is_shell_tool(name: &str) -> bool {
+    let shell = Capabilities {
+        shell: true,
+        ..Capabilities::default()
+    };
+    TOOL_SPECS
+        .iter()
+        .any(|spec| spec.name == name && shell.allows(spec.capability))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,334 +166,107 @@ enum AccessNeed {
     ReadWrite,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ListArgs {
-    /// Directory path. Relative paths resolve from the directory where dotlink was launched.
-    #[serde(default = "dot")]
-    path: String,
-
-    /// Glob over entry paths relative to `path`, and over the bare entry name.
-    /// `*`, `?`, `[...]`, `{a,b}` stay within one path segment; `**` recurses.
-    #[serde(default)]
-    pattern: Option<String>,
-
-    /// Directory levels to descend: 1, or 4 when `pattern` contains `/` or `**`.
-    /// An explicit value always wins. Symlinked directories are never traversed.
-    #[serde(default)]
-    depth: Option<usize>,
-
-    /// Entry kind filter.
-    #[serde(default)]
-    kind: ListKind,
-
-    /// Entry ordering. `mtime` is newest first; undated entries sort last.
-    #[serde(default)]
-    sort: ListSort,
-
-    /// Maximum number of entries to return. Defaults to 4096 and is capped at 16384.
-    #[serde(default)]
-    limit: Option<usize>,
+/// What a runtime may advertise. Named fields, not positional booleans, so a
+/// new capability cannot be passed in the wrong slot.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Capabilities {
+    pub read: bool,
+    pub write: bool,
+    pub read_write: bool,
+    pub shell: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum ListKind {
-    #[default]
-    Any,
-    File,
-    Dir,
+/// What one tool needs. `ShellUnix`/`ShellWindows` are the same grant with a
+/// platform-dependent tool name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Capability {
+    Read,
+    Write,
+    ReadWrite,
+    ShellUnix,
+    ShellWindows,
 }
 
-impl ListKind {
-    fn accepts(self, kind: &str) -> bool {
-        match self {
-            Self::Any => true,
-            Self::File => kind == "file",
-            Self::Dir => kind == "dir",
+/// One row per advertised tool: the single place that records a tool's
+/// capability and whether it may run concurrently. Visibility, the concurrency
+/// gate, `--list-tools` and log labels all read this table.
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub capability: Capability,
+    /// Pure reads that may overlap each other without an operation gate. Read
+    /// only on platforms that still serialize mutation.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub concurrent_read: bool,
+}
+
+pub const TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "ls",
+        capability: Capability::Read,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "grep",
+        capability: Capability::Read,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "read",
+        capability: Capability::Read,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "bread",
+        capability: Capability::Read,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "write",
+        capability: Capability::Write,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "bwrite",
+        capability: Capability::Write,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "edit",
+        capability: Capability::ReadWrite,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "patch",
+        capability: Capability::ReadWrite,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "bedit",
+        capability: Capability::ReadWrite,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "bash",
+        capability: Capability::ShellUnix,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "powershell",
+        capability: Capability::ShellWindows,
+        concurrent_read: false,
+    },
+];
+
+impl Capabilities {
+    pub fn allows(self, capability: Capability) -> bool {
+        match capability {
+            Capability::Read => self.read,
+            Capability::Write => self.write,
+            Capability::ReadWrite => self.read_write,
+            Capability::ShellUnix => self.shell && !cfg!(windows),
+            Capability::ShellWindows => self.shell && cfg!(windows),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum ListSort {
-    #[default]
-    Path,
-    Mtime,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ReadArgs {
-    /// UTF-8 text file path. Relative paths resolve from the directory where dotlink was launched.
-    path: String,
-
-    /// First 1-based line to return. Defaults to 1.
-    #[serde(default)]
-    offset: Option<usize>,
-
-    /// Maximum number of lines to return. Defaults to 4096, bounded by the profile read limit.
-    /// A capped result ends with one `… truncated at line N of M` marker.
-    #[serde(default)]
-    limit: Option<usize>,
-
-    /// Prefix each line with its 1-based line number and a tab. Defaults to true.
-    /// Set false to return the file text exactly.
-    #[serde(default)]
-    numbered: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum GrepOutputMode {
-    #[default]
-    Content,
-    Files,
-    Count,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct GrepArgs {
-    /// Regular expression, or literal text when `literal` is set. Maximum 1024 printable characters.
-    pattern: String,
-
-    /// Directory to search. Relative paths resolve from the directory where dotlink was launched.
-    #[serde(default = "dot")]
-    path: String,
-
-    /// Glob filter over entry paths and names. Same grammar as `ls`.
-    #[serde(default)]
-    glob: Option<String>,
-
-    /// Treat `pattern` as literal text instead of a regular expression.
-    #[serde(default)]
-    literal: bool,
-
-    /// Case-insensitive matching.
-    #[serde(default)]
-    ignore_case: bool,
-
-    /// `content` returns matching lines, `files` returns paths, `count` returns per-file counts.
-    #[serde(default)]
-    output_mode: GrepOutputMode,
-
-    /// Context lines before each hit. Maximum 8.
-    #[serde(default)]
-    before: Option<usize>,
-
-    /// Context lines after each hit. Maximum 8.
-    #[serde(default)]
-    after: Option<usize>,
-
-    /// Prefix content lines with `path:line:`. Defaults to true.
-    #[serde(default)]
-    numbered: Option<bool>,
-
-    /// Hits, or files, to skip before `limit`.
-    #[serde(default)]
-    offset: Option<usize>,
-
-    /// Maximum hits, or files. Defaults to 200 and is capped at 200.
-    #[serde(default)]
-    limit: Option<usize>,
-
-    /// Honour `.gitignore` files below `path`. Off by default.
-    #[serde(default)]
-    gitignore: bool,
-
-    /// Skip entries whose name starts with `.`. Off by default.
-    #[serde(default)]
-    skip_hidden: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct WriteArgs {
-    /// File path. Relative paths resolve from the directory where dotlink was launched.
-    path: String,
-
-    /// UTF-8 content. Missing parent directories are created automatically.
-    content: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct EditArgs {
-    /// Default file path for entries that omit their own. Relative paths resolve
-    /// from the directory where dotlink was launched.
-    #[serde(default)]
-    path: Option<String>,
-
-    /// Ordered edits. Entries for one file apply to that file's evolving buffer.
-    edits: Vec<EditOp>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct EditOp {
-    /// File path for this entry. Falls back to the top-level `path`.
-    #[serde(default)]
-    path: Option<String>,
-
-    /// Exact text to find. Never include the `N\t` prefix that `read` adds.
-    old_text: String,
-
-    /// Replacement text. May be empty.
-    new_text: String,
-
-    /// Replace every exact occurrence. Without this flag the match must be unique.
-    #[serde(default)]
-    replace_all: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct PatchArgs {
-    /// Base directory for the patch's relative paths. Relative paths resolve
-    /// from the directory where dotlink was launched.
-    #[serde(default = "dot")]
-    dir: String,
-
-    /// Codex patch text: `*** Begin Patch`, `*** Update File:` / `*** Add File:`
-    /// sections, then `*** End Patch`.
-    patch: String,
-
-    /// Write the files that planned cleanly and report the rest instead of
-    /// failing the whole call.
-    #[serde(default)]
-    best_effort: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum BreadFormat {
-    #[default]
-    Mcp,
-    Base64,
-    Hex,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum BinaryEncoding {
-    #[default]
-    Base64,
-    Hex,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct BreadArgs {
-    /// Binary file path.
-    path: String,
-
-    /// "mcp" returns typed MCP image/audio/blob content; base64/hex return encoded text.
-    #[serde(default)]
-    format: BreadFormat,
-
-    /// Byte offset for base64/hex reads. MCP format requires offset 0.
-    #[serde(default)]
-    offset: Option<u64>,
-
-    /// Maximum bytes to read. MCP format requires the complete file.
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct BwriteArgs {
-    /// File path.
-    path: String,
-
-    /// Encoded binary payload.
-    data: String,
-
-    /// Encoding of data.
-    #[serde(default)]
-    encoding: BinaryEncoding,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct BeditArgs {
-    /// Existing binary file path.
-    path: String,
-
-    /// Byte ranges, all relative to the original file. Applied ascending.
-    edits: Vec<BeditRange>,
-
-    /// Optional lowercase hex SHA-256 of the current file content. A mismatch
-    /// writes nothing.
-    #[serde(default)]
-    sha256: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct BeditRange {
-    /// Zero-based byte offset in the original file.
-    offset: usize,
-
-    /// Number of existing bytes to replace. Defaults to the decoded payload
-    /// length. Use 0 to insert; empty data with a positive length deletes.
-    #[serde(default)]
-    length: Option<usize>,
-
-    /// Replacement bytes encoded as base64 or hex. May be empty.
-    #[serde(default)]
-    data: String,
-
-    /// Encoding of data.
-    #[serde(default)]
-    encoding: BinaryEncoding,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ShellArgs {
-    /// Command string to execute.
-    command: String,
-
-    /// Working directory. Relative paths resolve from the directory where dotlink was launched.
-    #[serde(default = "dot")]
-    dir: String,
-
-    /// Optional stdin text passed to the process.
-    #[serde(default)]
-    stdin: Option<String>,
-
-    /// Timeout in seconds. Defaults to the client's response window when the transport provides one, else the profile ceiling (max_shell_timeout_secs); clamped to that ceiling.
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-
-    /// Output byte limit per stream. Defaults to the profile ceiling (max_output_bytes); clamped to it.
-    #[serde(default)]
-    max_output_bytes: Option<usize>,
-}
-
-/// One directory entry produced by the shared walk.
-struct WalkedEntry {
-    /// Logical, policy-checked path.
-    path: PathBuf,
-    /// `path` relative to the walk root; the candidate for glob matching.
-    relative: PathBuf,
-    /// `file`, `dir`, `symlink` or `other`.
-    kind: &'static str,
-    size: u64,
-    mtime: Option<std::time::SystemTime>,
-}
-
-#[derive(Debug, Serialize)]
-struct FsEntry {
-    path: String,
-    kind: &'static str,
-    size: u64,
-    /// Ordering input only; never serialized.
-    #[serde(skip)]
-    mtime: Option<std::time::SystemTime>,
-}
-
-fn dot() -> String {
-    ".".to_owned()
-}
-
-fn ok_text(text: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(text.into())])
-}
-
-fn tool_error(error: impl std::fmt::Display) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(error.to_string())])
 }
 
 fn contains_parent_component(path: &Path) -> bool {
@@ -476,640 +278,27 @@ fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
-/// Client-controlled shell timeout. The caller picks it; the profile ceiling
-/// (`max_shell_timeout_secs`) only bounds it, and is the fallback when omitted.
-fn resolve_shell_timeout(requested: Option<u64>, ceiling: u64) -> u64 {
-    resolve_capped(requested, ceiling)
-}
-
-/// Client-controlled limit under a policy ceiling. Both the shell timeout and
-/// the per-stream output limit follow this shape: the caller picks any value up
-/// to the configured ceiling, which is also the fallback when omitted.
-fn resolve_capped<T>(requested: Option<T>, ceiling: T) -> T
-where
-    T: Ord + From<u8> + Copy,
-{
-    let ceiling = ceiling.max(T::from(1));
-    requested.unwrap_or(ceiling).clamp(T::from(1), ceiling)
-}
-
-/// Shell progress is a bare heartbeat: the caller cannot know how much of an
-/// arbitrary command is done, so no percentages or messages are reported.
-#[cfg(not(test))]
-const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Salvage window for partial output after a killed child.
-const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
-
-/// Heartbeat sink for one `tools/call` that carried a progress token.
-struct ProgressHeartbeat {
-    peer: Peer<RoleServer>,
-    token: ProgressToken,
-    ticks: AtomicU64,
-}
-
-impl ProgressHeartbeat {
-    fn for_request(context: &RequestContext<RoleServer>) -> Option<Self> {
-        let token = context.meta.get_progress_token()?;
-        Some(Self {
-            peer: context.peer.clone(),
-            token,
-            ticks: AtomicU64::new(0),
-        })
-    }
-
-    /// Monotonic progress counter with no total and no message.
-    async fn report(&self) {
-        let progress = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        let param = ProgressNotificationParam::new(self.token.clone(), progress as f64);
-        let _ = self.peer.notify_progress(param).await;
-    }
-}
-
-async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
-    match heartbeat {
-        Some(_) => tokio::time::sleep(SHELL_HEARTBEAT_INTERVAL).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// One glob grammar for every tool: `globset` with `literal_separator`, so
-/// `*`/`?`/`[...]` never cross `/` and `**` is the only recursive form.
-/// `{a,b}` alternation comes from the same builder. Candidates are always a
-/// path already held in memory; nothing here touches the filesystem.
-struct GlobFilter {
-    matcher: globset::GlobMatcher,
-}
-
-impl GlobFilter {
-    fn new(pattern: &str) -> Result<Self> {
-        let matcher = globset::GlobBuilder::new(pattern)
-            .literal_separator(true)
-            .build()
-            .with_context(|| format!("invalid glob pattern: {pattern}"))?
-            .compile_matcher();
-        Ok(Self { matcher })
-    }
-
-    fn matches(&self, candidate: &Path) -> bool {
-        self.matcher.is_match(candidate)
-    }
-
-    /// Match an entry by its path relative to the search root, or by its bare
-    /// name: `*.rs` stays useful below the root, `src/**/*.rs` addresses a
-    /// subtree. One rule, so `ls` and `grep` cannot drift.
-    fn matches_entry(&self, relative: &Path) -> bool {
-        self.matches(relative)
-            || relative
-                .file_name()
-                .is_some_and(|name| self.matches(Path::new(name)))
-    }
-}
-
-/// Filters applied before an entry reaches the tool: opt-in hidden skipping and
-/// opt-in `.gitignore` handling.
-#[derive(Default, Clone, Copy)]
-struct WalkFilter {
-    skip_hidden: bool,
-    gitignore: bool,
-}
-
-fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
-    name.to_string_lossy().starts_with('.')
-}
-
-/// Directories that cannot be enumerated are skipped, like `rg`: a permission
-/// wall or a directory that vanished mid-walk is not a tool failure. Policy
-/// denies never reach here — they are applied before a directory is queued.
-fn skippable_io_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-    )
-}
-
-fn skippable_directory_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(skippable_io_error)
-}
-
-/// Deepest matcher first; the first decisive rule wins, which is git's order.
-fn is_gitignored(ignores: &[Arc<Gitignore>], path: &Path, is_dir: bool) -> bool {
-    for ignore in ignores.iter().rev() {
-        match ignore.matched(path, is_dir) {
-            ignore::Match::Ignore(_) => return true,
-            ignore::Match::Whitelist(_) => return false,
-            ignore::Match::None => {}
+/// Fold `.` and `..` without touching the filesystem, so a policy path with a
+/// not-yet-existing component cannot smuggle `..` into a comparison.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
         }
     }
-    false
+    normalized
 }
 
-fn list_entry_limit(requested: Option<usize>) -> usize {
-    requested
-        .unwrap_or(DEFAULT_MAX_LIST_ENTRIES)
-        .clamp(1, MAX_LIST_ENTRIES)
-}
-
-/// Codex `*** Begin Patch` grammar, v1: `*** Update File:` and
-/// `*** Add File:` only. Delete and Move are rejected explicitly rather than
-/// silently ignored.
-#[derive(Debug)]
-enum PatchOp {
-    Update { path: String, hunks: Vec<PatchHunk> },
-    Add { path: String, lines: Vec<String> },
-}
-
-#[derive(Debug)]
-struct PatchHunk {
-    anchor: Option<String>,
-    lines: Vec<PatchLine>,
-}
-
-#[derive(Debug)]
-enum PatchLine {
-    Context(String),
-    Removed(String),
-    Added(String),
-}
-
-fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
-    let mut ops: Vec<PatchOp> = Vec::new();
-    let mut saw_begin = false;
-    let mut saw_end = false;
-    let mut hunks = 0_usize;
-
-    for (index, line) in text.lines().enumerate() {
-        let number = index + 1;
-        if !saw_begin {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if line.trim_end() != "*** Begin Patch" {
-                bail!("patch: missing '*** Begin Patch' header");
-            }
-            saw_begin = true;
-            continue;
-        }
-        if saw_end {
-            if !line.trim().is_empty() {
-                bail!("patch: line {number}: unexpected text after '*** End Patch'");
-            }
-            continue;
-        }
-
-        if let Some(directive) = line.strip_prefix("*** ") {
-            let directive = directive.trim_end();
-            if directive == "End Patch" {
-                saw_end = true;
-                continue;
-            }
-            if let Some(path) = directive.strip_prefix("Update File:") {
-                let path = path.trim().to_owned();
-                if path.is_empty() {
-                    bail!("patch: line {number}: '*** Update File' needs a path");
-                }
-                ops.push(PatchOp::Update {
-                    path,
-                    hunks: Vec::new(),
-                });
-                continue;
-            }
-            if let Some(path) = directive.strip_prefix("Add File:") {
-                let path = path.trim().to_owned();
-                if path.is_empty() {
-                    bail!("patch: line {number}: '*** Add File' needs a path");
-                }
-                ops.push(PatchOp::Add {
-                    path,
-                    lines: Vec::new(),
-                });
-                continue;
-            }
-            let name = directive.split(':').next().unwrap_or(directive);
-            bail!("patch: line {number}: unsupported directive '*** {name}'");
-        }
-
-        let Some(current) = ops.last_mut() else {
-            bail!("patch: line {number}: text outside a file section");
-        };
-
-        if let Some(rest) = line.strip_prefix("@@") {
-            let PatchOp::Update { hunks: list, .. } = current else {
-                bail!("patch: line {number}: '*** Add File' does not take hunks");
-            };
-            hunks += 1;
-            if hunks > MAX_PATCH_HUNKS {
-                bail!("patch: {hunks} hunks, above the {MAX_PATCH_HUNKS} hunk limit");
-            }
-            list.push(PatchHunk {
-                anchor: parse_patch_anchor(rest),
-                lines: Vec::new(),
-            });
-            continue;
-        }
-
-        match current {
-            PatchOp::Update { hunks: list, .. } => {
-                let Some(hunk) = list.last_mut() else {
-                    bail!("patch: line {number}: text outside a hunk");
-                };
-                match line.as_bytes().first() {
-                    Some(b' ') => hunk.lines.push(PatchLine::Context(line[1..].to_owned())),
-                    Some(b'-') => hunk.lines.push(PatchLine::Removed(line[1..].to_owned())),
-                    Some(b'+') => hunk.lines.push(PatchLine::Added(line[1..].to_owned())),
-                    _ if line.trim().is_empty() => {
-                        hunk.lines.push(PatchLine::Context(String::new()))
-                    }
-                    _ => {
-                        bail!("patch: line {number}: unexpected text '{line}'");
-                    }
-                }
-            }
-            PatchOp::Add { lines, .. } => match line.as_bytes().first() {
-                Some(b'+') => lines.push(line[1..].to_owned()),
-                Some(b' ') => lines.push(line[1..].to_owned()),
-                _ if line.trim().is_empty() => lines.push(String::new()),
-                _ => bail!("patch: line {number}: unexpected text '{line}'"),
-            },
-        }
-    }
-
-    if !saw_begin {
-        bail!("patch: missing '*** Begin Patch' header");
-    }
-    if !saw_end {
-        bail!("patch: missing '*** End Patch' terminator");
-    }
-    if ops.len() > MAX_PATCH_FILES {
-        bail!(
-            "patch: {} files, above the {MAX_PATCH_FILES} file limit",
-            ops.len()
-        );
-    }
-    for op in &ops {
-        if let PatchOp::Update { path, hunks } = op
-            && hunks.is_empty()
-        {
-            bail!("patch: '*** Update File' for {path} has no hunks");
-        }
-    }
-    Ok(ops)
-}
-
-/// `@@` may carry anchor text or unified-diff line numbers. Numbers are
-/// accepted and ignored; anchor text narrows where the search starts.
-fn parse_patch_anchor(rest: &str) -> Option<String> {
-    let rest = rest.trim();
-    if rest.is_empty() || rest.starts_with('-') || rest.starts_with('+') {
-        return None;
-    }
-    Some(rest.to_owned())
-}
-
-/// Hunk location is content-based: exact match first, then a per-line
-/// `trim_end` comparison. Ambiguity is an error, and hunks within a file apply
-/// top-down without re-scanning above the previous match.
-fn apply_patch_hunks(
-    text: &str,
-    hunks: &[PatchHunk],
-    display: &str,
-    first_hunk: usize,
-    total_hunks: usize,
-) -> Result<(String, usize, usize)> {
-    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
-    let mut from_line = 0_usize;
-    let mut added = 0_usize;
-    let mut removed = 0_usize;
-
-    for (offset, hunk) in hunks.iter().enumerate() {
-        let position = first_hunk + offset + 1;
-        let block = hunk
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                PatchLine::Context(text) => Some(text.as_str()),
-                PatchLine::Removed(text) => Some(text.as_str()),
-                PatchLine::Added(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let mut search_start = from_line;
-        if let Some(anchor) = hunk.anchor.as_deref()
-            && let Some(at) = lines
-                .iter()
-                .enumerate()
-                .skip(search_start)
-                .find(|(_, line)| line.contains(anchor))
-                .map(|(index, _)| index)
-        {
-            search_start = at;
-        }
-        let near = search_start + 1;
-
-        if block.is_empty() {
-            bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
-        }
-
-        let mut exact = Vec::new();
-        let mut lenient = Vec::new();
-        for start in search_start..lines.len() {
-            if start + block.len() > lines.len() {
-                break;
-            }
-            if lines[start..start + block.len()]
-                .iter()
-                .zip(&block)
-                .all(|(file, patch)| file == patch)
-            {
-                exact.push(start);
-                continue;
-            }
-            if lines[start..start + block.len()]
-                .iter()
-                .zip(&block)
-                .all(|(file, patch)| file.trim_end() == patch.trim_end())
-            {
-                lenient.push(start);
-            }
-        }
-        let matches = if exact.is_empty() { lenient } else { exact };
-        let Some(&start) = matches.first() else {
-            bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
-        };
-        if matches.len() > 1 {
-            let lines_listed = matches
-                .iter()
-                .take(10)
-                .map(|line| (line + 1).to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "hunk {position}/{total_hunks} ({display}): context matches {} locations (lines {lines_listed})",
-                matches.len()
-            );
-        }
-
-        let mut replacement = Vec::with_capacity(hunk.lines.len());
-        // Cursor into the consumed block: only context/removed lines consume
-        // existing file lines.
-        let mut consumed_at = 0_usize;
-        for line in &hunk.lines {
-            match line {
-                // Keep the file's own bytes for context lines, so a lenient
-                // match never rewrites trailing whitespace it did not touch.
-                PatchLine::Context(_) => {
-                    replacement.push(lines[start + consumed_at].clone());
-                    consumed_at += 1;
-                }
-                PatchLine::Removed(_) => {
-                    removed += 1;
-                    consumed_at += 1;
-                }
-                PatchLine::Added(text) => {
-                    added += 1;
-                    replacement.push(text.clone());
-                }
-            }
-        }
-        let replacement_len = replacement.len();
-        lines.splice(start..start + block.len(), replacement);
-        from_line = start + replacement_len;
-    }
-
-    Ok((lines.join("\n"), added, removed))
-}
-
-/// Patch paths are relative to the patch's `dir`, not to the launch directory.
-fn join_patch_path(dir: &str, path: &str) -> String {
-    if Path::new(path).is_absolute() || dir == "." {
-        return path.to_owned();
-    }
-    Path::new(dir).join(path).to_string_lossy().into_owned()
-}
-
-/// One validated byte range, kept in request order for messages until sorted.
-struct RangePlan {
-    offset: usize,
-    end: usize,
-    length: usize,
-    /// 1-based position in the request, used for error text.
-    position: usize,
-    data: Vec<u8>,
-}
-
-/// Byte offsets of every occurrence of `needle` in `haystack`.
-fn match_indices(haystack: &str, needle: &str) -> Vec<usize> {
-    haystack.match_indices(needle).map(|(at, _)| at).collect()
-}
-
-/// 1-based line number of a byte offset.
-fn line_number(text: &str, offset: usize) -> usize {
-    text.as_bytes()[..offset.min(text.len())]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
-        + 1
-}
-
-fn line_count(text: &str) -> usize {
-    text.lines().count()
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+/// SHA-256 of a byte buffer, used for snapshot conflict detection and the
+/// `bedit` precondition.
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
-}
-
-/// Why a planned write is no longer safe, if the file moved on since planning.
-/// Callers decide the consequence: atomic tools fail the call, `best_effort`
-/// reports the file and keeps the rest.
-fn snapshot_changed(display: &str, current: &[u8], snapshot: &[u8], verb: &str) -> Option<String> {
-    (sha256(current) != sha256(snapshot)).then(|| format!("{display} changed while {verb}"))
-}
-
-/// All-or-nothing text tools plan against a read snapshot and re-check every
-/// file before the first write.
-fn verify_snapshot(display: &str, current: &[u8], snapshot: &[u8], verb: &str) -> Result<()> {
-    match snapshot_changed(display, current, snapshot, verb) {
-        Some(reason) => bail!("{reason}; nothing was written"),
-        None => Ok(()),
-    }
-}
-
-/// `read` numbers lines as `N\tline`; an `old_text` copied from that output
-/// starts with digits and a tab.
-fn has_line_number_prefix(text: &str) -> bool {
-    let digits = text.chars().take_while(char::is_ascii_digit).count();
-    digits > 0 && text[digits..].starts_with('\t')
-}
-
-/// Trim rendered text at the policy byte ceiling without splitting a character,
-/// appending one marker so the caller knows the result is short.
-fn cap_text(text: String, limit: usize, marker: &str) -> (String, bool) {
-    if text.len() <= limit {
-        return (text, false);
-    }
-    // Reserve room for the marker so the result stays within the ceiling.
-    let mut end = limit.saturating_sub(marker.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut capped = text;
-    capped.truncate(end);
-    capped.push_str(marker);
-    (capped, true)
-}
-
-/// Explicit `depth` always wins. A pattern that addresses more than one path
-/// segment implies recursion, so it defaults to 4 levels instead of 1.
-fn list_depth(requested: Option<usize>, pattern: Option<&str>) -> usize {
-    if let Some(depth) = requested {
-        return depth.max(1);
-    }
-    match pattern {
-        Some(pattern) if pattern.contains('/') || pattern.contains("**") => 4,
-        _ => 1,
-    }
-}
-
-fn shell_timeout_description(max_secs: u64) -> String {
-    format!(
-        "Timeout in seconds. Defaults to the client's response window when the transport provides one, else {max_secs}; capped at {max_secs}."
-    )
-}
-
-fn shell_output_description(max_bytes: usize) -> String {
-    format!("Output byte limit per stream. Defaults to {max_bytes} and is capped there.")
-}
-
-/// Tool schemas are static, the policy ceilings are not. Replace the limit
-/// arguments' descriptions with the numbers this profile actually enforces.
-fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usize) -> Tool {
-    if !matches!(tool.name.as_ref(), "bash" | "powershell") {
-        return tool;
-    }
-    let mut schema = (*tool.input_schema).clone();
-    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
-        return tool;
-    };
-    for (key, description) in [
-        ("timeout_secs", shell_timeout_description(max_secs)),
-        ("max_output_bytes", shell_output_description(max_bytes)),
-    ] {
-        if let Some(Value::Object(property)) = properties.get_mut(key) {
-            property.insert("description".to_owned(), Value::String(description));
-        }
-    }
-    tool.input_schema = Arc::new(schema);
-    tool
-}
-
-async fn drain_capped<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut kept = Vec::with_capacity(limit.min(64 * 1024));
-    let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
-
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-
-        let remaining = limit.saturating_sub(kept.len());
-        if remaining > 0 {
-            let copy_len = remaining.min(read);
-            kept.extend_from_slice(&buffer[..copy_len]);
-        }
-        if read > remaining {
-            truncated = true;
-        }
-    }
-
-    Ok((kept, truncated))
-}
-
-pub(crate) fn resolve_executable(name: &str) -> Option<PathBuf> {
-    let candidate = Path::new(name);
-    let found = if candidate.components().count() > 1 {
-        candidate.exists().then(|| candidate.to_path_buf())
-    } else {
-        env::var_os("PATH").and_then(|path| {
-            env::split_paths(&path)
-                .map(|dir| dir.join(name))
-                .find(|path| path.is_file())
-        })
-    }?;
-
-    Some(std::fs::canonicalize(&found).unwrap_or(found))
-}
-
-#[cfg(target_os = "linux")]
-fn sandbox_visible_path(access: &AccessPolicy) -> std::ffi::OsString {
-    let mut paths = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    if let Some(path) = env::var_os("PATH") {
-        for dir in env::split_paths(&path) {
-            let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
-            let system_visible = [
-                Path::new("/nix/store"),
-                Path::new("/run/current-system"),
-                Path::new("/etc/profiles"),
-                Path::new("/nix/var/nix/profiles"),
-                Path::new("/usr"),
-                Path::new("/bin"),
-                Path::new("/sbin"),
-            ]
-            .iter()
-            .any(|root| canonical.starts_with(root));
-
-            if (system_visible || access.can_read(&canonical)) && seen.insert(canonical.clone()) {
-                paths.push(canonical);
-            }
-        }
-    }
-
-    for fallback in [
-        PathBuf::from("/run/current-system/sw/bin"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-    ] {
-        if fallback.exists() && seen.insert(fallback.clone()) {
-            paths.push(fallback);
-        }
-    }
-
-    env::join_paths(paths)
-        .unwrap_or_else(|_| std::ffi::OsString::from("/run/current-system/sw/bin:/usr/bin:/bin"))
-}
-
-#[cfg(target_os = "linux")]
-fn sandbox_runtime_mounts() -> Vec<PathBuf> {
-    let mut paths = vec![
-        PathBuf::from("/nix/store"),
-        PathBuf::from("/run/current-system"),
-        PathBuf::from("/etc/profiles"),
-        PathBuf::from("/nix/var/nix/profiles"),
-        PathBuf::from("/usr"),
-        PathBuf::from("/bin"),
-        PathBuf::from("/sbin"),
-        PathBuf::from("/lib"),
-        PathBuf::from("/lib64"),
-    ];
-
-    if let Some(home) = env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".nix-profile"));
-    }
-
-    paths.retain(|path| path.exists());
-    paths
 }
 
 async fn canonicalize_grant(base_dir: &Path, path: &Path) -> Result<PathBuf> {
@@ -1127,12 +316,17 @@ async fn canonicalize_grant(base_dir: &Path, path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Deny and protected roots may name paths that do not exist yet, so the nearest
+/// existing ancestor is canonicalized and the remainder is appended. The target
+/// is folded lexically first: a `..` after a missing component would otherwise
+/// survive into the comparison and quietly fail to match the path it denies.
 async fn canonicalize_deny(base_dir: &Path, path: &Path) -> Result<PathBuf> {
-    let target = if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base_dir.join(path)
     };
+    let target = lexical_normalize(&joined);
 
     if let Ok(canonical) = fs::canonicalize(&target).await {
         return Ok(canonical);
@@ -1145,7 +339,7 @@ async fn canonicalize_deny(base_dir: &Path, path: &Path) -> Result<PathBuf> {
                 let remainder = target
                     .strip_prefix(&ancestor)
                     .map_err(|_| anyhow!("failed to resolve deny path {}", target.display()))?;
-                return Ok(canonical_ancestor.join(remainder));
+                return Ok(lexical_normalize(&canonical_ancestor.join(remainder)));
             }
             Err(_) => {
                 if !ancestor.pop() {
@@ -1154,25 +348,6 @@ async fn canonicalize_deny(base_dir: &Path, path: &Path) -> Result<PathBuf> {
             }
         }
     }
-}
-
-fn decode_binary(data: &str, encoding: BinaryEncoding, max_bytes: usize) -> Result<Vec<u8>> {
-    if data.len() > max_bytes.saturating_mul(2).saturating_add(16) {
-        bail!("encoded payload is too large");
-    }
-
-    let bytes = match encoding {
-        BinaryEncoding::Base64 => BASE64.decode(data).context("invalid base64 payload")?,
-        BinaryEncoding::Hex => hex::decode(data).context("invalid hex payload")?,
-    };
-    if bytes.len() > max_bytes {
-        bail!(
-            "decoded payload is {} bytes, above the {} byte limit",
-            bytes.len(),
-            max_bytes
-        );
-    }
-    Ok(bytes)
 }
 
 impl AccessPolicy {
@@ -1345,10 +520,12 @@ impl AccessPolicy {
             return vec![(PathBuf::from("/"), true)];
         }
 
+        // Grants are directories, and deny-write roots are mounted read-only. A
+        // deny-write root may name a single file, so it is enforced by the
+        // shell's dedicated `--ro-bind` pass instead of this directory list.
         let mut candidates = BTreeSet::new();
         candidates.extend(self.read_roots.iter().cloned());
         candidates.extend(self.write_roots.iter().cloned());
-        candidates.extend(self.deny_write_roots.iter().cloned());
 
         let mut mounts = candidates
             .into_iter()
@@ -1603,14 +780,31 @@ impl LocalMachine {
                 allow_network: args.allow_network,
                 shell_program,
                 bwrap_program,
-                max_shell_timeout_secs: args.max_shell_timeout_secs.max(1),
-                max_output_bytes: args.max_output_bytes.max(1024),
-                max_read_bytes: args.max_read_bytes.max(1024),
-                max_write_bytes: args.max_write_bytes.max(1024),
+                max_shell_timeout_secs: checked_limit(
+                    "max_shell_timeout_secs",
+                    args.max_shell_timeout_secs,
+                    MIN_SHELL_TIMEOUT_SECS,
+                )?,
+                max_output_bytes: checked_limit(
+                    "max_output_bytes",
+                    args.max_output_bytes,
+                    MIN_BYTE_LIMIT,
+                )?,
+                max_read_bytes: checked_limit(
+                    "max_read_bytes",
+                    args.max_read_bytes,
+                    MIN_BYTE_LIMIT,
+                )?,
+                max_write_bytes: checked_limit(
+                    "max_write_bytes",
+                    args.max_write_bytes,
+                    MIN_BYTE_LIMIT,
+                )?,
                 protected_paths,
             },
             operation_gate: Arc::new(RwLock::new(())),
             serialize: args.serialize,
+            router: OnceLock::new(),
             #[cfg(target_os = "linux")]
             secure_fs,
         })
@@ -1668,6 +862,18 @@ impl LocalMachine {
         }
     }
 
+    /// The largest request body a tool call can need, for transports that cap
+    /// bodies independently of the tools (the streamable-HTTP server and the
+    /// tunnel). It follows the write ceiling, so raising `max_write_bytes`
+    /// raises the transport ceiling with it instead of leaving a hidden 4 MiB
+    /// limit that refuses writes the tools accept.
+    pub(crate) fn max_request_body_bytes(&self) -> usize {
+        self.config
+            .max_write_bytes
+            .saturating_mul(MAX_JSON_ESCAPE)
+            .saturating_add(MAX_REQUEST_FRAMING_BYTES)
+    }
+
     pub fn access_summary(&self) -> String {
         if self.config.access.unrestricted_fs {
             return "unrestricted read+write".to_owned();
@@ -1687,68 +893,6 @@ impl LocalMachine {
         )
     }
 
-    pub fn tool_router_for_policy(
-        any_read: bool,
-        any_write: bool,
-        any_read_write: bool,
-        allow_shell: bool,
-    ) -> ToolRouter<Self> {
-        let mut router = Self::tool_router();
-
-        if !any_read {
-            for name in ["ls", "grep", "read", "bread"] {
-                router.disable_route(name.to_owned());
-            }
-        }
-        if !any_write {
-            for name in ["write", "bwrite"] {
-                router.disable_route(name.to_owned());
-            }
-        }
-        if !any_read_write {
-            for name in ["edit", "patch", "bedit"] {
-                router.disable_route(name.to_owned());
-            }
-        }
-
-        if !allow_shell {
-            router.disable_route("bash".to_owned());
-            router.disable_route("powershell".to_owned());
-        } else if cfg!(windows) {
-            router.disable_route("bash".to_owned());
-        } else {
-            router.disable_route("powershell".to_owned());
-        }
-
-        router
-    }
-
-    fn policy_tool_router(&self) -> ToolRouter<Self> {
-        Self::tool_router_for_policy(
-            self.config.access.has_read_capability(),
-            self.config.access.has_write_capability(),
-            self.config.access.has_read_write_capability(),
-            self.config.allow_shell,
-        )
-    }
-
-    pub fn visible_tool_descriptions(&self) -> Vec<(String, String)> {
-        self.policy_tool_router()
-            .list_all()
-            .into_iter()
-            .map(|tool| {
-                let title = tool
-                    .title
-                    .as_deref()
-                    .or_else(|| tool.annotations.as_ref().and_then(|a| a.title.as_deref()))
-                    .or(tool.description.as_deref())
-                    .unwrap_or("")
-                    .to_owned();
-                (tool.name.to_string(), title)
-            })
-            .collect()
-    }
-
     fn ensure_not_protected(&self, path: &Path) -> Result<()> {
         for protected in &self.config.protected_paths {
             if path == protected || path.starts_with(protected) {
@@ -1758,6 +902,14 @@ impl LocalMachine {
             }
         }
         Ok(())
+    }
+
+    /// One guard spans planning through commit, shared by every mutating tool.
+    pub(crate) async fn lock_mutations<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<crate::mutation::MutationGuard> {
+        crate::mutation::lock(paths).await
     }
 
     async fn resolve_existing(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
@@ -1773,18 +925,8 @@ impl LocalMachine {
     }
 
     #[cfg(any(test, not(target_os = "linux")))]
-    async fn require_regular_or_missing(&self, path: &Path) -> Result<()> {
-        match fs::metadata(path).await {
-            Ok(metadata) if metadata.is_file() => Ok(()),
-            Ok(_) => bail!("path is not a regular file: {}", path.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    #[cfg(any(test, not(target_os = "linux")))]
     async fn require_regular_file(&self, path: &Path) -> Result<()> {
-        let metadata = fs::metadata(path).await?;
+        let metadata = fs::symlink_metadata(path).await?;
         if !metadata.is_file() {
             bail!("path is not a regular file: {}", path.display());
         }
@@ -1793,12 +935,6 @@ impl LocalMachine {
 
     // Tokio file writes may finish on a background blocking task even after
     // write_all returns. Flush before acknowledging a mutating MCP call.
-    async fn write_complete(file: &mut fs::File, bytes: &[u8]) -> Result<()> {
-        file.write_all(bytes).await?;
-        file.flush().await?;
-        Ok(())
-    }
-
     // Size checks before reading are not sufficient: a concurrent shell can
     // extend a file while it is being read. Bound actual I/O to one byte over
     // the limit so even adversarial growth cannot cause unbounded allocation.
@@ -1843,1979 +979,180 @@ impl LocalMachine {
         }
     }
 
-    async fn open_write_file(&self, path: &Path) -> Result<fs::File> {
+    /// Replace a file's content without ever exposing a partial write, and
+    /// without truncating the original: the bytes are staged beside the target
+    /// and renamed over it, preserving the existing mode.
+    pub(crate) async fn write_file_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        self.commit_write(self.stage_replace_write(path, bytes).await?)
+            .await
+    }
+
+    /// Prepare an in-place update: the bytes are flushed beside the target and
+    /// removed again if the value is dropped without being committed. The
+    /// expected length/digest is re-checked at commit.
+    pub(crate) async fn stage_update_write(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected: (u64, [u8; 32]),
+    ) -> Result<PendingWrite> {
+        self.stage_write_mode(path, bytes, false, false, Some(expected))
+            .await
+    }
+
+    /// Prepare a create-or-replace write that needs only write authority.
+    pub(crate) async fn stage_replace_write(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<PendingWrite> {
+        self.stage_write_mode(path, bytes, false, true, None).await
+    }
+
+    /// Prepare a create-only write. The target is installed only when the
+    /// staged value is committed, so a reader never observes an empty file and
+    /// an existing path cannot be replaced.
+    pub(crate) async fn stage_create_write(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<PendingWrite> {
+        self.stage_write_mode(path, bytes, true, true, None).await
+    }
+
+    async fn stage_write_mode(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        create_only: bool,
+        write_only: bool,
+        expected: Option<(u64, [u8; 32])>,
+    ) -> Result<PendingWrite> {
         #[cfg(target_os = "linux")]
         {
-            Ok(fs::File::from_std(self.secure_fs.open_write(path)?))
+            let staged = match (create_only, write_only) {
+                (true, _) => self.secure_fs.stage_create(path, bytes)?,
+                (false, true) => self.secure_fs.stage(path, bytes)?,
+                (false, false) => {
+                    let expected = expected.ok_or_else(|| {
+                        anyhow!("internal error: an update requires an expected snapshot")
+                    })?;
+                    self.secure_fs.stage_update(path, bytes, expected)?
+                }
+            };
+            Ok(PendingWrite(staged))
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.require_regular_or_missing(path).await?;
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            Ok(fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)
-                .await?)
+            let _ = write_only;
+            Ok(PendingWrite(
+                crate::staging::stage_path(path, bytes, create_only, expected).await?,
+            ))
         }
     }
 
-    /// Read one `.gitignore` through the descriptor-rooted reader and turn it
-    /// into a matcher rooted at its own directory. Bounded at 64 KiB and 1024
-    /// lines per file; an invalid pattern fails the whole call (fail closed).
-    async fn load_gitignore(&self, dir: &Path) -> Result<Option<Gitignore>> {
-        let path = dir.join(".gitignore");
-        // The walk drops denied entries, but this open is separate: a deny rule
-        // or protected path on the ignore file itself must still win.
-        if self.config.access.denied_read(&path) || self.ensure_not_protected(&path).is_err() {
-            return Ok(None);
-        }
-        let file = match self.open_read_file(&path).await {
-            Ok(file) => file,
-            Err(_) => return Ok(None),
-        };
-        let mut bytes = Vec::new();
-        file.take(GITIGNORE_MAX_BYTES as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .with_context(|| format!("failed reading {}", path.display()))?;
-        let text = String::from_utf8_lossy(&bytes);
-        let mut builder = GitignoreBuilder::new(dir);
-        for (index, line) in text.lines().take(GITIGNORE_MAX_LINES).enumerate() {
-            builder
-                .add_line(Some(path.clone()), line)
-                .map_err(|error| {
-                    anyhow!(
-                        "invalid .gitignore pattern in {} at line {}: {error}",
-                        path.display(),
-                        index + 1
-                    )
-                })?;
-        }
-        Ok(Some(builder.build().with_context(|| {
-            format!("invalid .gitignore in {}", path.display())
-        })?))
-    }
-
-    /// Descriptor-rooted directory walk shared by `ls` and `grep`. Denies and
-    /// protected paths are dropped before the caller sees an entry, and only
-    /// the already-open directory is enumerated: no path is reopened by name
-    /// after authorization. Returning `false` from `on_entry` stops the walk.
-    async fn walk_entries(
-        &self,
-        root: &Path,
-        depth: usize,
-        filter: WalkFilter,
-        mut on_entry: impl FnMut(WalkedEntry) -> bool,
-    ) -> Result<()> {
-        // (directory, remaining levels below it, gitignore chain root..dir)
-        let mut pending: Vec<(PathBuf, usize, Vec<Arc<Gitignore>>)> =
-            vec![(root.to_path_buf(), depth.max(1), Vec::new())];
-
-        while let Some((dir, remaining, mut ignores)) = pending.pop() {
-            if filter.gitignore
-                && let Some(ignore) = self.load_gitignore(&dir).await?
-            {
-                ignores.push(Arc::new(ignore));
-            }
-
-            // One unreadable or vanished subdirectory must not abort a search
-            // over the rest of the tree; policy denies are separate and already
-            // applied before a directory is queued.
-            #[cfg(target_os = "linux")]
-            let directory_handle = match self.secure_fs.open_directory(&dir) {
-                Ok(handle) => handle,
-                Err(error) if dir != root && skippable_directory_error(&error) => continue,
-                Err(error) => return Err(error),
-            };
-            #[cfg(target_os = "linux")]
-            let read_path = PathBuf::from(format!(
-                "/proc/self/fd/{}",
-                std::os::fd::AsRawFd::as_raw_fd(&directory_handle)
-            ));
-            #[cfg(not(target_os = "linux"))]
-            let read_path = dir.clone();
-            let mut reader = match fs::read_dir(&read_path).await {
-                Ok(reader) => reader,
-                Err(error) if dir != root && skippable_io_error(&error) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            loop {
-                let entry = match reader.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => break,
-                    // Stop this directory, keep the rest of the walk.
-                    Err(error) if skippable_io_error(&error) => break,
-                    Err(error) => return Err(error.into()),
-                };
-                // The Linux enumerator reads via /proc/self/fd/<pinned-dir>.
-                // Its DirEntry.path() is therefore an *internal* FD path,
-                // not the logical authorized path. Use the original name for
-                // denies, protected-path filtering, display and recursion.
-                let path = dir.join(entry.file_name());
-
-                if self.config.access.denied_read(&path)
-                    || self.ensure_not_protected(&path).is_err()
-                {
-                    continue;
-                }
-                if filter.skip_hidden && starts_with_dot(entry.file_name().as_ref()) {
-                    continue;
-                }
-
-                // Inspect the already opened directory instead of reopening
-                // `dir` through a potentially replaced host pathname. Entries
-                // may disappear while other tools work concurrently; skip
-                // vanished entries rather than failing the entire listing.
-                let metadata = match fs::symlink_metadata(entry.path()).await {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                let file_type = metadata.file_type();
-                let kind = if file_type.is_symlink() {
-                    "symlink"
-                } else if file_type.is_dir() {
-                    "dir"
-                } else if file_type.is_file() {
-                    "file"
-                } else {
-                    "other"
-                };
-
-                // Deeper `.gitignore` files win, and a whitelist stops the
-                // search: that is git's precedence order.
-                if !ignores.is_empty() && is_gitignored(&ignores, &path, file_type.is_dir()) {
-                    continue;
-                }
-
-                let walked = WalkedEntry {
-                    relative: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
-                    path,
-                    kind,
-                    size: metadata.len(),
-                    mtime: metadata.modified().ok(),
-                };
-                let descend = remaining > 1
-                    && file_type.is_dir()
-                    && self.config.access.can_read(&walked.path);
-                let next = (descend, walked.path.clone());
-                if !on_entry(walked) {
-                    return Ok(());
-                }
-                if next.0 {
-                    pending.push((next.1, remaining - 1, ignores.clone()));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Create-only write. On Linux this is `O_EXCL` beneath the pinned root, so
-    /// a path that appears between policy check and open is refused rather than
-    /// truncated.
-    async fn open_create_file(&self, path: &Path) -> Result<fs::File> {
+    /// Make a staged write visible.
+    pub(crate) async fn commit_write(&self, pending: PendingWrite) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            Ok(fs::File::from_std(self.secure_fs.open_create(path)?))
+            pending.0.commit()
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.require_regular_or_missing(path).await?;
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            Ok(fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .await?)
+            pending.0.commit().await
         }
-    }
-
-    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool)> {
-        let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
-        if !fs::metadata(&root).await?.is_dir() {
-            bail!("not a directory: {}", args.path);
-        }
-
-        let depth = list_depth(args.depth, args.pattern.as_deref());
-        let pattern = args
-            .pattern
-            .as_deref()
-            .filter(|pattern| !pattern.is_empty())
-            .map(GlobFilter::new)
-            .transpose()?;
-        let limit = list_entry_limit(args.limit);
-        let mut output: Vec<FsEntry> = Vec::new();
-        let mut truncated = false;
-
-        self.walk_entries(&root, depth, WalkFilter::default(), |entry| {
-            if pattern
-                .as_ref()
-                .is_some_and(|pattern| !pattern.matches_entry(&entry.relative))
-            {
-                return true;
-            }
-            if !args.kind.accepts(entry.kind) {
-                return true;
-            }
-            if output.len() >= MAX_LIST_ENTRIES {
-                truncated = true;
-                return false;
-            }
-            output.push(FsEntry {
-                path: self.config.access.relative_display(&entry.path),
-                kind: entry.kind,
-                size: entry.size,
-                mtime: entry.mtime,
-            });
-            true
-        })
-        .await?;
-
-        match args.sort {
-            ListSort::Path => output.sort_by(|a, b| a.path.cmp(&b.path)),
-            // Newest first; entries without a timestamp sort after dated ones.
-            ListSort::Mtime => {
-                output.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)))
-            }
-        }
-        if output.len() > limit {
-            output.truncate(limit);
-            truncated = true;
-        }
-        Ok((output, truncated))
-    }
-
-    fn output_limit(&self, requested: Option<usize>) -> usize {
-        resolve_capped(requested, self.config.max_output_bytes)
-    }
-
-    /// Read one UTF-8 file for search: bounded at the per-file cap, and skipped
-    /// (rather than failing) when it is not text or grew while being read.
-    async fn read_search_file(&self, path: &Path) -> Option<String> {
-        let mut file = self.open_read_file(path).await.ok()?;
-        let bytes = Self::read_bounded(&mut file, MAX_GREP_FILE_BYTES)
-            .await
-            .ok()?;
-        String::from_utf8(bytes).ok()
-    }
-
-    async fn grep_impl(&self, args: GrepArgs) -> Result<String> {
-        if args.pattern.is_empty() {
-            bail!("pattern must not be empty");
-        }
-        if args.pattern.chars().count() > MAX_GREP_PATTERN {
-            bail!("pattern is longer than {MAX_GREP_PATTERN} characters");
-        }
-        if args.pattern.chars().any(char::is_control) {
-            bail!("pattern must be printable text");
-        }
-
-        let source = if args.literal {
-            regex::escape(&args.pattern)
-        } else {
-            args.pattern.clone()
-        };
-        let regex = regex::RegexBuilder::new(&source)
-            .case_insensitive(args.ignore_case)
-            .size_limit(MAX_GREP_FILE_BYTES)
-            .dfa_size_limit(MAX_GREP_FILE_BYTES)
-            .build()
-            .with_context(|| format!("invalid regex: {}", args.pattern))?;
-
-        let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
-        if !fs::metadata(&root).await?.is_dir() {
-            bail!(
-                "not a directory: {} (use read for a single file)",
-                args.path
-            );
-        }
-
-        let glob = args
-            .glob
-            .as_deref()
-            .filter(|glob| !glob.is_empty())
-            .map(GlobFilter::new)
-            .transpose()?;
-        let before = args.before.unwrap_or(0).min(MAX_GREP_CONTEXT);
-        let after = args.after.unwrap_or(0).min(MAX_GREP_CONTEXT);
-        let limit = args.limit.unwrap_or(MAX_GREP_HITS).clamp(1, MAX_GREP_HITS);
-        let offset = args.offset.unwrap_or(0);
-        let numbered = args.numbered.unwrap_or(true);
-
-        // Candidate files first, so paging and output are path-ordered rather
-        // than dependent on directory enumeration order.
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        let mut truncated = false;
-        self.walk_entries(
-            &root,
-            usize::MAX,
-            WalkFilter {
-                skip_hidden: args.skip_hidden,
-                gitignore: args.gitignore,
-            },
-            |entry| {
-                if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
-                    return true;
-                }
-                if glob
-                    .as_ref()
-                    .is_some_and(|glob| !glob.matches_entry(&entry.relative))
-                {
-                    return true;
-                }
-                if candidates.len() >= MAX_GREP_FILES {
-                    truncated = true;
-                    return false;
-                }
-                candidates.push(entry.path);
-                true
-            },
-        )
-        .await?;
-        candidates.sort();
-
-        let mut hits_skipped = 0_usize;
-        let mut hits_emitted = 0_usize;
-        let mut files: Vec<String> = Vec::new();
-        let mut counts: Vec<(String, usize)> = Vec::new();
-        let mut content = String::new();
-        let mut stopped = false;
-
-        for path in &candidates {
-            if stopped {
-                break;
-            }
-            let Some(text) = self.read_search_file(path).await else {
-                continue;
-            };
-            let display = self.config.access.relative_display(path);
-            let lines = text.lines().collect::<Vec<_>>();
-            let mut file_hits: Vec<usize> = Vec::new();
-            for (index, line) in lines.iter().enumerate() {
-                if !regex.is_match(line) {
-                    continue;
-                }
-                if file_hits.len() >= MAX_GREP_PER_FILE {
-                    truncated = true;
-                    break;
-                }
-                file_hits.push(index);
-            }
-            if file_hits.is_empty() {
-                continue;
-            }
-
-            match args.output_mode {
-                GrepOutputMode::Content => {
-                    // Context windows are per file: a new file starts a new group.
-                    let mut last_context_line: Option<usize> = None;
-                    for hit in file_hits {
-                        if hits_skipped < offset {
-                            hits_skipped += 1;
-                            continue;
-                        }
-                        if hits_emitted >= limit {
-                            truncated = true;
-                            stopped = true;
-                            break;
-                        }
-                        let start = hit
-                            .saturating_sub(before)
-                            .max(last_context_line.map_or(0, |line| line + 1));
-                        let end = hit.saturating_add(after).min(lines.len() - 1);
-                        // Context windows that do not touch start a new group.
-                        // Without context there is no gap to mark.
-                        if (before > 0 || after > 0)
-                            && last_context_line.is_some_and(|line| start > line + 1)
-                        {
-                            content.push_str("--\n");
-                        }
-                        for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
-                            match numbered {
-                                true => {
-                                    content.push_str(&format!("{display}:{}: {line}\n", index + 1))
-                                }
-                                false => content.push_str(&format!("{display}: {line}\n")),
-                            }
-                        }
-                        last_context_line = Some(end);
-                        hits_emitted += 1;
-                    }
-                }
-                GrepOutputMode::Files | GrepOutputMode::Count => {
-                    if hits_skipped < offset {
-                        hits_skipped += 1;
-                    } else if hits_emitted >= limit {
-                        truncated = true;
-                        stopped = true;
-                    } else {
-                        hits_emitted += 1;
-                        match args.output_mode {
-                            GrepOutputMode::Files => files.push(display),
-                            _ => counts.push((display, file_hits.len())),
-                        }
-                    }
-                }
-            }
-        }
-
-        match args.output_mode {
-            GrepOutputMode::Content => {
-                while content.ends_with('\n') {
-                    content.pop();
-                }
-                if truncated {
-                    content.push_str(&format!("\n… truncated at {hits_emitted} hits"));
-                }
-                let (capped, _) = cap_text(
-                    content,
-                    self.config.max_output_bytes,
-                    &format!("\n… truncated at {} bytes", self.config.max_output_bytes),
-                );
-                Ok(capped)
-            }
-            GrepOutputMode::Files => Ok(serde_json::json!({
-                "files": files,
-                "truncated": truncated,
-            })
-            .to_string()),
-            GrepOutputMode::Count => {
-                let total = counts.iter().map(|(_, count)| count).sum::<usize>();
-                Ok(serde_json::json!({
-                    "counts": counts
-                        .iter()
-                        .map(|(path, count)| serde_json::json!({"path": path, "count": count}))
-                        .collect::<Vec<_>>(),
-                    "total": total,
-                    "truncated": truncated,
-                })
-                .to_string())
-            }
-        }
-    }
-
-    async fn terminate_child(child: &mut tokio::process::Child) {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-
-    async fn execute_shell(
-        &self,
-        args: ShellArgs,
-        powershell: bool,
-        heartbeat: Option<ProgressHeartbeat>,
-    ) -> Result<CallToolResult, McpError> {
-        if args.command.trim().is_empty() {
-            return Err(McpError::invalid_params("command must not be empty", None));
-        }
-        if let Some(stdin_text) = args.stdin.as_ref()
-            && stdin_text.len() > self.config.max_write_bytes
-        {
-            return Ok(tool_error(format!(
-                "stdin is {} bytes, above the {} byte limit",
-                stdin_text.len(),
-                self.config.max_write_bytes
-            )));
-        }
-
-        let working_dir = match self.resolve_existing(&args.dir, AccessNeed::Read).await {
-            Ok(path) => path,
-            Err(error) => return Ok(tool_error(error)),
-        };
-        if !fs::metadata(&working_dir)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            return Ok(tool_error("dir is not a directory"));
-        }
-
-        let timeout_secs =
-            resolve_shell_timeout(args.timeout_secs, self.config.max_shell_timeout_secs);
-        let shell_program = match &self.config.shell_program {
-            Some(path) => path,
-            None => return Ok(tool_error("shell execution is disabled")),
-        };
-
-        #[cfg(target_os = "linux")]
-        let mut command = if self.config.sandbox_shell && !powershell {
-            match self.bubblewrap_command(shell_program, &working_dir, &args.command) {
-                Ok(command) => command,
-                Err(error) => return Ok(tool_error(error)),
-            }
-        } else {
-            direct_shell_command(shell_program, powershell, &working_dir, &args.command)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let mut command =
-            direct_shell_command(shell_program, powershell, &working_dir, &args.command);
-
-        command
-            .stdin(if args.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_remove("DOTLINK_API_KEY")
-            .env_remove("DOTLINK_API_KEY_FILE")
-            .env_remove("NGROK_AUTHTOKEN_FILE")
-            .env_remove("CONTROL_PLANE_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("OPENAI_ADMIN_KEY")
-            .env_remove("NGROK_AUTHTOKEN")
-            .kill_on_drop(true);
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => return Ok(tool_error(error)),
-        };
-
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-
-        if let Some(stdin_text) = args.stdin
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            match timeout_at(deadline, stdin.write_all(stdin_text.as_bytes())).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    Self::terminate_child(&mut child).await;
-                    return Ok(tool_error(format!("failed writing stdin: {error}")));
-                }
-                Err(_) => {
-                    Self::terminate_child(&mut child).await;
-                    return Ok(tool_error(format!(
-                        "writing command stdin timed out after {timeout_secs} seconds"
-                    )));
-                }
-            }
-        }
-
-        let output_limit = self.output_limit(args.max_output_bytes);
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                Self::terminate_child(&mut child).await;
-                return Ok(tool_error("failed to capture child stdout"));
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                Self::terminate_child(&mut child).await;
-                return Ok(tool_error("failed to capture child stderr"));
-            }
-        };
-        let stdout_task = tokio::spawn(drain_capped(stdout, output_limit));
-        let stderr_task = tokio::spawn(drain_capped(stderr, output_limit));
-
-        let status = {
-            let wait = timeout_at(deadline, child.wait());
-            tokio::pin!(wait);
-            loop {
-                tokio::select! {
-                    result = &mut wait => break result,
-                    () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
-                        if let Some(heartbeat) = heartbeat.as_ref() {
-                            heartbeat.report().await;
-                        }
-                    }
-                }
-            }
-        };
-
-        let status = match status {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(error)) => {
-                Self::terminate_child(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                return Ok(tool_error(error));
-            }
-            Err(_) => {
-                Self::terminate_child(&mut child).await;
-                None
-            }
-        };
-        let timed_out = status.is_none();
-
-        // A killed child closes its pipes; descendants may still hold them, so a
-        // timed-out call gets a short grace to salvage partial output.
-        let collect_deadline = match timed_out {
-            false => deadline,
-            true => Instant::now() + TIMEOUT_OUTPUT_GRACE,
-        };
-        let mut stdout_task = stdout_task;
-        let mut stderr_task = stderr_task;
-        let collected = timeout_at(collect_deadline, async {
-            let stdout = (&mut stdout_task).await;
-            let stderr = (&mut stderr_task).await;
-            (stdout, stderr)
-        })
-        .await;
-        let collected = match collected {
-            Ok(results) => Some(results),
-            Err(_) => {
-                stdout_task.abort();
-                stderr_task.abort();
-                None
-            }
-        };
-
-        let (stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated) = match collected {
-            Some((stdout_result, stderr_result)) => {
-                let (stdout_bytes, stdout_truncated) = match stdout_result {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => {
-                        return Ok(tool_error(format!("failed reading stdout: {error}")));
-                    }
-                    Err(error) => {
-                        return Ok(tool_error(format!("stdout reader task failed: {error}")));
-                    }
-                };
-                let (stderr_bytes, stderr_truncated) = match stderr_result {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => {
-                        return Ok(tool_error(format!("failed reading stderr: {error}")));
-                    }
-                    Err(error) => {
-                        return Ok(tool_error(format!("stderr reader task failed: {error}")));
-                    }
-                };
-                (
-                    stdout_bytes,
-                    stdout_truncated,
-                    stderr_bytes,
-                    stderr_truncated,
-                )
-            }
-            None if timed_out => (Vec::new(), false, Vec::new(), false),
-            None => {
-                return Ok(tool_error(format!(
-                    "collecting command output timed out after {timeout_secs} seconds"
-                )));
-            }
-        };
-
-        let mut payload = serde_json::json!({
-            "exit_code": status.as_ref().and_then(|status| status.code()),
-            "success": status.as_ref().is_some_and(|status| status.success()),
-            "timed_out": timed_out,
-            "dir": self.config.access.relative_display(&working_dir),
-            "sandboxed": self.config.sandbox_shell,
-            "network": self.config.allow_network,
-            "stdout": String::from_utf8_lossy(&stdout_bytes),
-            "stderr": String::from_utf8_lossy(&stderr_bytes),
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-        });
-        if timed_out {
-            // Report a real MCP error so the model knows why it has no result,
-            // and keep whatever output arrived before the deadline.
-            payload["error"] = Value::String(format!(
-                "command timed out after {timeout_secs} seconds and was terminated; retry with a larger timeout_secs or run it in the background"
-            ));
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                payload.to_string(),
-            )]));
-        }
-        Ok(ok_text(payload.to_string()))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn bubblewrap_command(
-        &self,
-        shell: &Path,
-        working_dir: &Path,
-        script: &str,
-    ) -> Result<Command> {
-        let bwrap = self
-            .config
-            .bwrap_program
-            .as_ref()
-            .expect("bwrap validated at startup");
-        let mut command = Command::new(bwrap);
-        let mut mount_fds: Vec<std::fs::File> = Vec::new();
-        let mut bind_fd = |command: &mut Command,
-                           source: std::fs::File,
-                           dest: &Path,
-                           write: bool,
-                           device: bool| {
-            let descriptor = std::os::fd::AsRawFd::as_raw_fd(&source);
-            if device {
-                // Bubblewrap's regular binds set MS_NODEV, making opened
-                // device nodes unusable. --dev-bind preserves character
-                // device access; the source is the already-pinned FD,
-                // never a mutable host pathname.
-                command
-                    .arg("--dev-bind")
-                    .arg(format!("/proc/self/fd/{descriptor}"))
-                    .arg(dest);
-            } else {
-                command
-                    .arg(if write { "--bind-fd" } else { "--ro-bind-fd" })
-                    .arg(descriptor.to_string())
-                    .arg(dest);
-            }
-            mount_fds.push(source);
-        };
-
-        command
-            .arg("--die-with-parent")
-            .arg("--new-session")
-            .arg("--unshare-pid")
-            .arg("--unshare-ipc")
-            .arg("--unshare-uts");
-        if !self.config.allow_network {
-            command.arg("--unshare-net");
-        }
-
-        if self.config.access.unrestricted_fs {
-            command.arg("--bind").arg("/").arg("/");
-        }
-
-        command
-            .arg("--proc")
-            .arg("/proc")
-            .arg("--dev")
-            .arg("/dev")
-            .arg("--tmpfs")
-            .arg("/tmp")
-            .arg("--dir")
-            .arg("/tmp/home");
-        if !self.config.access.unrestricted_fs {
-            command.arg("--dir").arg("/etc");
-        }
-
-        let mounts = self.config.access.sandbox_mounts();
-        if !self.config.access.unrestricted_fs {
-            for path in sandbox_runtime_mounts() {
-                prepare_mount_target_dirs(&mut command, &path);
-                command.arg("--ro-bind").arg(&path).arg(&path);
-            }
-
-            if self.config.allow_network {
-                for network_path in [
-                    "/etc/resolv.conf",
-                    "/etc/hosts",
-                    "/etc/nsswitch.conf",
-                    "/etc/ssl",
-                    "/etc/ca-certificates",
-                    "/etc/pki",
-                ] {
-                    let path = Path::new(network_path);
-                    if path.exists() {
-                        prepare_mount_target_dirs(&mut command, path);
-                        command.arg("--ro-bind").arg(path).arg(path);
-                    }
-                }
-            }
-
-            for (path, writable) in mounts {
-                prepare_mount_target_dirs(&mut command, &path);
-                let source = self.secure_fs.open_directory(&path)?;
-                bind_fd(&mut command, source, &path, writable, false);
-            }
-        }
-
-        for cache in &self.config.cache_mounts {
-            prepare_directory_mount_target(&mut command, &cache.target);
-            let source = crate::secure_fs::SecureFs::open_canonical_directory(&cache.source)?;
-            bind_fd(&mut command, source, &cache.target, cache.writable, false);
-        }
-
-        for mount in &self.config.host_shell.mounts {
-            prepare_mount_target_dirs(&mut command, &mount.target);
-            let source = mount.pinned.try_clone()?;
-            bind_fd(
-                &mut command,
-                source,
-                &mount.target,
-                false,
-                mount.kind == crate::host_services::HostMountKind::CharacterDevice,
-            );
-        }
-
-        if self.config.host_shell.ssh_agent {
-            // OpenSSH's ssh-keygen -Y sign resolves the invoking Unix user
-            // through getpwuid(). We intentionally keep /etc private by
-            // default, so expose only the read-only account lookup files
-            // when the owner explicitly opts into SSH agent integration.
-            for path in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
-                let path = Path::new(path);
-                if path.is_file()
-                    && !self.config.access.denied_read(path)
-                    && !self
-                        .config
-                        .protected_paths
-                        .iter()
-                        .any(|protected| path == protected || path.starts_with(protected))
-                {
-                    prepare_mount_target_dirs(&mut command, path);
-                    let (source, _) = crate::secure_fs::SecureFs::open_host_mount(
-                        path,
-                        crate::host_services::HostMountKind::RegularFile,
-                    )?;
-                    bind_fd(&mut command, source, path, false, false);
-                }
-            }
-        }
-
-        for denied in self.config.access.deny_write_roots() {
-            if self.config.access.denied_read(denied)
-                || !self.config.access.grant_read(denied)
-                || !self.config.access.grant_write(denied)
-            {
-                continue;
-            }
-            prepare_mount_target_dirs(&mut command, denied);
-            if denied.exists() {
-                command.arg("--ro-bind").arg(denied).arg(denied);
-            }
-        }
-
-        for denied in self.config.access.deny_read_roots() {
-            if !(self.config.access.grant_read(denied) || self.config.access.grant_write(denied)) {
-                continue;
-            }
-            mask_path(&mut command, denied);
-        }
-
-        for protected in &self.config.protected_paths {
-            if self.config.access.grant_read(protected)
-                && !self.config.access.denied_read(protected)
-            {
-                mask_path(&mut command, protected);
-            }
-        }
-
-        if !self.config.host_shell.nix_daemon {
-            // Nix daemon access is a separate shell capability, not a side
-            // effect of --allow-network or filesystem grants. Mask this last
-            // so a broad user grant, a writable cache or a pre-existing root
-            // bind cannot reintroduce a daemon socket after the restriction.
-            for daemon_endpoint in [
-                Path::new("/nix/var/nix/daemon-socket"),
-                Path::new("/run/nix-daemon"),
-            ] {
-                mask_path(&mut command, daemon_endpoint);
-            }
-        }
-
-        command
-            .arg("--chdir")
-            .arg(working_dir)
-            .arg("--clearenv")
-            .arg("--setenv")
-            .arg("HOME")
-            .arg("/tmp/home")
-            .arg("--setenv")
-            .arg("TMPDIR")
-            .arg("/tmp")
-            .arg("--setenv")
-            .arg("PATH")
-            .arg(sandbox_visible_path(&self.config.access));
-
-        for name in ["LANG", "LC_ALL", "TERM", "USER"] {
-            if let Ok(value) = env::var(name) {
-                command.arg("--setenv").arg(name).arg(value);
-            }
-        }
-
-        for (name, value) in &self.config.shell_env {
-            command.arg("--setenv").arg(name).arg(value);
-        }
-        for (name, value) in &self.config.host_shell.environment {
-            command.arg("--setenv").arg(name).arg(value);
-        }
-
-        command
-            .arg("--")
-            .arg(shell)
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg("-lc")
-            .arg(script);
-
-        if !mount_fds.is_empty() {
-            use std::os::{fd::AsRawFd, unix::process::CommandExt};
-            // SAFETY: only async-signal-safe fcntl calls run in the child
-            // before exec. Parent FDs retain CLOEXEC, so concurrent child
-            // processes cannot inherit another request's mount capabilities.
-            unsafe {
-                command.as_std_mut().pre_exec(move || {
-                    for source in &mount_fds {
-                        if libc::fcntl(source.as_raw_fd(), libc::F_SETFD, 0) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
-        Ok(command)
     }
 }
 
-#[cfg(target_os = "linux")]
-fn mask_path(command: &mut Command, path: &Path) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-
-    prepare_mount_target_dirs(command, path);
-
-    if metadata.is_dir() {
-        command
-            .arg("--tmpfs")
-            .arg(path)
-            .arg("--chmod")
-            .arg("000")
-            .arg(path);
-    } else {
-        command.arg("--ro-bind").arg("/dev/null").arg(path);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn prepare_directory_mount_target(command: &mut Command, path: &Path) {
-    prepare_mount_target_dirs(command, path);
-    command.arg("--dir").arg(path);
-}
-
-#[cfg(target_os = "linux")]
-fn prepare_mount_target_dirs(command: &mut Command, path: &Path) {
-    if path == Path::new("/") {
-        return;
-    }
-
-    let mut current = PathBuf::from("/");
-    let components = path.components().collect::<Vec<_>>();
-    let final_is_directory = path.is_dir();
-
-    for (index, component) in components.iter().enumerate() {
-        match component {
-            Component::RootDir | Component::Prefix(_) => continue,
-            Component::CurDir | Component::ParentDir => continue,
-            Component::Normal(part) => current.push(part),
-        }
-        if !final_is_directory && index + 1 == components.len() {
-            break;
-        }
-        command.arg("--dir").arg(&current);
-    }
-}
-
-fn direct_shell_command(
-    shell: &Path,
-    powershell: bool,
-    working_dir: &Path,
-    script: &str,
-) -> Command {
-    let mut command = Command::new(shell);
-    if powershell {
-        command
-            .arg("-NoLogo")
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(script);
-    } else {
-        command
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg("-lc")
-            .arg(script);
-    }
-    command.current_dir(working_dir);
-    command
-}
-
-#[cfg(any(test, not(target_os = "linux")))]
-fn is_concurrent_read_tool(name: &str) -> bool {
-    matches!(name, "ls" | "grep" | "read" | "bread")
-}
-
-fn summarize_tool_call_arguments(arguments: Option<&serde_json::Map<String, Value>>) -> String {
-    let Some(arguments) = arguments else {
-        return String::new();
-    };
-
-    let mut parts = Vec::new();
-    for key in [
-        "path",
-        "dir",
-        "command",
-        "format",
-        "encoding",
-        "pattern",
-        "depth",
-        "kind",
-        "sort",
-        "replace_all",
-        "offset",
-        "limit",
-        "length",
-        "timeout_secs",
-        "max_output_bytes",
-    ] {
-        let Some(value) = arguments.get(key) else {
-            continue;
-        };
-        let rendered = match value {
-            Value::String(value) if key == "command" => truncate(value, 180),
-            Value::String(value) => truncate(value, 240),
-            Value::Bool(value) => value.to_string(),
-            Value::Number(value) => value.to_string(),
-            Value::Null => "null".to_owned(),
-            _ => continue,
-        };
-        parts.push(format!("{key}={rendered}"));
-    }
-
-    for (key, label) in [
-        ("content", "content_bytes"),
-        ("data", "encoded_chars"),
-        ("old_text", "old_bytes"),
-        ("new_text", "new_bytes"),
-        ("patch", "patch_bytes"),
-    ] {
-        if let Some(Value::String(value)) = arguments.get(key) {
-            parts.push(format!("{label}={}", value.len()));
-        }
-    }
-    if let Some(Value::Array(edits)) = arguments.get("edits") {
-        parts.push(format!("edits={}", edits.len()));
-    }
-
-    parts.join(" ")
-}
-
-#[tool_router(vis = "pub")]
 impl LocalMachine {
-    #[tool(
-        description = "List files and directories. `depth` defaults to 1, or 4 when `pattern` contains `/` or `**`; an explicit `depth` wins. Symlinked directories are never traversed. Returns {\"entries\":[{\"path\",\"kind\",\"size\"}],\"truncated\":bool}.",
-        annotations(
-            title = "List files",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn ls(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
-        match self.list_impl(args).await {
-            Ok((entries, truncated)) => {
-                let payload = serde_json::json!({ "entries": entries, "truncated": truncated });
-                match serde_json::to_string_pretty(&payload) {
-                    Ok(json) => ok_text(json),
-                    Err(error) => tool_error(error),
-                }
+    /// Every advertised tool, merged from the per-family routers. Each family
+    /// names its own `#[tool_router]`, so tools stay with their implementation.
+    fn all_tools() -> ToolRouter<Self> {
+        let mut router = Self::discovery_router();
+        router.merge(Self::text_router());
+        router.merge(Self::grep_router());
+        router.merge(Self::edit_router());
+        router.merge(Self::patch_router());
+        router.merge(Self::binary_router());
+        router.merge(Self::shell_router());
+        router
+    }
+
+    pub fn tool_router_for_policy(capabilities: Capabilities) -> ToolRouter<Self> {
+        let mut router = Self::all_tools();
+        for spec in TOOL_SPECS {
+            if !capabilities.allows(spec.capability) {
+                router.disable_route(spec.name);
             }
-            Err(error) => tool_error(error),
+        }
+        router
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            read: self.config.access.has_read_capability(),
+            write: self.config.access.has_write_capability(),
+            read_write: self.config.access.has_read_write_capability(),
+            shell: self.config.allow_shell,
         }
     }
 
-    #[tool(
-        description = "Search UTF-8 text files with a regular expression. output_mode=content returns matching lines as `path:line: text` (or `path: text` when numbered=false), with context windows separated by `--`; files returns {\"files\":[\"path\"],\"truncated\":bool}; count returns {\"counts\":[{\"path\",\"count\"}],\"total\":n,\"truncated\":bool}. Scans at most 1 MiB per file and 50 matches per file; hit groups and files are paged by offset/limit (limit defaults to 200).",
-        annotations(
-            title = "Search text files",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn grep(&self, Parameters(args): Parameters<GrepArgs>) -> CallToolResult {
-        match self.grep_impl(args).await {
-            Ok(text) => ok_text(text),
-            Err(error) => tool_error(error),
-        }
+    fn policy_tool_router(&self) -> &ToolRouter<Self> {
+        self.router
+            .get_or_init(|| Arc::new(Self::tool_router_for_policy(self.capabilities())))
     }
 
-    #[tool(
-        description = "Read a UTF-8 text file. Use bread for non-text files.",
-        annotations(
-            title = "Read text file",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> CallToolResult {
-        let path = match self.resolve_existing(&args.path, AccessNeed::Read).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let mut file = match self.open_read_file(&path).await {
-            Ok(file) => file,
-            Err(error) => return tool_error(error),
-        };
-        let metadata = match file.metadata().await {
-            Ok(metadata) => metadata,
-            Err(error) => return tool_error(error),
-        };
-        if metadata.len() > self.config.max_read_bytes as u64 {
-            return tool_error(format!(
-                "file is {} bytes, above the {} byte text-read limit",
-                metadata.len(),
-                self.config.max_read_bytes
-            ));
-        }
-
-        let bytes = match Self::read_bounded(&mut file, self.config.max_read_bytes).await {
-            Ok(bytes) => bytes,
-            Err(error) => return tool_error(error),
-        };
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => return tool_error("binary file; use bread"),
-        };
-
-        let offset = args.offset.unwrap_or(1).max(1);
-        // A zero window would render a nonsense marker ("truncated at line 0").
-        let limit = args.limit.unwrap_or(DEFAULT_READ_LINES).max(1);
-        let numbered = args.numbered.unwrap_or(true);
-        let all = text.lines().collect::<Vec<_>>();
-        let total = all.len();
-        let mut lines = all
+    /// Pure reads may overlap each other; everything else takes the operation
+    /// gate on platforms without descriptor-rooted IO.
+    #[cfg(any(test, not(target_os = "linux")))]
+    fn is_concurrent_read_tool(name: &str) -> bool {
+        TOOL_SPECS
             .iter()
-            .skip(offset - 1)
-            .take(limit)
-            .enumerate()
-            .map(|(index, line)| match numbered {
-                true => format!("{}\t{line}", offset + index),
-                false => (*line).to_owned(),
-            })
-            .collect::<Vec<_>>();
-        // A single trailing marker, only when the window really is capped.
-        let last = offset.saturating_sub(1).saturating_add(lines.len());
-        if last < total {
-            lines.push(format!("… truncated at line {last} of {total}"));
-        }
-        ok_text(lines.join("\n"))
+            .any(|spec| spec.name == name && spec.concurrent_read)
     }
 
-    #[tool(
-        description = "Create or replace a UTF-8 text file. Missing parent directories are created automatically.",
-        annotations(
-            title = "Write text file",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn write(&self, Parameters(args): Parameters<WriteArgs>) -> CallToolResult {
-        if args.content.len() > self.config.max_write_bytes {
-            return tool_error(format!(
-                "content is {} bytes, above the {} byte write limit",
-                args.content.len(),
-                self.config.max_write_bytes
-            ));
-        }
-        let path = match self.resolve_for_create(&args.path, AccessNeed::Write).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let mut file = match self.open_write_file(&path).await {
-            Ok(file) => file,
-            Err(error) => return tool_error(error),
-        };
-        match Self::write_complete(&mut file, args.content.as_bytes()).await {
-            Ok(()) => ok_text(format!(
-                "wrote {} bytes to {}",
-                args.content.len(),
-                args.path
-            )),
-            Err(error) => tool_error(error),
-        }
-    }
-
-    /// Multi-file, all-or-nothing exact-text edit. Every entry is planned
-    /// against an in-memory snapshot in array order, then each file is
-    /// re-hashed before anything is written.
-    async fn edit_impl(&self, args: EditArgs) -> Result<String> {
-        let total = args.edits.len();
-        if total == 0 {
-            bail!("edit: edits must not be empty");
-        }
-        if total > MAX_EDIT_OPS {
-            bail!("edit: {total} edits, above the {MAX_EDIT_OPS} edit limit");
-        }
-
-        struct FilePlan {
-            path: PathBuf,
-            display: String,
-            snapshot: Vec<u8>,
-            text: String,
-            edits: usize,
-            new_texts: Vec<String>,
-        }
-
-        let mut files: Vec<FilePlan> = Vec::new();
-        let mut combined_bytes = 0_usize;
-
-        for (index, op) in args.edits.iter().enumerate() {
-            let position = index + 1;
-            combined_bytes = combined_bytes
-                .saturating_add(op.old_text.len())
-                .saturating_add(op.new_text.len());
-            if combined_bytes > self.config.max_write_bytes {
-                bail!(
-                    "edit {position}/{total}: edits are {combined_bytes} bytes, above the {} byte write limit",
-                    self.config.max_write_bytes
-                );
-            }
-
-            let target = op.path.as_deref().or(args.path.as_deref());
-            let Some(target) = target else {
-                bail!("edit {position}/{total}: no path (set edits[].path or a top-level path)");
-            };
-            let path = self.resolve_existing(target, AccessNeed::ReadWrite).await?;
-            let slot = match files.iter().position(|file| file.path == path) {
-                Some(slot) => slot,
-                None => {
-                    if files.len() >= MAX_EDIT_FILES {
-                        bail!(
-                            "edit {position}/{total}: {} files, above the {MAX_EDIT_FILES} file limit",
-                            files.len() + 1
-                        );
-                    }
-                    let mut file = self.open_edit_file(&path).await?;
-                    let snapshot =
-                        Self::read_bounded(&mut file, self.config.max_read_bytes).await?;
-                    let text = match String::from_utf8(snapshot.clone()) {
-                        Ok(text) => text,
-                        Err(_) => bail!(
-                            "edit {position}/{total} ({}): binary file; use bedit",
-                            self.config.access.relative_display(&path)
-                        ),
-                    };
-                    files.push(FilePlan {
-                        display: self.config.access.relative_display(&path),
-                        path,
-                        snapshot,
-                        text,
-                        edits: 0,
-                        new_texts: Vec::new(),
-                    });
-                    files.len() - 1
-                }
-            };
-            let file = &mut files[slot];
-            if op.old_text.is_empty() {
-                bail!(
-                    "edit {position}/{total} ({}): old_text must not be empty",
-                    file.display
-                );
-            }
-            if file
-                .new_texts
-                .iter()
-                .any(|new_text| new_text.contains(&op.old_text))
-            {
-                bail!(
-                    "edit {position}/{total} ({}): old_text is a substring of this edit's predecessor's new_text in the same file",
-                    file.display
-                );
-            }
-
-            let occurrences = match_indices(&file.text, &op.old_text);
-            if occurrences.is_empty() {
-                if has_line_number_prefix(&op.old_text) {
-                    bail!(
-                        "edit {position}/{total} ({}): old_text appears to include a read line-number prefix (digits then tab); strip it",
-                        file.display
-                    );
-                }
-                bail!(
-                    "edit {position}/{total} ({}): old_text does not occur at the point that edit applies",
-                    file.display
-                );
-            }
-            if !op.replace_all && occurrences.len() > 1 {
-                let lines = occurrences
-                    .iter()
-                    .take(10)
-                    .map(|offset| line_number(&file.text, *offset).to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                bail!(
-                    "edit {position}/{total} ({}): old_text occurs {} times at lines {lines}; make it unique or set replace_all",
-                    file.display,
-                    occurrences.len()
-                );
-            }
-
-            file.text = match op.replace_all {
-                true => file.text.replace(&op.old_text, &op.new_text),
-                false => file.text.replacen(&op.old_text, &op.new_text, 1),
-            };
-            file.edits += 1;
-            file.new_texts.push(op.new_text.clone());
-
-            if file.text.len() > self.config.max_write_bytes {
-                bail!(
-                    "edit {position}/{total} ({}): edited file would be {} bytes, above the {} byte write limit",
-                    file.display,
-                    file.text.len(),
-                    self.config.max_write_bytes
-                );
-            }
-        }
-
-        let changed = files
-            .iter()
-            .filter(|file| file.text.as_bytes() != file.snapshot.as_slice())
-            .collect::<Vec<_>>();
-        if changed.is_empty() {
-            let receipt = serde_json::json!({
-                "files": [],
-                "edits_applied": total,
-                "changed_files": 0,
-            });
-            return Ok(receipt.to_string());
-        }
-
-        // Verify every snapshot before the first write: a file that changed
-        // since it was read fails the whole call.
-        let mut verified: Vec<(&PathBuf, &FilePlan)> = Vec::new();
-        for file in &changed {
-            let mut handle = self.open_edit_file(&file.path).await?;
-            let current = Self::read_bounded(&mut handle, self.config.max_read_bytes).await?;
-            verify_snapshot(&file.display, &current, &file.snapshot, "editing")?;
-            verified.push((&file.path, file));
-        }
-
-        for (path, file) in &verified {
-            let mut handle = self.open_edit_file(path).await?;
-            handle.rewind().await?;
-            handle.set_len(0).await?;
-            Self::write_complete(&mut handle, file.text.as_bytes()).await?;
-        }
-
-        let files = changed
-            .iter()
-            .map(|file| {
-                serde_json::json!({
-                    "path": file.display,
-                    "edits": file.edits,
-                    // Signed: a shrinking file is a negative delta.
-                    "line_delta": line_count(&file.text) as i64
-                        - line_count(&String::from_utf8_lossy(&file.snapshot)) as i64,
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok(serde_json::json!({
-            "files": files,
-            "edits_applied": total,
-            "changed_files": changed.len(),
-        })
-        .to_string())
-    }
-
-    #[tool(
-        description = "Replace exact text in one or more existing UTF-8 files, all or nothing. `edits` is an ordered array of {path?, old_text, new_text, replace_all?}; `path` is the inherited default. Each old_text must be unique unless replace_all is set, and must not be a substring of an earlier edit's new_text in the same file. `read` prefixes lines with a line number and a tab; never include that prefix in old_text. Returns a receipt with per-file path, edits and line_delta, plus edits_applied and changed_files.",
-        annotations(
-            title = "Edit text files",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> CallToolResult {
-        match self.edit_impl(args).await {
-            Ok(receipt) => ok_text(receipt),
-            Err(error) => tool_error(error),
-        }
-    }
-
-    /// Codex-grammar patch application: plan every file in memory, verify each
-    /// snapshot, then write. `best_effort` writes the files that planned
-    /// cleanly and reports the failures instead.
-    async fn patch_impl(&self, args: PatchArgs) -> Result<String> {
-        if args.patch.len() > self.config.max_write_bytes {
-            bail!(
-                "patch: {} bytes, above the {} byte write limit",
-                args.patch.len(),
-                self.config.max_write_bytes
-            );
-        }
-        let ops = parse_patch(&args.patch)?;
-        let total_hunks = ops
-            .iter()
-            .map(|op| match op {
-                PatchOp::Update { hunks, .. } => hunks.len(),
-                PatchOp::Add { .. } => 0,
-            })
-            .sum::<usize>();
-
-        // Update and create are different plans with different write rules;
-        // keep them distinct instead of overloading `Option<snapshot>`.
-        enum PlanKind {
-            Update { snapshot: Vec<u8> },
-            Create,
-        }
-
-        struct PlannedFile {
-            path: PathBuf,
-            display: String,
-            kind: PlanKind,
-            text: String,
-            hunks: usize,
-            added: usize,
-            removed: usize,
-        }
-
-        let mut planned: Vec<PlannedFile> = Vec::new();
-        let mut failures: Vec<(String, String)> = Vec::new();
-        let mut planned_paths: Vec<PathBuf> = Vec::new();
-        let mut hunk_index = 0_usize;
-        let dir = args.dir.as_str();
-
-        for op in &ops {
-            match op {
-                PatchOp::Update { path, hunks } => {
-                    let first_hunk = hunk_index;
-                    hunk_index += hunks.len();
-                    let resolved = match self
-                        .resolve_existing(&join_patch_path(dir, path), AccessNeed::ReadWrite)
-                        .await
-                    {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            if !args.best_effort {
-                                return Err(error);
-                            }
-                            failures.push((path.clone(), error.to_string()));
-                            continue;
-                        }
-                    };
-                    let display = self.config.access.relative_display(&resolved);
-                    if planned_paths.contains(&resolved) {
-                        let error = format!("patch: {display} appears in more than one section");
-                        if !args.best_effort {
-                            bail!("{error}");
-                        }
-                        failures.push((display, error));
-                        continue;
-                    }
-                    planned_paths.push(resolved.clone());
-                    let outcome = async {
-                        let mut handle = self.open_edit_file(&resolved).await?;
-                        let snapshot =
-                            Self::read_bounded(&mut handle, self.config.max_read_bytes).await?;
-                        let text = String::from_utf8(snapshot.clone())
-                            .map_err(|_| anyhow!("{display}: binary file; use bedit"))?;
-                        let (edited, added, removed) =
-                            apply_patch_hunks(&text, hunks, &display, first_hunk, total_hunks)?;
-                        if edited.len() > self.config.max_write_bytes {
-                            bail!(
-                                "{display}: patched file would be {} bytes, above the {} byte write limit",
-                                edited.len(),
-                                self.config.max_write_bytes
-                            );
-                        }
-                        Ok(PlannedFile {
-                            path: resolved.clone(),
-                            display: display.clone(),
-                            kind: PlanKind::Update { snapshot },
-                            text: edited,
-                            hunks: hunks.len(),
-                            added,
-                            removed,
-                        })
-                    }
-                    .await;
-                    match outcome {
-                        Ok(file) => planned.push(file),
-                        Err(error) => {
-                            if !args.best_effort {
-                                return Err(error);
-                            }
-                            failures.push((display, error.to_string()));
-                        }
-                    }
-                }
-                PatchOp::Add { path, lines } => {
-                    let resolved = match self
-                        .resolve_for_create(&join_patch_path(dir, path), AccessNeed::Write)
-                        .await
-                    {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            if !args.best_effort {
-                                return Err(error);
-                            }
-                            failures.push((path.clone(), error.to_string()));
-                            continue;
-                        }
-                    };
-                    let display = self.config.access.relative_display(&resolved);
-                    // Create-only: checked here so an atomic call fails before
-                    // any write, and again by the exclusive open below, so a
-                    // file created in between cannot be clobbered.
-                    if fs::symlink_metadata(&resolved).await.is_ok() {
-                        let error = format!("{display}: '*** Add File' target already exists");
-                        if !args.best_effort {
-                            bail!("{error}");
-                        }
-                        failures.push((display, error));
-                        planned_paths.push(resolved);
-                        continue;
-                    }
-                    let text = if lines.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{}\n", lines.join("\n"))
-                    };
-                    if text.len() > self.config.max_write_bytes {
-                        let error = format!(
-                            "{display}: added file would be {} bytes, above the {} byte write limit",
-                            text.len(),
-                            self.config.max_write_bytes
-                        );
-                        if !args.best_effort {
-                            bail!("{error}");
-                        }
-                        failures.push((display, error));
-                        planned_paths.push(resolved);
-                        continue;
-                    }
-                    planned_paths.push(resolved.clone());
-                    planned.push(PlannedFile {
-                        path: resolved,
-                        display,
-                        kind: PlanKind::Create,
-                        text,
-                        hunks: 0,
-                        added: lines.len(),
-                        removed: 0,
-                    });
-                }
-            }
-        }
-
-        // Verify every update snapshot before the first write. Atomic fails the
-        // whole call; `best_effort` reports the file and keeps the rest.
-        let mut ready: Vec<PlannedFile> = Vec::with_capacity(planned.len());
-        for file in planned {
-            if let PlanKind::Update { snapshot } = &file.kind {
-                let mut handle = self.open_edit_file(&file.path).await?;
-                let current = Self::read_bounded(&mut handle, self.config.max_read_bytes).await?;
-                if let Some(reason) =
-                    snapshot_changed(&file.display, &current, snapshot, "patching")
-                {
-                    if !args.best_effort {
-                        bail!("{reason}; nothing was written");
-                    }
-                    failures.push((file.display.clone(), format!("{reason}; skipped")));
-                    continue;
-                }
-            }
-            ready.push(file);
-        }
-
-        let mut written: Vec<PlannedFile> = Vec::with_capacity(ready.len());
-        for file in ready {
-            // A patch that reproduces the file byte for byte touches nothing.
-            if let PlanKind::Update { snapshot } = &file.kind
-                && file.text.as_bytes() == snapshot.as_slice()
-            {
-                written.push(file);
-                continue;
-            }
-            let outcome = async {
-                let mut handle = match file.kind {
-                    PlanKind::Update { .. } => {
-                        let mut handle = self.open_edit_file(&file.path).await?;
-                        handle.rewind().await?;
-                        handle.set_len(0).await?;
-                        handle
-                    }
-                    // Exclusive create: create-only is enforced by the open, not
-                    // just by the planning-time existence check.
-                    PlanKind::Create => self.open_create_file(&file.path).await?,
-                };
-                Self::write_complete(&mut handle, file.text.as_bytes()).await
-            }
-            .await;
-            match outcome {
-                Ok(()) => written.push(file),
-                Err(error) if args.best_effort => {
-                    failures.push((file.display.clone(), error.to_string()))
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        let mode = if args.best_effort {
-            "best_effort"
-        } else {
-            "atomic"
-        };
-        let mut receipt = serde_json::json!({
-            "files": written
-                .iter()
-                .map(|file| serde_json::json!({
-                    "path": file.display,
-                    "hunks": file.hunks,
-                    "added": file.added,
-                    "removed": file.removed,
-                }))
-                .collect::<Vec<_>>(),
-            "mode": mode,
-        });
-        if !failures.is_empty() {
-            receipt["failures"] = serde_json::json!(
-                failures
-                    .iter()
-                    .map(|(path, error)| serde_json::json!({"path": path, "error": error}))
-                    .collect::<Vec<_>>()
-            );
-        }
-        Ok(receipt.to_string())
-    }
-
-    #[tool(
-        description = "Apply a Codex-grammar patch atomically. Supports \"*** Update File:\" hunks and \"*** Add File:\" only; Delete and Move are rejected. Hunks are located by their context lines (exact first, then trailing-whitespace-tolerant), an ambiguous match fails, and hunks apply top-down within a file. best_effort writes the files that planned cleanly and reports the rest. Returns a receipt with per-file hunks/added/removed and mode.",
-        annotations(
-            title = "Apply patch",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn patch(&self, Parameters(args): Parameters<PatchArgs>) -> CallToolResult {
-        match self.patch_impl(args).await {
-            Ok(receipt) => ok_text(receipt),
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Read a binary file. format=mcp returns typed MCP image/audio/blob content; base64 or hex returns encoded bytes.",
-        annotations(
-            title = "Read binary file",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn bread(&self, Parameters(args): Parameters<BreadArgs>) -> CallToolResult {
-        let path = match self.resolve_existing(&args.path, AccessNeed::Read).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let mut file = match self.open_read_file(&path).await {
-            Ok(file) => file,
-            Err(error) => return tool_error(error),
-        };
-        let metadata = match file.metadata().await {
-            Ok(metadata) => metadata,
-            Err(error) => return tool_error(error),
-        };
-        let total_size = metadata.len();
-
-        match args.format {
-            BreadFormat::Mcp => {
-                if args.offset.unwrap_or(0) != 0 {
-                    return tool_error("format=mcp requires offset=0");
-                }
-                let limit = args.limit.unwrap_or(self.config.max_read_bytes);
-                if total_size > limit.min(self.config.max_read_bytes) as u64 {
-                    return tool_error(
-                        "format=mcp requires the complete file within the read limit; use base64 or hex for chunked reads",
-                    );
-                }
-                let bytes = match Self::read_bounded(
-                    &mut file,
-                    limit.min(self.config.max_read_bytes),
-                )
-                .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(error) => return tool_error(error),
-                };
-                let encoded = BASE64.encode(bytes);
-                let mime = mime_guess::from_path(&path)
-                    .first_or_octet_stream()
-                    .essence_str()
+    pub fn visible_tool_descriptions(&self) -> Vec<(String, String)> {
+        self.policy_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                let title = tool
+                    .title
+                    .as_deref()
+                    .or_else(|| tool.annotations.as_ref().and_then(|a| a.title.as_deref()))
+                    .or(tool.description.as_deref())
+                    .unwrap_or("")
                     .to_owned();
-                let content = if mime.starts_with("image/") {
-                    ContentBlock::image(encoded, mime)
-                } else if mime.starts_with("audio/") {
-                    ContentBlock::audio(encoded, mime)
-                } else {
-                    let uri = format!(
-                        "abird://file/{}",
-                        self.config.access.relative_display(&path)
-                    );
-                    ContentBlock::resource(
-                        ResourceContents::blob(encoded, uri).with_mime_type(mime),
-                    )
-                };
-                CallToolResult::success(vec![content])
-            }
-            BreadFormat::Base64 | BreadFormat::Hex => {
-                let offset = args.offset.unwrap_or(0);
-                if offset > total_size {
-                    return tool_error("offset is beyond end of file");
-                }
-                let limit = args
-                    .limit
-                    .unwrap_or(self.config.max_read_bytes)
-                    .clamp(1, self.config.max_read_bytes);
-                if let Err(error) = file.seek(std::io::SeekFrom::Start(offset)).await {
-                    return tool_error(error);
-                }
-                let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-                if let Err(error) = file.take(limit as u64).read_to_end(&mut bytes).await {
-                    return tool_error(error);
-                }
-                let (format, encoded) = match args.format {
-                    BreadFormat::Base64 => ("base64", BASE64.encode(&bytes)),
-                    BreadFormat::Hex => ("hex", hex::encode(&bytes)),
-                    BreadFormat::Mcp => unreachable!(),
-                };
-                let truncated = offset + (bytes.len() as u64) < total_size;
-                ok_text(
-                    serde_json::json!({
-                        "path": args.path,
-                        "format": format,
-                        "offset": offset,
-                        "bytes": bytes.len(),
-                        "total_size": total_size,
-                        "truncated": truncated,
-                        "data": encoded,
-                    })
-                    .to_string(),
-                )
-            }
-        }
+                (tool.name.to_string(), title)
+            })
+            .collect()
     }
 
-    #[tool(
-        description = "Create or replace a binary file using base64 or hex data.",
-        annotations(
-            title = "Write binary file",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn bwrite(&self, Parameters(args): Parameters<BwriteArgs>) -> CallToolResult {
-        let bytes = match decode_binary(&args.data, args.encoding, self.config.max_write_bytes) {
-            Ok(bytes) => bytes,
-            Err(error) => return tool_error(error),
-        };
-        let path = match self.resolve_for_create(&args.path, AccessNeed::Write).await {
-            Ok(path) => path,
-            Err(error) => return tool_error(error),
-        };
-        let mut file = match self.open_write_file(&path).await {
-            Ok(file) => file,
-            Err(error) => return tool_error(error),
-        };
-        match Self::write_complete(&mut file, &bytes).await {
-            Ok(()) => ok_text(format!("wrote {} bytes to {}", bytes.len(), args.path)),
-            Err(error) => tool_error(error),
-        }
+    /// The tool's own argument names, in schema order. The TOOL log renders
+    /// exactly these keys, so a new argument is logged without a second list.
+    fn argument_names(&self, name: &str) -> Vec<String> {
+        self.policy_tool_router()
+            .get(name)
+            .and_then(|tool| tool.input_schema.get("properties"))
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    /// Multi-range binary edit against original-file offsets. Ranges are
-    /// decoded and validated before the file is rewritten; nothing is written
-    /// when any range is invalid or the optional sha256 precondition fails.
-    async fn bedit_impl(&self, args: BeditArgs) -> Result<String> {
-        let total = args.edits.len();
-        if total == 0 {
-            bail!("bedit: edits must not be empty");
-        }
-        if total > MAX_BEDIT_RANGES {
-            bail!("bedit: {total} ranges, above the {MAX_BEDIT_RANGES} range limit");
-        }
-        let path = self
-            .resolve_existing(&args.path, AccessNeed::ReadWrite)
-            .await?;
-        let display = self.config.access.relative_display(&path);
-        let mut file = self.open_edit_file(&path).await?;
-        let metadata = file.metadata().await?;
-        if metadata.len() > MAX_PATCH_FILE_BYTES as u64 {
-            bail!(
-                "bedit target is {} bytes; maximum patchable file size is {MAX_PATCH_FILE_BYTES} bytes",
-                metadata.len()
-            );
-        }
-        let original = Self::read_bounded(&mut file, MAX_PATCH_FILE_BYTES).await?;
-        let size_before = original.len();
-
-        if let Some(expected) = args.sha256.as_deref() {
-            let found = hex::encode(sha256(&original));
-            if !expected.eq_ignore_ascii_case(&found) {
-                bail!("bedit: sha256 mismatch (expected {expected}, found {found})");
-            }
-        }
-
-        // Decoded payloads are held until the plan is valid, so the running
-        // total is bounded: no request can pin more than one patchable file
-        // worth of bytes in memory while its ranges are validated.
-        let mut decoded_bytes = 0_usize;
-        let mut ranges = Vec::with_capacity(total);
-        for (index, range) in args.edits.iter().enumerate() {
-            let position = index + 1;
-            if range.offset > size_before {
-                bail!(
-                    "bedit {position}/{total}: offset {} is beyond end of file ({size_before} bytes)",
-                    range.offset
-                );
-            }
-            let data = decode_binary(&range.data, range.encoding, MAX_PATCH_FILE_BYTES)
-                .with_context(|| format!("bedit {position}/{total}"))?;
-            decoded_bytes = decoded_bytes.saturating_add(data.len());
-            if decoded_bytes > MAX_PATCH_FILE_BYTES {
-                bail!(
-                    "bedit: replacement payloads total {decoded_bytes} bytes, above the {MAX_PATCH_FILE_BYTES} byte limit"
-                );
-            }
-            let length = range.length.unwrap_or(data.len());
-            let end = range
-                .offset
-                .checked_add(length)
-                .filter(|end| *end <= size_before);
-            let Some(end) = end else {
-                bail!(
-                    "bedit {position}/{total}: range extends beyond end of file ({size_before} bytes)"
-                );
-            };
-            ranges.push(RangePlan {
-                offset: range.offset,
-                end,
-                length,
-                position,
-                data,
-            });
-        }
-
-        ranges.sort_by_key(|range| range.offset);
-        for (index, range) in ranges.iter().enumerate() {
-            let Some(previous) = index.checked_sub(1).map(|index| &ranges[index]) else {
-                continue;
-            };
-            if range.offset < previous.end {
-                bail!(
-                    "bedit {}/{total}: range overlaps range {} (offset {}, length {})",
-                    range.position,
-                    previous.position,
-                    previous.offset,
-                    previous.length
-                );
-            }
-        }
-
-        let bytes_written = ranges.iter().map(|range| range.data.len()).sum::<usize>();
-        let bytes_removed = ranges
-            .iter()
-            .map(|range| range.end - range.offset)
-            .sum::<usize>();
-        let size_after = size_before - bytes_removed + bytes_written;
-        if size_after > MAX_PATCH_FILE_BYTES {
-            bail!("bedit: patched file would exceed the {MAX_PATCH_FILE_BYTES} byte limit");
-        }
-
-        let mut edited = Vec::with_capacity(size_after);
-        let mut cursor = 0_usize;
-        for range in &ranges {
-            edited.extend_from_slice(&original[cursor..range.offset]);
-            edited.extend_from_slice(&range.data);
-            cursor = range.end;
-        }
-        edited.extend_from_slice(&original[cursor..]);
-        debug_assert_eq!(edited.len(), size_after);
-
-        file.rewind().await?;
-        file.set_len(0).await?;
-        Self::write_complete(&mut file, &edited).await?;
-        Ok(serde_json::json!({
-            "path": display,
-            "ranges": total,
-            "bytes_written": bytes_written,
-            "size_before": size_before,
-            "size_after": size_after,
-        })
-        .to_string())
-    }
-
-    #[tool(
-        description = "Edit byte ranges in an existing binary file, all or nothing. `edits` is an array of {offset, length?, data, encoding}; offsets are relative to the original file, ranges are applied ascending, and overlaps are rejected. `length` defaults to the decoded payload size, 0 inserts, and empty data with a positive length deletes. An optional lowercase-hex `sha256` precondition is checked before writing. Returns a receipt with path, ranges, bytes_written, size_before and size_after.",
-        annotations(
-            title = "Edit binary file",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn bedit(&self, Parameters(args): Parameters<BeditArgs>) -> CallToolResult {
-        match self.bedit_impl(args).await {
-            Ok(receipt) => ok_text(receipt),
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Run a Bash command.",
-        annotations(
-            title = "Run Bash command",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn bash(
+    fn summarize_tool_call_arguments(
         &self,
-        Parameters(args): Parameters<ShellArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.execute_shell(args, false, ProgressHeartbeat::for_request(&context))
-            .await
-    }
-
-    #[tool(
-        description = "Run a PowerShell command.",
-        annotations(
-            title = "Run PowerShell command",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn powershell(
-        &self,
-        Parameters(args): Parameters<ShellArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.execute_shell(args, true, ProgressHeartbeat::for_request(&context))
-            .await
+        name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+    ) -> String {
+        let Some(arguments) = arguments else {
+            return String::new();
+        };
+        let names = self.argument_names(name);
+        crate::logging::summarize_arguments(arguments, names.iter().map(String::as_str))
     }
 }
 
-#[rmcp::tool_handler(
+#[tool_handler(
     router = self.policy_tool_router(),
     name = "dotlink",
     instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
@@ -3866,7 +1203,12 @@ impl rmcp::ServerHandler for LocalMachine {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
-        let detail = summarize_tool_call_arguments(request.arguments.as_ref());
+        // Building the router to read the schema is not free, so only do it when
+        // the detail line will actually be printed.
+        let detail = match self.config.log.activity_enabled() {
+            true => self.summarize_tool_call_arguments(&name, request.arguments.as_ref()),
+            false => String::new(),
+        };
         let started = self.config.log.activity_start(&name, detail);
 
         let context = ToolCallContext::new(self, request, context);
@@ -3890,7 +1232,7 @@ impl rmcp::ServerHandler for LocalMachine {
             {
                 // Until the other platforms get descriptor-relative tools,
                 // preserve their conservative filesystem topology gate.
-                if is_concurrent_read_tool(&name) {
+                if Self::is_concurrent_read_tool(&name) {
                     let _guard = self.operation_gate.read().await;
                     self.policy_tool_router().call(context).await
                 } else {
@@ -3915,1550 +1257,10 @@ impl rmcp::ServerHandler for LocalMachine {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncSeekExt;
+
     use super::*;
-
-    #[test]
-    fn glob_grammar_covers_stars_classes_alternation_and_separators() {
-        let matches = |pattern: &str, candidate: &str| {
-            GlobFilter::new(pattern)
-                .unwrap()
-                .matches(Path::new(candidate))
-        };
-
-        assert!(matches("*.rs", "lib.rs"));
-        assert!(matches("*", "anything"));
-        assert!(matches("test_?.rs", "test_a.rs"));
-        assert!(!matches("test_?.rs", "test_ab.rs"));
-        assert!(matches("a*b*c", "axxbyyc"));
-        assert!(matches("a*c", "ac"));
-        assert!(!matches("*.rs", "lib.rs.bak"));
-        assert!(matches("lib.rs", "lib.rs"));
-        assert!(matches("[abc].rs", "b.rs"));
-        assert!(!matches("[!abc].rs", "b.rs"));
-        assert!(matches("*.{rs,md}", "notes.md"));
-        assert!(!matches("*.{rs,md}", "notes.txt"));
-        assert!(matches("**/*.rs", "src/nested/deep.rs"));
-        assert!(matches("src/**", "src/nested/deep.rs"));
-        // `literal_separator`: a bare `*` never crosses a separator.
-        assert!(!matches("*.rs", "src/lib.rs"));
-        assert!(!matches("src/*.rs", "src/nested/deep.rs"));
-        assert!(GlobFilter::new("[unclosed").is_err());
-    }
-
-    impl Default for ListArgs {
-        fn default() -> Self {
-            Self {
-                path: dot(),
-                pattern: None,
-                depth: None,
-                kind: ListKind::Any,
-                sort: ListSort::Path,
-                limit: None,
-            }
-        }
-    }
-
-    fn test_machine(root: PathBuf) -> LocalMachine {
-        #[cfg(target_os = "linux")]
-        let root_for_secure_fs = root.clone();
-        LocalMachine {
-            config: RuntimeConfig {
-                access: AccessPolicy::from_spec(AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: vec![root.clone()],
-                    write_roots: vec![root.clone()],
-                    deny_read_roots: Vec::new(),
-                    deny_write_roots: Vec::new(),
-                    unrestricted_fs: false,
-                })
-                .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
-                #[cfg(target_os = "linux")]
-                host_shell: crate::host_services::HostShell::default(),
-                log: LogConfig::default(),
-                allow_shell: false,
-                sandbox_shell: false,
-                allow_network: false,
-                shell_program: None,
-                bwrap_program: None,
-                max_shell_timeout_secs: 60,
-                max_output_bytes: 65536,
-                max_read_bytes: 65536,
-                max_write_bytes: 65536,
-                protected_paths: Vec::new(),
-            },
-            operation_gate: Arc::new(RwLock::new(())),
-            serialize: false,
-            #[cfg(target_os = "linux")]
-            secure_fs: Arc::new(
-                crate::secure_fs::SecureFs::new(
-                    std::slice::from_ref(&root_for_secure_fs),
-                    std::slice::from_ref(&root_for_secure_fs),
-                )
-                .unwrap(),
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn ls_globs_and_limits_depth() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("src/nested")).unwrap();
-        std::fs::write(root.join("top.rs"), "x").unwrap();
-        std::fs::write(root.join("src/lib.rs"), "x").unwrap();
-        std::fs::write(root.join("src/nested/deep.rs"), "x").unwrap();
-        std::fs::write(root.join("README.md"), "x").unwrap();
-        let machine = test_machine(root);
-
-        // Default depth 1: this directory only.
-        let (entries, truncated) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                pattern: None,
-                depth: None,
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        assert!(!truncated);
-        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-        assert_eq!(names, ["README.md", "src", "top.rs"]);
-
-        // Depth 2 descends one more level.
-        let (entries, _) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                pattern: None,
-                depth: Some(2),
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-        assert!(names.contains(&"src/lib.rs"), "{names:?}");
-        assert!(!names.contains(&"src/nested/deep.rs"), "{names:?}");
-
-        // Pattern filters every level it descends into.
-        let (entries, _) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                pattern: Some("*.rs".to_owned()),
-                depth: Some(3),
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        let mut names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(names, ["src/lib.rs", "src/nested/deep.rs", "top.rs"]);
-
-        // A capped listing reports truncation instead of silently dropping entries.
-        let (entries, truncated) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                pattern: Some("*.rs".to_owned()),
-                depth: Some(3),
-                limit: Some(2),
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(truncated);
-    }
-
-    #[tokio::test]
-    async fn ls_depth_follows_patterns_kind_and_mtime() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("src/nested")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "x").unwrap();
-        std::fs::write(root.join("src/nested/deep.rs"), "x").unwrap();
-        std::fs::write(root.join("top.rs"), "x").unwrap();
-        let machine = test_machine(root.clone());
-
-        // A pattern addressing a nested path implies depth 4.
-        let (entries, _) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                pattern: Some("src/**/*.rs".to_owned()),
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        let mut names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(names, ["src/lib.rs", "src/nested/deep.rs"]);
-
-        // An explicit depth still wins over the implied default.
-        let (entries, _) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                pattern: Some("src/**/*.rs".to_owned()),
-                depth: Some(1),
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        assert!(entries.is_empty(), "{entries:?}");
-
-        // `kind` filters entries without stopping the descent.
-        let (entries, _) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                kind: ListKind::File,
-                depth: Some(3),
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        assert!(
-            entries.iter().all(|entry| entry.kind == "file"),
-            "{entries:?}"
-        );
-        assert_eq!(entries.len(), 3, "{entries:?}");
-
-        // `sort=mtime` returns newest first; `path` is alphabetical.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(root.join("newest.rs"), "x").unwrap();
-        let (entries, _) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                sort: ListSort::Mtime,
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(entries.first().unwrap().path, "newest.rs", "{entries:?}");
-        let (entries, _) = machine
-            .list_impl(ListArgs {
-                path: ".".to_owned(),
-                sort: ListSort::Path,
-                ..ListArgs::default()
-            })
-            .await
-            .unwrap();
-        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-        assert_eq!(names, ["newest.rs", "src", "top.rs"]);
-    }
-
-    #[test]
-    fn depth_defaults_to_one_or_four_for_nested_patterns() {
-        assert_eq!(list_depth(None, None), 1);
-        assert_eq!(list_depth(None, Some("*.rs")), 1);
-        assert_eq!(list_depth(None, Some("**/*.rs")), 4);
-        assert_eq!(list_depth(None, Some("src/lib.rs")), 4);
-        assert_eq!(list_depth(Some(2), Some("src/**")), 2);
-        assert_eq!(list_depth(Some(0), None), 1);
-    }
-
-    #[tokio::test]
-    async fn read_numbers_lines_and_respects_ranges() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
-        let machine = test_machine(root);
-
-        let result = machine
-            .read(Parameters(ReadArgs {
-                path: "a.txt".to_owned(),
-                offset: None,
-                limit: None,
-                numbered: None,
-            }))
-            .await;
-        let serialized = serde_json::to_value(&result).unwrap();
-        assert_eq!(
-            serialized["content"][0]["text"].as_str().unwrap(),
-            "1\talpha\n2\tbeta\n3\tgamma"
-        );
-
-        let result = machine
-            .read(Parameters(ReadArgs {
-                path: "a.txt".to_owned(),
-                offset: Some(2),
-                limit: Some(1),
-                numbered: None,
-            }))
-            .await;
-        let serialized = serde_json::to_value(&result).unwrap();
-        assert_eq!(
-            serialized["content"][0]["text"].as_str().unwrap(),
-            "2\tbeta\n… truncated at line 2 of 3"
-        );
-
-        let result = machine
-            .read(Parameters(ReadArgs {
-                path: "a.txt".to_owned(),
-                offset: Some(2),
-                limit: None,
-                numbered: Some(false),
-            }))
-            .await;
-        let serialized = serde_json::to_value(&result).unwrap();
-        assert_eq!(
-            serialized["content"][0]["text"].as_str().unwrap(),
-            "beta\ngamma"
-        );
-
-        // The default window is 4096 lines and ends with exactly one marker.
-        let total = DEFAULT_READ_LINES + 5;
-        let big = (1..=total)
-            .map(|line| format!("line{line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(machine.config.access.base_dir.join("big.txt"), &big).unwrap();
-        let result = machine
-            .read(Parameters(ReadArgs {
-                path: "big.txt".to_owned(),
-                offset: None,
-                limit: None,
-                numbered: Some(false),
-            }))
-            .await;
-        let serialized = serde_json::to_value(&result).unwrap();
-        let text = serialized["content"][0]["text"].as_str().unwrap();
-        assert!(text.ends_with(&format!(
-            "line{DEFAULT_READ_LINES}\n\u{2026} truncated at line {DEFAULT_READ_LINES} of {total}"
-        )));
-        assert_eq!(text.matches("truncated at line").count(), 1);
-    }
-
-    fn grep_args(pattern: &str) -> GrepArgs {
-        GrepArgs {
-            pattern: pattern.to_owned(),
-            path: dot(),
-            glob: None,
-            literal: false,
-            ignore_case: false,
-            output_mode: GrepOutputMode::Content,
-            before: None,
-            after: None,
-            numbered: None,
-            offset: None,
-            limit: None,
-            gitignore: false,
-            skip_hidden: false,
-        }
-    }
-
-    fn grep_tree() -> (tempfile::TempDir, LocalMachine) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("src/nested")).unwrap();
-        std::fs::write(root.join("top.txt"), "alpha\nneedle one\nomega\n").unwrap();
-        std::fs::write(root.join("src/lib.rs"), "needle two\nplain\nneedle three\n").unwrap();
-        std::fs::write(root.join("src/nested/deep.rs"), "deep needle\n").unwrap();
-        std::fs::write(root.join("notes.md"), "needle notes\n").unwrap();
-        std::fs::write(root.join("binary.bin"), [0xff_u8, 0xfe, 0x00]).unwrap();
-        std::fs::write(root.join(".hidden.txt"), "needle hidden\n").unwrap();
-        let machine = test_machine(root);
-        (temp, machine)
-    }
-
-    #[tokio::test]
-    async fn grep_content_mode_renders_numbered_hits_in_path_order() {
-        let (_temp, machine) = grep_tree();
-        let content = machine.grep_impl(grep_args("needle")).await.unwrap();
-        assert_eq!(
-            content,
-            ".hidden.txt:1: needle hidden\n\
-             notes.md:1: needle notes\n\
-             src/lib.rs:1: needle two\n\
-             src/lib.rs:3: needle three\n\
-             src/nested/deep.rs:1: deep needle\n\
-             top.txt:2: needle one"
-        );
-
-        let mut args = grep_args("needle");
-        args.numbered = Some(false);
-        let content = machine.grep_impl(args).await.unwrap();
-        assert_eq!(
-            content,
-            ".hidden.txt: needle hidden\n\
-             notes.md: needle notes\n\
-             src/lib.rs: needle two\n\
-             src/lib.rs: needle three\n\
-             src/nested/deep.rs: deep needle\n\
-             top.txt: needle one"
-        );
-    }
-
-    #[tokio::test]
-    async fn grep_context_windows_group_and_separate() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(
-            root.join("a.txt"),
-            "l1\nl2\nhit\nl4\nl5\nl6\nl7\nl8\nhit2\nl10\n",
-        )
-        .unwrap();
-        let machine = test_machine(root);
-
-        let mut args = grep_args("hit");
-        args.before = Some(1);
-        args.after = Some(1);
-        let content = machine.grep_impl(args).await.unwrap();
-        assert_eq!(
-            content,
-            "a.txt:2: l2\n\
-             a.txt:3: hit\n\
-             a.txt:4: l4\n\
-             --\n\
-             a.txt:8: l8\n\
-             a.txt:9: hit2\n\
-             a.txt:10: l10"
-        );
-
-        // Context is capped at 8 lines per side.
-        let mut args = grep_args("hit");
-        args.before = Some(100);
-        args.after = Some(100);
-        let content = machine.grep_impl(args).await.unwrap();
-        assert!(content.starts_with("a.txt:1: l1\n"), "{content}");
-        assert!(content.ends_with("a.txt:10: l10"), "{content}");
-    }
-
-    #[tokio::test]
-    async fn grep_files_and_count_modes_page_files() {
-        let (_temp, machine) = grep_tree();
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!([
-                ".hidden.txt",
-                "notes.md",
-                "src/lib.rs",
-                "src/nested/deep.rs",
-                "top.txt"
-            ])
-        );
-        assert_eq!(files["truncated"], Value::Bool(false));
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        args.offset = Some(1);
-        args.limit = Some(2);
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!(["notes.md", "src/lib.rs"])
-        );
-        assert_eq!(files["truncated"], Value::Bool(true));
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Count;
-        let counts: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(counts["total"], serde_json::json!(6));
-        assert_eq!(
-            counts["counts"][2],
-            serde_json::json!({"path": "src/lib.rs", "count": 2})
-        );
-
-        // Hit paging in content mode skips hits, not lines.
-        let mut args = grep_args("needle");
-        args.offset = Some(1);
-        args.limit = Some(2);
-        let content = machine.grep_impl(args).await.unwrap();
-        assert_eq!(
-            content,
-            "notes.md:1: needle notes\n\
-             src/lib.rs:1: needle two\n\
-             … truncated at 2 hits"
-        );
-    }
-
-    #[tokio::test]
-    async fn grep_pattern_options_and_glob_filter() {
-        let (_temp, machine) = grep_tree();
-
-        let mut args = grep_args("NEEDLE");
-        args.ignore_case = true;
-        args.output_mode = GrepOutputMode::Files;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(files["files"].as_array().unwrap().len(), 5);
-
-        // `literal` escapes regex metacharacters.
-        let mut args = grep_args("needle .*");
-        args.literal = true;
-        assert!(machine.grep_impl(args).await.unwrap().is_empty());
-
-        let mut args = grep_args("needle .*");
-        args.output_mode = GrepOutputMode::Files;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(files["files"].as_array().unwrap().len(), 4);
-
-        let mut args = grep_args("needle");
-        args.glob = Some("*.rs".to_owned());
-        args.output_mode = GrepOutputMode::Files;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!(["src/lib.rs", "src/nested/deep.rs"])
-        );
-
-        let mut args = grep_args("needle");
-        args.glob = Some("src/**/*.rs".to_owned());
-        args.output_mode = GrepOutputMode::Files;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!(["src/lib.rs", "src/nested/deep.rs"])
-        );
-    }
-
-    #[tokio::test]
-    async fn grep_per_file_cap_and_invalid_patterns() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let many = (0..120)
-            .map(|line| format!("hit {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(root.join("many.txt"), many).unwrap();
-        let machine = test_machine(root);
-
-        let mut args = grep_args("hit");
-        args.output_mode = GrepOutputMode::Count;
-        let counts: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(counts["counts"][0]["count"], serde_json::json!(50));
-        assert_eq!(counts["truncated"], Value::Bool(true));
-
-        // Pattern bounds and regex errors are tool failures.
-        let mut args = grep_args("");
-        args.literal = true;
-        assert!(machine.grep_impl(args).await.is_err());
-        let args = grep_args(&"a".repeat(MAX_GREP_PATTERN + 1));
-        assert!(machine.grep_impl(args).await.is_err());
-        let args = grep_args("[unclosed");
-        assert!(machine.grep_impl(args).await.is_err());
-        let args = grep_args("a\tb");
-        assert!(
-            machine
-                .grep_impl(args)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("printable")
-        );
-    }
-
-    #[tokio::test]
-    async fn grep_gitignore_and_hidden_are_opt_in() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("build/nested")).unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join(".gitignore"), "build/\n*.log\n!keep.log\n").unwrap();
-        std::fs::write(root.join("build/nested/out.rs"), "needle\n").unwrap();
-        std::fs::write(root.join("src/lib.rs"), "needle\n").unwrap();
-        std::fs::write(root.join("debug.log"), "needle\n").unwrap();
-        std::fs::write(root.join("keep.log"), "needle\n").unwrap();
-        std::fs::write(root.join(".secret.rs"), "needle\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(files["files"].as_array().unwrap().len(), 5, "{files}");
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        args.gitignore = true;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!([".secret.rs", "keep.log", "src/lib.rs"])
-        );
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        args.skip_hidden = true;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!(["build/nested/out.rs", "debug.log", "keep.log", "src/lib.rs"])
-        );
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        args.skip_hidden = true;
-        args.gitignore = true;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!(["keep.log", "src/lib.rs"])
-        );
-
-        // An invalid gitignore pattern fails closed.
-        std::fs::write(root.join(".gitignore"), "{unclosed\n").unwrap();
-        let mut args = grep_args("needle");
-        args.gitignore = true;
-        let error = machine.grep_impl(args).await.unwrap_err().to_string();
-        assert!(error.contains("invalid .gitignore pattern"), "{error}");
-    }
-
-    fn edit_args(path: Option<&str>, edits: Vec<EditOp>) -> EditArgs {
-        EditArgs {
-            path: path.map(str::to_owned),
-            edits,
-        }
-    }
-
-    fn edit_op(path: Option<&str>, old_text: &str, new_text: &str) -> EditOp {
-        EditOp {
-            path: path.map(str::to_owned),
-            old_text: old_text.to_owned(),
-            new_text: new_text.to_owned(),
-            replace_all: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn edit_applies_ordered_multi_file_edits_with_inherited_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
-        std::fs::create_dir_all(root.join("crates/y/src")).unwrap();
-        std::fs::write(root.join("crates/x/src/lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
-        std::fs::write(root.join("crates/y/src/lib.rs"), "alpha\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let receipt = machine
-            .edit_impl(edit_args(
-                Some("crates/x/src/lib.rs"),
-                vec![
-                    edit_op(None, "fn a() {}", "fn a() { one() }"),
-                    // Same file, later in the array: applies to the buffer the
-                    // first edit produced.
-                    edit_op(None, "fn b() {}", "fn b() { two() }"),
-                    edit_op(Some("crates/y/src/lib.rs"), "alpha", "beta\ngamma"),
-                ],
-            ))
-            .await
-            .unwrap();
-        let receipt: Value = serde_json::from_str(&receipt).unwrap();
-        assert_eq!(receipt["edits_applied"], serde_json::json!(3));
-        assert_eq!(receipt["changed_files"], serde_json::json!(2));
-        assert_eq!(
-            receipt["files"][0],
-            serde_json::json!({
-                "path": "crates/x/src/lib.rs",
-                "edits": 2,
-                "line_delta": 0
-            })
-        );
-        assert_eq!(receipt["files"][1]["line_delta"], serde_json::json!(1));
-        assert_eq!(
-            std::fs::read_to_string(root.join("crates/x/src/lib.rs")).unwrap(),
-            "fn a() { one() }\nfn b() { two() }\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("crates/y/src/lib.rs")).unwrap(),
-            "beta\ngamma\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_rejects_failures_with_contract_texts() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
-        std::fs::write(root.join("crates/x/src/lib.rs"), "one\ntwo\ntwo\nthree\n").unwrap();
-        std::fs::write(root.join("plain.txt"), "plain\n").unwrap();
-        let machine = test_machine(root.clone());
-        let target = "crates/x/src/lib.rs";
-
-        // Missing path.
-        let error = machine
-            .edit_impl(edit_args(None, vec![edit_op(None, "one", "1")]))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "edit 1/1: no path (set edits[].path or a top-level path)"
-        );
-
-        // Not found.
-        let error = machine
-            .edit_impl(edit_args(Some(target), vec![edit_op(None, "nope", "x")]))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "edit 1/1 (crates/x/src/lib.rs): old_text does not occur at the point that edit applies"
-        );
-
-        // Ambiguity lists the matching lines.
-        let error = machine
-            .edit_impl(edit_args(
-                Some(target),
-                vec![edit_op(None, "one", "1"), edit_op(None, "two", "2")],
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "edit 2/2 (crates/x/src/lib.rs): old_text occurs 2 times at lines 2, 3; make it unique or set replace_all"
-        );
-
-        // The read line-number prefix hint.
-        let error = machine
-            .edit_impl(edit_args(Some(target), vec![edit_op(None, "2\ttwo", "2")]))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "edit 1/1 (crates/x/src/lib.rs): old_text appears to include a read line-number prefix (digits then tab); strip it"
-        );
-
-        // old_text that is a substring of the predecessor's new_text.
-        let error = machine
-            .edit_impl(edit_args(
-                Some(target),
-                vec![
-                    edit_op(None, "one", "one and two"),
-                    edit_op(None, "two", "three"),
-                ],
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "edit 2/2 (crates/x/src/lib.rs): old_text is a substring of this edit's predecessor's new_text in the same file"
-        );
-
-        // Nothing was written by any failed plan.
-        assert_eq!(
-            std::fs::read_to_string(root.join(target)).unwrap(),
-            "one\ntwo\ntwo\nthree\n"
-        );
-
-        // A snapshot that no longer matches disk fails before any write.
-        let error = verify_snapshot("crates/y/src/lib.rs", b"changed", b"planned", "editing")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "crates/y/src/lib.rs changed while editing; nothing was written"
-        );
-        assert!(verify_snapshot("a.txt", b"same", b"same", "editing").is_ok());
-    }
-
-    #[tokio::test]
-    async fn edit_replace_all_and_bounds() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.txt"), "x\ny\nx\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let mut op = edit_op(None, "x", "z");
-        op.replace_all = true;
-        let receipt = machine
-            .edit_impl(edit_args(Some("a.txt"), vec![op]))
-            .await
-            .unwrap();
-        let receipt: Value = serde_json::from_str(&receipt).unwrap();
-        assert_eq!(receipt["files"][0]["edits"], serde_json::json!(1));
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "z\ny\nz\n"
-        );
-
-        let error = machine
-            .edit_impl(edit_args(Some("a.txt"), Vec::new()))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("edits must not be empty"), "{error}");
-
-        let too_many = (0..=MAX_EDIT_OPS)
-            .map(|index| edit_op(None, &format!("m{index}"), "n"))
-            .collect::<Vec<_>>();
-        let error = machine
-            .edit_impl(edit_args(Some("a.txt"), too_many))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("edit limit"), "{error}");
-    }
-
-    #[test]
-    fn edit_helpers_detect_line_prefixes_and_numbers() {
-        assert!(has_line_number_prefix("12\tfn main()"));
-        assert!(!has_line_number_prefix("fn main()"));
-        assert!(!has_line_number_prefix("\tfn main()"));
-        assert_eq!(line_number("a\nb\nc", 0), 1);
-        assert_eq!(line_number("a\nb\nc", 2), 2);
-        assert_eq!(line_number("a\nb\nc", 4), 3);
-    }
-
-    fn patch_args(patch: &str) -> PatchArgs {
-        PatchArgs {
-            dir: dot(),
-            patch: patch.to_owned(),
-            best_effort: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn patch_applies_update_and_add_sections_atomically() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
-        std::fs::write(
-            root.join("crates/x/src/lib.rs"),
-            "fn main() {\n    one();\n    two();\n}\n",
-        )
-        .unwrap();
-        let machine = test_machine(root.clone());
-
-        let patch = r#"*** Begin Patch
-*** Update File: crates/x/src/lib.rs
-@@ fn main() {
- fn main() {
--    one();
-+    uno();
-*** Add File: crates/new/src/lib.rs
-+pub fn fresh() {}
-+
-*** End Patch"#;
-        let receipt = machine.patch_impl(patch_args(patch)).await.unwrap();
-        let receipt: Value = serde_json::from_str(&receipt).unwrap();
-        assert_eq!(receipt["mode"], "atomic");
-        assert_eq!(
-            receipt["files"],
-            serde_json::json!([
-                {"path": "crates/x/src/lib.rs", "hunks": 1, "added": 1, "removed": 1},
-                {"path": "crates/new/src/lib.rs", "hunks": 0, "added": 2, "removed": 0}
-            ])
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("crates/x/src/lib.rs")).unwrap(),
-            "fn main() {\n    uno();\n    two();\n}\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("crates/new/src/lib.rs")).unwrap(),
-            "pub fn fresh() {}\n\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn patch_parser_rejects_missing_header_terminator_and_directives() {
-        let machine = test_machine(tempfile::tempdir().unwrap().path().canonicalize().unwrap());
-
-        let error = machine
-            .patch_impl(patch_args("*** Update File: a.txt\n*** End Patch"))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "patch: missing '*** Begin Patch' header");
-
-        let error = machine
-            .patch_impl(patch_args("*** Begin Patch\n*** Update File: a.txt"))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "patch: missing '*** End Patch' terminator");
-
-        let error = machine
-            .patch_impl(patch_args(
-                "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch",
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "patch: line 2: unsupported directive '*** Delete File'"
-        );
-
-        let error = machine
-            .patch_impl(patch_args(
-                "*** Begin Patch\n*** Update File: a.txt\n@@\n x\n*** Move to: b.txt\n*** End Patch",
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "patch: line 5: unsupported directive '*** Move to'");
-
-        let error = machine
-            .patch_impl(patch_args(
-                "*** Begin Patch\n*** Update File: a.txt\n@@\n x\nstray text\n*** End Patch",
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "patch: line 5: unexpected text 'stray text'");
-    }
-
-    #[tokio::test]
-    async fn patch_hunk_location_reports_missing_and_ambiguous_context() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.txt"), "same\nsame\nsame\n").unwrap();
-        std::fs::write(root.join("b.txt"), "alpha\nbeta\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let error = machine
-            .patch_impl(patch_args(
-                "*** Begin Patch\n*** Update File: b.txt\n@@\n-nope\n+yep\n*** End Patch",
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "hunk 1/1 (b.txt): context not found near line 1");
-
-        let error = machine
-            .patch_impl(patch_args(
-                "*** Begin Patch\n*** Update File: a.txt\n@@\n-same\n+other\n*** End Patch",
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "hunk 1/1 (a.txt): context matches 3 locations (lines 1, 2, 3)"
-        );
-
-        // Nothing was written by either failure.
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "same\nsame\nsame\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn patch_falls_back_to_trim_end_and_applies_hunks_top_down() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.txt"), "first  \nsecond\nthird\nfourth\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        machine
-            .patch_impl(patch_args(
-                "*** Begin Patch\n\
-                 *** Update File: a.txt\n\
-                 @@\n\
-                 -first\n\
-                 +FIRST\n\
-                 @@\n\
-                 -third\n\
-                 +THIRD\n\
-                 *** End Patch",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "FIRST\nsecond\nTHIRD\nfourth\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn patch_add_file_refuses_existing_targets() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.txt"), "present\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let error = machine
-            .patch_impl(patch_args(
-                "*** Begin Patch\n*** Add File: a.txt\n+new\n*** End Patch",
-            ))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "a.txt: '*** Add File' target already exists");
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "present\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn patch_best_effort_writes_what_planned_cleanly() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("good.txt"), "old\n").unwrap();
-        std::fs::write(root.join("exists.txt"), "keep\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let patch = "*** Begin Patch\n\
-                     *** Update File: good.txt\n\
-                     @@\n\
-                     -old\n\
-                     +new\n\
-                     *** Update File: missing.txt\n\
-                     @@\n\
-                     -x\n\
-                     +y\n\
-                     *** Add File: exists.txt\n\
-                     +nope\n\
-                     *** End Patch";
-        // Atomic mode fails the whole call.
-        let error = machine.patch_impl(patch_args(patch)).await.unwrap_err();
-        assert!(error.to_string().contains("missing.txt"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(root.join("good.txt")).unwrap(),
-            "old\n"
-        );
-
-        let mut args = patch_args(patch);
-        args.best_effort = true;
-        let receipt: Value =
-            serde_json::from_str(&machine.patch_impl(args).await.unwrap()).unwrap();
-        assert_eq!(receipt["mode"], "best_effort");
-        assert_eq!(receipt["files"][0]["path"], "good.txt");
-        assert_eq!(receipt["failures"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            std::fs::read_to_string(root.join("good.txt")).unwrap(),
-            "new\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("exists.txt")).unwrap(),
-            "keep\n"
-        );
-    }
-
-    #[test]
-    fn patch_parser_bounds_hunks_and_files() {
-        let mut patch = String::from("*** Begin Patch\n*** Update File: a.txt\n");
-        for _ in 0..=MAX_PATCH_HUNKS {
-            patch.push_str("@@\n x\n");
-        }
-        patch.push_str("*** End Patch\n");
-        let error = parse_patch(&patch).unwrap_err().to_string();
-        assert!(error.contains("hunk limit"), "{error}");
-
-        let mut patch = String::from("*** Begin Patch\n");
-        for index in 0..=MAX_PATCH_FILES {
-            patch.push_str(&format!("*** Add File: f{index}.txt\n+x\n"));
-        }
-        patch.push_str("*** End Patch\n");
-        let error = parse_patch(&patch).unwrap_err().to_string();
-        assert!(error.contains("file limit"), "{error}");
-
-        assert_eq!(
-            parse_patch(
-                "*** Begin Patch\n*** Update File: a.txt\n@@ -12,3 +12,4 @@\n-x\n+y\n*** End Patch"
-            )
-            .unwrap()
-            .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn patch_reports_a_snapshot_that_changed_during_planning() {
-        let error = verify_snapshot("crates/y/src/lib.rs", b"changed", b"planned", "patching")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "crates/y/src/lib.rs changed while patching; nothing was written"
-        );
-    }
-
-    #[test]
-    fn patch_anchor_text_is_kept_and_line_numbers_are_ignored() {
-        assert_eq!(
-            parse_patch_anchor(" fn main() {"),
-            Some("fn main() {".to_owned())
-        );
-        assert_eq!(parse_patch_anchor(" -12,3 +12,4"), None);
-        assert_eq!(parse_patch_anchor(" +12,4"), None);
-        assert_eq!(parse_patch_anchor(""), None);
-    }
-
-    fn bedit_range(offset: usize, length: Option<usize>, data: &str) -> BeditRange {
-        BeditRange {
-            offset,
-            length,
-            data: BASE64.encode(data.as_bytes()),
-            encoding: BinaryEncoding::Base64,
-        }
-    }
-
-    #[tokio::test]
-    async fn bedit_applies_multi_range_edits_against_original_offsets() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("data.bin"), b"0123456789").unwrap();
-        let machine = test_machine(root.clone());
-
-        let receipt = machine
-            .bedit_impl(BeditArgs {
-                path: "data.bin".to_owned(),
-                // Out of order on purpose: ranges apply ascending by offset
-                // while every offset stays relative to the original file.
-                edits: vec![
-                    bedit_range(6, Some(2), "ab"),
-                    bedit_range(1, Some(2), ""),
-                    bedit_range(9, Some(1), "XYZ"),
-                ],
-                sha256: None,
-            })
-            .await
-            .unwrap();
-        let receipt: Value = serde_json::from_str(&receipt).unwrap();
-        assert_eq!(receipt["path"], "data.bin");
-        assert_eq!(receipt["ranges"], serde_json::json!(3));
-        assert_eq!(receipt["bytes_written"], serde_json::json!(5));
-        assert_eq!(receipt["size_before"], serde_json::json!(10));
-        assert_eq!(receipt["size_after"], serde_json::json!(10));
-        assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), b"0345ab8XYZ");
-    }
-
-    #[tokio::test]
-    async fn bedit_insert_delete_and_sha256_precondition() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("data.bin"), b"abcdef").unwrap();
-        let machine = test_machine(root.clone());
-        let digest = hex::encode(sha256(b"abcdef"));
-
-        machine
-            .bedit_impl(BeditArgs {
-                path: "data.bin".to_owned(),
-                edits: vec![bedit_range(0, Some(0), ">>"), bedit_range(2, Some(2), "")],
-                sha256: Some(digest.clone()),
-            })
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), b">>abef");
-
-        let error = machine
-            .bedit_impl(BeditArgs {
-                path: "data.bin".to_owned(),
-                edits: vec![bedit_range(0, Some(0), "x")],
-                sha256: Some(digest),
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.starts_with("bedit: sha256 mismatch (expected "),
-            "{error}"
-        );
-        assert_eq!(std::fs::read(root.join("data.bin")).unwrap(), b">>abef");
-    }
-
-    #[tokio::test]
-    async fn bedit_rejects_overlaps_and_out_of_bounds_ranges() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("data.bin"), vec![b'x'; 512]).unwrap();
-        let machine = test_machine(root.clone());
-
-        let error = machine
-            .bedit_impl(BeditArgs {
-                path: "data.bin".to_owned(),
-                edits: vec![bedit_range(0, Some(16), "a"), bedit_range(8, Some(16), "b")],
-                sha256: None,
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "bedit 2/2: range overlaps range 1 (offset 0, length 16)"
-        );
-
-        let error = machine
-            .bedit_impl(BeditArgs {
-                path: "data.bin".to_owned(),
-                edits: vec![bedit_range(999, Some(1), "a")],
-                sha256: None,
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "bedit 1/1: offset 999 is beyond end of file (512 bytes)"
-        );
-
-        let error = machine
-            .bedit_impl(BeditArgs {
-                path: "data.bin".to_owned(),
-                edits: vec![bedit_range(510, Some(16), "a")],
-                sha256: None,
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("beyond end of file"), "{error}");
-
-        let too_many = (0..=MAX_BEDIT_RANGES)
-            .map(|offset| bedit_range(offset, Some(0), ""))
-            .collect::<Vec<_>>();
-        let error = machine
-            .bedit_impl(BeditArgs {
-                path: "data.bin".to_owned(),
-                edits: too_many,
-                sha256: None,
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("range limit"), "{error}");
-
-        // Nothing was written by any rejected plan.
-        assert_eq!(
-            std::fs::read(root.join("data.bin")).unwrap(),
-            vec![b'x'; 512]
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_line_delta_is_signed_when_a_file_shrinks() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let receipt = machine
-            .edit_impl(edit_args(Some("a.txt"), vec![edit_op(None, "two\n", "")]))
-            .await
-            .unwrap();
-        let receipt: Value = serde_json::from_str(&receipt).unwrap();
-        assert_eq!(receipt["files"][0]["line_delta"], serde_json::json!(-1));
-        assert_eq!(
-            std::fs::read_to_string(root.join("a.txt")).unwrap(),
-            "one\nthree\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_zero_limit_never_renders_a_nonsense_marker() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.txt"), "alpha\nbeta\n").unwrap();
-        let machine = test_machine(root);
-
-        let result = machine
-            .read(Parameters(ReadArgs {
-                path: "a.txt".to_owned(),
-                offset: None,
-                limit: Some(0),
-                numbered: None,
-            }))
-            .await;
-        let serialized = serde_json::to_value(&result).unwrap();
-        let text = serialized["content"][0]["text"].as_str().unwrap();
-        assert_eq!(text, "1\talpha\n… truncated at line 1 of 2");
-        assert!(!text.contains("line 0"));
-    }
-
-    #[test]
-    fn snapshot_changed_returns_the_reason_without_deciding_the_outcome() {
-        assert_eq!(
-            snapshot_changed("a.txt", b"changed", b"planned", "patching").as_deref(),
-            Some("a.txt changed while patching")
-        );
-        assert_eq!(snapshot_changed("a.txt", b"same", b"same", "editing"), None);
-        assert_eq!(
-            verify_snapshot("a.txt", b"changed", b"planned", "editing")
-                .unwrap_err()
-                .to_string(),
-            "a.txt changed while editing; nothing was written"
-        );
-    }
-
-    #[tokio::test]
-    async fn patch_best_effort_reports_a_create_failure_and_keeps_the_rest() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("present.txt"), "present\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let mut args = patch_args(
-            "*** Begin Patch\n\
-             *** Add File: present.txt\n\
-             +nope\n\
-             *** Add File: fresh.txt\n\
-             +yes\n\
-             *** End Patch",
-        );
-        args.best_effort = true;
-        let receipt: Value =
-            serde_json::from_str(&machine.patch_impl(args).await.unwrap()).unwrap();
-        assert_eq!(receipt["files"][0]["path"], "fresh.txt");
-        assert_eq!(receipt["failures"][0]["path"], "present.txt");
-        assert_eq!(
-            std::fs::read_to_string(root.join("fresh.txt")).unwrap(),
-            "yes\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("present.txt")).unwrap(),
-            "present\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn patch_create_only_write_refuses_an_existing_target() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("present.txt"), "present\n").unwrap();
-        let machine = test_machine(root.clone());
-
-        let error = machine
-            .open_create_file(&root.join("present.txt"))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("already exists"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(root.join("present.txt")).unwrap(),
-            "present\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn grep_does_not_read_a_denied_gitignore() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("build")).unwrap();
-        std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
-        std::fs::write(root.join("build/out.rs"), "needle\n").unwrap();
-        std::fs::write(root.join("src.rs"), "needle\n").unwrap();
-        let mut machine = test_machine(root.clone());
-        // A deny on the ignore file itself must win over `gitignore`.
-        machine.config.access.deny_read_roots = vec![root.join(".gitignore")];
-
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        args.gitignore = true;
-        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
-        assert_eq!(
-            files["files"],
-            serde_json::json!(["build/out.rs", "src.rs"])
-        );
-    }
-
-    #[tokio::test]
-    async fn unreadable_named_root_is_an_error_but_unreadable_children_are_skipped() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir(root.join("locked")).unwrap();
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
-        let locked_readable = std::fs::read_dir(root.join("locked")).is_ok();
-        let machine = test_machine(root.clone());
-
-        let listed = machine
-            .list_impl(ListArgs {
-                path: "locked".to_owned(),
-                ..ListArgs::default()
-            })
-            .await;
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-
-        // A privileged user can read it; everyone else gets a real error.
-        assert_eq!(listed.is_err(), !locked_readable, "{listed:?}");
-    }
-
-    #[tokio::test]
-    async fn walk_skips_an_unreadable_directory_instead_of_failing() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("locked")).unwrap();
-        std::fs::write(root.join("locked/secret.rs"), "needle\n").unwrap();
-        std::fs::write(root.join("open.rs"), "needle\n").unwrap();
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
-        // Root (or a privileged CI user) can still enumerate it; the point is
-        // that an unreadable directory never fails the search.
-        let locked_readable = std::fs::read_dir(root.join("locked")).is_ok();
-        let machine = test_machine(root.clone());
-        let mut args = grep_args("needle");
-        args.output_mode = GrepOutputMode::Files;
-        let outcome = machine.grep_impl(args).await;
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-
-        let files: Value = serde_json::from_str(&outcome.unwrap()).unwrap();
-        let expected = match locked_readable {
-            true => serde_json::json!(["locked/secret.rs", "open.rs"]),
-            false => serde_json::json!(["open.rs"]),
-        };
-        assert_eq!(files["files"], expected);
-    }
-
-    #[tokio::test]
-    async fn patch_rewrites_nothing_when_a_hunk_reproduces_the_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let path = root.join("a.txt");
-        std::fs::write(&path, "same\n").unwrap();
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let machine = test_machine(root);
-
-        let receipt: Value = serde_json::from_str(
-            &machine
-                .patch_impl(patch_args(
-                    "*** Begin Patch\n*** Update File: a.txt\n@@\n same\n*** End Patch",
-                ))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(receipt["files"][0]["added"], serde_json::json!(0));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "same\n");
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            before,
-            "an unchanged patch must not touch the file"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_skips_writing_a_file_whose_text_did_not_change() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let path = root.join("a.txt");
-        std::fs::write(&path, "same\n").unwrap();
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let machine = test_machine(root);
-
-        let receipt: Value = serde_json::from_str(
-            &machine
-                .edit_impl(edit_args(
-                    Some("a.txt"),
-                    vec![edit_op(None, "same", "same")],
-                ))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(receipt["edits_applied"], serde_json::json!(1));
-        assert_eq!(receipt["changed_files"], serde_json::json!(0));
-        assert_eq!(receipt["files"], serde_json::json!([]));
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            before,
-            "a no-op edit must not touch the file"
-        );
-    }
-
-    #[test]
-    fn list_entry_limit_defaults_to_4096_and_caps_at_16384() {
-        assert_eq!(list_entry_limit(None), 4 * 1024);
-        assert_eq!(list_entry_limit(Some(10)), 10);
-        assert_eq!(list_entry_limit(Some(1_000_000)), 16 * 1024);
-        assert_eq!(list_entry_limit(Some(0)), 1);
-    }
-
-    #[test]
-    fn shell_tool_schema_reports_configured_ceilings() {
-        let bash = LocalMachine::tool_router().get("bash").cloned().unwrap();
-        let patched = with_profile_limits(bash.clone(), 42, 2048);
-        let properties = patched.input_schema["properties"].as_object().unwrap();
-        let timeout = properties["timeout_secs"]["description"].as_str().unwrap();
-        let output = properties["max_output_bytes"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(timeout.contains("42"), "{timeout}");
-        assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
-        assert!(output.contains("2048"), "{output}");
-        // Non-shell tools keep their static schemas.
-        let read = LocalMachine::tool_router().get("read").cloned().unwrap();
-        assert_eq!(
-            with_profile_limits(read.clone(), 42, 2048).input_schema,
-            read.input_schema
-        );
-    }
-
-    #[test]
-    fn output_limits_are_client_controlled_under_a_policy_ceiling() {
-        // Omitted -> the profile ceiling.
-        assert_eq!(resolve_capped(None, 1_048_576_usize), 1_048_576);
-        // Caller lowers it freely.
-        assert_eq!(resolve_capped(Some(4_096_usize), 1_048_576), 4_096);
-        // Caller cannot exceed the ceiling.
-        assert_eq!(resolve_capped(Some(8_388_608_usize), 1_048_576), 1_048_576);
-        assert_eq!(resolve_capped(Some(0_usize), 1_048_576), 1);
-    }
-
-    #[test]
-    fn shell_timeout_is_client_controlled_under_a_policy_ceiling() {
-        // Omitted -> the profile ceiling, not a hidden 30 s default.
-        assert_eq!(resolve_shell_timeout(None, 3_600), 3_600);
-        // Explicit caller values are honored inside the ceiling.
-        assert_eq!(resolve_shell_timeout(Some(600), 3_600), 600);
-        assert_eq!(resolve_shell_timeout(Some(1), 3_600), 1);
-        // The caller cannot exceed the ceiling.
-        assert_eq!(resolve_shell_timeout(Some(7_200), 3_600), 3_600);
-        // Zero is clamped up; a degenerate ceiling still yields a positive deadline.
-        assert_eq!(resolve_shell_timeout(Some(0), 3_600), 1);
-        assert_eq!(resolve_shell_timeout(None, 0), 1);
-    }
-
-    #[tokio::test]
-    async fn bounded_read_enforces_real_io_limit() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("growing.txt");
-        std::fs::write(&path, b"abcdefghij").unwrap();
-        let mut file = fs::File::open(&path).await.unwrap();
-        assert!(LocalMachine::read_bounded(&mut file, 4).await.is_err());
-        file.rewind().await.unwrap();
-        assert_eq!(
-            LocalMachine::read_bounded(&mut file, 10).await.unwrap(),
-            b"abcdefghij"
-        );
-        file.rewind().await.unwrap();
-        assert_eq!(
-            LocalMachine::read_bounded(&mut file, 11).await.unwrap(),
-            b"abcdefghij"
-        );
-    }
-
-    fn access(root: &Path) -> AccessPolicy {
-        AccessPolicy::from_spec(AccessSpec {
-            base_dir: root.to_path_buf(),
-            read_roots: vec![root.to_path_buf()],
-            write_roots: Vec::new(),
-            deny_read_roots: Vec::new(),
-            deny_write_roots: Vec::new(),
-            unrestricted_fs: false,
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn only_explicit_pure_reads_share_the_operation_gate() {
-        for name in ["ls", "read", "bread"] {
-            assert!(is_concurrent_read_tool(name), "{name}");
-        }
-        for name in [
-            "write",
-            "edit",
-            "bwrite",
-            "bedit",
-            "bash",
-            "powershell",
-            "future_tool",
-        ] {
-            assert!(!is_concurrent_read_tool(name), "{name}");
-        }
-    }
+    use crate::mcp::tools::test_support::access;
 
     #[test]
     fn default_access_is_read_only() {
@@ -5627,7 +1429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_targets_accept_regular_files_or_missing_paths_only() {
+    async fn write_targets_accept_regular_files_only() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let regular = root.join("regular");
@@ -5663,15 +1465,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(machine.require_regular_or_missing(&regular).await.is_ok());
-        assert!(machine.require_regular_or_missing(&missing).await.is_ok());
-        assert!(
-            machine
-                .require_regular_or_missing(&directory)
-                .await
-                .is_err()
-        );
         assert!(machine.require_regular_file(&regular).await.is_ok());
+        assert!(machine.require_regular_file(&missing).await.is_err());
         assert!(machine.require_regular_file(&directory).await.is_err());
     }
 
@@ -5764,23 +1559,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bounded_read_enforces_real_io_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("growing.txt");
+        std::fs::write(&path, b"abcdefghij").unwrap();
+        let mut file = fs::File::open(&path).await.unwrap();
+        assert!(LocalMachine::read_bounded(&mut file, 4).await.is_err());
+        file.rewind().await.unwrap();
+        assert_eq!(
+            LocalMachine::read_bounded(&mut file, 10).await.unwrap(),
+            b"abcdefghij"
+        );
+        file.rewind().await.unwrap();
+        assert_eq!(
+            LocalMachine::read_bounded(&mut file, 11).await.unwrap(),
+            b"abcdefghij"
+        );
+    }
+
+    #[test]
+    fn only_explicit_pure_reads_share_the_operation_gate() {
+        for name in ["ls", "read", "bread"] {
+            assert!(LocalMachine::is_concurrent_read_tool(name), "{name}");
+        }
+        for name in [
+            "write",
+            "edit",
+            "bwrite",
+            "bedit",
+            "bash",
+            "powershell",
+            "future_tool",
+        ] {
+            assert!(!LocalMachine::is_concurrent_read_tool(name), "{name}");
+        }
+    }
+
     #[test]
     fn default_tool_policy_is_read_only() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, false, false, false)
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(Capabilities {
+            read: true,
+            ..Default::default()
+        })
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
         assert_eq!(names, ["bread", "grep", "ls", "read"]);
     }
 
     #[test]
     fn write_policy_adds_mutators() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, true, true, false)
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(Capabilities {
+            read: true,
+            write: true,
+            read_write: true,
+            ..Default::default()
+        })
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
         assert_eq!(
             names,
             [
@@ -5791,31 +1631,42 @@ mod tests {
 
     #[test]
     fn write_only_policy_advertises_only_write_tools() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(false, true, false, false)
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(Capabilities {
+            write: true,
+            ..Default::default()
+        })
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
         assert_eq!(names, ["bwrite", "write"]);
     }
 
     #[test]
     fn split_read_write_without_overlap_does_not_advertise_edit_tools() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, true, false, false)
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(Capabilities {
+            read: true,
+            write: true,
+            ..Default::default()
+        })
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
         assert_eq!(names, ["bread", "bwrite", "grep", "ls", "read", "write"]);
     }
 
     #[test]
     fn shell_policy_is_platform_specific() {
-        let names: Vec<_> = LocalMachine::tool_router_for_policy(true, false, false, true)
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+        let names: Vec<_> = LocalMachine::tool_router_for_policy(Capabilities {
+            read: true,
+            shell: true,
+            ..Default::default()
+        })
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
         if cfg!(windows) {
             assert_eq!(names, ["bread", "grep", "ls", "powershell", "read"]);
         } else {
@@ -5823,1143 +1674,153 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn prepare_mount_target_dirs_treats_unix_socket_as_leaf() {
-        use std::{ffi::OsStr, os::unix::net::UnixListener};
+    fn tool_table_matches_the_advertised_router() {
+        // One table drives visibility; prove it covers every route exactly once.
+        let all: Vec<String> = LocalMachine::all_tools()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        let mut from_table: Vec<String> =
+            TOOL_SPECS.iter().map(|spec| spec.name.to_owned()).collect();
+        from_table.sort();
+        assert_eq!(all, from_table, "table and routers disagree");
 
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("daemon.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-
-        let mut command = Command::new("true");
-        prepare_mount_target_dirs(&mut command, &socket);
-        let args: Vec<_> = command.as_std().get_args().collect();
-
-        assert!(
-            !args.windows(2).any(|window| {
-                window[0] == OsStr::new("--dir") && window[1] == socket.as_os_str()
-            }),
-            "socket leaf itself must not be created as a directory"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn mask_path_is_type_aware() {
-        use std::{ffi::OsStr, os::unix::net::UnixListener};
-
-        let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("directory");
-        let socket = temp.path().join("daemon.sock");
-        std::fs::create_dir(&directory).unwrap();
-        let _listener = UnixListener::bind(&socket).unwrap();
-
-        let mut command = Command::new("true");
-        mask_path(&mut command, &directory);
-        mask_path(&mut command, &socket);
-        let args: Vec<_> = command.as_std().get_args().collect();
-
-        assert!(
-            args.windows(2).any(|window| {
-                window[0] == OsStr::new("--tmpfs") && window[1] == directory.as_os_str()
-            }),
-            "directories should be hidden with an inaccessible tmpfs mount"
-        );
-        assert!(
-            args.windows(3).any(|window| {
-                window[0] == OsStr::new("--ro-bind")
-                    && window[1] == OsStr::new("/dev/null")
-                    && window[2] == socket.as_os_str()
-            }),
-            "non-directories should be hidden behind /dev/null"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sandbox_runtime_mounts_include_available_nix_profiles_without_home_root() {
-        let mounts = sandbox_runtime_mounts();
-
-        for expected in [
-            PathBuf::from("/nix/store"),
-            PathBuf::from("/run/current-system"),
-            PathBuf::from("/etc/profiles"),
-            PathBuf::from("/nix/var/nix/profiles"),
-        ] {
-            if expected.exists() {
-                assert!(
-                    mounts.contains(&expected),
-                    "expected runtime mount {}",
-                    expected.display()
-                );
-            }
-        }
-
-        if let Some(home) = env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            let profile = home.join(".nix-profile");
-            if profile.exists() {
-                assert!(mounts.contains(&profile));
-            }
-            assert!(
-                !mounts.contains(&home),
-                "sandbox runtime mounts must not expose the whole home directory"
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sandbox_mounts_follow_additive_policy_and_deny() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let writable = root.join("writable");
-        let denied = root.join("denied");
-        std::fs::create_dir(&writable).unwrap();
-        std::fs::create_dir(&denied).unwrap();
-
-        let access = AccessPolicy::from_spec(AccessSpec {
-            base_dir: root.clone(),
-            read_roots: vec![root.clone()],
-            write_roots: vec![writable.clone()],
-            deny_read_roots: vec![denied.clone()],
-            deny_write_roots: vec![denied.clone()],
-            unrestricted_fs: false,
-        })
-        .unwrap();
-
-        let mounts = access.sandbox_mounts();
-        assert!(mounts.contains(&(root.clone(), false)));
-        assert!(mounts.contains(&(writable, true)));
-        assert!(!mounts.iter().any(|(path, _)| path == &denied));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sandbox_write_deny_downgrades_rw_subtree_to_read_only() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let denied = root.join("readable-but-not-writable");
-        std::fs::create_dir(&denied).unwrap();
-
-        let access = AccessPolicy::from_spec(AccessSpec {
-            base_dir: root.clone(),
-            read_roots: vec![root.clone()],
-            write_roots: vec![root.clone()],
-            deny_read_roots: Vec::new(),
-            deny_write_roots: vec![denied.clone()],
-            unrestricted_fs: false,
-        })
-        .unwrap();
-
-        let mounts = access.sandbox_mounts();
-        assert!(mounts.contains(&(root, true)));
-        assert!(mounts.contains(&(denied, false)));
-    }
-
-    #[tokio::test]
-    async fn filesystem_denies_override_cache_grants() {
-        let project = tempfile::tempdir().unwrap();
-        let caches = tempfile::tempdir().unwrap();
-        let root = project.path().canonicalize().unwrap();
-        let denied_read = caches.path().join("deny-read");
-        let denied_write = caches.path().join("deny-write");
-        std::fs::create_dir(&denied_read).unwrap();
-        std::fs::create_dir(&denied_write).unwrap();
-
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: vec![denied_read.clone()],
-                deny_write_roots: vec![denied_write.clone()],
-                unrestricted_fs: false,
-            },
-            cache_mounts: vec![
-                SandboxCacheMount {
-                    source: denied_read,
-                    target: PathBuf::from("/tmp/home/.cache/read-denied"),
-                    writable: true,
-                },
-                SandboxCacheMount {
-                    source: denied_write,
-                    target: PathBuf::from("/tmp/home/.cache/write-denied"),
-                    writable: true,
-                },
-            ],
-            shell_env: Vec::new(),
-            #[cfg(target_os = "linux")]
-            host_shell: crate::host_services::HostShell::default(),
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: false,
-            sandbox_shell: false,
-            allow_network: false,
-            max_shell_timeout_secs: 5,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(machine.config.cache_mounts.len(), 1);
+        // Every capability the table names is grantable, and the concurrent-read
+        // class is what the operation gate expects.
         assert_eq!(
-            machine.config.cache_mounts[0].target,
-            PathBuf::from("/tmp/home/.cache/write-denied")
-        );
-        assert!(
-            !machine.config.cache_mounts[0].writable,
-            "deny-write must downgrade a shared cache to read-only"
+            TOOL_SPECS
+                .iter()
+                .filter(|spec| spec.concurrent_read)
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>(),
+            ["ls", "grep", "read", "bread"]
         );
     }
 
+    /// Both HTTP entry points must use the ceiling derived from the profile, not
+    /// rmcp's fixed 4 MiB default: the tools accept a write up to
+    /// `max_write_bytes`, its JSON encoding can be six times that, and the
+    /// transport must not refuse what the tool would have accepted.
     #[tokio::test]
-    async fn cache_mounts_do_not_expand_mcp_filesystem_access() {
-        let project = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let root = project.path().canonicalize().unwrap();
-        let cache_root = cache.path().canonicalize().unwrap();
-
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: Vec::new(),
-                deny_write_roots: Vec::new(),
-                unrestricted_fs: false,
-            },
-            cache_mounts: vec![SandboxCacheMount {
-                source: cache_root.clone(),
-                target: PathBuf::from("/tmp/home/.cargo/registry"),
-                writable: true,
-            }],
-            shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
-            #[cfg(target_os = "linux")]
-            host_shell: crate::host_services::HostShell::default(),
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: false,
-            sandbox_shell: false,
-            allow_network: false,
-            max_shell_timeout_secs: 5,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-
-        assert!(
-            machine
-                .resolve_existing(cache_root.to_str().unwrap(), AccessNeed::Read)
-                .await
-                .is_err(),
-            "cache sharing must not grant MCP read access to the host cache"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn bubblewrap_cache_mounts_preserve_ro_rw_and_cache_env() {
-        use std::ffi::OsStr;
-
+    async fn streamable_transports_follow_the_configured_write_ceiling() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let read_only = root.join("cache-ro");
-        let read_write = root.join("cache-rw");
-        std::fs::create_dir(&read_only).unwrap();
-        std::fs::create_dir(&read_write).unwrap();
-
-        let machine = LocalMachine {
-            config: RuntimeConfig {
-                access: AccessPolicy::from_spec(AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: vec![root.clone()],
-                    write_roots: Vec::new(),
-                    deny_read_roots: Vec::new(),
-                    deny_write_roots: Vec::new(),
-                    unrestricted_fs: false,
-                })
-                .unwrap(),
-                cache_mounts: vec![
-                    SandboxCacheMount {
-                        source: read_only.clone(),
-                        target: PathBuf::from("/tmp/home/.cargo/registry"),
-                        writable: false,
-                    },
-                    SandboxCacheMount {
-                        source: read_write.clone(),
-                        target: PathBuf::from("/tmp/home/.cargo/git"),
-                        writable: true,
-                    },
-                ],
-                shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
-                #[cfg(target_os = "linux")]
-                host_shell: crate::host_services::HostShell::default(),
-                log: LogConfig::default(),
-                allow_shell: true,
-                sandbox_shell: true,
-                allow_network: false,
-                shell_program: Some(PathBuf::from("/bin/bash")),
-                bwrap_program: Some(PathBuf::from("/bin/bwrap")),
-                max_shell_timeout_secs: 5,
-                max_output_bytes: 4096,
-                max_read_bytes: 4096,
-                max_write_bytes: 4096,
-                protected_paths: Vec::new(),
-            },
-            operation_gate: Arc::new(RwLock::new(())),
-            serialize: false,
-            #[cfg(target_os = "linux")]
-            secure_fs: Arc::new(
-                crate::secure_fs::SecureFs::new(std::slice::from_ref(&root), &[]).unwrap(),
-            ),
-        };
-
-        let command = machine
-            .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .unwrap();
-        let args: Vec<_> = command.as_std().get_args().collect();
-
-        assert!(args.windows(3).any(|window| {
-            window[0] == OsStr::new("--ro-bind-fd")
-                && window[2] == OsStr::new("/tmp/home/.cargo/registry")
-        }));
-        assert!(args.windows(3).any(|window| {
-            window[0] == OsStr::new("--bind-fd") && window[2] == OsStr::new("/tmp/home/.cargo/git")
-        }));
-        assert!(args.windows(3).any(|window| {
-            window[0] == OsStr::new("--setenv")
-                && window[1] == OsStr::new("CARGO_HOME")
-                && window[2] == OsStr::new("/tmp/home/.cargo")
-        }));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn bubblewrap_blocks_network_by_default_and_masks_denies() {
-        use std::ffi::OsStr;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let denied = root.join("denied");
-        std::fs::create_dir(&denied).unwrap();
-
-        let machine = LocalMachine {
-            config: RuntimeConfig {
-                access: AccessPolicy::from_spec(AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: vec![root.clone()],
-                    write_roots: Vec::new(),
-                    deny_read_roots: vec![denied.clone()],
-                    deny_write_roots: vec![denied.clone()],
-                    unrestricted_fs: false,
-                })
-                .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
-                #[cfg(target_os = "linux")]
-                host_shell: crate::host_services::HostShell::default(),
-                log: LogConfig::default(),
-                allow_shell: true,
-                sandbox_shell: true,
-                allow_network: false,
-                shell_program: Some(PathBuf::from("/bin/bash")),
-                bwrap_program: Some(PathBuf::from("/bin/bwrap")),
-                max_shell_timeout_secs: 5,
-                max_output_bytes: 4096,
-                max_read_bytes: 4096,
-                max_write_bytes: 4096,
-                protected_paths: Vec::new(),
-            },
-            operation_gate: Arc::new(RwLock::new(())),
-            serialize: false,
-            #[cfg(target_os = "linux")]
-            secure_fs: Arc::new(
-                crate::secure_fs::SecureFs::new(std::slice::from_ref(&root), &[]).unwrap(),
-            ),
-        };
-
-        let command = machine
-            .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .unwrap();
-        let args: Vec<_> = command.as_std().get_args().collect();
-
-        assert!(args.iter().any(|arg| *arg == OsStr::new("--unshare-net")));
-
-        for endpoint in [
-            Path::new("/nix/var/nix/daemon-socket"),
-            Path::new("/run/nix-daemon"),
-        ] {
-            let Ok(metadata) = std::fs::symlink_metadata(endpoint) else {
-                continue;
-            };
-
-            if metadata.is_dir() {
-                assert!(
-                    args.windows(2).any(|window| {
-                        window[0] == OsStr::new("--tmpfs") && window[1] == endpoint.as_os_str()
-                    }),
-                    "Nix daemon endpoint directory should be hidden when network is denied"
-                );
-            } else {
-                assert!(
-                    args.windows(3).any(|window| {
-                        window[0] == OsStr::new("--ro-bind")
-                            && window[1] == OsStr::new("/dev/null")
-                            && window[2] == endpoint.as_os_str()
-                    }),
-                    "Nix daemon endpoint should be hidden when network is denied"
-                );
-            }
-        }
-
-        assert!(
-            args.windows(2).any(|window| {
-                window[0] == OsStr::new("--tmpfs") && window[1] == denied.as_os_str()
-            }),
-            "denied directory should be hidden behind a tmpfs mount"
-        );
-        assert!(
-            args.windows(3).any(|window| {
-                window[0] == OsStr::new("--chmod")
-                    && window[1] == OsStr::new("000")
-                    && window[2] == denied.as_os_str()
-            }),
-            "denied directory mask should be mode 000"
-        );
-
-        let mut networked = machine.clone();
-        networked.config.allow_network = true;
-        let command = networked
-            .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .unwrap();
-        assert!(
-            !command
-                .as_std()
-                .get_args()
-                .any(|arg| arg == OsStr::new("--unshare-net"))
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_timeout_includes_output_collection_from_descendants() {
-        let Some(bash) = resolve_executable("bash") else {
-            return;
-        };
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let machine = LocalMachine {
-            config: RuntimeConfig {
-                access: AccessPolicy::from_spec(AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: vec![root],
-                    write_roots: Vec::new(),
-                    deny_read_roots: Vec::new(),
-                    deny_write_roots: Vec::new(),
-                    unrestricted_fs: false,
-                })
-                .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
-                #[cfg(target_os = "linux")]
-                host_shell: crate::host_services::HostShell::default(),
-                log: LogConfig::default(),
-                allow_shell: true,
-                sandbox_shell: false,
-                allow_network: true,
-                shell_program: Some(bash),
-                bwrap_program: None,
-                max_shell_timeout_secs: 2,
-                max_output_bytes: 4096,
-                max_read_bytes: 4096,
-                max_write_bytes: 4096,
-                protected_paths: Vec::new(),
-            },
-            operation_gate: Arc::new(RwLock::new(())),
-            serialize: false,
-            #[cfg(target_os = "linux")]
-            secure_fs: Arc::new(crate::secure_fs::SecureFs::new(&[], &[]).unwrap()),
-        };
-
-        let started = Instant::now();
-        let result = machine
-            .execute_shell(
-                ShellArgs {
-                    // The background process inherits the captured pipes after
-                    // Bash exits, so output collection must share the same
-                    // absolute deadline as the command itself.
-                    command: "sleep 2 & printf done".to_owned(),
-                    dir: ".".to_owned(),
-                    stdin: None,
-                    timeout_secs: Some(1),
-                    max_output_bytes: Some(4096),
-                },
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert!(started.elapsed() < Duration::from_millis(1800));
-        let serialized = serde_json::to_string(&result).unwrap();
-        assert!(
-            serialized.contains("collecting command output timed out after 1 seconds"),
-            "unexpected shell result: {serialized}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_timeout_returns_tool_error_with_partial_output() {
-        let Some(bash) = resolve_executable("bash") else {
-            return;
-        };
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let machine = LocalMachine {
-            config: RuntimeConfig {
-                access: AccessPolicy::from_spec(AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: vec![root],
-                    write_roots: Vec::new(),
-                    deny_read_roots: Vec::new(),
-                    deny_write_roots: Vec::new(),
-                    unrestricted_fs: false,
-                })
-                .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
-                #[cfg(target_os = "linux")]
-                host_shell: crate::host_services::HostShell::default(),
-                log: LogConfig::default(),
-                allow_shell: true,
-                sandbox_shell: false,
-                allow_network: true,
-                shell_program: Some(bash),
-                bwrap_program: None,
-                max_shell_timeout_secs: 2,
-                max_output_bytes: 4096,
-                max_read_bytes: 4096,
-                max_write_bytes: 4096,
-                protected_paths: Vec::new(),
-            },
-            operation_gate: Arc::new(RwLock::new(())),
-            serialize: false,
-            #[cfg(target_os = "linux")]
-            secure_fs: Arc::new(crate::secure_fs::SecureFs::new(&[], &[]).unwrap()),
-        };
-
-        let result = machine
-            .execute_shell(
-                ShellArgs {
-                    command: "printf 'partial output\\n'; sleep 30".to_owned(),
-                    dir: ".".to_owned(),
-                    stdin: None,
-                    timeout_secs: Some(1),
-                    max_output_bytes: Some(4096),
-                },
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.is_error, Some(true));
-        let serialized = serde_json::to_value(&result).unwrap();
-        let text = serialized["content"][0]["text"].as_str().unwrap();
-        let payload: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(payload["timed_out"], Value::Bool(true));
-        assert_eq!(payload["success"], Value::Bool(false));
-        assert_eq!(payload["exit_code"], Value::Null);
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap()
-                .contains("timed out after 1 seconds"),
-            "{payload}"
-        );
-        assert!(
-            payload["stdout"]
-                .as_str()
-                .unwrap()
-                .contains("partial output"),
-            "{payload}"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn bubblewrap_cache_runtime_smoke_when_requested() {
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-
-        let Some(bwrap) = resolve_executable("bwrap") else {
-            panic!("DOTLINK_TEST_BWRAP requested but bwrap is not installed");
-        };
-        let Some(bash) = resolve_executable("bash") else {
-            panic!("DOTLINK_TEST_BWRAP requested but bash is not installed");
-        };
-
-        let project = tempfile::tempdir().unwrap();
-        let caches = tempfile::tempdir().unwrap();
-        let root = project.path().canonicalize().unwrap();
-        let read_only = caches.path().join("registry");
-        let read_write = caches.path().join("git");
-        std::fs::create_dir(&read_only).unwrap();
-        std::fs::create_dir(&read_write).unwrap();
-        std::fs::write(read_only.join("cached.txt"), b"cached").unwrap();
-
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: Vec::new(),
-                deny_write_roots: Vec::new(),
-                unrestricted_fs: false,
-            },
-            cache_mounts: vec![
-                SandboxCacheMount {
-                    source: read_only.clone(),
-                    target: PathBuf::from("/tmp/home/.cargo/registry"),
-                    writable: false,
-                },
-                SandboxCacheMount {
-                    source: read_write.clone(),
-                    target: PathBuf::from("/tmp/home/.cargo/git"),
-                    writable: true,
-                },
-            ],
-            shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
-            #[cfg(target_os = "linux")]
-            host_shell: crate::host_services::HostShell::default(),
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
-            allow_network: false,
-            max_shell_timeout_secs: 10,
-            max_output_bytes: 16 * 1024,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-
-        // Use the executable paths resolved by LocalMachine::new.
-        assert_eq!(machine.config.shell_program.as_ref(), Some(&bash));
-        assert_eq!(machine.config.bwrap_program.as_ref(), Some(&bwrap));
-
-        let result = machine
-            .execute_shell(
-                ShellArgs {
-                    command: concat!(
-                        "set -eu; ",
-                        "test \"$CARGO_HOME\" = /tmp/home/.cargo; ",
-                        "cat \"$CARGO_HOME/registry/cached.txt\" >/dev/null; ",
-                        "if touch \"$CARGO_HOME/registry/blocked\" >/dev/null 2>&1; then exit 21; fi; ",
-                        "touch \"$CARGO_HOME/git/works\""
-                    )
-                    .to_owned(),
-                    dir: ".".to_owned(),
-                    stdin: None,
-                    timeout_secs: Some(10),
-                    max_output_bytes: Some(16 * 1024),
-                },
-                false, None)
-            .await
-            .unwrap();
-
-        let serialized = serde_json::to_string(&result).unwrap();
-        assert!(
-            serialized.contains("\\\"exit_code\\\":0"),
-            "cache sandbox smoke failed: {serialized}"
-        );
-        assert!(!read_only.join("blocked").exists());
-        assert!(read_write.join("works").exists());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn bubblewrap_uses_pinned_mount_sources_after_symlink_swap() {
-        use std::os::unix::fs::symlink;
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let bash = resolve_executable("bash").expect("bash required for sandbox test");
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("granted");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(root.join("marker"), "allowed").unwrap();
-        std::fs::write(outside.join("marker"), "not-allowed").unwrap();
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root.clone()],
-                write_roots: Vec::new(),
-                deny_read_roots: Vec::new(),
-                deny_write_roots: Vec::new(),
-                unrestricted_fs: false,
-            },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
-            #[cfg(target_os = "linux")]
-            host_shell: crate::host_services::HostShell::default(),
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
-            allow_network: false,
-            max_shell_timeout_secs: 5,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-        let mut command = machine
-            .bubblewrap_command(&bash, &root, "cat marker")
-            .unwrap();
-        std::fs::rename(&root, temp.path().join("moved")).unwrap();
-        symlink(&outside, &root).unwrap();
-        let output = command.output().await.unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"allowed");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn opted_in_host_services_mount_files_and_ssh_agent_without_network() {
-        use crate::host_services::{Discovery, HostAccess, HostShell};
-        use std::io::{Read as _, Write as _};
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let Some(bash) = resolve_executable("bash") else {
-            return;
-        };
-        let Some(python) = resolve_executable("python3") else {
-            return;
-        };
-        let Some(git) = resolve_executable("git") else {
-            return;
-        };
-        let bwrap = resolve_executable("bwrap").expect("requested Bubblewrap validation");
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("workspace");
-        let home = temp.path().join("private-home");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        let legacy_git = home.join(".gitconfig");
-        let xdg_git = home.join("git-config");
-        let nix_config = home.join("nix.conf");
-        std::fs::write(&legacy_git, "[user]\n name = Dotlink Fixture\n").unwrap();
-        std::fs::write(&xdg_git, "[dotlink]\n probe = visible\n").unwrap();
-        std::fs::write(&nix_config, "experimental-features = nix-command flakes\n").unwrap();
-        let sock = temp.path().join("agent.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-
-        let host_shell = HostShell::prepare_discovered(
-            HostAccess {
-                nix_daemon: false,
-                nix_config: true,
-                ssh_agent: true,
-                git_config: true,
-            },
-            Discovery {
-                nix_daemon: None,
-                nix_config: Some(nix_config.clone()),
-                ssh_agent: Some(sock.clone()),
-                git_configs: vec![legacy_git, xdg_git],
-            },
-        )
-        .unwrap();
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: Vec::new(),
-                deny_write_roots: Vec::new(),
-                unrestricted_fs: false,
-            },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
-            host_shell,
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
-            allow_network: false,
-            max_shell_timeout_secs: 8,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-
-        let acceptor = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            let mut ping = [0_u8; 4];
-            conn.read_exact(&mut ping).unwrap();
-            assert_eq!(&ping, b"ping");
-            conn.write_all(b"pong").unwrap();
+        let write_ceiling = 8 * 1024 * 1024;
+        let machine = crate::mcp::tools::test_support::test_machine_with(root, |config| {
+            config.max_write_bytes = write_ceiling;
         });
-        let command = format!(
-            r#"set -eu
-                test -S "$SSH_AUTH_SOCK"
-                test -r /tmp/home/.config/nix/nix.conf
-                test ! -e /tmp/home/.ssh
-                test -r /etc/passwd
-                test -r /etc/group
-                {git} config --global --get user.name | grep -q 'Dotlink Fixture'
-                test -r /tmp/home/.config/git/config
-                {git} config --get dotlink.probe | grep -q visible
-                {python} -c 'import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect("/tmp/ssh-agent.sock"); s.sendall(b"ping"); assert s.recv(4)==b"pong"'
-            "#,
-            git = git.display(),
-            python = python.display(),
+
+        let config = crate::transports::streamable_config(
+            &machine,
+            tokio_util::sync::CancellationToken::new(),
         );
-        let response = machine
-            .execute_shell(
-                ShellArgs {
-                    command,
-                    dir: ".".to_owned(),
-                    stdin: None,
-                    timeout_secs: Some(8),
-                    max_output_bytes: None,
-                },
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains(r#"\"exit_code\":0"#), "{json}");
-        acceptor.join().unwrap();
-        // Host config sources were never native filesystem grants.
+        assert_eq!(
+            config.max_request_body_bytes,
+            machine.max_request_body_bytes()
+        );
+        assert_eq!(
+            config.max_request_body_bytes,
+            write_ceiling * 6 + 64 * 1024,
+            "one encoded byte is at most six, plus framing"
+        );
         assert!(
-            machine
-                .resolve_existing(&nix_config.to_string_lossy(), AccessNeed::Read)
-                .await
-                .is_err()
+            config.max_request_body_bytes > 4 * 1024 * 1024,
+            "the transport must not keep rmcp's smaller default"
         );
-        let _ = bash;
-        let _ = bwrap;
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn nix_daemon_stays_masked_without_opt_in_even_with_network_and_broad_grants() {
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let daemon_socket = Path::new("/nix/var/nix/daemon-socket/socket");
-        if !daemon_socket.exists() {
-            return;
-        }
+    async fn configured_resource_ceilings_are_rejected_not_widened() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        for unrestricted_fs in [false, true] {
-            let machine = LocalMachine::new(MachineConfig {
-                access: AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: if unrestricted_fs {
-                        vec![PathBuf::from("/")]
-                    } else {
-                        vec![root.clone(), PathBuf::from("/nix/var/nix/daemon-socket")]
-                    },
-                    write_roots: if unrestricted_fs {
-                        vec![PathBuf::from("/")]
-                    } else {
-                        Vec::new()
-                    },
-                    deny_read_roots: Vec::new(),
-                    deny_write_roots: Vec::new(),
-                    unrestricted_fs,
-                },
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
-                host_shell: crate::host_services::HostShell::default(),
-                log: LogConfig::default(),
-                serialize: false,
-                allow_shell: true,
-                sandbox_shell: true,
-                // Network alone must not grant the independent Nix daemon capability.
-                allow_network: true,
-                max_shell_timeout_secs: 8,
-                max_output_bytes: 4096,
-                max_read_bytes: 4096,
-                max_write_bytes: 4096,
-                protected_paths: Vec::new(),
-            })
-            .await
-            .unwrap();
-            let result = machine
-                .execute_shell(
-                    ShellArgs {
-                        command: concat!(
-                            "set -eu; test ! -e /nix/var/nix/daemon-socket/socket; ",
-                            "for node in /dev/kvm /dev/kfd /dev/nvidia0 /dev/nvidiactl /dev/dri/renderD128; do ",
-                            r#"if test -e "$node" && ( : <> "$node" ) 2>/dev/null; then exit 61; fi; "#,
-                            "done; printf masked"
-                        ).into(),
-                        dir: if unrestricted_fs {
-                            "/".into()
-                        } else {
-                            ".".into()
-                        },
-                        stdin: None,
-                        timeout_secs: Some(8),
-                        max_output_bytes: None,
-                    },
-                    false, None)
-                .await
-                .unwrap();
-            let json = serde_json::to_string(&result).unwrap();
-            assert!(
-                json.contains("masked") && json.contains(r#"\"exit_code\":0"#),
-                "Nix daemon unexpectedly visible (unrestricted={unrestricted_fs}): {json}"
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn pinned_host_mount_denies_are_not_changed_by_alias_swap() {
-        use crate::host_services::{HostMount, HostMountKind, HostShell};
-        use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("workspace");
-        let private = temp.path().join("private");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&private).unwrap();
-        let denied = private.join("secret.conf");
-        let public = root.join("visible.conf");
-        std::fs::write(&denied, "secret").unwrap();
-        std::fs::write(&public, "public").unwrap();
-        let alias = root.join("mutable-alias");
-        symlink(&denied, &alias).unwrap();
-        let mount = HostMount::new(
-            alias.clone(),
-            PathBuf::from("/tmp/home/.gitconfig"),
-            HostMountKind::RegularFile,
-        )
-        .unwrap();
-        assert_eq!(mount.resolved, denied);
-        std::fs::remove_file(&alias).unwrap();
-        symlink(&public, &alias).unwrap();
-        let result = LocalMachine::new(MachineConfig {
+        let root = temp.path().canonicalize().unwrap();
+        let machine_config = |max_write_bytes: usize| MachineConfig {
             access: AccessSpec {
                 base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: vec![private],
+                read_roots: vec![root.clone()],
+                write_roots: vec![root.clone()],
+                deny_read_roots: Vec::new(),
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
             cache_mounts: Vec::new(),
             shell_env: Vec::new(),
-            host_shell: HostShell {
-                mounts: vec![mount],
-                ..HostShell::default()
-            },
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
             serialize: false,
             allow_shell: false,
             sandbox_shell: false,
             allow_network: false,
-            max_shell_timeout_secs: 5,
+            max_shell_timeout_secs: 60,
             max_output_bytes: 4096,
             max_read_bytes: 4096,
-            max_write_bytes: 4096,
+            max_write_bytes,
             protected_paths: Vec::new(),
-        })
-        .await;
-        let error = result.expect_err("canonical denied target must remain denied");
-        assert!(error.to_string().contains("denied or protected"));
+        };
+
+        // A ceiling below the supported minimum is an error naming the value,
+        // not a silent promotion to the minimum.
+        let error = LocalMachine::new(machine_config(32)).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max_write_bytes must be at least 1024")
+                && error.to_string().contains("got 32"),
+            "{error}"
+        );
+
+        // An accepted value is used exactly as configured.
+        let machine = LocalMachine::new(machine_config(2048)).await.unwrap();
+        assert_eq!(machine.config.max_write_bytes, 2048);
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn git_ssh_signing_uses_only_opted_in_agent_without_private_key_mounts() {
-        use crate::host_services::{Discovery, HostAccess, HostShell};
-        use std::os::unix::fs::FileTypeExt;
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let tools = ["ssh-agent", "ssh-add", "ssh-keygen", "git", "bash", "bwrap"];
-        let Some(paths) = tools
-            .iter()
-            .map(|tool| resolve_executable(tool))
-            .collect::<Option<Vec<_>>>()
-        else {
-            // Not all developer images include OpenSSH and Git tools.
-            return;
+    #[test]
+    fn the_shell_predicate_is_derived_from_the_tool_table() {
+        // Exactly one advertised tool is the platform's shell: every other
+        // consumer (schema limits, delivery reserve, logging) asks this.
+        let platform_shell = match cfg!(windows) {
+            true => "powershell",
+            false => "bash",
         };
-        let [ssh_agent, ssh_add, ssh_keygen, git, _bash, _bwrap] =
-            paths.try_into().expect("exactly six executable paths");
+        let accepted = TOOL_SPECS
+            .iter()
+            .filter(|spec| is_shell_tool(spec.name))
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(accepted, [platform_shell]);
+        assert!(!is_shell_tool("read"));
+        assert!(!is_shell_tool("future_tool"));
+    }
+
+    #[tokio::test]
+    async fn deny_paths_are_normalized_before_they_are_matched() {
+        // A deny that names a not-yet-existing component and then walks back out
+        // of it must still deny the real path. Without lexical folding the
+        // stored root keeps `..` and silently matches nothing.
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repository");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("README.md"), b"signed fixture").unwrap();
-        let key = temp.path().join("disposable-signing-key");
-        let agent_socket = temp.path().join("disposable-agent.sock");
-        let mut agent = tokio::process::Command::new(&ssh_agent)
-            .arg("-D")
-            .arg("-a")
-            .arg(&agent_socket)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        for _ in 0..100 {
-            if std::fs::metadata(&agent_socket).is_ok_and(|meta| meta.file_type().is_socket()) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(agent_socket.exists(), "disposable agent did not start");
-        let generate = std::process::Command::new(&ssh_keygen)
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(&key)
-            .output()
-            .unwrap();
-        assert!(
-            generate.status.success(),
-            "{}",
-            String::from_utf8_lossy(&generate.stderr)
-        );
-        let add_key = std::process::Command::new(&ssh_add)
-            .arg(&key)
-            .env("SSH_AUTH_SOCK", &agent_socket)
-            .output()
-            .unwrap();
-        assert!(
-            add_key.status.success(),
-            "{}",
-            String::from_utf8_lossy(&add_key.stderr)
-        );
-        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
-        let config = temp.path().join(".gitconfig");
-        std::fs::write(&config, format!(
-            "[user]\n name = Disposable Fixture\n email = fixture@example.invalid\n signingkey = key::{}\n[gpg]\n format = ssh\n[gpg \"ssh\"]\n program = {}\n[commit]\n gpgsign = true\n",
-            public.trim(), ssh_keygen.display()
-        )).unwrap();
-        let git_init = std::process::Command::new(&git)
-            .args(["init", "-q"])
-            .arg(&root)
-            .output()
-            .unwrap();
-        assert!(git_init.status.success());
-        let host_shell = HostShell::prepare_discovered(
-            HostAccess {
-                ssh_agent: true,
-                git_config: true,
-                ..HostAccess::default()
-            },
-            Discovery {
-                ssh_agent: Some(agent_socket),
-                git_configs: vec![config],
-                ..Discovery::default()
-            },
-        )
-        .unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("secret")).unwrap();
         let machine = LocalMachine::new(MachineConfig {
             access: AccessSpec {
                 base_dir: root.clone(),
                 read_roots: vec![root.clone()],
-                write_roots: vec![root],
-                deny_read_roots: Vec::new(),
+                write_roots: vec![root.clone()],
+                deny_read_roots: vec![PathBuf::from("missing/../secret")],
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
             cache_mounts: Vec::new(),
             shell_env: Vec::new(),
-            host_shell,
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
-            allow_network: false,
-            max_shell_timeout_secs: 15,
-            max_output_bytes: 16 * 1024,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-        let result = machine.execute_shell(ShellArgs {
-            command: format!(
-                "set -eu; {} add README.md; {} commit -qm 'Signed in Bubblewrap'; {} cat-file commit HEAD; test ! -e /tmp/home/.ssh",
-                git.display(), git.display(), git.display(),
-            ),
-            dir: ".".into(), stdin: None,
-            timeout_secs: Some(15), max_output_bytes: None,
-        }, false, None).await.unwrap();
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(
-            json.contains("BEGIN SSH SIGNATURE"),
-            "commit was not signed: {json}"
-        );
-        assert!(
-            json.contains(r#"\"exit_code\":0"#),
-            "sandboxed Git commit failed: {json}"
-        );
-        let _ = agent.kill().await;
-        let _ = agent.wait().await;
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn unrestricted_filesystem_grant_does_not_grant_device_access() {
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: temp.path().to_path_buf(),
-                read_roots: vec![PathBuf::from("/")],
-                write_roots: vec![PathBuf::from("/")],
-                deny_read_roots: Vec::new(),
-                deny_write_roots: Vec::new(),
-                unrestricted_fs: true,
-            },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
+            serialize: true,
+            allow_shell: false,
+            sandbox_shell: false,
             allow_network: false,
-            max_shell_timeout_secs: 8,
+            max_shell_timeout_secs: 60,
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
@@ -6967,467 +1828,12 @@ mod tests {
         })
         .await
         .unwrap();
-        let result = machine.execute_shell(ShellArgs {
-            command: concat!(
-                "set -eu; ",
-                "for node in /dev/kvm /dev/kfd /dev/nvidia0 /dev/nvidiactl /dev/dri/renderD128; do ",
-                r#"if test -e "$node" && ( : <> "$node" ) 2>/dev/null; then exit 61; fi; "#,
-                "done; echo isolated"
-            ).into(),
-            dir: "/".into(), stdin: None,
-            timeout_secs: Some(8), max_output_bytes: None,
-        }, false, None).await.unwrap();
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(
-            json.contains("isolated") && json.contains(r#"\"exit_code\":0"#),
-            "{json}"
-        );
-    }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn deny_write_revokes_explicit_character_device_access() {
-        use crate::host_services::{HostMount, HostMountKind, HostShell};
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let source = PathBuf::from("/dev/null");
-        let mount = HostMount::new(
-            source.clone(),
-            PathBuf::from("/dev/kvm"),
-            HostMountKind::CharacterDevice,
-        )
-        .unwrap();
-        let outcome = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: Vec::new(),
-                deny_write_roots: vec![source],
-                unrestricted_fs: false,
-            },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
-            host_shell: HostShell {
-                mounts: vec![mount],
-                kvm: true,
-                ..HostShell::default()
-            },
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
-            allow_network: false,
-            max_shell_timeout_secs: 5,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await;
-        let error = outcome.expect_err("deny-write must override the device grant");
-        assert!(error.to_string().contains("denied or protected"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn discovered_gpu_and_kvm_nodes_are_visible_only_when_granted() {
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let available = crate::hardware::available();
-        let vendors = [
-            (crate::setup::GpuVendor::Amd, available.amd),
-            (crate::setup::GpuVendor::Nvidia, available.nvidia),
-        ]
-        .into_iter()
-        .filter_map(|(vendor, present)| present.then_some(vendor))
-        .collect::<Vec<_>>();
-        if !available.kvm && vendors.is_empty() {
-            return;
-        }
-
-        let mut host_shell = crate::host_services::HostShell::default();
-        crate::hardware::add_to_shell(&mut host_shell, available.kvm, &vendors).unwrap();
-        assert_eq!(host_shell.gpu, vendors);
-        if available.kvm {
-            assert!(host_shell.kvm);
-        }
-        let mut checked = String::new();
-        for mount in &host_shell.mounts {
-            if mount.kind == crate::host_services::HostMountKind::CharacterDevice {
-                checked.push_str(&format!(
-                    "test -c '{}' || exit 47; ",
-                    mount.target.display()
-                ));
-            }
-        }
-        if !vendors.is_empty() {
-            checked.push_str("test -d /sys/class/drm || exit 48; ");
-        }
-        if std::env::var_os("DOTLINK_TEST_GPU_SMOKE").is_some() {
-            if available.nvidia
-                && let Some(smi) = resolve_executable("nvidia-smi")
-            {
-                checked.push_str(&format!("'{}' -L >/dev/null || exit 49; ", smi.display()));
-            }
-            if !vendors.is_empty()
-                && let Some(vulkan) = resolve_executable("vulkaninfo")
-            {
-                checked.push_str(&format!(
-                    "'{}' --summary >/dev/null || exit 50; ",
-                    vulkan.display()
-                ));
-            }
-        }
-        checked.push_str("echo hardware-visible");
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: Vec::new(),
-                deny_write_roots: Vec::new(),
-                unrestricted_fs: false,
-            },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
-            host_shell,
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
-            allow_network: false,
-            max_shell_timeout_secs: 12,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-        let result = machine
-            .execute_shell(
-                ShellArgs {
-                    command: checked,
-                    dir: ".".into(),
-                    stdin: None,
-                    timeout_secs: Some(12),
-                    max_output_bytes: None,
-                },
-                false,
-                None,
-            )
+        let error = machine
+            .resolve_existing("secret", AccessNeed::Read)
             .await
-            .unwrap();
-        let serialized = serde_json::to_string(&result).unwrap();
-        assert!(serialized.contains("hardware-visible"), "{serialized}");
-        assert!(serialized.contains(r#"\"exit_code\":0"#), "{serialized}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn pinned_character_device_mounts_are_usable_in_bubblewrap() {
-        use crate::host_services::{HostMount, HostMountKind, HostShell};
-        use std::os::unix::fs::{MetadataExt, symlink};
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let alias = root.join("device-alias");
-        symlink("/dev/null", &alias).unwrap();
-        let first = HostMount::new(
-            alias.clone(),
-            PathBuf::from("/dev/kvm"),
-            HostMountKind::CharacterDevice,
-        )
-        .unwrap();
-        std::fs::remove_file(&alias).unwrap();
-        symlink("/dev/zero", &alias).unwrap();
-        // The pin cannot switch to the new device inode or identity.
-        assert_eq!(
-            first.pinned.metadata().unwrap().rdev(),
-            std::fs::metadata("/dev/null").unwrap().rdev()
-        );
-        assert_ne!(
-            first.pinned.metadata().unwrap().rdev(),
-            std::fs::metadata(&alias).unwrap().rdev()
-        );
-
-        let second = HostMount::new(
-            PathBuf::from("/dev/zero"),
-            PathBuf::from("/dev/dri/renderD128"),
-            HostMountKind::CharacterDevice,
-        )
-        .unwrap();
-        for expose in [false, true] {
-            let host_shell = if expose {
-                HostShell {
-                    mounts: vec![first.clone(), second.clone()],
-                    kvm: true,
-                    gpu: vec![crate::setup::GpuVendor::Amd],
-                    ..HostShell::default()
-                }
-            } else {
-                HostShell::default()
-            };
-            let machine = LocalMachine::new(MachineConfig {
-                access: AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: vec![root.clone()],
-                    write_roots: Vec::new(),
-                    deny_read_roots: Vec::new(),
-                    deny_write_roots: Vec::new(),
-                    unrestricted_fs: false,
-                },
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
-                host_shell,
-                log: LogConfig::default(),
-                serialize: false,
-                allow_shell: true,
-                sandbox_shell: true,
-                allow_network: false,
-                max_shell_timeout_secs: 10,
-                max_output_bytes: 4096,
-                max_read_bytes: 4096,
-                max_write_bytes: 4096,
-                protected_paths: Vec::new(),
-            })
-            .await
-            .unwrap();
-            let command = if expose {
-                "set -eu; test -c /dev/kvm; test -c /dev/dri/renderD128; exec 3</dev/kvm; exec 4</dev/dri/renderD128; echo mounted"
-            } else {
-                "set -eu; test ! -e /dev/kvm; test ! -e /dev/dri/renderD128; echo isolated"
-            };
-            let result = machine
-                .execute_shell(
-                    ShellArgs {
-                        command: command.to_owned(),
-                        dir: ".".to_owned(),
-                        stdin: None,
-                        timeout_secs: Some(10),
-                        max_output_bytes: None,
-                    },
-                    false,
-                    None,
-                )
-                .await
-                .unwrap();
-            let json = serde_json::to_string(&result).unwrap();
-            assert!(json.contains(r#"\"exit_code\":0"#), "{json}");
-            assert!(
-                json.contains(if expose { "mounted" } else { "isolated" }),
-                "{json}"
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn opted_in_nix_daemon_works_without_shell_network() {
-        use crate::host_services::{Discovery, HostAccess, HostShell};
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let Some(nix) = resolve_executable("nix") else {
-            return;
-        };
-        let Some(daemon) = crate::host_services::discover().nix_daemon else {
-            return;
-        };
-        let Some(bash) = resolve_executable("bash") else {
-            return;
-        };
-        let Some(bwrap) = resolve_executable("bwrap") else {
-            return;
-        };
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let host_shell = HostShell::prepare_discovered(
-            HostAccess {
-                nix_daemon: true,
-                ..HostAccess::default()
-            },
-            Discovery {
-                nix_daemon: Some(daemon),
-                ..Discovery::default()
-            },
-        )
-        .unwrap();
-        let machine = LocalMachine::new(MachineConfig {
-            access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root],
-                write_roots: Vec::new(),
-                deny_read_roots: Vec::new(),
-                deny_write_roots: Vec::new(),
-                unrestricted_fs: false,
-            },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
-            host_shell,
-            log: LogConfig::default(),
-            serialize: false,
-            allow_shell: true,
-            sandbox_shell: true,
-            allow_network: false,
-            max_shell_timeout_secs: 8,
-            max_output_bytes: 4096,
-            max_read_bytes: 4096,
-            max_write_bytes: 4096,
-            protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
-        let result = machine
-            .execute_shell(
-                ShellArgs {
-                    command: format!(
-                        "{} --extra-experimental-features 'nix-command flakes' store info",
-                        nix.display()
-                    ),
-                    dir: ".".into(),
-                    stdin: None,
-                    timeout_secs: Some(8),
-                    max_output_bytes: None,
-                },
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("Store URL: daemon"), "{json}");
-        assert!(json.contains(r#"\"exit_code\":0"#), "{json}");
-        let _ = bash;
-        let _ = bwrap;
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn bubblewrap_runtime_smoke_when_requested() {
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-
-        let Some(bwrap) = resolve_executable("bwrap") else {
-            panic!("DOTLINK_TEST_BWRAP requested but bwrap is not installed");
-        };
-        let Some(bash) = resolve_executable("bash") else {
-            panic!("DOTLINK_TEST_BWRAP requested but bash is not installed");
-        };
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let writable = root.join("writable");
-        let denied = root.join("denied");
-        std::fs::create_dir(&writable).unwrap();
-        std::fs::create_dir(&denied).unwrap();
-        std::fs::write(root.join("visible.txt"), b"visible").unwrap();
-        std::fs::write(denied.join("secret.txt"), b"secret").unwrap();
-
-        let machine = LocalMachine {
-            config: RuntimeConfig {
-                access: AccessPolicy::from_spec(AccessSpec {
-                    base_dir: root.clone(),
-                    read_roots: vec![root.clone()],
-                    write_roots: vec![writable.clone()],
-                    deny_read_roots: vec![denied.clone()],
-                    deny_write_roots: vec![denied],
-                    unrestricted_fs: false,
-                })
-                .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
-                #[cfg(target_os = "linux")]
-                host_shell: crate::host_services::HostShell::default(),
-                log: LogConfig::default(),
-                allow_shell: true,
-                sandbox_shell: true,
-                allow_network: false,
-                shell_program: Some(bash),
-                bwrap_program: Some(bwrap),
-                max_shell_timeout_secs: 10,
-                max_output_bytes: 16 * 1024,
-                max_read_bytes: 4096,
-                max_write_bytes: 4096,
-                protected_paths: Vec::new(),
-            },
-            operation_gate: Arc::new(RwLock::new(())),
-            serialize: false,
-            #[cfg(target_os = "linux")]
-            secure_fs: Arc::new(
-                crate::secure_fs::SecureFs::new(
-                    std::slice::from_ref(&root),
-                    std::slice::from_ref(&writable),
-                )
-                .unwrap(),
-            ),
-        };
-
-        let result = machine
-            .execute_shell(
-                ShellArgs {
-                    command: concat!(
-                        "set -eu; ",
-                        "cat visible.txt >/dev/null; ",
-                        "if cat denied/secret.txt >/dev/null 2>&1; then exit 11; fi; ",
-                        "for d in /proc/self/fd/*; do if cat \"$d/denied/secret.txt\" >/dev/null 2>&1; then exit 14; fi; done; ",
-                        "if touch should-not-work >/dev/null 2>&1; then exit 12; fi; ",
-                        "touch writable/works; ",
-                        "test ! -e /etc/resolv.conf"
-                    )
-                    .to_owned(),
-                    dir: ".".to_owned(),
-                    stdin: None,
-                    timeout_secs: Some(10),
-                    max_output_bytes: Some(16 * 1024),
-                },
-                false, None)
-            .await
-            .unwrap();
-
-        let serialized = serde_json::to_string(&result).unwrap();
-        assert!(
-            serialized.contains("\\\"exit_code\\\":0"),
-            "sandbox smoke failed: {serialized}"
-        );
-        assert!(writable.join("works").exists());
-        assert!(!root.join("should-not-work").exists());
-
-        let late = writable.join("late");
-        let background = machine
-            .execute_shell(
-                ShellArgs {
-                    command: "(sleep 2; touch writable/late) >/dev/null 2>&1 &".to_owned(),
-                    dir: ".".to_owned(),
-                    stdin: None,
-                    timeout_secs: Some(10),
-                    max_output_bytes: Some(16 * 1024),
-                },
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        let serialized = serde_json::to_string(&background).unwrap();
-        assert!(
-            serialized.contains("\\\"exit_code\\\":0"),
-            "background sandbox smoke failed: {serialized}"
-        );
-
-        if !late.exists() {
-            tokio::time::sleep(Duration::from_millis(2500)).await;
-            assert!(
-                !late.exists(),
-                "sandbox descendant mutated a host mount after the shell tool returned"
-            );
-        }
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("denied by policy"), "{error}");
     }
 }

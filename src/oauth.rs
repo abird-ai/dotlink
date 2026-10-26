@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    env, fs, io,
+    fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -728,16 +728,7 @@ impl Server {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
-    let base = if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(xdg)
-    } else if cfg!(windows) {
-        env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or(home_dir()?.join(".local/state"))
-    } else {
-        home_dir()?.join(".local/state")
-    };
-    Ok(base.join("abird/dotlink"))
+    Ok(crate::xdg::state_home()?.join("abird/dotlink"))
 }
 
 pub fn state_path(profile: Option<&str>) -> Result<PathBuf> {
@@ -1812,13 +1803,6 @@ fn write_state(path: &Path, state: &PersistentState) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(state)?;
     bytes.push(b'\n');
     atomic_write_private(path, &bytes, true)
-}
-
-fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME is not set"))
 }
 
 fn canonical_public_origin(url: &Url) -> Result<String> {

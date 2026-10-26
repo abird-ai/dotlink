@@ -9,6 +9,7 @@ use std::{
 
 use chrono::Local;
 use clap::ValueEnum;
+use serde_json::{Map, Value};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum ColorMode {
@@ -195,6 +196,55 @@ impl LogConfig {
     }
 }
 
+/// Widest scalar argument rendered literally in a tool-call summary.
+const SUMMARY_VALUE_CHARS: usize = 120;
+
+/// Arguments that carry whole payloads. Their values are always logged as a byte
+/// count, never as text: file content, patches and stdin must not reach a
+/// journal. Shell commands can include inline credentials and are payloads,
+/// too. This is a semantic list (which arguments are payloads) that no
+/// schema can express, and it is shared by every caller.
+const PAYLOAD_ARGUMENTS: &[&str] = &[
+    "content", "stdin", "data", "old_text", "new_text", "patch", "command",
+];
+
+/// One-line rendering of tool-call arguments for the TOOL and REQ logs.
+///
+/// `keys` is the tool's own argument order, taken from its JSON schema, so a new
+/// argument cannot silently go unlogged. Strings wider than a preview become a
+/// byte count, which keeps file content, shell commands, patches and stdin out of logs.
+pub fn summarize_arguments<'a>(
+    arguments: &Map<String, Value>,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut parts = Vec::new();
+    for key in keys {
+        let Some(value) = arguments.get(key) else {
+            continue;
+        };
+        match value {
+            Value::String(value) if PAYLOAD_ARGUMENTS.contains(&key) => {
+                parts.push(format!("{key}_bytes={}", value.len()));
+            }
+            Value::String(value) if value.chars().count() > SUMMARY_VALUE_CHARS => {
+                parts.push(format!("{key}_bytes={}", value.len()));
+            }
+            Value::String(value) => {
+                let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+                parts.push(format!(
+                    "{key}={:?}",
+                    truncate(&compact, SUMMARY_VALUE_CHARS)
+                ));
+            }
+            Value::Bool(value) => parts.push(format!("{key}={value}")),
+            Value::Number(value) => parts.push(format!("{key}={value}")),
+            Value::Array(items) => parts.push(format!("{key}={}", items.len())),
+            Value::Null | Value::Object(_) => {}
+        }
+    }
+    parts.join(" ")
+}
+
 pub fn truncate(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
@@ -208,6 +258,38 @@ pub fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argument_summaries_redact_bulk_values_and_keep_scalars() {
+        let arguments = serde_json::json!({
+            "path": "src/main.rs",
+            "command": "curl -H 'Authorization: Bearer FAKE_TEST_SECRET' https://example.org",
+            "content": "x".repeat(200),
+            "old_text": "short secret",
+            "edits": [{"old_text": "a"}, {"old_text": "b"}],
+            "literal": true,
+            "limit": 20,
+            "absent": null,
+        });
+        let summary = summarize_arguments(
+            arguments.as_object().unwrap(),
+            [
+                "path", "command", "content", "old_text", "edits", "literal", "limit", "absent",
+                "missing",
+            ],
+        );
+        assert!(summary.contains("path=\"src/main.rs\""), "{summary}");
+        assert!(summary.contains("command_bytes="), "{summary}");
+        assert!(!summary.contains("FAKE_TEST_SECRET"), "{summary}");
+        assert!(summary.contains("content_bytes=200"), "{summary}");
+        // A payload stays a byte count even when it is short.
+        assert!(summary.contains("old_text_bytes=12"), "{summary}");
+        assert!(!summary.contains("short secret"), "{summary}");
+        assert!(summary.contains("edits=2"), "{summary}");
+        assert!(summary.contains("literal=true"), "{summary}");
+        assert!(summary.contains("limit=20"), "{summary}");
+        assert!(!summary.contains("xxxx"), "{summary}");
+    }
 
     #[test]
     fn truncate_marks_long_values() {

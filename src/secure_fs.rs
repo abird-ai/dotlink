@@ -9,15 +9,16 @@
 use std::{
     ffi::CString,
     fs::{self, File},
-    io,
+    io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
     },
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
 
 #[repr(C)]
 struct OpenHow {
@@ -57,6 +58,134 @@ fn openat2(dir: &OwnedFd, path: &Path, flags: i32, mode: u32, resolve: u64) -> i
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
+/// Flags every child open must carry, whatever mask the caller supplies. The
+/// mask is an implementation detail of the pinned root; keeping the security
+/// boundary inside this function means a future caller cannot relax it by
+/// passing a stale or hand-built value.
+fn mandatory_resolve(resolve: u64) -> u64 {
+    resolve | RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
+}
+
+/// Open `name` inside an already-pinned directory. `resolve` is the mask the
+/// directory was pinned with, so a child is never less restricted than its
+/// parent: symlinks and magic links are always refused, and mount crossing
+/// follows the grant (only an explicit `/` root may cross one).
+fn open_child(
+    dir: &OwnedFd,
+    name: &std::ffi::OsStr,
+    flags: i32,
+    resolve: u64,
+) -> io::Result<OwnedFd> {
+    openat2(dir, Path::new(name), flags, 0, mandatory_resolve(resolve))
+}
+
+fn unlink_at(dir: &OwnedFd, name: &Path) {
+    if let Ok(name) = CString::new(name.as_os_str().as_bytes()) {
+        // SAFETY: `dir` is an open directory descriptor and `name` owns its
+        // NUL-terminated buffer for the duration of the call.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    }
+}
+
+fn rename_at(dir: &OwnedFd, from: &Path, to: &Path) -> io::Result<()> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in filesystem path"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in filesystem path"))?;
+    // SAFETY: both paths are NUL-terminated buffers that outlive the call, and
+    // `dir` is an open directory descriptor.
+    let result =
+        unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Install `from` as `to` only when `to` does not exist. `linkat` is the
+/// create-only primitive: unlike rename, it cannot replace an existing name.
+fn link_at(dir: &OwnedFd, from: &Path, to: &Path) -> io::Result<()> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in filesystem path"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in filesystem path"))?;
+    // SAFETY: both paths are NUL-terminated buffers that outlive the call, and
+    // `dir` is an open directory descriptor.
+    let result = unsafe {
+        libc::linkat(
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Resolve the parent directory of `rel` beneath `root`, creating missing
+/// components on the way. Returns the pinned parent and the file name.
+fn open_parent_dir<'a>(
+    root: &Root,
+    rel: &'a Path,
+    target: &Path,
+    create_missing: bool,
+) -> Result<(OwnedFd, &'a std::ffi::OsStr)> {
+    let Some(file_name) = rel.file_name() else {
+        bail!("cannot replace an authorized root directory");
+    };
+    let mut current: OwnedFd = openat2(
+        &root.fd,
+        Path::new("."),
+        libc::O_PATH | libc::O_DIRECTORY,
+        0,
+        root.resolve,
+    )?;
+    let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent.components() {
+        let Component::Normal(name) = component else {
+            bail!("unexpected component in relative path {}", target.display());
+        };
+        let child = Path::new(name);
+        match openat2(
+            &current,
+            child,
+            libc::O_PATH | libc::O_DIRECTORY,
+            0,
+            root.resolve,
+        ) {
+            Ok(fd) => current = fd,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !create_missing => {
+                return Err(error)
+                    .with_context(|| format!("missing parent directory in {}", target.display()));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                mkdirat(&current, child).with_context(|| {
+                    format!(
+                        "failed creating directory inside grant: {}",
+                        target.display()
+                    )
+                })?;
+                current = openat2(
+                    &current,
+                    child,
+                    libc::O_PATH | libc::O_DIRECTORY,
+                    0,
+                    root.resolve,
+                )?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("unsafe parent in {}", target.display()));
+            }
+        }
+    }
+    Ok((current, file_name))
+}
+
 fn mkdirat(dir: &OwnedFd, path: &Path) -> io::Result<()> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in directory name"))?;
@@ -70,6 +199,151 @@ fn mkdirat(dir: &OwnedFd, path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// What a staged write will do when committed.
+#[derive(Clone, Copy, Debug)]
+enum StageMode {
+    Create,
+    Replace,
+    /// Existing-file update; the tuple is the expected length and SHA-256.
+    Update((u64, [u8; 32])),
+}
+
+/// A replacement that is written and flushed but not yet visible. `commit`
+/// either renames it over an existing target or links it into a free name;
+/// dropping it removes the temporary.
+#[derive(Debug)]
+pub struct StagedWrite {
+    parent: OwnedFd,
+    name: std::ffi::OsString,
+    target: PathBuf,
+    temporary: std::ffi::OsString,
+    resolve: u64,
+    create_only: bool,
+    /// Length and SHA-256 of the bytes the caller planned against. Updates
+    /// re-check this immediately before the commit.
+    expected: Option<(u64, [u8; 32])>,
+    committed: bool,
+}
+
+impl StagedWrite {
+    /// Make the staged bytes visible. Installing the name is the only step
+    /// after the data is durable, so a failed write can never leave a
+    /// half-written target.
+    pub fn commit(mut self) -> Result<()> {
+        if self.create_only {
+            link_at(
+                &self.parent,
+                Path::new(&self.temporary),
+                Path::new(&self.name),
+            )?;
+            // The target now owns the inode. The temporary name is redundant;
+            // removing it is best effort because the requested file exists.
+            unlink_at(&self.parent, Path::new(&self.temporary));
+        } else {
+            // Re-check immediately before the rename. A target that became a
+            // symlink or special file, or whose bytes changed after the
+            // snapshot was verified, is refused rather than silently replaced.
+            if let Some((len, digest)) = self.expected {
+                let fd = openat2(
+                    &self.parent,
+                    Path::new(&self.name),
+                    libc::O_RDONLY | libc::O_NONBLOCK,
+                    0,
+                    self.resolve,
+                )
+                .with_context(|| format!("{} changed before commit", self.target.display()))?;
+                let mut file = File::from(fd);
+                let metadata = file.metadata()?;
+                if !metadata.is_file() || metadata.len() != len {
+                    bail!("{} changed before commit", self.target.display());
+                }
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                let mut total = 0_u64;
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    total = total.saturating_add(read as u64);
+                    if total > len {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                let found: [u8; 32] = hasher.finalize().into();
+                if total != len || found != digest {
+                    bail!("{} changed before commit", self.target.display());
+                }
+            }
+            match openat2(
+                &self.parent,
+                Path::new(&self.name),
+                libc::O_PATH | libc::O_NOFOLLOW,
+                0,
+                self.resolve,
+            ) {
+                Ok(fd) => {
+                    if !File::from(fd).metadata()?.is_file() {
+                        bail!(
+                            "path is not a regular file: {}",
+                            self.name.to_string_lossy()
+                        );
+                    }
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound && self.expected.is_some() =>
+                {
+                    bail!("{} changed before commit", self.target.display())
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "refused unsafe write target {}",
+                            self.name.to_string_lossy()
+                        )
+                    });
+                }
+            }
+            rename_at(
+                &self.parent,
+                Path::new(&self.temporary),
+                Path::new(&self.name),
+            )?;
+        }
+        self.committed = true;
+        // The commit contract is atomic visibility, not guaranteed crash
+        // durability. Bytes were synced before rename; directory sync is best
+        // effort because the containing directory may be writable but not
+        // readable. Never report an error after a successful rename: a retry
+        // could otherwise replay an already-committed edit.
+        if let Ok(dir) = openat2(
+            &self.parent,
+            Path::new("."),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+            self.resolve,
+        ) {
+            // SAFETY: dir is an owned descriptor that stays alive for fsync.
+            if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+                let error = io::Error::last_os_error();
+                tracing::warn!(%error, path = %self.target.display(),
+                    "file committed, but directory durability could not be confirmed");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        if !self.committed {
+            unlink_at(&self.parent, Path::new(&self.temporary));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -153,7 +427,7 @@ impl SecureFs {
         Ok(Self { read, write })
     }
 
-    fn root<'a>(&'a self, target: &'a Path, write: bool) -> Result<(&'a Root, &'a Path)> {
+    fn root<'a, 'b>(&'a self, target: &'b Path, write: bool) -> Result<(&'a Root, &'b Path)> {
         let roots = if write { &self.write } else { &self.read };
         roots
             .iter()
@@ -203,82 +477,197 @@ impl SecureFs {
         Ok(file)
     }
 
-    pub fn open_write(&self, path: &Path) -> Result<File> {
-        self.open_write_mode(path, false)
+    /// Prepare a create-or-replace write. This needs only write authority, so
+    /// it uses the write root rather than a possibly read-only narrower grant.
+    pub fn stage(&self, path: &Path, bytes: &[u8]) -> Result<StagedWrite> {
+        self.stage_in_root(self.root(path, true)?.0, path, bytes, StageMode::Replace)
     }
 
-    /// Create-only write: refuses an existing path, including one that appeared
-    /// between the policy check and this open (O_EXCL, or `create_new` elsewhere).
-    pub fn open_create(&self, path: &Path) -> Result<File> {
-        self.open_write_mode(path, true)
+    /// Prepare an in-place update. This requires both grants and uses the
+    /// narrower of them, so the bytes cannot land under a broader write-only
+    /// grant than the one the snapshot was verified against. `expected` is the
+    /// length and SHA-256 the caller planned against; commit re-checks it.
+    pub fn stage_update(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        expected: (u64, [u8; 32]),
+    ) -> Result<StagedWrite> {
+        self.stage_in_root(
+            self.replacement_root(path)?,
+            path,
+            bytes,
+            StageMode::Update(expected),
+        )
     }
 
-    fn open_write_mode(&self, path: &Path, exclusive: bool) -> Result<File> {
-        let (root, rel) = self.root(path, true)?;
-        let Some(file_name) = rel.file_name() else {
-            bail!("cannot replace an authorized root directory");
-        };
-        let mut current: OwnedFd = openat2(
-            &root.fd,
-            Path::new("."),
-            libc::O_PATH | libc::O_DIRECTORY,
+    /// Prepare a create-only write. The target is not created until `commit`,
+    /// which installs it with `linkat`, so a reader never sees an empty file
+    /// and an existing target cannot be replaced.
+    pub fn stage_create(&self, path: &Path, bytes: &[u8]) -> Result<StagedWrite> {
+        self.stage_in_root(self.root(path, true)?.0, path, bytes, StageMode::Create)
+    }
+
+    fn stage_in_root(
+        &self,
+        root: &Root,
+        path: &Path,
+        bytes: &[u8],
+        mode: StageMode,
+    ) -> Result<StagedWrite> {
+        let rel = path
+            .strip_prefix(&root.path)
+            .map_err(|_| anyhow!("path has no authorized root: {}", path.display()))?;
+        let (parent, file_name) = open_parent_dir(root, rel, path, true)?;
+        self.stage_at(&parent, file_name, root.resolve, path, bytes, mode)
+    }
+
+    /// The replacement root is the deeper of the read and write grants: an
+    /// edit/update requires both capabilities, and the narrower pinned inode is
+    /// the one the snapshot was verified against.
+    fn replacement_root(&self, path: &Path) -> Result<&Root> {
+        let (read_root, _) = self.root(path, false)?;
+        let (write_root, _) = self.root(path, true)?;
+        let read_depth = read_root.path.components().count();
+        match read_depth >= write_root.path.components().count() {
+            true => Ok(read_root),
+            false => Ok(write_root),
+        }
+    }
+
+    /// Stage `bytes` for `name` inside an already-pinned parent directory.
+    fn stage_at(
+        &self,
+        parent: &OwnedFd,
+        name: &std::ffi::OsStr,
+        resolve: u64,
+        target: &Path,
+        bytes: &[u8],
+        mode: StageMode,
+    ) -> Result<StagedWrite> {
+        use std::io::Write;
+
+        let resolve = mandatory_resolve(resolve);
+        let create_only = matches!(mode, StageMode::Create);
+        // Keep the mode of an existing regular file (`+x` scripts, 0600 keys).
+        // A symlink or non-file target is refused, never followed and never
+        // replaced, so the rename below can only land on a regular file.
+        let existing_mode = match openat2(
+            parent,
+            Path::new(name),
+            libc::O_PATH | libc::O_NOFOLLOW,
             0,
-            root.resolve,
-        )?;
-        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-        for component in parent.components() {
-            let Component::Normal(name) = component else {
-                bail!("unexpected component in relative path {}", path.display());
-            };
-            let child = Path::new(name);
-            match openat2(
-                &current,
-                child,
-                libc::O_PATH | libc::O_DIRECTORY,
-                0,
-                root.resolve,
-            ) {
-                Ok(fd) => current = fd,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    mkdirat(&current, child).with_context(|| {
-                        format!("failed creating directory inside grant: {}", path.display())
-                    })?;
-                    current = openat2(
-                        &current,
-                        child,
-                        libc::O_PATH | libc::O_DIRECTORY,
-                        0,
-                        root.resolve,
-                    )?;
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("unsafe parent in {}", path.display()));
-                }
+            resolve,
+        ) {
+            Ok(fd) if create_only => {
+                drop(fd);
+                bail!("path already exists: {}", target.display());
             }
-        }
-        let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK;
-        if exclusive {
-            flags |= libc::O_EXCL;
-        }
-        let fd = match openat2(&current, Path::new(file_name), flags, 0o666, root.resolve) {
-            Ok(fd) => fd,
-            Err(error) if exclusive && error.kind() == io::ErrorKind::AlreadyExists => {
-                bail!("path already exists: {}", path.display())
+            Ok(fd) => {
+                let metadata = File::from(fd).metadata()?;
+                if !metadata.is_file() {
+                    bail!("path is not a regular file: {}", target.display());
+                }
+                Some(metadata.permissions().mode() & 0o7777)
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("refused unsafe write target {}", path.display()));
+                    .with_context(|| format!("refused unsafe write target {}", target.display()));
             }
         };
-        let file = File::from(fd);
-        if !file.metadata()?.is_file() {
-            bail!("path is not a regular file: {}", path.display());
+
+        // Clone the pinned parent before creating the temporary, so a
+        // descriptor-exhaustion failure cannot strand a temp with no owner.
+        let staged_parent = parent.try_clone()?;
+
+        let temporary = crate::staging::staging_name();
+        // Create with the target's own mode (never a broader default), so a
+        // private file is not world-readable while its replacement is written.
+        // A target that does not exist yet keeps ordinary create semantics.
+        let fd = openat2(
+            parent,
+            Path::new(&temporary),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            crate::staging::staging_mode(existing_mode),
+            resolve,
+        )
+        .with_context(|| format!("refused a temporary file next to {}", target.display()))?;
+        let mut file = File::from(fd);
+
+        let written = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            if let Some(mode) = existing_mode {
+                // SAFETY: `file` is an open descriptor owned by this scope.
+                if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+                    return Err(io::Error::last_os_error()).context("failed preserving file mode");
+                }
+            }
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            drop(file);
+            unlink_at(parent, Path::new(&temporary));
+            return Err(error);
         }
-        if !exclusive {
-            file.set_len(0)?;
+        drop(file);
+        let expected = match mode {
+            StageMode::Update(expected) => Some(expected),
+            StageMode::Create | StageMode::Replace => None,
+        };
+        Ok(StagedWrite {
+            parent: staged_parent,
+            name: name.to_owned(),
+            target: target.to_path_buf(),
+            temporary,
+            resolve,
+            create_only,
+            expected,
+            committed: false,
+        })
+    }
+
+    /// Open a child of an already-pinned directory as a regular file. No root
+    /// lookup and no path resolution happen here: `name` is one component of a
+    /// directory the policy already authorized.
+    pub fn open_child_read(
+        &self,
+        dir: &OwnedFd,
+        name: &std::ffi::OsStr,
+        resolve: u64,
+    ) -> Result<File> {
+        let file = File::from(open_child(
+            dir,
+            name,
+            libc::O_RDONLY | libc::O_NONBLOCK,
+            resolve,
+        )?);
+        if !file.metadata()?.is_file() {
+            bail!("path is not a regular file: {}", name.to_string_lossy());
         }
         Ok(file)
+    }
+
+    /// Open a child directory of an already-pinned directory, for descent.
+    pub fn open_child_dir(
+        &self,
+        dir: &OwnedFd,
+        name: &std::ffi::OsStr,
+        resolve: u64,
+    ) -> Result<File> {
+        Ok(File::from(open_child(
+            dir,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            resolve,
+        )?))
+    }
+
+    /// The resolve mask the read root that owns `path` was pinned with, so the
+    /// walk can open children with the same restrictions.
+    pub fn read_resolve(&self, path: &Path) -> Result<u64> {
+        self.root(path, false).map(|(root, _)| root.resolve)
     }
 
     pub fn open_directory(&self, path: &Path) -> Result<File> {
@@ -366,18 +755,19 @@ mod tests {
         // reopened through an alias that changed to an external directory.
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
         assert!(sandbox.open_read(&root.join("escape/secret")).is_err());
-        assert!(sandbox.open_write(&root.join("escape/new")).is_err());
+        assert!(sandbox.stage(&root.join("escape/new"), b"x").is_err());
         assert!(!outside.join("new").exists());
 
-        let mut file = sandbox.open_write(&root.join("nested/new.txt")).unwrap();
-        use std::io::Write;
-        file.write_all(b"hello").unwrap();
+        let file = sandbox
+            .stage_create(&root.join("nested/new.txt"), b"hello")
+            .unwrap();
+        file.commit().unwrap();
         assert_eq!(fs::read(root.join("nested/new.txt")).unwrap(), b"hello");
     }
 
     #[test]
     fn concurrent_symlink_swaps_cannot_redirect_opened_handles() {
-        use std::io::{Read, Write};
+        use std::io::Read;
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -409,8 +799,8 @@ mod tests {
                     file.read_to_string(&mut text).unwrap();
                     assert_ne!(text, "never-touch");
                 }
-                if let Ok(mut file) = safe.open_write(&selected) {
-                    file.write_all(b"local").unwrap();
+                if let Ok(staged) = safe.stage(&selected, b"local") {
+                    let _ = staged.commit();
                 }
             }
         });
@@ -457,8 +847,6 @@ mod tests {
 
     #[test]
     fn create_only_write_refuses_existing_and_symlinked_targets() {
-        use std::io::Write;
-
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
         let outside = temp.path().join("outside");
@@ -469,16 +857,286 @@ mod tests {
             SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
 
         fs::write(root.join("present"), b"present").unwrap();
-        assert!(sandbox.open_create(&root.join("present")).is_err());
+        assert!(sandbox.stage_create(&root.join("present"), b"new").is_err());
         assert_eq!(fs::read(root.join("present")).unwrap(), b"present");
 
         std::os::unix::fs::symlink(outside.join("secret"), root.join("alias")).unwrap();
-        assert!(sandbox.open_create(&root.join("alias")).is_err());
+        assert!(sandbox.stage_create(&root.join("alias"), b"new").is_err());
         assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
 
-        let mut file = sandbox.open_create(&root.join("nested/new.txt")).unwrap();
-        file.write_all(b"hello").unwrap();
+        // The target is absent until commit, then appears with the whole payload.
+        let staged = sandbox
+            .stage_create(&root.join("nested/new.txt"), b"hello")
+            .unwrap();
+        assert!(!root.join("nested/new.txt").exists());
+        staged.commit().unwrap();
         assert_eq!(fs::read(root.join("nested/new.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_keeps_mode_and_refuses_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+        let sandbox =
+            SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
+
+        // A new file appears with the whole payload and no leftover temp file.
+        sandbox
+            .stage(&root.join("nested/new.txt"), b"first")
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(fs::read(root.join("nested/new.txt")).unwrap(), b"first");
+        assert_eq!(fs::read_dir(root.join("nested")).unwrap().count(), 1);
+
+        // Replacing keeps the permission bits of the existing file.
+        let script = root.join("script.sh");
+        fs::write(&script, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o750)).unwrap();
+        sandbox
+            .stage(&script, b"#!/bin/sh\necho hi\n")
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            fs::read(&script).unwrap(),
+            b"#!/bin/sh\necho hi\n",
+            "content replaced"
+        );
+        assert_eq!(
+            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+
+        // A symlink target is refused and its target is untouched.
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("alias")).unwrap();
+        assert!(sandbox.stage(&root.join("alias"), b"evil").is_err());
+        assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
+        assert!(root.join("alias").is_symlink());
+
+        // A directory target is refused rather than renamed over.
+        fs::create_dir(root.join("dir")).unwrap();
+        assert!(sandbox.stage(&root.join("dir"), b"x").is_err());
+
+        // A name at the filesystem's length limit still gets a replaceable
+        // temporary, and no temporary is left behind.
+        let long = "n".repeat(200);
+        sandbox
+            .stage(&root.join(&long), b"first")
+            .unwrap()
+            .commit()
+            .unwrap();
+        sandbox
+            .stage(&root.join(&long), b"second")
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(fs::read(root.join(&long)).unwrap(), b"second");
+        assert!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".dotlink-"))
+        );
+    }
+
+    /// A replacement of a private file must never be readable by another user
+    /// while it is being written. The staging temporary starts at the target's
+    /// mode, not at 0666-minus-umask narrowed only after the payload is written.
+    #[test]
+    fn staging_never_widens_a_private_target_mid_write() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        // A traversable parent is what makes the temporary observable at all.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let secret = root.join("secret");
+        fs::write(&secret, b"old").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let sandbox =
+            SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::<(u32, u64)>::new()));
+        let scanner = {
+            let root = root.clone();
+            let stop = stop.clone();
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
+                        if !crate::staging::is_staging_temporary(&entry.file_name()) {
+                            continue;
+                        }
+                        let Ok(metadata) = entry.metadata() else {
+                            continue;
+                        };
+                        let mode = metadata.permissions().mode() & 0o777;
+                        let mut seen = seen.lock().unwrap();
+                        if !seen.contains(&(mode, metadata.len())) {
+                            seen.push((mode, metadata.len()));
+                        }
+                    }
+                }
+            })
+        };
+
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let staged = sandbox.stage(&secret, &payload).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        scanner.join().unwrap();
+        staged.commit().unwrap();
+        assert_eq!(
+            fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "the temporary was never observed");
+        for (mode, _) in seen.iter() {
+            assert_eq!(
+                mode & !0o600,
+                0,
+                "staging a 0600 file produced a broader temporary: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_update_refuses_bytes_changed_after_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("target");
+        fs::write(&path, b"old").unwrap();
+        let sandbox =
+            SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
+
+        let expected = (3, crate::mcp::sha256(b"old"));
+        let staged = sandbox.stage_update(&path, b"new", expected).unwrap();
+        fs::write(&path, b"external").unwrap();
+        let error = staged.commit().unwrap_err().to_string();
+        assert!(error.contains("changed before commit"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"external");
+        assert!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".dotlink-"))
+        );
+    }
+
+    #[test]
+    fn staged_replacement_rechecks_a_target_swapped_for_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("target"), b"old").unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+        let sandbox =
+            SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
+
+        let staged = sandbox.stage(&root.join("target"), b"new").unwrap();
+        fs::remove_file(root.join("target")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("target")).unwrap();
+        let error = staged.commit().unwrap_err().to_string();
+        assert!(
+            error.contains("regular file") || error.contains("unsafe"),
+            "{error}"
+        );
+        assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
+        assert!(root.join("target").is_symlink());
+        assert!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".dotlink-"))
+        );
+    }
+
+    #[test]
+    fn child_opens_stay_inside_the_pinned_directory() {
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(outside.join("secret"), b"secret").unwrap();
+        let sandbox =
+            SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
+
+        let dir: OwnedFd = sandbox.open_directory(&root).unwrap().into();
+        let mut opened = sandbox
+            .open_child_read(
+                &dir,
+                "a.txt".as_ref(),
+                RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+            )
+            .unwrap();
+        let mut text = String::new();
+        opened.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "a");
+
+        assert!(
+            sandbox
+                .open_child_read(
+                    &dir,
+                    "missing".as_ref(),
+                    RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
+                )
+                .is_err()
+        );
+        // A directory opens for descent but never as a file.
+        fs::create_dir(root.join("sub")).unwrap();
+        assert!(
+            sandbox
+                .open_child_dir(&dir, "sub".as_ref(), RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
+                .is_ok()
+        );
+        assert!(
+            sandbox
+                .open_child_read(&dir, "sub".as_ref(), RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
+                .is_err()
+        );
+        // One component only: neither an empty name nor traversal escapes.
+        assert!(
+            sandbox
+                .open_child_read(&dir, "".as_ref(), RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
+                .is_err()
+        );
+        assert!(
+            sandbox
+                .open_child_read(
+                    &dir,
+                    outside.join("secret").as_os_str(),
+                    RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+                )
+                .is_err()
+        );
+        assert!(
+            sandbox
+                .open_child_read(
+                    &dir,
+                    "../outside/secret".as_ref(),
+                    RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -489,7 +1147,7 @@ mod tests {
         fs::create_dir(&one).unwrap();
         fs::create_dir(&two).unwrap();
         let secure = SecureFs::new(std::slice::from_ref(&one), std::slice::from_ref(&one)).unwrap();
-        assert!(secure.open_write(&two.join("file")).is_err());
+        assert!(secure.stage(&two.join("file"), b"x").is_err());
         assert!(!two.join("file").exists());
     }
 }
