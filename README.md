@@ -168,7 +168,7 @@ Run setup, select **HTTP**, then enable the public ngrok endpoint:
 dotlink --setup
 ~~~
 
-Setup asks for one **owner password** the first time OAuth is needed. The password itself is never stored; dotlink persists only an Argon2id hash in its private state directory.
+Setup asks for one **owner password** the first time OAuth is needed. The password itself is never stored; dotlink persists only an Argon2id hash in its private state directory. Changing the owner password is effective for new authorizations on a running HTTP server without restarting it; previously issued short-lived access tokens still require restart for immediate invalidation.
 
 Set your ngrok account token and start dotlink:
 
@@ -431,7 +431,10 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 
 `DOTLINK_CONFIG` may move the JSONC file, but Runtime keys always stay in dotlink's private XDG directory above. The active config and credential directory are control-plane state and are not exposed through dotlink's MCP/filesystem/shell surface.
 
-When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
+When OpenAI transport is disabled for a profile, that profile does not require
+or even read a saved Runtime key. At startup, explicit environment credentials
+and `DOTLINK_API_KEY_FILE` take precedence over a saved key, so a missing
+persisted key never blocks an otherwise valid override.
 If a selected Runtime key is missing, enabled OpenAI execution fails closed;
 `dotlink profile show default` and `dotlink profile edit default` still work
 so you can inspect and replace it. Completed credential rotations prune obsolete

@@ -80,8 +80,13 @@ credential rotation commit, best-effort generation pruning retains the selected
 and immediately preceding secrets; unrelated profile edits leave these secrets
 intact for older running dotlink processes. Failed cleanup retries on the
 next credential rotation.
-Profile inspection/editing tolerates a missing selected key for recovery, but
-starting an enabled OpenAI tunnel fails closed. Interrupted deletion can be
+At runtime, environment or credential-file overrides take precedence before
+reading a saved Runtime key. A disabled OpenAI transport never reads dormant
+keys; an enabled transport with no usable override fails closed if its selected
+key is absent. Profile inspection/editing stays usable for recovery.
+OAuth owner authorization resolves the currently committed profile generation
+on each password check (with a post-verify recheck); a deleted persisted
+profile cannot fall back to a legacy hash. Interrupted deletion can be
 retried even if only generated credentials survive. Legacy profiles without
 selectors continue using their original credential files and owner hash.
 Profile-specific OAuth state lives under the Abird XDG state namespace (`$XDG_STATE_HOME/abird/dotlink/oauth[.<profile>].json`), while OpenAI Runtime keys remain under the Abird XDG config namespace. Both are protected control-plane paths.

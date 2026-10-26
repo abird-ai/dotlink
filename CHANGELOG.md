@@ -22,6 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Live OAuth owner-password rotation is applied to new approvals without an HTTP restart: verification uses the currently committed profile generation, checks it again after a successful hash, and rejects fallback to legacy after a saved profile is removed.
+- Runtime secrets resolve by explicit environment and `DOTLINK_API_KEY_FILE` precedence before persisted keys. Local-only profiles never open dormant Runtime keys, and valid overrides work when the selected saved key is missing.
+
 - Profile inspection and editing recover from missing selected Runtime keys without relaxing OpenAI startup validation. Retry interrupted profile deletion even when only generated key files remain.
 - Safely retire obsolete Runtime key and OAuth owner-hash generations after a durable credential rotation; keep selected and prior credentials (also through unrelated profile edits), and treat post-commit cleanup failure as a warning.
 - OAuth password-verification concurrency permits now remain with blocking Argon2 workers after request cancellation.

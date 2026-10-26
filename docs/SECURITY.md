@@ -314,7 +314,7 @@ Protocol/security properties:
 - short-lived opaque access tokens kept only in memory;
 - rotating opaque refresh tokens persisted only as SHA-256 hashes;
 - one-time authorization codes held only in memory;
-- owner password persisted only as an Argon2id hash;
+- owner password persisted only as an Argon2id hash, with each live authorization resolving the current committed profile revision and rechecking it after successful Argon2 verification; a deleted saved profile cannot reactivate an older legacy hash;
 - bounded pending registrations, authorization requests/codes, access tokens, refresh grants, and DCR clients;
 - Argon2 verification offloaded to blocking workers that **own** their two-check concurrency permits through completion, including after the HTTP request is cancelled; failed attempts are delayed without a remotely triggerable global lockout;
 - OAuth refresh grants and authorization codes are checked for correct client/resource/PKCE bindings before they are consumed; failed validation leaves valid credentials untouched;
