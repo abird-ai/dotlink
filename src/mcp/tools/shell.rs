@@ -291,6 +291,7 @@ impl LocalMachine {
         let mut command =
             direct_shell_command(shell_program, powershell, &working_dir, &args.command);
 
+        crate::shell_process::configure(&mut command);
         command
             .stdin(if args.stdin.is_some() {
                 Stdio::piped()
@@ -311,6 +312,15 @@ impl LocalMachine {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => return Ok(tool_error(error)),
+        };
+        let mut process_tree = match crate::shell_process::Guard::attach(&child) {
+            Ok(group) => group,
+            Err(error) => {
+                Self::terminate_child(&mut child).await;
+                return Ok(tool_error(format!(
+                    "could not contain command tree: {error}"
+                )));
+            }
         };
 
         // A configured ceiling can exceed what the clock can represent; fail
@@ -418,6 +428,7 @@ impl LocalMachine {
                 return Ok(tool_error(message));
             }
             WaitOutcome::Timeout => {
+                process_tree.terminate();
                 Self::terminate_child(&mut child).await;
                 if let Some(task) = stdin_task.take() {
                     task.abort();
@@ -527,6 +538,9 @@ impl LocalMachine {
                 payload.to_string(),
             )]));
         }
+        // A normal exit is allowed to start independent background work.
+        // Error/cancellation paths retain the guard and kill the tree.
+        process_tree.disarm();
         Ok(ok_text(payload.to_string()))
     }
 

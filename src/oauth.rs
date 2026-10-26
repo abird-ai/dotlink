@@ -93,6 +93,10 @@ fn admit_cimd_fetch() -> Result<tokio::sync::SemaphorePermit<'static>> {
 
 const OWNER_PASSWORD_MIN_LEN: usize = 12;
 const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 2;
+#[cfg(not(test))]
+const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STATE_LOCK_TIMEOUT: Duration = Duration::from_millis(200);
 const PASSWORD_CHECK_WAIT: Duration = Duration::from_secs(2);
 const FAILED_PASSWORD_DELAY: Duration = Duration::from_millis(300);
 const SCOPE_MCP: &str = "mcp:access";
@@ -342,25 +346,31 @@ impl Runtime {
         &self,
         update: impl FnOnce(&mut PersistentState) -> Result<T>,
     ) -> Result<T> {
-        let mut memory = self
-            .inner
-            .persistent
-            .lock()
-            .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-        let (latest, value) = update_state(&self.inner.state_path, update)?;
-        *memory = latest;
-        Ok(value)
+        // Keep the memory lock and whole disk transaction in one synchronous
+        // section; contention must not stall unrelated Tokio requests.
+        crate::blocking::run(|| {
+            let mut memory = self
+                .inner
+                .persistent
+                .lock()
+                .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
+            let (latest, value) = update_state(&self.inner.state_path, update)?;
+            *memory = latest;
+            Ok(value)
+        })
     }
 
     fn reload_persistent(&self) -> Result<()> {
-        let mut state = self
-            .inner
-            .persistent
-            .lock()
-            .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-        let latest = read_state(&self.inner.state_path)?;
-        *state = latest;
-        Ok(())
+        crate::blocking::run(|| {
+            let mut state = self
+                .inner
+                .persistent
+                .lock()
+                .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
+            let latest = read_state(&self.inner.state_path)?;
+            *state = latest;
+            Ok(())
+        })
     }
 
     async fn verify_owner_password(&self, password: &str) -> Result<bool> {
@@ -1792,9 +1802,23 @@ fn open_state_lock(path: &Path) -> Result<fs::File> {
         .open(&lock_path)
         .with_context(|| format!("failed to open {}", lock_path.display()))?;
     set_private_file_permissions(&lock_path)?;
-    lock.lock()
-        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(lock)
+    let deadline = Instant::now() + STATE_LOCK_TIMEOUT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                bail!("OAuth state is busy: {}; retry", lock_path.display());
+            }
+            Err(fs::TryLockError::Error(error)) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+        }
+    }
 }
 
 fn update_state<T>(
@@ -1999,6 +2023,19 @@ mod tests {
         .unwrap();
         assert_eq!(server.issuer(), "https://example.com");
         assert_eq!(server.resource(), "https://example.com/mcp");
+    }
+
+    #[test]
+    fn oauth_disk_state_lock_has_bounded_contention() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oauth.json");
+        let held = open_state_lock(&path).unwrap();
+        let started = Instant::now();
+        let busy = open_state_lock(&path).unwrap_err().to_string();
+        assert!(busy.contains("busy"), "{busy}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(held);
+        assert!(open_state_lock(&path).is_ok());
     }
 
     #[test]

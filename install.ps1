@@ -108,6 +108,7 @@ try {
     } else {
         $DestinationTemp = Join-Path $InstallDir (".dotlink.exe.tmp." + [guid]::NewGuid().ToString("N"))
         $DestinationBackup = Join-Path $InstallDir (".dotlink.exe.bak." + [guid]::NewGuid().ToString("N"))
+        $Installed = $false
         try {
             Copy-Item -LiteralPath $BinaryPath -Destination $DestinationTemp
             if ($HadExisting) {
@@ -115,10 +116,30 @@ try {
             } else {
                 [System.IO.File]::Move($DestinationTemp, $Destination)
             }
+            $Installed = $true
         }
         finally {
-            Remove-Item -Force -ErrorAction SilentlyContinue $DestinationTemp
-            Remove-Item -Force -ErrorAction SilentlyContinue $DestinationBackup
+            if ($Installed) {
+                Remove-Item -Force -ErrorAction SilentlyContinue $DestinationTemp
+                Remove-Item -Force -ErrorAction SilentlyContinue $DestinationBackup
+            } else {
+                # File.Replace can fail after moving the original to the backup.
+                # Restore only if the destination is vacant: never clobber a
+                # concurrently created file. Retain all uncertain artifacts.
+                if ((Test-Path -LiteralPath $DestinationBackup) -and
+                    -not (Test-Path -LiteralPath $Destination)) {
+                    try {
+                        [System.IO.File]::Move($DestinationBackup, $Destination)
+                    } catch {
+                        Write-Warning "Could not restore $DestinationBackup to $Destination : $_"
+                    }
+                }
+                $Recovery = @($DestinationTemp, $DestinationBackup) |
+                    Where-Object { Test-Path -LiteralPath $_ }
+                if ($Recovery.Count -gt 0) {
+                    Write-Warning "Install failed; preserved recovery files: $($Recovery -join ', ')"
+                }
+            }
         }
 
         if ($HadExisting) {

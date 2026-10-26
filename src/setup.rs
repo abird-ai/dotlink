@@ -1925,6 +1925,15 @@ pub(crate) fn atomic_write_private(
     contents: &[u8],
     harden_parent: bool,
 ) -> Result<()> {
+    atomic_write_private_with_sync(path, contents, harden_parent, sync_parent_directory)
+}
+
+fn atomic_write_private_with_sync(
+    path: &Path,
+    contents: &[u8],
+    harden_parent: bool,
+    sync: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("private file path has no parent"))?;
@@ -1955,14 +1964,19 @@ pub(crate) fn atomic_write_private(
         let mut file = options
             .open(&temp)
             .with_context(|| format!("failed to create {}", temp.display()))?;
+        // Harden the empty temporary before any secret bytes are written.
+        set_private_file_permissions(&temp)?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
 
-        set_private_file_permissions(&temp)?;
+        // Rename is the commit boundary. No error returned afterward may
+        // trigger a rollback of a credential paired with this configuration.
         atomic_replace_file(&temp, path)?;
-        set_private_file_permissions(path)?;
-        sync_parent_directory(path)?;
+        if let Err(error) = sync(path) {
+            tracing::warn!(%error, path = %path.display(),
+                "private file committed, but directory durability is unconfirmed");
+        }
         Ok(())
     })();
 
@@ -2846,9 +2860,9 @@ pub(crate) fn set_private_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub(crate) fn set_private_file_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+#[cfg(windows)]
+pub(crate) fn set_private_file_permissions(path: &Path) -> Result<()> {
+    crate::windows_private::protect(path, false)
 }
 
 #[cfg(unix)]
@@ -2858,9 +2872,9 @@ pub(crate) fn set_private_dir_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub(crate) fn set_private_dir_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+#[cfg(windows)]
+pub(crate) fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    crate::windows_private::protect(path, true)
 }
 
 #[cfg(test)]
@@ -2966,6 +2980,18 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn committed_private_write_survives_failed_directory_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.jsonc");
+        std::fs::write(&target, b"old").unwrap();
+        let result = atomic_write_private_with_sync(&target, b"new", false, |_| {
+            anyhow::bail!("injected post-commit fsync failure")
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 
     #[test]

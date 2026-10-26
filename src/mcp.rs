@@ -1038,16 +1038,18 @@ impl LocalMachine {
     ) -> Result<PendingWrite> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let staged = match (create_only, write_only) {
-                (true, _) => self.secure_fs.stage_create(path, bytes)?,
-                (false, true) => self.secure_fs.stage(path, bytes)?,
+            // Run descriptor-rooted staging as one synchronous segment:
+            // cancellation cannot outlive its caller's mutation lock.
+            let staged = crate::blocking::run(|| match (create_only, write_only) {
+                (true, _) => self.secure_fs.stage_create(path, bytes),
+                (false, true) => self.secure_fs.stage(path, bytes),
                 (false, false) => {
                     let expected = expected.ok_or_else(|| {
                         anyhow!("internal error: an update requires an expected snapshot")
                     })?;
-                    self.secure_fs.stage_update(path, bytes, expected)?
+                    self.secure_fs.stage_update(path, bytes, expected)
                 }
-            };
+            })?;
             Ok(PendingWrite(staged))
         }
         #[cfg(windows)]
@@ -1063,7 +1065,7 @@ impl LocalMachine {
     pub(crate) async fn commit_write(&self, pending: PendingWrite) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            pending.0.commit()
+            crate::blocking::run(|| pending.0.commit())
         }
         #[cfg(windows)]
         {

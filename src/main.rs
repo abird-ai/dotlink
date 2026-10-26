@@ -1,4 +1,5 @@
 mod backoff;
+mod blocking;
 mod bounded;
 mod controls;
 mod credentials;
@@ -13,10 +14,13 @@ mod oauth;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod secure_fs;
 mod setup;
+mod shell_process;
 mod staging;
 mod transports;
 #[cfg(windows)]
 mod windows_fs;
+#[cfg(windows)]
+mod windows_private;
 mod xdg;
 
 use std::{
