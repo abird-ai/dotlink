@@ -78,7 +78,8 @@ where
 
 /// Skip one line without buffering it. Skipped lines must not need to fit the
 /// read ceiling: a window selected by `offset` is independent of what precedes
-/// it, and scanning newlines is constant memory.
+/// it. Inspect binary-control bytes while scanning, without buffering or
+/// decoding skipped lines.
 async fn skip_line<R>(reader: &mut R) -> io::Result<bool>
 where
     R: AsyncBufRead + Unpin,
@@ -90,17 +91,24 @@ where
             // An unterminated final line still counts as a line.
             return Ok(consumed);
         }
-        match available.iter().position(|byte| *byte == b'\n') {
-            Some(index) => {
-                reader.consume(index + 1);
-                return Ok(true);
-            }
-            None => {
-                let len = available.len();
-                reader.consume(len);
-                consumed = true;
-            }
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        // Even skipped lines cannot silently cross a NUL-containing binary
+        // prefix. No buffering or UTF-8 decoding of skipped lines is required.
+        if super::has_binary_control(&available[..end]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "binary file; use bread",
+            ));
         }
+        let newline = end < available.len() || available.get(end - 1) == Some(&b'\n');
+        reader.consume(end);
+        if newline {
+            return Ok(true);
+        }
+        consumed = true;
     }
 }
 
@@ -170,9 +178,9 @@ impl LocalMachine {
             {
                 break;
             }
-            // Only returned lines are decoded: `offset` selects the window, and
-            // content outside it is not the caller's answer.
-            let text = std::str::from_utf8(&line)
+            // Only returned lines are UTF-8 decoded; skipped lines are
+            // checked for binary controls without buffering their contents.
+            let text = super::require_text_bytes(&line, "bread")
                 .map_err(|_| anyhow::anyhow!("binary file; use bread"))?;
             let number = (line_number + 1).to_string();
             let body = if numbered { line_body(text) } else { text };
@@ -244,6 +252,7 @@ impl LocalMachine {
     }
 
     async fn write_impl(&self, args: WriteArgs) -> Result<String> {
+        super::require_text_bytes(args.content.as_bytes(), "bwrite")?;
         if args.content.len() > self.config.max_write_bytes {
             anyhow::bail!(
                 "content is {} bytes, above the {} byte write limit",

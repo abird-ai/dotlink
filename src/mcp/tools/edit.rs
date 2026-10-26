@@ -77,6 +77,8 @@ impl LocalMachine {
         let mut resolved_paths = Vec::with_capacity(total);
         for (index, op) in args.edits.iter().enumerate() {
             let position = index + 1;
+            super::require_text_bytes(op.old_text.as_bytes(), "bedit")?;
+            super::require_text_bytes(op.new_text.as_bytes(), "bedit")?;
             combined_bytes = combined_bytes
                 .saturating_add(op.old_text.len())
                 .saturating_add(op.new_text.len());

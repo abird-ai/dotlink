@@ -10,6 +10,7 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
 };
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 
 use super::{
     GlobFilter, LocalMachine, WalkFilter, dot, marker_bytes, marker_files, marker_hits, ok_text,
@@ -23,6 +24,9 @@ const MAX_GREP_PATTERN: usize = 1024;
 const MAX_GREP_PER_FILE: usize = 50;
 const MAX_GREP_CONTEXT: usize = 8;
 const MAX_GREP_FILES: usize = 65_536;
+/// Per-request search I/O (not a limit on concurrent HTTP/stdio tool calls).
+const MAX_GREP_SCAN_BYTES: usize = 32 * 1024 * 1024;
+const MAX_GREP_SCAN_FILES: usize = 4_096;
 /// Rendered-size estimate for one JSON array element (braces, keys, quotes).
 const JSON_ENTRY_OVERHEAD: usize = 48;
 
@@ -35,6 +39,7 @@ enum StopReason {
     PerFileCap,
     CandidateCap,
     ScanBudget,
+    WorkBudget,
 }
 
 /// Suffix that names the per-file cap as the reason a content page stopped, so a
@@ -50,6 +55,7 @@ fn marker_reserve() -> usize {
         .max(marker_hits(usize::MAX).len() + PER_FILE_CAP_SUFFIX.len())
         .max(format!("… no hits at offset {}", usize::MAX).len())
         .max("… discovery scan incomplete; narrow path or glob".len())
+        .max("… search work budget exhausted; narrow path or glob".len())
         + 1 // the newline that separates the marker from the last hit
 }
 
@@ -144,20 +150,60 @@ impl OutputBudget {
     }
 }
 
+enum SearchRead {
+    Text(String, usize),
+    Skipped(usize),
+    WorkBudgetExceeded,
+}
+
 impl LocalMachine {
-    /// Read one search candidate through the descriptor-rooted reader, so the
-    /// file is opened beneath the pinned root with symlinks and nested mounts
-    /// refused, one file at a time (the walk itself descends through pinned
-    /// directory handles).
-    async fn read_search_file(&self, path: &Path) -> Option<String> {
-        let mut file = self.open_read_file(path).await.ok()?;
-        let bytes = Self::read_bounded(&mut file, MAX_GREP_FILE_BYTES)
-            .await
-            .ok()?;
-        String::from_utf8(bytes).ok()
+    /// Read through the capability-rooted file descriptor, charging *actual*
+    /// bytes even when the result is non-text or unreadable. An over-budget
+    /// candidate ends the lexically ordered search rather than silently
+    /// skipping it and returning misleading later matches.
+    async fn read_search_file(&self, path: &Path, remaining: usize) -> SearchRead {
+        let Ok(file) = self.open_read_file(path).await else {
+            return SearchRead::Skipped(0);
+        };
+        let Ok(metadata) = file.metadata().await else {
+            return SearchRead::Skipped(0);
+        };
+        if metadata.len() > MAX_GREP_FILE_BYTES as u64 {
+            return SearchRead::Skipped(0);
+        }
+        if metadata.len() > remaining as u64 {
+            return SearchRead::WorkBudgetExceeded;
+        }
+        let limit = remaining.min(MAX_GREP_FILE_BYTES);
+        let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+        let read_result = file
+            .take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .await;
+        if bytes.len() > remaining {
+            return SearchRead::WorkBudgetExceeded;
+        }
+        let scanned = bytes.len();
+        if read_result.is_err() || scanned > MAX_GREP_FILE_BYTES {
+            return SearchRead::Skipped(scanned);
+        }
+        match super::text_bytes(&bytes) {
+            Some(text) => SearchRead::Text(text.to_owned(), scanned),
+            None => SearchRead::Skipped(scanned),
+        }
     }
 
     async fn grep_impl(&self, args: GrepArgs) -> Result<String> {
+        self.grep_impl_with_budget(args, MAX_GREP_SCAN_BYTES, MAX_GREP_SCAN_FILES)
+            .await
+    }
+
+    async fn grep_impl_with_budget(
+        &self,
+        args: GrepArgs,
+        max_scanned_bytes: usize,
+        max_scanned_files: usize,
+    ) -> Result<String> {
         if args.pattern.is_empty() {
             anyhow::bail!("pattern must not be empty");
         }
@@ -244,13 +290,31 @@ impl LocalMachine {
         // not be emitted after a skipped one, or paging would repeat or lose
         // records depending on where the caller resumes.
         let mut stop: Option<StopReason> = None;
+        let mut remaining_bytes = max_scanned_bytes;
+        let mut remaining_files = max_scanned_files;
 
         for path in &candidates {
             if stop.is_some() {
                 break;
             }
-            let Some(text) = self.read_search_file(path).await else {
-                continue;
+            if remaining_bytes == 0 || remaining_files == 0 {
+                stop = Some(StopReason::WorkBudget);
+                break;
+            }
+            remaining_files -= 1;
+            let text = match self.read_search_file(path, remaining_bytes).await {
+                SearchRead::Text(text, scanned) => {
+                    remaining_bytes -= scanned;
+                    text
+                }
+                SearchRead::Skipped(scanned) => {
+                    remaining_bytes -= scanned;
+                    continue;
+                }
+                SearchRead::WorkBudgetExceeded => {
+                    stop = Some(StopReason::WorkBudget);
+                    break;
+                }
             };
             let display = self.config.access.relative_display(path);
             let lines = text.lines().collect::<Vec<_>>();
@@ -352,9 +416,16 @@ impl LocalMachine {
                 }
             }
         }
-        if progress.incomplete {
-            // In text mode there is no separate metadata field: incomplete
-            // discovery takes precedence over a page-full marker.
+        let work_incomplete = stop == Some(StopReason::WorkBudget);
+        let scan_incomplete = work_incomplete || progress.incomplete;
+        let incomplete_reason = if work_incomplete {
+            Some("content_budget")
+        } else if progress.incomplete {
+            Some("directory_budget")
+        } else {
+            None
+        };
+        if progress.incomplete && !work_incomplete {
             stop = Some(StopReason::ScanBudget);
         } else if stop.is_none() && candidates_capped {
             stop = Some(StopReason::CandidateCap);
@@ -372,6 +443,9 @@ impl LocalMachine {
                     Some(StopReason::CandidateCap) => Some(marker_files(MAX_GREP_FILES)),
                     Some(StopReason::ScanBudget) => {
                         Some("… discovery scan incomplete; narrow path or glob".to_owned())
+                    }
+                    Some(StopReason::WorkBudget) => {
+                        Some("… search work budget exhausted; narrow path or glob".to_owned())
                     }
                     Some(StopReason::PerFileCap) => Some(format!(
                         "{}{PER_FILE_CAP_SUFFIX}",
@@ -397,14 +471,16 @@ impl LocalMachine {
                 let render = |files: &[String], truncated: bool| {
                     serde_json::json!({
                         "files": files, "truncated": truncated,
-                        "scan_incomplete": progress.incomplete,
+                        "scan_incomplete": scan_incomplete,
+                        "incomplete_reason": incomplete_reason,
                     })
                     .to_string()
                 };
                 let (files, truncated) = trim_to_ceiling(files, ceiling, stop.is_some(), render);
                 Ok(serde_json::json!({
                     "files": files, "truncated": truncated,
-                    "scan_incomplete": progress.incomplete,
+                    "scan_incomplete": scan_incomplete,
+                    "incomplete_reason": incomplete_reason,
                 })
                 .to_string())
             }
@@ -418,7 +494,8 @@ impl LocalMachine {
                             .collect::<Vec<_>>(),
                         "page_total": page_total,
                         "truncated": truncated,
-                        "scan_incomplete": progress.incomplete,
+                        "scan_incomplete": scan_incomplete,
+                        "incomplete_reason": incomplete_reason,
                     })
                     .to_string()
                 };
@@ -524,7 +601,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 files recursively. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. A discovery scan visits up to 100000 entries, then reports partial results: JSON replies contain `scan_incomplete`, text replies an explicit marker; narrow `path`/`glob` for complete results. Hits and JSON replies obey the byte ceiling; a content page uses whole matching lines. Files over 1 MiB, non-text and symlink entries are skipped.",
+        description = "Search UTF-8 text files recursively. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry an explicit text marker or JSON `scan_incomplete` and `incomplete_reason` (directory_budget/content_budget). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
         annotations(
             title = "Search files",
             read_only_hint = true,
@@ -546,6 +623,67 @@ mod tests {
     use super::*;
     use crate::mcp::tools::test_support::{grep_args, grep_tree, test_machine};
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn grep_work_budgets_report_incomplete_ordered_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.join(name), "needle\n").unwrap();
+        }
+        let machine = test_machine(root);
+        for mode in [
+            GrepOutputMode::Content,
+            GrepOutputMode::Files,
+            GrepOutputMode::Count,
+        ] {
+            let mut args = grep_args("needle");
+            args.output_mode = mode;
+            let output = machine.grep_impl_with_budget(args, 8, 10).await.unwrap();
+            match mode {
+                GrepOutputMode::Content => {
+                    assert!(output.contains("a.txt:1: needle"), "{output}");
+                    assert!(!output.contains("b.txt"), "{output}");
+                    assert!(output.contains("search work budget exhausted"), "{output}");
+                }
+                GrepOutputMode::Files | GrepOutputMode::Count => {
+                    let value: Value = serde_json::from_str(&output).unwrap();
+                    assert_eq!(value["scan_incomplete"], true);
+                    assert_eq!(value["incomplete_reason"], "content_budget");
+                    assert_eq!(value["truncated"], true);
+                    assert!(!output.contains("b.txt"), "{output}");
+                }
+            }
+        }
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        let value: Value =
+            serde_json::from_str(&machine.grep_impl_with_budget(args, 1024, 1).await.unwrap())
+                .unwrap();
+        assert_eq!(value["scan_incomplete"], true);
+        assert_eq!(value["incomplete_reason"], "content_budget");
+        assert_eq!(value["files"], serde_json::json!(["a.txt"]));
+    }
+
+    #[tokio::test]
+    async fn grep_ignores_control_byte_binary_files_in_every_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.bin"), b"before\0needle\0after\n").unwrap();
+        std::fs::write(root.join("b.txt"), b"needle here\n").unwrap();
+        let machine = test_machine(root);
+        for mode in [
+            GrepOutputMode::Content,
+            GrepOutputMode::Files,
+            GrepOutputMode::Count,
+        ] {
+            let mut args = grep_args("needle");
+            args.output_mode = mode;
+            let output = machine.grep_impl(args).await.unwrap();
+            assert!(output.contains("b.txt"), "{output}");
+            assert!(!output.contains("a.bin"), "{output}");
+        }
+    }
 
     #[tokio::test]
     async fn grep_content_mode_renders_numbered_hits_in_path_order() {

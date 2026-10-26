@@ -416,6 +416,7 @@ struct ReadyFile {
 
 impl LocalMachine {
     async fn patch_impl(&self, args: PatchArgs) -> Result<String> {
+        super::require_text_bytes(args.patch.as_bytes(), "bwrite/bedit")?;
         if args.patch.len() > self.config.max_write_bytes {
             anyhow::bail!(
                 "patch: {} bytes, above the {} byte write limit",

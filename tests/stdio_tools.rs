@@ -382,3 +382,88 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
     // "abcd" with bytes 1..3 replaced by "XY".
     assert_eq!(bread["data"], json!("YVhZZA=="));
 }
+
+#[test]
+fn text_tools_share_binary_detection_without_restricting_binary_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("bytes.dat"), b"header\0needle\0trailer\n").unwrap();
+    std::fs::write(root.join("plain.txt"), b"needle original\n").unwrap();
+
+    let mut probe = Probe::start(&root);
+    let initialized = probe.request(&initialize_request(1));
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "dotlink");
+
+    for (id, name, arguments) in [
+        (2, "read", json!({"path": "bytes.dat"})),
+        (3, "read", json!({"path": "bytes.dat", "offset": 2})),
+        (
+            4,
+            "edit",
+            json!({
+                "path": "bytes.dat",
+                "edits": [{"old_text": "needle", "new_text": "changed"}]
+            }),
+        ),
+        (
+            5,
+            "write",
+            json!({"path": "new.dat", "content": "left\0right"}),
+        ),
+        (
+            6,
+            "edit",
+            json!({
+                "path": "plain.txt",
+                "edits": [{"old_text": "original", "new_text": "left\0right"}]
+            }),
+        ),
+        (
+            7,
+            "patch",
+            json!({
+                "patch": "*** Begin Patch\n*** Add File: new-patch.dat\n+left\0right\n*** End Patch\n"
+            }),
+        ),
+    ] {
+        let result = probe.request(&call_request(id, name, arguments));
+        assert_eq!(result["result"]["isError"], true, "{name}: {result}");
+        assert!(
+            text_of(&result).contains("binary"),
+            "{name} did not identify binary content: {result}"
+        );
+    }
+    assert!(!root.join("new.dat").exists());
+    assert!(!root.join("new-patch.dat").exists());
+    assert_eq!(
+        std::fs::read(root.join("plain.txt")).unwrap(),
+        b"needle original\n"
+    );
+
+    for (id, mode) in [(8, "content"), (9, "files"), (10, "count")] {
+        let result = probe.request(&call_request(
+            id,
+            "grep",
+            json!({"path": ".", "pattern": "needle", "output_mode": mode}),
+        ));
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        assert!(
+            text_of(&result).contains("plain.txt"),
+            "text match missing: {result}"
+        );
+        assert!(
+            !text_of(&result).contains("bytes.dat"),
+            "binary file leaked into grep {mode}: {result}"
+        );
+    }
+    let binary = probe.request(&call_request(
+        11,
+        "bread",
+        json!({"path": "bytes.dat", "format": "base64"}),
+    ));
+    assert_ne!(binary["result"]["isError"], true, "{binary}");
+    let bytes: Value = serde_json::from_str(text_of(&binary)).unwrap();
+    assert_eq!(bytes["data"], BASE64.encode(b"header\0needle\0trailer\n"));
+
+    probe.finish();
+}

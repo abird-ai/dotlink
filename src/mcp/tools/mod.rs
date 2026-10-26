@@ -45,6 +45,26 @@ pub(crate) struct WalkProgress {
     pub incomplete: bool,
 }
 
+/// Text tools accept UTF-8 without binary control bytes. Keep this predicate
+/// shared by paged reads, search, snapshots, and text mutations. Binary tools
+/// deliberately have no such restriction.
+pub(crate) fn has_binary_control(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|byte| matches!(byte, 0..=8 | 11..=12 | 14..=31 | 127))
+}
+
+pub(crate) fn text_bytes(bytes: &[u8]) -> Option<&str> {
+    if has_binary_control(bytes) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()
+}
+
+pub(crate) fn require_text_bytes<'a>(bytes: &'a [u8], hint: &str) -> Result<&'a str> {
+    text_bytes(bytes).ok_or_else(|| anyhow!("binary content; use {hint}"))
+}
+
 fn dot() -> String {
     ".".to_owned()
 }
@@ -652,7 +672,7 @@ impl Snapshot {
 
     /// The snapshot as UTF-8, or the hint that sends the caller to `bedit`.
     pub(crate) fn text(&self) -> Result<&str> {
-        std::str::from_utf8(&self.bytes)
+        require_text_bytes(&self.bytes, "bedit")
             .map_err(|_| anyhow!("{}: binary file; use bedit", self.display))
     }
 
