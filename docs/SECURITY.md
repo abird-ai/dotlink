@@ -316,7 +316,8 @@ Protocol/security properties:
 - one-time authorization codes held only in memory;
 - owner password persisted only as an Argon2id hash;
 - bounded pending registrations, authorization requests/codes, access tokens, refresh grants, and DCR clients;
-- Argon2 verification offloaded to a bounded blocking pool path, with concurrent checks capped and failed attempts delayed without a remotely triggerable global lockout;
+- Argon2 verification offloaded to blocking workers that **own** their two-check concurrency permits through completion, including after the HTTP request is cancelled; failed attempts are delayed without a remotely triggerable global lockout;
+- OAuth refresh grants and authorization codes are checked for correct client/resource/PKCE bindings before they are consumed; failed validation leaves valid credentials untouched;
 - cross-process locked OAuth state mutations so a live server, setup, and `dotlink oauth` management command cannot lose each other's approved-client/refresh/password changes;
 - refresh tokens issued only when the approved client advertises the `refresh_token` grant; `offline_access` requires that capability;
 - no JWT signing key or external auth service.

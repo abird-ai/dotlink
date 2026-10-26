@@ -75,8 +75,16 @@ OAuth secrets/grants are deliberately not stored in JSONC.
 Config changes select immutable generations of saved OpenAI runtime keys and
 OAuth owner password hashes. Generation bytes are persisted first; the JSONC
 profile rename is the single selection commit. A crash before that rename
-leaves the previously selected key/password valid. Legacy profiles without
-selectors continue using their original credential files and owner hash. Profile-specific OAuth state lives under the Abird XDG state namespace (`$XDG_STATE_HOME/abird/dotlink/oauth[.<profile>].json`), while OpenAI Runtime keys remain under the Abird XDG config namespace. Both are protected control-plane paths.
+leaves the previously selected key/password valid. After a durable profile
+credential rotation commit, best-effort generation pruning retains the selected
+and immediately preceding secrets; unrelated profile edits leave these secrets
+intact for older running dotlink processes. Failed cleanup retries on the
+next credential rotation.
+Profile inspection/editing tolerates a missing selected key for recovery, but
+starting an enabled OpenAI tunnel fails closed. Interrupted deletion can be
+retried even if only generated credentials survive. Legacy profiles without
+selectors continue using their original credential files and owner hash.
+Profile-specific OAuth state lives under the Abird XDG state namespace (`$XDG_STATE_HOME/abird/dotlink/oauth[.<profile>].json`), while OpenAI Runtime keys remain under the Abird XDG config namespace. Both are protected control-plane paths.
 
 The process launch directory is the internal relative-path base. It is readable by default when `permissions.default_allow=true`; `--no-default-allow` removes that implicit grant for one run. Relative profile/CLI paths resolve from the launch directory. `allow_rw: ["."]` means rw on the launch directory; `allow_rw: ["/"]` is unrestricted filesystem read+write.
 

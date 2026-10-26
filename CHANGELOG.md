@@ -22,6 +22,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Profile inspection and editing recover from missing selected Runtime keys without relaxing OpenAI startup validation. Retry interrupted profile deletion even when only generated key files remain.
+- Safely retire obsolete Runtime key and OAuth owner-hash generations after a durable credential rotation; keep selected and prior credentials (also through unrelated profile edits), and treat post-commit cleanup failure as a warning.
+- OAuth password-verification concurrency permits now remain with blocking Argon2 workers after request cancellation.
+- Validate refresh-token and authorization-code client/resource/PKCE bindings before consuming their grants.
+- Prepare both owned private XDG directories before assembling writable sandbox mounts; unknown absent protected paths still fail closed.
+- Sanitize protocol identifiers for both stdio and tunnel diagnostics through one logging primitive.
+
 - Stdio verbose logs never inspect nested request payloads for a method and sanitize all method names.
 - Sandbox protection fails closed on missing protected paths under writable mounts rather than letting Bubblewrap create host-side mount targets. Dotlink privately prepares its own OAuth state directory; existing protected files/directories remain masked.
 - Text reads error if a truncation marker would displace the only returned line; never emit line zero.

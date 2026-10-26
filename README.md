@@ -432,6 +432,11 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 `DOTLINK_CONFIG` may move the JSONC file, but Runtime keys always stay in dotlink's private XDG directory above. The active config and credential directory are control-plane state and are not exposed through dotlink's MCP/filesystem/shell surface.
 
 When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
+If a selected Runtime key is missing, enabled OpenAI execution fails closed;
+`dotlink profile show default` and `dotlink profile edit default` still work
+so you can inspect and replace it. Completed credential rotations prune obsolete
+generations, preserving the selected and immediately prior versions;
+deleting a profile is retryable after an interrupted cleanup.
 
 ### Automatic tunnel recovery
 
