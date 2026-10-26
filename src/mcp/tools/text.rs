@@ -220,6 +220,11 @@ impl LocalMachine {
                     anyhow::bail!("read window exceeds the {byte_limit} byte read limit");
                 }
                 emitted -= 1;
+                if emitted == 0 {
+                    anyhow::bail!(
+                        "line {offset} and its truncation marker do not fit the {byte_limit} byte read limit; raise max_read_bytes"
+                    );
+                }
                 marker = marker_lines(offset + emitted - 1);
             }
         }
@@ -301,6 +306,34 @@ impl LocalMachine {
 mod tests {
     use super::*;
     use crate::mcp::tools::test_support::{test_machine, test_machine_with};
+
+    #[tokio::test]
+    async fn read_refuses_to_replace_the_only_line_with_line_zero_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("long.txt"),
+            format!("{}\nnext\n", "a".repeat(1008)),
+        )
+        .unwrap();
+        let machine = test_machine_with(root, |config| {
+            config.max_read_bytes = 1024;
+        });
+        let result = machine
+            .read_impl(ReadArgs {
+                path: "long.txt".into(),
+                offset: None,
+                limit: Some(1),
+                numbered: None,
+            })
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("line 1 and its truncation marker")
+        );
+    }
 
     #[tokio::test]
     async fn read_numbers_lines_and_respects_ranges() {

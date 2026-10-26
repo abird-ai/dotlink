@@ -81,24 +81,9 @@ impl<R> RequestLoggingReader<R> {
             return;
         }
 
-        let method = serde_json::from_slice::<Value>(line)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .or_else(|| extract_method_prefix(line));
-
-        if let Some(method) = method {
-            let suffix = if self.overflow {
-                " (large request)"
-            } else {
-                ""
-            };
-            let _ = self.log.request("stdio", &format!("{method}{suffix}"));
-        }
+        let _ = self
+            .log
+            .request("stdio", &request_label(line, self.overflow));
     }
 }
 
@@ -123,15 +108,26 @@ impl<R: AsyncRead + Unpin> AsyncRead for RequestLoggingReader<R> {
     }
 }
 
-fn extract_method_prefix(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let key = "\"method\"";
-    let start = text.find(key)? + key.len();
-    let rest = text[start..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
+/// Log only complete, printable, top-level JSON-RPC method names.
+fn request_label(line: &[u8], overflow: bool) -> String {
+    if overflow {
+        return "large JSON-RPC request".to_owned();
+    }
+    serde_json::from_slice::<Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|method| {
+            method.len() <= 96
+                && method.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+                })
+        })
+        .unwrap_or_else(|| "unknown JSON-RPC method".to_owned())
 }
 
 pub async fn run(machine: LocalMachine, cancellation: CancellationToken) -> Result<()> {
@@ -155,12 +151,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn method_prefix_extraction_avoids_payload_logging() {
-        let request =
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"content":"secret"}}"#;
+    fn request_logging_rejects_nested_and_untrusted_method_fields() {
+        let nested = br#"{"jsonrpc":"2.0","params":{"method":"fake-secret"}}"#;
+        assert_eq!(request_label(nested, false), "unknown JSON-RPC method");
+        assert_eq!(request_label(nested, true), "large JSON-RPC request");
         assert_eq!(
-            extract_method_prefix(request).as_deref(),
-            Some("tools/call")
+            request_label(
+                br#"{"method":"tools/call","params":{"method":"fake-secret"}}"#,
+                false
+            ),
+            "tools/call"
+        );
+        assert_eq!(
+            request_label(br#"{"method":"api-token:secret/value"}"#, false),
+            "unknown JSON-RPC method"
+        );
+        assert_eq!(
+            request_label(br#"{"method":"tools/call\\nESCAPE"}"#, false),
+            "unknown JSON-RPC method"
+        );
+        assert_eq!(
+            request_label(br#"{"method":null,"params":{"method":"SECRET"}}"#, false),
+            "unknown JSON-RPC method"
         );
     }
 }
