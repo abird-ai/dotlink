@@ -1053,6 +1053,13 @@ async fn run_runtime(
     log: &LogConfig,
     setup_color: bool,
 ) -> Result<RuntimeOutcome> {
+    if args.print_id && !args.setup {
+        let tunnel_id = setup::configured_tunnel_id(args.profile.as_deref())?
+            .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
+        println!("{tunnel_id}");
+        return Ok(RuntimeOutcome::Exit);
+    }
+
     let Some(setup) = load_or_setup(args.setup, args.profile.as_deref(), setup_color).await? else {
         return Ok(RuntimeOutcome::Exit);
     };
@@ -1062,16 +1069,6 @@ async fn run_runtime(
     }
 
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
-
-    if args.print_id {
-        let tunnel_id = setup
-            .config
-            .tunnel_id
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
-        println!("{tunnel_id}");
-        return Ok(RuntimeOutcome::Exit);
-    }
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
 

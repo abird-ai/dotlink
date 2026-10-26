@@ -350,3 +350,54 @@ fn explicit_env_credentials_supersede_missing_persisted_runtime_keys() {
         String::from_utf8_lossy(&overridden_file.stderr)
     );
 }
+
+#[test]
+fn print_id_inspects_config_without_requiring_saved_runtime_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_home = temp.path().join("xdg");
+    let private = config_home.join("abird/dotlink");
+    fs::create_dir_all(&private).unwrap();
+    let config = private.join("config.jsonc");
+    let id = "tunnel_0123456789abcdef0123456789abcdef";
+    fs::write(
+        &config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":true,"stdio":true}},"tunnel_id":"{id}","runtime_key_revision":"{revision}"}}"#,
+            revision = "a".repeat(32)
+        ),
+    )
+    .unwrap();
+    let inspect = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--print-id")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&inspect.stdout).trim(), id);
+    // A malformed/missing runtime key still fails actual tool execution.
+    let runtime = run_with_profile(&config_home, &config);
+    assert!(!runtime.status.success());
+    assert!(String::from_utf8_lossy(&runtime.stderr).contains("selected runtime key is missing"));
+
+    let env_id = "tunnel_fedcba9876543210fedcba9876543210";
+    let overridden = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--print-id")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("DOTLINK_ID", env_id)
+        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_API_KEY")
+        .output()
+        .unwrap();
+    assert!(overridden.status.success());
+    assert_eq!(String::from_utf8_lossy(&overridden.stdout).trim(), env_id);
+}

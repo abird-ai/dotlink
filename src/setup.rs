@@ -588,6 +588,24 @@ fn read_profile_config(profile: Option<&str>) -> Result<Option<AppConfig>> {
     Ok(Some(config))
 }
 
+/// Read-only profile inspection must not resolve runtime credentials, initialize
+/// transports or require an interactive setup. The unnamed profile may be
+/// overridden by an explicit tunnel ID, just like normal runtime startup.
+pub(crate) fn configured_tunnel_id(profile: Option<&str>) -> Result<Option<String>> {
+    validate_profile(profile)?;
+    let config = read_profile_config_migrated(profile)?;
+    let override_id = if profile.is_none() {
+        env_first(&["DOTLINK_ID", "CONTROL_PLANE_TUNNEL_ID"])
+    } else {
+        None
+    };
+    let tunnel_id = override_id.or_else(|| config.and_then(|config| config.tunnel_id));
+    if let Some(tunnel_id) = tunnel_id.as_deref() {
+        validate_tunnel_id(tunnel_id)?;
+    }
+    Ok(tunnel_id)
+}
+
 fn load_profile_for_edit(profile: Option<&str>) -> Result<Option<AppConfig>> {
     let Some(mut config) = read_profile_config_migrated(profile)? else {
         return Ok(None);
