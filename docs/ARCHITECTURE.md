@@ -71,7 +71,12 @@ oauth.enabled
 oauth.public_url
 ~~~
 
-OAuth secrets/grants are deliberately not stored in JSONC. Profile-specific OAuth state lives under the Abird XDG state namespace (`$XDG_STATE_HOME/abird/dotlink/oauth[.<profile>].json`), while OpenAI Runtime keys remain under the Abird XDG config namespace. Both are protected control-plane paths.
+OAuth secrets/grants are deliberately not stored in JSONC.
+Config changes select immutable generations of saved OpenAI runtime keys and
+OAuth owner password hashes. Generation bytes are persisted first; the JSONC
+profile rename is the single selection commit. A crash before that rename
+leaves the previously selected key/password valid. Legacy profiles without
+selectors continue using their original credential files and owner hash. Profile-specific OAuth state lives under the Abird XDG state namespace (`$XDG_STATE_HOME/abird/dotlink/oauth[.<profile>].json`), while OpenAI Runtime keys remain under the Abird XDG config namespace. Both are protected control-plane paths.
 
 The process launch directory is the internal relative-path base. It is readable by default when `permissions.default_allow=true`; `--no-default-allow` removes that implicit grant for one run. Relative profile/CLI paths resolve from the launch directory. `allow_rw: ["."]` means rw on the launch directory; `allow_rw: ["/"]` is unrestricted filesystem read+write.
 
@@ -268,7 +273,12 @@ Bare --allow-write and --allow-rw add rw permission to the launch/base directory
 
 Existing paths are canonicalized before allow checks. Create targets canonicalize their nearest existing ancestor before the final path is checked. Denies are evaluated against both the normalized lexical request path and the resolved canonical target, so a denied path cannot be reintroduced as a symlink alias to another allowed subtree.
 
-On Linux, MCP tools dispatch concurrently by default. Native file I/O
+On Linux, MCP tools dispatch concurrently by default. **Intentional design:** local
+HTTP and stdio have no global tool-admission semaphore; model/client-directed
+parallelism is unrestricted beyond the tool's own limits. The OpenAI tunnel
+alone uses its separate transport-level in-flight ceiling. The aggregate
+resource implications are accepted, not an omitted admission mechanism.
+Native file I/O
 uses `src/secure_fs.rs`: canonical policy authorization first, followed by
 kernel-enforced `openat2` traversal from pinned allowed-directory handles
 (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, plus `RESOLVE_NO_XDEV` inside

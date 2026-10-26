@@ -339,11 +339,15 @@ Targets are canonicalized before checks; create targets canonicalize their neare
 
 One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
 `{a,b}` stay within one path segment and `**` recurses without a level cap.
-Every list/search tool has a documented `limit` and reports `truncated`; `read`
-ends a capped result with a single marker line instead. `ls` and `grep`
-retain the globally best sorted candidates in bounded memory, independent of
-filesystem enumeration order. Both bound their JSON replies at
-`max_output_bytes`, keeping the longest prefix that fits; `ls` derives its default depth from the pattern (one level per segment,
+Every list/search tool has a documented `limit` and reports `truncated`. Walks
+stop after 100,000 visited entries; `scan_incomplete` explicitly marks partial
+results, which are sorted only among the visited entries. Narrow `path` or
+`glob`/`pattern` for large trees. `read` returns an error rather than a misleading
+line-zero truncation marker if the first complete line plus marker cannot fit.
+Otherwise, `read` ends a capped result with a single marker. `ls` and `grep`
+retain the best sorted candidates within the scanned entries in bounded memory.
+Both bound their JSON replies at `max_output_bytes`, keeping the longest prefix
+that fits. `ls` derives its default depth from the pattern (one level per segment,
 unbounded for `**`) so a deep pattern never silently returns nothing, and
 `grep` pages only ever contain whole matching lines. `grep count` reports
 `page_total` for the returned page. `read` streams a line window, so
@@ -420,7 +424,9 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 
 ~~~text
 ~/.config/abird/dotlink/runtime.key
+~/.config/abird/dotlink/runtime.<generation>.key
 ~/.config/abird/dotlink/runtime.work.key
+~/.config/abird/dotlink/runtime.work.<generation>.key
 ~~~
 
 `DOTLINK_CONFIG` may move the JSONC file, but Runtime keys always stay in dotlink's private XDG directory above. The active config and credential directory are control-plane state and are not exposed through dotlink's MCP/filesystem/shell surface.
@@ -673,7 +679,9 @@ See [.agents/docs/nixos-service.md](.agents/docs/nixos-service.md).
 
 A single tunnel can dispatch up to sixteen in-flight MCP requests. On Linux,
 file tools use descriptor-rooted `openat2` access and Bubblewrap shells run
-independently; **tools execute concurrently by default**. Choose
+independently; **tools execute concurrently by default**. Local HTTP and stdio
+intentionally have **no global admission cap**: the client/model directs
+parallelism. The tunnel maintains its own in-flight limit. Choose
 `dotlink -s` or `dotlink --serialize` if you want one MCP call at a time
 across all transports handled by this process. This is an *ordering preference*,
 not an additional security boundary. It does not serialize separate dotlink

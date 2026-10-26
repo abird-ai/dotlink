@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Config/secret commits now use immutable key and OAuth-owner credential generations, atomically selected by JSONC; older profiles retain their legacy key/hash. Crash-before-commit leaves the previous selection intact.
+- Shared bounded discovery scanning returns explicit `scan_incomplete` metadata rather than unbounded traversal; partial sorted results never claim global completeness.
+- Documented that local HTTP/stdio requests intentionally have no global admission budget; clients control parallelism.
+
 - `grep` searches UTF-8 text files with a regex or literal pattern, `glob` filters, optional `ignore_case`, and three output modes: `content` (matching lines with context and `--` group separators), `files`, and `count`. Paging uses `offset`/`limit` (200 hits by default), and `gitignore`/`skip_hidden` are opt-in. It walks with the same descriptor-rooted enumerator as `ls`, so search stays inside filesystem read authority and never reaches shell-only grants.
 - `edit` accepts an ordered `edits[]` array of `{path?, old_text, new_text, replace_all?}` across up to 16 files with an inherited top-level `path`. Entries apply sequentially per file, each `old_text` must be unique unless `replace_all` is set, and every file is re-hashed before writing: any concurrent change or failed entry writes nothing. A failed `old_text` that starts with `digits + tab` reports that `read`'s line-number prefix must be stripped.
 - `patch` applies the Codex `*** Begin Patch` grammar: mandatory header and terminator, `*** Update File` hunks located by content (exact, then `trim_end`-tolerant, ambiguity failing), `*** Add File` as create-only, `*** End of File` enforced (the hunk must end at the last line, with no hunk after it), and explicit rejection of `*** Delete File` / `*** Move to`. Strict mode plans and verifies every section before any commit; each file replacement is atomic, but the commit sequence is not a multi-file transaction. `best_effort` writes the files that planned cleanly and reports the rest.
@@ -17,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Shell calls emit `notifications/progress` heartbeats while running when the client supplies a progress token: a monotonic counter with no total and no message, so long commands stay visibly alive on streamed transports.
 
 ### Fixed
+
+- Stdio verbose logs never inspect nested request payloads for a method and sanitize all method names.
+- Missing protected paths are masked inside Bubblewrap even under writable parent mounts.
+- Text reads error if a truncation marker would displace the only returned line; never emit line zero.
+- Shell request cancellation aborts all pipe workers; Windows children start suspended and join their Job Object before running. Unsandboxed Unix group cleanup explicitly does not claim to contain `setsid` descendants.
 
 - Private config/key/OAuth writes now treat atomic replacement as the commit boundary: a failed parent-directory sync cannot trigger a credential rollback after the file is already installed. The empty temporary is permission-hardened before any secret bytes are written.
 - Windows private state uses a protected user/SYSTEM/Administrators ACL, and the PowerShell installer restores a backup when safe or preserves recovery artifacts on partial replacement failure.

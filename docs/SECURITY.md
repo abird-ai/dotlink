@@ -101,8 +101,9 @@ the page, so a later page does not repeat a hit as context. A `content` page
 reserves room for its truncation marker before accepting a hit, so it ends with
 whole hit lines only; a page that stops on the per-file cap says so in the
 marker, and an offset past the last hit answers with an explicit marker. The candidate bound
-limits collected results; traversal itself is bounded by the caller's path,
-depth and filters.
+limits collected results; the shared walker visits at most 100,000 directory
+entries per request. On a partial walk, `scan_incomplete` distinguishes sorted
+results from a globally exhaustive search; narrow path/glob before paging.
 
 Native filesystem mutators (`write`, `bwrite`, `edit`, `patch`, `bedit`) take a
 bounded per-path mutation lock before reading a snapshot and hold it through
@@ -252,6 +253,12 @@ Filesystem deny rules remain authoritative: deny-read removes a matching cache m
 ### stdio
 
 stdio is local subprocess IPC over stdin/stdout.
+
+**No global local admission budget, by design:** direct HTTP and stdio MCP
+requests retain model/client-directed concurrency. The tunnel has a separate
+per-transport in-flight ceiling. This is an accepted operator trade-off, not
+an unimplemented safety feature. Individual tool file/output/timeout bounds
+still apply.
 
 When --stdio is active, stdout is protocol-only. Status and diagnostics are written to stderr. Runtime key capture (`v` / `Ctrl+R`) is disabled whenever stdio is active, so dotlink never competes for protocol stdin. If stdio is launched manually on a TTY, dotlink temporarily ensures `Ctrl+C` is a real interrupt signal and restores the exact original terminal state when it exits.
 
@@ -468,7 +475,7 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - the streamable-HTTP request-body ceiling is derived from the profile, not from the transport's default: a request body may be six times `max_write_bytes` (the worst-case JSON escaping of a payload the tools accept) plus 64 KiB of framing, for the local HTTP server and the OpenAI tunnel alike;
 - local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes` (sixfold JSON-escape headroom plus framing); unlike a fixed 16 MiB tunnel cap, a larger configured read can be returned consistently via HTTP, stdio, and the embedded tunnel;
 - shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants), chosen per call by the client, bounded by the tunnel client's own `response_timeout` window when present, and clamped to the profile `max_shell_timeout_secs` ceiling; a timeout still returns a bounded, non-secret error result with any partial output;
-- shell cancellation and timeout terminate the command tree via Unix process groups or Windows Job Objects; successful commands can deliberately start independent background work;
+- shell cancellation and timeout abort request-owned pipe tasks and terminate the associated Unix process group or Windows Job Object; Windows creates the process suspended until it joins the Job Object. Unsandboxed Unix descendants that call `setsid` can escape process-group cleanup by design; Bubblewrap's PID namespace provides the stronger default boundary. Successful commands can deliberately start background work;
 - HTTP and transport lifecycles share cancellation;
 - OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded;
 - recovery teardown waits at most 5 seconds before aborting unresponsive peer transport tasks;
