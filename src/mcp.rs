@@ -684,6 +684,22 @@ impl LocalMachine {
             );
         }
 
+        // Reserve dotlink's own OAuth state directory with private permissions
+        // before mounting a writable ancestor. A generic absent protected
+        // path instead fails closed; Bubblewrap may create its mount target
+        // on the host when the containing directory is a writable bind.
+        #[cfg(target_os = "linux")]
+        if args.allow_shell && args.sandbox_shell {
+            let state_dir = crate::oauth::state_dir()?;
+            let state_path = canonicalize_deny(&access.base_dir, &state_dir).await?;
+            if access.grant_write(&state_path)
+                && !access.denied_write(&state_path)
+                && protected_paths.contains(&state_path)
+            {
+                crate::oauth::ensure_private_state_dir()?;
+            }
+        }
+
         // Deny/protected policy is validated before resolving any sandbox or
         // shell tooling so that a policy violation fails closed even when
         // bwrap/bash are absent from PATH (for example inside a Nix build).

@@ -703,13 +703,17 @@ impl LocalMachine {
             if !(self.config.access.grant_read(denied) || self.config.access.grant_write(denied)) {
                 continue;
             }
-            mask_path(&mut command, denied);
+            mask_protected_path(&mut command, denied, self.config.access.grant_write(denied))?;
         }
 
         for protected in &self.config.protected_paths {
             if self.config.access.grant_read(protected) || self.config.access.grant_write(protected)
             {
-                mask_path(&mut command, protected);
+                mask_protected_path(
+                    &mut command,
+                    protected,
+                    self.config.access.grant_write(protected),
+                )?;
             }
         }
 
@@ -792,25 +796,41 @@ impl LocalMachine {
 }
 
 #[cfg(target_os = "linux")]
-fn mask_path(command: &mut Command, path: &Path) {
-    let metadata = std::fs::symlink_metadata(path);
-    prepare_mount_target_dirs(command, path);
-
-    // A protected path need not exist on the host yet. Reserve an inaccessible
-    // directory in the sandbox so even a writable parent cannot create it.
-    // Existing non-directories retain the /dev/null file mask.
-    if metadata.as_ref().is_ok_and(|metadata| !metadata.is_dir()) {
-        command.arg("--ro-bind").arg("/dev/null").arg(path);
-    } else {
-        if metadata.is_err() {
-            command.arg("--dir").arg(path);
+fn mask_protected_path(command: &mut Command, path: &Path, writable: bool) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            mask_path(command, path);
+            Ok(())
         }
+        // Bubblewrap mounts an empty root, but creating a missing mount target
+        // *inside a writable host bind* can also create it on the host. Never
+        // invent a filesystem object merely to enforce a security deny.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && writable => {
+            anyhow::bail!(
+                "cannot safely mask missing protected path {} inside writable shell mount; create it privately first",
+                path.display()
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mask_path(command: &mut Command, path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    prepare_mount_target_dirs(command, path);
+    if metadata.is_dir() {
         command
             .arg("--tmpfs")
             .arg(path)
             .arg("--chmod")
             .arg("000")
             .arg(path);
+    } else {
+        command.arg("--ro-bind").arg("/dev/null").arg(path);
     }
 }
 
@@ -1096,23 +1116,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn missing_protected_path_is_masked_without_creating_it_on_host() {
-        use std::ffi::OsStr;
+    fn missing_protected_path_fails_closed_before_mount_target_creation() {
         let temp = tempfile::tempdir().unwrap();
         let absent = temp.path().join("private-state");
         let mut command = Command::new("true");
-        mask_path(&mut command, &absent);
+        assert!(mask_protected_path(&mut command, &absent, true).is_err());
         assert!(!absent.exists());
-        let args = command.as_std().get_args().collect::<Vec<_>>();
-        for op in ["--dir", "--tmpfs", "--chmod"] {
-            assert!(args.windows(2).any(|pair| pair[0] == OsStr::new(op)
-                && pair[1]
-                    == (if op == "--chmod" {
-                        OsStr::new("000")
-                    } else {
-                        absent.as_os_str()
-                    })));
-        }
+        assert_eq!(command.as_std().get_args().count(), 0);
+        // No writable grant can create this missing path: no placeholder needed.
+        mask_protected_path(&mut command, &absent, false).unwrap();
+        assert_eq!(command.as_std().get_args().count(), 0);
     }
 
     #[cfg(target_os = "linux")]

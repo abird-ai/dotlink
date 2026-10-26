@@ -22,9 +22,12 @@ Windows process-job association and regression validation.
   `scan_incomplete`; content searches return an incomplete-scan marker. Narrow
   the path/glob for complete answers. Avoid falsely promising deterministic
   continuation across mutated directory trees.
-- **Private shell paths:** mask absent protected paths within Bubblewrap as well
-  as existing directories/files; handle read and write grants. Unsandboxed
-  execution intentionally has a weaker isolation boundary.
+- **Private shell paths:** mask existing protected files/directories. A missing
+  target inside a writable mount must fail closed: asking Bubblewrap to create
+  its mount target could mutate the host mount. Dotlink privately prepares its
+  own OAuth directory before constructing mounts. Missing read-only targets
+  cannot be created and need no placeholder. Unsandboxed execution
+  intentionally has a weaker isolation boundary.
 - **Process lifetime:** request-owned task handles abort on cancellation.
   Windows children begin suspended, join a Job Object, then resume. Unix
   process-group termination is best-effort for unsandboxed `setsid` children;

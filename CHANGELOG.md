@@ -23,7 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Stdio verbose logs never inspect nested request payloads for a method and sanitize all method names.
-- Missing protected paths are masked inside Bubblewrap even under writable parent mounts.
+- Sandbox protection fails closed on missing protected paths under writable mounts rather than letting Bubblewrap create host-side mount targets. Dotlink privately prepares its own OAuth state directory; existing protected files/directories remain masked.
 - Text reads error if a truncation marker would displace the only returned line; never emit line zero.
 - Shell request cancellation aborts all pipe workers; Windows children start suspended and join their Job Object before running. Unsandboxed Unix group cleanup explicitly does not claim to contain `setsid` descendants.
 

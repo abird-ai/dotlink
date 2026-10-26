@@ -16,7 +16,7 @@ Base: `55f8ef5`
 
 ### `b46f8c1` — Shell safety and lifetime
 
-- [x] Mask missing protected paths for readable or writable sandbox grants
+- [x] Mask existing protected paths; privately reserve owned state and fail closed when missing targets lie inside writable mounts
 - [x] Abort spawned pipe workers on request cancellation
 - [x] Start Windows child suspended; attach Job Object before resuming
 - [x] State best-effort unsandboxed Unix process-group boundary
@@ -36,7 +36,7 @@ Base: `55f8ef5`
 ## Tests and verification
 
 - [x] `cargo fmt --check` — `cb5d57c` tree
-- [x] `cargo test --locked --all-features` — 332 unit + 4 integration
+- [x] `cargo test --locked --all-features` — 333 unit + 4 integration
 - [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [x] `git diff --check`
 - [x] `alejandra --check flake.nix nix`

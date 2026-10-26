@@ -781,6 +781,19 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(crate::xdg::state_home()?.join("abird/dotlink"))
 }
 
+/// Reserve the privately owned OAuth state directory before an unrestricted
+/// writable Bubblewrap bind can create an unprotected placeholder for it.
+#[cfg(target_os = "linux")]
+fn prepare_private_state_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    set_private_dir_permissions(dir)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_private_state_dir() -> Result<()> {
+    prepare_private_state_dir(&state_dir()?)
+}
+
 pub fn state_path(profile: Option<&str>) -> Result<PathBuf> {
     let dir = state_dir()?;
     Ok(match profile {
@@ -2126,6 +2139,25 @@ mod tests {
         let hash = token_hash(raw);
         assert_ne!(hash, raw);
         assert_eq!(hash.len(), 64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_oauth_state_is_created_private_before_shell_mounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("nested/state");
+        prepare_private_state_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Repeated preparation must not widen an existing directory.
+        prepare_private_state_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]
