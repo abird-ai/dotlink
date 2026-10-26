@@ -46,6 +46,8 @@ pub(crate) struct MutationGuard {
     _shards: Vec<OwnedMutexGuard<()>>,
     #[cfg(unix)]
     _directories: Vec<Arc<DirectoryLock>>,
+    #[cfg(windows)]
+    _windows: Vec<WindowsMutationLock>,
 }
 
 #[cfg(unix)]
@@ -167,6 +169,89 @@ fn lock_plan(paths: &[&Path]) -> Result<BTreeMap<PathBuf, LockMode>> {
     Ok(plan)
 }
 
+/// Windows kernel mutexes work across processes and logon sessions, are
+/// abandoned automatically on process/thread death and leave no lockfiles.
+/// Mutex ownership is thread-affine, so the acquiring thread waits for a drop
+/// notification and releases it itself. A cancelled async request drops that
+/// notification; it can never strand the kernel mutex.
+#[cfg(windows)]
+struct WindowsMutationLock {
+    done: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsMutationLock {
+    fn drop(&mut self) {
+        drop(self.done.take());
+    }
+}
+
+#[cfg(windows)]
+fn windows_mutex_name(path: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    // NTFS is case-insensitive by default, unlike the Linux path namespace.
+    // Hash the entire canonical path: an atomic rename changes the inode, not
+    // the path-based lock identity.
+    let canonical = path.to_string_lossy().to_lowercase();
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("Global\\abird-dotlink-path-{}", hex::encode(digest))
+}
+
+#[cfg(windows)]
+impl WindowsMutationLock {
+    async fn acquire(path: &Path, deadline: Instant) -> Result<Self> {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+        };
+        let identity = windows_mutex_name(path);
+        let display = path.display().to_string();
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let (ready, wait) = tokio::sync::oneshot::channel::<Result<std::sync::mpsc::Sender<()>>>();
+        std::thread::Builder::new()
+            .name("dotlink-file-lock".into())
+            .spawn(move || {
+                let wide = identity.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+                // SAFETY: NUL-terminated stable name, kernel object scope and
+                // ownership are validated by the OS on creation/open.
+                let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+                if handle.is_null() {
+                    let _ = ready.send(Err(std::io::Error::last_os_error().into()));
+                    return;
+                }
+                // SAFETY: handle is a live Windows mutex. Blocking occurs
+                // on this dedicated OS thread, never on a Tokio executor.
+                let code = unsafe { WaitForSingleObject(handle, millis) };
+                if code == WAIT_OBJECT_0 || code == WAIT_ABANDONED {
+                    let (released, closed) = std::sync::mpsc::channel::<()>();
+                    if ready.send(Ok(released)).is_ok() {
+                        // A dropped guard or receiver releases from the same
+                        // OS thread that acquired the mutex.
+                        let _ = closed.recv();
+                    }
+                    // SAFETY: the mutex belongs to the current OS thread.
+                    if unsafe { ReleaseMutex(handle) } == 0 {
+                        tracing::warn!(path = %display, "failed releasing Windows mutation mutex");
+                    }
+                } else {
+                    let reason = if code == WAIT_TIMEOUT {
+                        anyhow::anyhow!("another process is mutating {display}; retry")
+                    } else {
+                        std::io::Error::last_os_error().into()
+                    };
+                    let _ = ready.send(Err(reason));
+                }
+                // SAFETY: CreateMutexW returned an owned kernel object handle.
+                unsafe { CloseHandle(handle) };
+            })
+            .map_err(|error| anyhow::anyhow!("cannot start Windows file-lock worker: {error}"))?;
+        Ok(Self {
+            done: Some(wait.await??),
+        })
+    }
+}
+
 pub(crate) async fn lock<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<MutationGuard> {
     let paths = paths.into_iter().collect::<Vec<_>>();
     let indices = paths
@@ -189,16 +274,44 @@ pub(crate) async fn lock<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Resul
             directories.push(DirectoryLock::acquire(&path, mode, deadline).await?);
         }
     }
+    #[cfg(windows)]
+    let mut windows = Vec::new();
+    #[cfg(windows)]
+    {
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        let targets = paths
+            .iter()
+            .map(|path| path.to_path_buf())
+            .collect::<BTreeSet<_>>();
+        for path in targets {
+            windows.push(WindowsMutationLock::acquire(&path, deadline).await?);
+        }
+    }
     Ok(MutationGuard {
         _shards: guards,
         #[cfg(unix)]
         _directories: directories,
+        #[cfg(windows)]
+        _windows: windows,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_keys_are_case_insensitive_and_stable() {
+        assert_eq!(
+            windows_mutex_name(Path::new("C:\\Repo\\DATA.TXT")),
+            windows_mutex_name(Path::new("c:\\repo\\data.txt"))
+        );
+        assert_ne!(
+            windows_mutex_name(Path::new("C:\\Repo\\a.txt")),
+            windows_mutex_name(Path::new("C:\\Repo\\b.txt"))
+        );
+    }
 
     #[cfg(unix)]
     #[test]

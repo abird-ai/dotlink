@@ -1,7 +1,7 @@
-//! Linux descriptor-rooted filesystem operations.
+//! Descriptor-rooted Unix filesystem operations (Linux and macOS).
 //!
 //! Native tools never operate on a pathname after checking its policy:
-//! every open uses openat2 beneath an already-open authorized directory,
+//! opens stay beneath already-open authorized directories,
 //! refuses symlinks/magic links and nested mounts, and carries the returned
 //! descriptor through IO. Existing symlink aliases may be canonicalized by
 //! the policy before reaching this layer, but an alias swap cannot redirect
@@ -20,6 +20,12 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+const PATH_ONLY: i32 = libc::O_PATH;
+#[cfg(target_os = "macos")]
+const PATH_ONLY: i32 = libc::O_RDONLY;
+
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct OpenHow {
     flags: u64,
@@ -32,6 +38,7 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 const SAFE_RESOLVE: u64 = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV;
 
+#[cfg(target_os = "linux")]
 fn openat2(dir: &OwnedFd, path: &Path, flags: i32, mode: u32, resolve: u64) -> io::Result<OwnedFd> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in filesystem path"))?;
@@ -56,6 +63,87 @@ fn openat2(dir: &OwnedFd, path: &Path, flags: i32, mode: u32, resolve: u64) -> i
     }
     // SAFETY: openat2 returned a new descriptor owned by this process.
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// macOS has no Linux openat2; walk one component at a time from the
+/// pinned descriptor. O_NOFOLLOW at each open rejects swapped symlinks.
+#[cfg(any(target_os = "macos", test))]
+fn openat_beneath(
+    dir: &OwnedFd,
+    path: &Path,
+    flags: i32,
+    mode: u32,
+    resolve: u64,
+) -> io::Result<OwnedFd> {
+    use std::os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _};
+    fn open_part(dir: &OwnedFd, part: &Path, flags: i32, mode: u32) -> io::Result<OwnedFd> {
+        let name = CString::new(part.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in filesystem path"))?;
+        // SAFETY: valid descriptor and NUL-terminated path.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat returns a new owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    let mut parts = path.components().peekable();
+    let mut cursor = dir.try_clone()?;
+    if parts.peek().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty file path",
+        ));
+    }
+    let mut current_device = File::from(cursor.try_clone()?).metadata()?.dev();
+    while let Some(part) = parts.next() {
+        let name = match part {
+            Component::Normal(name) => Path::new(name),
+            Component::CurDir => Path::new("."),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "path escapes pinned directory",
+                ));
+            }
+        };
+        let final_component = parts.peek().is_none();
+        let next = open_part(
+            &cursor,
+            name,
+            if final_component {
+                flags
+            } else {
+                libc::O_RDONLY | libc::O_DIRECTORY
+            },
+            if final_component { mode } else { 0 },
+        )?;
+        let metadata = File::from(next.try_clone()?).metadata()?;
+        if (resolve & RESOLVE_NO_XDEV != 0) && metadata.dev() != current_device {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        if !final_component && !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "non-directory path component",
+            ));
+        }
+        current_device = metadata.dev();
+        cursor = next;
+    }
+    Ok(cursor)
+}
+
+#[cfg(target_os = "macos")]
+fn openat2(dir: &OwnedFd, path: &Path, flags: i32, mode: u32, resolve: u64) -> io::Result<OwnedFd> {
+    openat_beneath(dir, path, flags, mode, resolve)
 }
 
 /// Flags every child open must carry, whatever mask the caller supplies. The
@@ -140,7 +228,7 @@ fn open_parent_dir<'a>(
     let mut current: OwnedFd = openat2(
         &root.fd,
         Path::new("."),
-        libc::O_PATH | libc::O_DIRECTORY,
+        PATH_ONLY | libc::O_DIRECTORY,
         0,
         root.resolve,
     )?;
@@ -153,7 +241,7 @@ fn open_parent_dir<'a>(
         match openat2(
             &current,
             child,
-            libc::O_PATH | libc::O_DIRECTORY,
+            PATH_ONLY | libc::O_DIRECTORY,
             0,
             root.resolve,
         ) {
@@ -172,7 +260,7 @@ fn open_parent_dir<'a>(
                 current = openat2(
                     &current,
                     child,
-                    libc::O_PATH | libc::O_DIRECTORY,
+                    PATH_ONLY | libc::O_DIRECTORY,
                     0,
                     root.resolve,
                 )?;
@@ -281,7 +369,7 @@ impl StagedWrite {
             match openat2(
                 &self.parent,
                 Path::new(&self.name),
-                libc::O_PATH | libc::O_NOFOLLOW,
+                PATH_ONLY | libc::O_NOFOLLOW,
                 0,
                 self.resolve,
             ) {
@@ -389,7 +477,7 @@ impl SecureFs {
                     } else {
                         rel
                     },
-                    libc::O_PATH | libc::O_DIRECTORY,
+                    PATH_ONLY | libc::O_DIRECTORY,
                     0,
                     RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
                 )
@@ -418,7 +506,7 @@ impl SecureFs {
             openat2(
                 &root.fd,
                 Path::new("."),
-                libc::O_PATH | libc::O_DIRECTORY,
+                PATH_ONLY | libc::O_DIRECTORY,
                 0,
                 root.resolve,
             )
@@ -555,7 +643,7 @@ impl SecureFs {
         let existing_mode = match openat2(
             parent,
             Path::new(name),
-            libc::O_PATH | libc::O_NOFOLLOW,
+            PATH_ONLY | libc::O_NOFOLLOW,
             0,
             resolve,
         ) {
@@ -678,6 +766,7 @@ impl SecureFs {
     /// replacement and verifying the actual pinned object type. Only the
     /// explicitly requested object is mounted; no parent directory authority
     /// is shared with the sandbox.
+    #[cfg(target_os = "linux")]
     pub fn open_host_mount(
         source: &Path,
         kind: crate::host_services::HostMountKind,
@@ -690,7 +779,7 @@ impl SecureFs {
         let fd = openat2(
             &slash,
             relative,
-            libc::O_PATH | libc::O_NOFOLLOW,
+            PATH_ONLY | libc::O_NOFOLLOW,
             0,
             RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
         )
@@ -716,6 +805,7 @@ impl SecureFs {
 
     /// Pin an explicitly configured shell-only cache source to the directory
     /// validated at startup. This is not an MCP filesystem grant.
+    #[cfg(target_os = "linux")]
     pub fn open_canonical_directory(path: &Path) -> Result<File> {
         let slash: OwnedFd = File::open("/")?.into();
         let relative = path.strip_prefix("/")?;
@@ -739,6 +829,49 @@ impl SecureFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_openat_walk_rejects_symlink_swaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let allowed = root.join("allowed");
+        let other = root.join("other");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("secret"), b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&other, allowed.join("jump")).unwrap();
+        let dir: OwnedFd = File::open(&allowed).unwrap().into();
+        assert!(
+            openat_beneath(
+                &dir,
+                Path::new("jump/secret"),
+                libc::O_RDONLY,
+                0,
+                SAFE_RESOLVE
+            )
+            .is_err()
+        );
+        assert!(
+            openat_beneath(
+                &dir,
+                Path::new("../other/secret"),
+                libc::O_RDONLY,
+                0,
+                SAFE_RESOLVE
+            )
+            .is_err()
+        );
+        assert!(
+            openat_beneath(
+                &dir,
+                Path::new("future"),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+                SAFE_RESOLVE
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn securely_denies_redirected_symlinks_and_writes_inside_grant() {

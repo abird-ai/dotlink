@@ -62,7 +62,7 @@ pub(crate) fn is_staging_temporary(name: &OsStr) -> bool {
 }
 
 /// Pathname backend for platforms without descriptor-rooted IO.
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(any(test, windows))]
 mod path_backend {
     use std::path::{Path, PathBuf};
 
@@ -304,6 +304,8 @@ mod path_backend {
         committed: bool,
         #[cfg(windows)]
         preserve_staged_on_failure: bool,
+        #[cfg(windows)]
+        _pinned: crate::windows_fs::PinnedDirectory,
     }
 
     /// Stage `bytes` beside `path`. An existing target must be a regular file;
@@ -317,6 +319,9 @@ mod path_backend {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("cannot replace a root directory: {}", path.display()))?;
+        #[cfg(windows)]
+        let pinned = crate::windows_fs::PinnedDirectory::parent(path, true)?;
+        #[cfg(not(windows))]
         fs::create_dir_all(parent).await?;
         let existing_permissions = match fs::symlink_metadata(path).await {
             Ok(_) if create_only => bail!("path already exists: {}", path.display()),
@@ -383,6 +388,8 @@ mod path_backend {
             committed: false,
             #[cfg(windows)]
             preserve_staged_on_failure: false,
+            #[cfg(windows)]
+            _pinned: pinned,
         })
     }
 
@@ -525,7 +532,7 @@ mod path_backend {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 pub(crate) use path_backend::{StagedWrite, stage as stage_path};
 
 #[cfg(test)]

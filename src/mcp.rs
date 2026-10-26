@@ -107,18 +107,18 @@ pub struct LocalMachine {
     /// immutable access policy, so every request can share one router instead
     /// of merging the per-family routers again.
     router: OnceLock<Arc<ToolRouter<Self>>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     secure_fs: Arc<crate::secure_fs::SecureFs>,
 }
 
 /// A write that is staged but not yet visible; see `LocalMachine::stage_write`.
 /// Both backends stage beside the target and install in one step; the shared
 /// mode and naming policy lives in [`crate::staging`].
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 pub(crate) struct PendingWrite(crate::secure_fs::StagedWrite);
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct PendingWrite(crate::staging::StagedWrite);
 
@@ -761,7 +761,7 @@ impl LocalMachine {
         #[cfg(not(target_os = "linux"))]
         let bwrap_program = None;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let secure_fs = Arc::new(crate::secure_fs::SecureFs::new(
             &access.read_roots,
             &access.write_roots,
@@ -805,7 +805,7 @@ impl LocalMachine {
             operation_gate: Arc::new(RwLock::new(())),
             serialize: args.serialize,
             router: OnceLock::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs,
         })
     }
@@ -937,7 +937,7 @@ impl LocalMachine {
         Ok(path)
     }
 
-    #[cfg(any(test, not(target_os = "linux")))]
+    #[cfg(any(test, windows))]
     async fn require_regular_file(&self, path: &Path) -> Result<()> {
         let metadata = fs::symlink_metadata(path).await?;
         if !metadata.is_file() {
@@ -962,33 +962,28 @@ impl LocalMachine {
     }
 
     async fn open_read_file(&self, path: &Path) -> Result<fs::File> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             Ok(fs::File::from_std(self.secure_fs.open_read(path)?))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
-            let file = fs::File::open(path).await?;
-            if !file.metadata().await?.is_file() {
-                bail!("path is not a regular file: {}", path.display());
-            }
-            Ok(file)
+            Ok(fs::File::from_std(crate::windows_fs::open_file(
+                path, false,
+            )?))
         }
     }
 
     async fn open_edit_file(&self, path: &Path) -> Result<fs::File> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             Ok(fs::File::from_std(self.secure_fs.open_edit(path)?))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
-            self.require_regular_file(path).await?;
-            Ok(fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .await?)
+            Ok(fs::File::from_std(crate::windows_fs::open_file(
+                path, true,
+            )?))
         }
     }
 
@@ -1041,7 +1036,7 @@ impl LocalMachine {
         write_only: bool,
         expected: Option<(u64, [u8; 32])>,
     ) -> Result<PendingWrite> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let staged = match (create_only, write_only) {
                 (true, _) => self.secure_fs.stage_create(path, bytes)?,
@@ -1055,7 +1050,7 @@ impl LocalMachine {
             };
             Ok(PendingWrite(staged))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
             let _ = write_only;
             Ok(PendingWrite(
@@ -1066,11 +1061,11 @@ impl LocalMachine {
 
     /// Make a staged write visible.
     pub(crate) async fn commit_write(&self, pending: PendingWrite) -> Result<()> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             pending.0.commit()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
             pending.0.commit().await
         }
@@ -1117,7 +1112,7 @@ impl LocalMachine {
 
     /// Pure reads may overlap each other; everything else takes the operation
     /// gate on platforms without descriptor-rooted IO.
-    #[cfg(any(test, not(target_os = "linux")))]
+    #[cfg(any(test, windows))]
     fn is_concurrent_read_tool(name: &str) -> bool {
         TOOL_SPECS
             .iter()
@@ -1235,15 +1230,15 @@ impl rmcp::ServerHandler for LocalMachine {
             let _guard = self.operation_gate.write().await;
             self.policy_tool_router().call(context).await
         } else {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 // Native file operations use checked directory handles, and
                 // Bubblewrap gives each shell its own process/filesystem view.
                 self.policy_tool_router().call(context).await
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
             {
-                // Until the other platforms get descriptor-relative tools,
+                // Until Windows gets descriptor-relative tools,
                 // preserve their conservative filesystem topology gate.
                 if Self::is_concurrent_read_tool(&name) {
                     let _guard = self.operation_gate.read().await;

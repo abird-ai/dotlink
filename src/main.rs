@@ -10,11 +10,13 @@ mod logging;
 mod mcp;
 mod mutation;
 mod oauth;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod secure_fs;
 mod setup;
 mod staging;
 mod transports;
+#[cfg(windows)]
+mod windows_fs;
 mod xdg;
 
 use std::{

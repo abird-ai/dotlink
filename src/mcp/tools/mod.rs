@@ -99,18 +99,18 @@ impl GlobFilter {
 }
 
 /// Pinned handle of a directory, plus the resolve mask it was pinned with.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 type DirHandle = Arc<DirHandleInner>;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 pub(crate) struct DirHandleInner {
     fd: std::os::fd::OwnedFd,
     resolve: u64,
 }
 
-#[cfg(not(target_os = "linux"))]
-type DirHandle = ();
+#[cfg(windows)]
+type DirHandle = Arc<crate::windows_fs::PinnedDirectory>;
 
 /// One directory entry produced by the shared walk.
 pub(crate) struct WalkedEntry {
@@ -186,7 +186,7 @@ impl LocalMachine {
     /// Pin the caller-named root. A root that cannot be opened is a tool error,
     /// never a silently empty result.
     fn pin_root_directory(&self, root: &Path) -> Result<Option<DirHandle>> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let resolve = self.secure_fs.read_resolve(root)?;
             Ok(Some(Arc::new(DirHandleInner {
@@ -194,10 +194,11 @@ impl LocalMachine {
                 resolve,
             })))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
-            let _ = root;
-            Ok(None)
+            Ok(Some(Arc::new(crate::windows_fs::PinnedDirectory::new(
+                root, false,
+            )?)))
         }
     }
 
@@ -209,7 +210,7 @@ impl LocalMachine {
         name: &OsStr,
         path: &Path,
     ) -> Result<Option<DirHandle>> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let Some(parent) = parent else {
                 return self.pin_root_directory(path);
@@ -222,10 +223,12 @@ impl LocalMachine {
                 resolve: parent.resolve,
             })))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
-            let _ = (parent, name, path);
-            Ok(None)
+            let _ = (parent, name);
+            Ok(Some(Arc::new(crate::windows_fs::PinnedDirectory::new(
+                path, false,
+            )?)))
         }
     }
 
@@ -234,7 +237,7 @@ impl LocalMachine {
     /// available the walk fails closed rather than reopening a pathname that a
     /// concurrent rename could have redirected.
     async fn read_directory(&self, handle: Option<&DirHandle>, path: &Path) -> Result<fs::ReadDir> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let Some(handle) = handle else {
                 bail!(
@@ -242,21 +245,30 @@ impl LocalMachine {
                     path.display()
                 );
             };
+            #[cfg(target_os = "linux")]
+            let fd_root = "/proc/self/fd";
+            #[cfg(target_os = "macos")]
+            let fd_root = "/dev/fd";
             let pinned = PathBuf::from(format!(
-                "/proc/self/fd/{}",
+                "{}/{}",
+                fd_root,
                 std::os::fd::AsRawFd::as_raw_fd(&handle.fd)
             ));
             let reader = fs::read_dir(&pinned).await.with_context(|| {
                 format!(
-                    "descriptor-rooted enumeration needs procfs (/proc); cannot list {}",
+                    "descriptor-rooted enumeration needs an OS descriptor filesystem; cannot list {}",
                     path.display()
                 )
             })?;
             Ok(reader)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
         {
-            let _ = handle;
+            if handle.is_none() {
+                bail!("Windows native enumeration requires a pinned directory");
+            }
+            // All ancestors and this directory remain open without delete
+            // sharing for the entire walk; the path cannot be redirected.
             Ok(fs::read_dir(path).await?)
         }
     }
@@ -323,13 +335,17 @@ impl LocalMachine {
         name: &OsStr,
         path: &Path,
     ) -> Option<fs::File> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(handle) = handle {
             return self
                 .secure_fs
                 .open_child_read(&handle.fd, name, handle.resolve)
                 .ok()
                 .map(fs::File::from_std);
+        }
+        #[cfg(windows)]
+        if handle.is_none() {
+            return None;
         }
         self.open_read_file(path).await.ok()
     }
