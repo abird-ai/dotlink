@@ -341,7 +341,9 @@ One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
 `{a,b}` stay within one path segment and `**` recurses without a level cap.
 Every list/search tool has a documented `limit` and reports `truncated`. Walks
 stop after 100,000 visited entries; `scan_incomplete` explicitly marks partial
-results, which are sorted only among the visited entries. Narrow `path` or
+results, which are sorted only among the visited entries. `grep` also limits
+file-content work to 32 MiB across at most 4096 candidates per request;
+`incomplete_reason` distinguishes `directory_budget` and `content_budget`. Narrow `path` or
 `glob`/`pattern` for large trees. `read` returns an error rather than a misleading
 line-zero truncation marker if the first complete line plus marker cannot fit.
 Otherwise, `read` ends a capped result with a single marker. `ls` and `grep`
@@ -356,6 +358,10 @@ rejecting a large file outright; the page is assembled in one buffer, and lines
 skipped to reach `offset` are scanned rather than buffered, so a long first line
 never blocks a later window; a single returned line larger than the ceiling is
 an error naming it, since cutting it silently would hide content.
+
+Text tools (`grep`, `read`, `write`, `edit`, `patch`) accept UTF-8
+without binary control bytes. Use `bread`, `bwrite`, or `bedit` for
+byte-oriented files.
 
 Every write is atomic: the new bytes go beside the target and are installed only
 at commit, so a failed or interrupted write leaves the old file intact and a
@@ -578,7 +584,7 @@ DEVELOPER CACHES (discovered paths; bare flag = ro, =rw enables writes)
 
 OUTPUT & DIAGNOSTICS
 --list-tools                    show tools exposed by the effective policy
---print-id                      print configured OpenAI Tunnel ID
+--print-id                      print configured tunnel ID (no Runtime key needed)
 -s, --serialize                 execute MCP tools one at a time (opt-in)
 -q, --quiet                     suppress TOOL activity
 -v, --verbose                   -v TOOL; -vv TOOL + REQ

@@ -83,7 +83,8 @@ next credential rotation.
 At runtime, environment or credential-file overrides take precedence before
 reading a saved Runtime key. A disabled OpenAI transport never reads dormant
 keys; an enabled transport with no usable override fails closed if its selected
-key is absent. Profile inspection/editing stays usable for recovery.
+key is absent. Profile inspection/editing stays usable for recovery. `--print-id` is a
+configuration-only inspection path that never resolves a Runtime secret.
 OAuth owner authorization resolves the currently committed profile generation
 on each password check (with a post-verify recheck); a deleted persisted
 profile cannot fall back to a legacy hash. Interrupted deletion can be
@@ -546,6 +547,9 @@ Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases
 - Directory enumeration is descriptor-rooted on Linux: the walk enumerates the
   pinned FD through procfs and fails closed with an explicit error when procfs is
   unavailable, rather than reopening the directory by pathname.
+- Text tools share UTF-8/binary-control classification and keep binary
+  payloads in `bread`/`bwrite`/`bedit`. `grep` caps a call at 32 MiB
+  of file reads and 4096 candidates, independently of model concurrency.
 - `grep` walks with the same descriptor-rooted enumerator as `ls`; regex, glob
   and `.gitignore` matching are pure matchers over paths and buffers already
   held, `.gitignore` files are read through the pinned directory handle, and

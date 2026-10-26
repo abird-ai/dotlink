@@ -317,7 +317,7 @@ Protocol/security properties:
 - owner password persisted only as an Argon2id hash, with each live authorization resolving the current committed profile revision and rechecking it after successful Argon2 verification; a deleted saved profile cannot reactivate an older legacy hash;
 - bounded pending registrations, authorization requests/codes, access tokens, refresh grants, and DCR clients;
 - Argon2 verification offloaded to blocking workers that **own** their two-check concurrency permits through completion, including after the HTTP request is cancelled; failed attempts are delayed without a remotely triggerable global lockout;
-- OAuth refresh grants and authorization codes are checked for correct client/resource/PKCE bindings before they are consumed; failed validation leaves valid credentials untouched;
+- OAuth refresh grants and authorization codes are checked for correct client/resource/PKCE bindings before consumption; code redemption retains the one-time-code lock until issuance commits, so temporary storage failure returns retryable HTTP 503 rather than burning a code;
 - cross-process locked OAuth state mutations so a live server, setup, and `dotlink oauth` management command cannot lose each other's approved-client/refresh/password changes;
 - refresh tokens issued only when the approved client advertises the `refresh_token` grant; `offline_access` requires that capability;
 - no JWT signing key or external auth service.
@@ -472,6 +472,7 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - shell stdout/stderr are drained continuously with bounded retained output;
 - shell stdin is written concurrently with process execution after the output drains start, so a child that writes before reading its input cannot deadlock both pipes;
 - `max_output_bytes`, `max_read_bytes` and `max_write_bytes` are hard ceilings: a value below the supported minimum is rejected at configuration time, never silently widened at startup;
+- UTF-8 text tools share binary-control rejection, and grep skips non-text candidates; byte-oriented files use bread/bwrite/bedit; grep caps a request at 32 MiB content I/O and 4096 candidate files, reporting incomplete search coverage;
 - text/binary reads and writes are bounded; `read` streams a line window instead of preloading the whole file, builds the page in one output buffer, and its reply — truncation marker included — fits `max_read_bytes`; lines skipped to reach `offset` are scanned for their newline without being buffered or decoded, so a preceding line larger than the ceiling cannot block the requested window;
 - the streamable-HTTP request-body ceiling is derived from the profile, not from the transport's default: a request body may be six times `max_write_bytes` (the worst-case JSON escaping of a payload the tools accept) plus 64 KiB of framing, for the local HTTP server and the OpenAI tunnel alike;
 - local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes` (sixfold JSON-escape headroom plus framing); unlike a fixed 16 MiB tunnel cap, a larger configured read can be returned consistently via HTTP, stdio, and the embedded tunnel;

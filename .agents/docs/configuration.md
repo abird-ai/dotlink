@@ -16,6 +16,10 @@ Current profile schema: **v10**. Compatible older schemas migrate forward automa
 ~/.local/state/abird/dotlink/oauth.<profile>.json
 ```
 
+`dotlink --print-id` reads only the configured tunnel ID (or an explicit
+default-profile `DOTLINK_ID` override); it does not need saved Runtime
+credentials, transports or interactive setup.
+
 The config paths follow `$XDG_CONFIG_HOME`; OAuth state follows `$XDG_STATE_HOME` (with the platform-appropriate state-directory fallback). An XDG override must be non-empty and absolute; a relative or empty value is ignored and the home-directory fallback is used.
 
 On runtime startup, explicit `DOTLINK_ID` + `DOTLINK_API_KEY` (or corresponding `CONTROL_PLANE_*` aliases) and `DOTLINK_API_KEY_FILE` are resolved before any saved Runtime key. The file override takes precedence over a key in the environment; a file override alone may reuse the profile's saved tunnel ID. When OpenAI is disabled and not explicitly enabled through environment credentials, dotlink does not open its saved Runtime key at all. A missing/unreadable saved key matters only when an enabled OpenAI transport actually needs it. Explicit overrides do not rewrite the saved profile.
@@ -113,6 +117,13 @@ For OpenAI Tunnel setup, either create/manage the tunnel yourself at <https://pl
 ```
 
 Relative permission paths resolve from the launch directory. `default_allow=true` adds read access to that directory; `--no-default-allow` suppresses it for one run.
+
+grep has a per-request work limit: up to 100,000 directory entries, 32 MiB
+of file-content I/O, and 4096 candidate files. Incomplete results include
+`scan_incomplete` and `incomplete_reason` (directory or content budget).
+Text tools reject binary controls and invalid UTF-8; use bread/bwrite/bedit
+for bytes. Local HTTP/stdio tool calls remain intentionally unrestricted in
+aggregate concurrency.
 
 `max_shell_timeout_secs` and `max_output_bytes` are policy ceilings, not the values themselves, and a configured ceiling is honoured exactly: a byte limit below **1024** or a timeout below **1 s** is rejected when the profile is loaded, never raised at startup. Per-call arguments are caller-controlled, clamped to `1..=ceiling`, and fall back to the ceiling when omitted. On the OpenAI tunnel the client owns the delivery window, so an omitted `timeout_secs` defaults to that window minus a 5 s delivery reserve instead of the ceiling; an explicit value larger than the window is shortened, and every tool dispatch is bounded by the same reserve so the terminal response can still be posted. The default shell ceiling is 3600 s (60 min) and the default output ceiling is 1 MiB; lower them in config to bound runaway commands or oversized results. `max_output_bytes` also bounds the JSON replies of `grep` and `ls`, not only a shell stream. `max_read_bytes` bounds the `read` reply — the returned window, the truncation marker and each returned line — not the total size of a file that is scanned to reach an offset; making room for the marker drops whole lines, never part of one, and a line that alone exceeds the ceiling is an error naming it (read it with `bread` or raise the ceiling). Lines skipped to reach `offset` are only scanned for their newline, so they may exceed the ceiling and are never decoded. `max_write_bytes` is also the per-call payload ceiling for every mutating tool (`write` content, `edit` old+new text, `patch` text, `bwrite` decoded data, `bedit` decoded ranges), and the streamable-HTTP request-body ceiling follows it: a body may be six times `max_write_bytes` plus 64 KiB, so raising the ceiling raises the transport ceiling instead of hitting a hidden 4 MiB limit. The embedded tunnel's MCP response limit is similarly derived from the configured read/output ceilings, with JSON escaping and framing headroom, instead of a fixed 16 MiB limit. The advertised `bash`/`powershell` schema reports those ceilings as concrete numbers, and a shell call emits bare `notifications/progress` heartbeats (monotonic counter, no total, no message) while it runs when the client supplies a progress token.
 

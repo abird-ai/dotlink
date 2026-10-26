@@ -22,6 +22,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- --print-id uses configuration-only inspection, without loading secrets or triggering setup.
+- Text tools share UTF-8 and binary-control-byte classification: read/write/edit/patch reject binary content and grep skips it; byte-oriented data stays with bread/bwrite/bedit.
+- OAuth authorization codes are consumed only after token issuance succeeds under the code lock; a storage failure returns retryable HTTP 503 without burning the code, and fallible token setup precedes persistent refresh mutations.
+- grep limits per-call content I/O to 32 MiB across 4096 candidates, reporting incomplete coverage and its cause independently of local transport concurrency.
+
 - Live OAuth owner-password rotation is applied to new approvals without an HTTP restart: verification uses the currently committed profile generation, checks it again after a successful hash, and rejects fallback to legacy after a saved profile is removed.
 - Runtime secrets resolve by explicit environment and `DOTLINK_API_KEY_FILE` precedence before persisted keys. Local-only profiles never open dormant Runtime keys, and valid overrides work when the selected saved key is missing.
 
