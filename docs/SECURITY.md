@@ -162,8 +162,10 @@ files are retained for manual restoration, never blindly deleted. Successful
 replacements remove the backup where possible. The non-Linux staging backend
 owns the temporary file from creation through asynchronous write/sync: aborts
 and cancellations trigger RAII cleanup rather than leaving a half-written file
-behind. Windows runtime ACL behaviour
-still requires validation on a native Windows filesystem.
+behind. Windows native writes preserve an existing file's ACL. Separately, dotlink's
+own configuration, keys, and OAuth state use a protected DACL granting access
+only to the current user, SYSTEM and Administrators, even under a custom
+configuration directory. Windows ACL behaviour still requires native tests.
 `write`, `bwrite` and `*** Add File` create content without a prior snapshot.
 A create-only install refuses any name that already exists: Linux uses a
 descriptor-rooted hard link, Windows an atomic `MoveFileW` without replacement,
@@ -458,7 +460,7 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 
 ## Resource limits
 
-- tunnel concurrency is bounded;
+- tunnel concurrency is bounded; SSE events are decoded incrementally and forwarded through a bounded notification queue while the tool is still running;
 - shell stdout/stderr are drained continuously with bounded retained output;
 - shell stdin is written concurrently with process execution after the output drains start, so a child that writes before reading its input cannot deadlock both pipes;
 - `max_output_bytes`, `max_read_bytes` and `max_write_bytes` are hard ceilings: a value below the supported minimum is rejected at configuration time, never silently widened at startup;
@@ -466,6 +468,7 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - the streamable-HTTP request-body ceiling is derived from the profile, not from the transport's default: a request body may be six times `max_write_bytes` (the worst-case JSON escaping of a payload the tools accept) plus 64 KiB of framing, for the local HTTP server and the OpenAI tunnel alike;
 - local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes` (sixfold JSON-escape headroom plus framing); unlike a fixed 16 MiB tunnel cap, a larger configured read can be returned consistently via HTTP, stdio, and the embedded tunnel;
 - shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants), chosen per call by the client, bounded by the tunnel client's own `response_timeout` window when present, and clamped to the profile `max_shell_timeout_secs` ceiling; a timeout still returns a bounded, non-secret error result with any partial output;
+- shell cancellation and timeout terminate the command tree via Unix process groups or Windows Job Objects; successful commands can deliberately start independent background work;
 - HTTP and transport lifecycles share cancellation;
 - OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded;
 - recovery teardown waits at most 5 seconds before aborting unresponsive peer transport tasks;

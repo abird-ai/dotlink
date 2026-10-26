@@ -340,9 +340,10 @@ Targets are canonicalized before checks; create targets canonicalize their neare
 One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
 `{a,b}` stay within one path segment and `**` recurses without a level cap.
 Every list/search tool has a documented `limit` and reports `truncated`; `read`
-ends a capped result with a single marker line instead. `ls` and `grep` also
-bound their JSON replies at `max_output_bytes`, keeping the longest prefix that
-fits; `ls` derives its default depth from the pattern (one level per segment,
+ends a capped result with a single marker line instead. `ls` and `grep`
+retain the globally best sorted candidates in bounded memory, independent of
+filesystem enumeration order. Both bound their JSON replies at
+`max_output_bytes`, keeping the longest prefix that fits; `ls` derives its default depth from the pattern (one level per segment,
 unbounded for `**`) so a deep pattern never silently returns nothing, and
 `grep` pages only ever contain whole matching lines. `grep count` reports
 `page_total` for the returned page. `read` streams a line window, so

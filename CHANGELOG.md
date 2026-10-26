@@ -18,6 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Private config/key/OAuth writes now treat atomic replacement as the commit boundary: a failed parent-directory sync cannot trigger a credential rollback after the file is already installed. The empty temporary is permission-hardened before any secret bytes are written.
+- Windows private state uses a protected user/SYSTEM/Administrators ACL, and the PowerShell installer restores a backup when safe or preserves recovery artifacts on partial replacement failure.
+- Unix native staging/commit and OAuth persistence run as cancellation-safe blocking sections rather than stalling Tokio workers; OAuth state locks have a finite acquisition deadline.
+- OpenAI tunnel progress notifications are decoded and delivered incrementally before the command completes, through a bounded queue rather than a buffered terminal response.
+- Shell timeouts and request cancellation terminate Unix process groups or Windows Job Objects, without preventing successful commands from launching background work.
+- `ls` and `grep` select globally sorted candidates with bounded top-K heaps; the truncation and pagination contract is independent of directory enumeration order.
+
 - Consolidated the signed stale-index correction into the preceding transport commit, preserving the tree and removing the broken intermediate commit.
 - OpenAI tunnel poll bodies now fit a configured largest single write plus framing, subject to a 256 MiB safety limit and explicit oversized-profile startup errors.
 - macOS native files use pinned-root, component-wise openat/O_NOFOLLOW for authorization, writes and walks instead of unchecked pathname reopens.

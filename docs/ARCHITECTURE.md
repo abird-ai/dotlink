@@ -172,7 +172,7 @@ The embedded OAuth server is single-owner and uses:
 - opaque in-memory access tokens;
 - rotating refresh tokens persisted only as hashes and issued only to clients that advertise the refresh grant;
 - an Argon2id owner-password hash with bounded `spawn_blocking` verification;
-- cross-process file locking around OAuth state read/modify/write operations so setup, a live server, and management commands compose without lost updates.
+- cross-process file locking around OAuth state read/modify/write operations so setup, a live server, and management commands compose without lost updates; lock acquisition times out, and synchronous transactions release Tokio workers via a cancellation-safe blocking section.
 
 Unauthenticated DCR registrations stay bounded/in-memory until successful owner consent; only approved clients are persisted.
 
@@ -216,7 +216,7 @@ ngrok uses `NGROK_AUTHTOKEN` through the SDK's authtoken-from-environment flow.
 
 src/transports/openai.rs owns the OpenAI-specific protocol implementation.
 
-It converts tunnel-polled JSON-RPC requests into in-process requests against an rmcp StreamableHttpService and returns the MCP response to the OpenAI control plane.
+It converts tunnel-polled JSON-RPC requests into in-process requests against an rmcp StreamableHttpService and returns the MCP response to the OpenAI control plane. SSE is decoded incrementally: progress notifications pass through a bounded channel and reach the tunnel before the terminal tool response. The response deadline also bounds intermediate delivery.
 
 The OpenAI transport is the only transport that requires:
 
@@ -307,6 +307,12 @@ its operation gate and uses named cross-process mutation mutexes with
 thread-affine release and automatic crash abandonment. Ancestor directory
 handles are pinned against rename and reparse points refused. External
 writers remain outside these advisory locks.
+
+Native Unix writes and OAuth state transactions execute their synchronous,
+descriptor-safe stages within a cancellation-safe Tokio blocking section. This
+does not detach a write after its mutation guard has been dropped. Private
+configuration and OAuth file replacement has one commit boundary: post-rename
+directory-sync failures are warnings, never grounds to roll back a paired key.
 
 Developer caches are modeled separately from filesystem grants. A cache record stores its tool family, host source path, and RO/RW mode. At runtime the source is canonicalized and mounted only into the shell sandbox, typically below `/tmp/home` at the tool's expected path. Cache mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical cache sources before mounting.
 

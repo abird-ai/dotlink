@@ -48,6 +48,10 @@ dotlink-macos-aarch64
 dotlink-macos-aarch64.sha256
 ```
 
+The Windows installer restores a backup when an interrupted replacement leaves the
+destination missing; if recovery is uncertain, it retains both staged and
+backup copies and prints their locations instead of deleting them.
+
 The Linux binaries are static musl builds with no distro-specific glibc dependency, so the same artifact runs across NixOS, Debian, and other compatible Linux distributions.
 
 ## Nix / Crane outputs
