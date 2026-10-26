@@ -5,6 +5,7 @@
 - [~] P1 DL-060 — @pvl — [details](dotlink-handoff-2026-10-01/TODO.md)
 - [!] P2 DL-110 — @agent — Remediation committed; native Windows/macOS and Bubblewrap smoke checks blocked in connector — [details](dotlink-reliability-2026-10-26/README.md)
 - [!] P2 DL-120 — @agent — All seven review fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-recovery-2026-10-26/README.md)
+- [!] P2 DL-130 — @agent — Runtime/OAuth fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-live-credentials-2026-10-26/README.md)
 
 ## Icebox
 
