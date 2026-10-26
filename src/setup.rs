@@ -367,6 +367,13 @@ pub struct AppConfig {
     pub tunnel_id: Option<String>,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub runtime_api_key: String,
+    /// Opaque generation of the private runtime key selected by this config.
+    /// None selects the legacy runtime.key, retaining v10 compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_key_revision: Option<String>,
+    /// Same atomic selector for an OAuth owner credential generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_password_revision: Option<String>,
     #[serde(default)]
     pub organization_id: Option<String>,
     #[serde(default = "default_base_url")]
@@ -494,6 +501,8 @@ fn default_app_config() -> AppConfig {
         caches: Vec::new(),
         tunnel_id: None,
         runtime_api_key: String::new(),
+        runtime_key_revision: None,
+        owner_password_revision: None,
         organization_id: None,
         base_url: default_base_url(),
         max_shell_timeout_secs: default_shell_timeout(),
@@ -543,6 +552,10 @@ fn read_profile_config_migrated(profile: Option<&str>) -> Result<Option<AppConfi
     let config =
         migrate_config(config).with_context(|| format!("failed to migrate {}", path.display()))?;
     Ok(Some(config))
+}
+
+pub(crate) fn profile_owner_revision(profile: Option<&str>) -> Result<Option<String>> {
+    Ok(read_profile_config(profile)?.and_then(|config| config.owner_password_revision))
 }
 
 fn read_profile_config(profile: Option<&str>) -> Result<Option<AppConfig>> {
@@ -1074,6 +1087,9 @@ async fn interactive_setup(
         println!();
     }
 
+    // Remember only the persisted, nonsecret profile snapshot. A long
+    // interactive setup must not overwrite a concurrent profile manager edit.
+    let persisted_before = read_profile_config(profile)?;
     let mut config = existing.unwrap_or_else(default_app_config);
     let previous = config.clone();
     let current_transports = config.transports.clone();
@@ -1277,7 +1293,7 @@ async fn interactive_setup(
         }
 
         if oauth_config.enabled || transports.ngrok {
-            if oauth::owner_configured(profile)? {
+            if oauth::owner_configured(profile, config.owner_password_revision.as_deref())? {
                 println!(
                     "   {}",
                     setup_style(color, "2", "Owner credential: [existing credential]")
@@ -1536,11 +1552,27 @@ async fn interactive_setup(
     config.runtime_api_key = runtime_api_key;
     config.organization_id = organization_id;
 
+    if let Some(change) = owner_password_change.as_ref() {
+        config.owner_password_revision = Some(change.revision().to_owned());
+    }
     validate_config(&config)?;
+    // One profile lock owns the complete credential-selection transaction;
+    // other profile writers cannot overwrite or select half-staged state.
+    let _profile_lock = profile_lock(profile)?;
+    let persisted_now = read_profile_config(profile)?;
+    if serde_json::to_value(&persisted_now)? != serde_json::to_value(&persisted_before)? {
+        bail!("profile changed during setup; rerun setup to avoid overwriting another edit");
+    }
     if let Some(change) = owner_password_change.as_ref() {
         change.apply()?;
+        // The referenced OAuth generation must survive a crash before the
+        // config commit can safely select it.
+        if let Err(error) = sync_parent_directory(&oauth::state_path(profile)?) {
+            let _ = change.rollback();
+            return Err(error).context("could not durably stage OAuth owner credential");
+        }
     }
-    if let Err(error) = save_config(&config, profile) {
+    if let Err(error) = save_config_locked(&config, profile, owner_password_change.is_some()) {
         if let Some(change) = owner_password_change.as_ref()
             && let Err(rollback_error) = change.rollback()
         {
@@ -1986,41 +2018,61 @@ fn atomic_write_private_with_sync(
     result
 }
 
-fn save_config(config: &AppConfig, profile: Option<&str>) -> Result<()> {
-    // Runtime credentials always live in dotlink's owned XDG namespace, even
-    // when DOTLINK_CONFIG points at a project-local JSONC file.
-    ensure_dotlink_config_dir()?;
-    let path = config_path(profile)?;
-    let config_bytes = serialize_jsonc(config)?.into_bytes();
+fn profile_lock(profile: Option<&str>) -> Result<fs::File> {
+    let dir = ensure_dotlink_config_dir()?;
+    let name = profile.unwrap_or("default");
+    crate::private_state::acquire(
+        &dir.join(format!("profile.{name}.lock")),
+        Duration::from_secs(10),
+    )
+}
+
+/// The JSONC rename chooses the credential generation. All referenced secrets
+/// have been written and synced before that single commit; a crash before it
+/// leaves the old profile intact, while a crash after it loads the new pair.
+fn save_config_locked(
+    config: &AppConfig,
+    profile: Option<&str>,
+    owner_changed: bool,
+) -> Result<()> {
+    let previous = read_profile_config(profile)?;
     let existing_key = try_read_saved_runtime_key(profile)?;
     let desired_key = config.runtime_api_key.trim();
-    let key_changed = !desired_key.is_empty() && existing_key.as_deref() != Some(desired_key);
-
-    // Write a changed secret first so a new config can never point at a
-    // missing/truncated key. If the config replace then fails, roll the secret
-    // back atomically to preserve the previous profile state.
-    if key_changed {
-        save_runtime_key(desired_key, profile)?;
+    let mut next = config.clone();
+    next.runtime_key_revision = previous
+        .as_ref()
+        .and_then(|previous| previous.runtime_key_revision.clone());
+    if !owner_changed {
+        // A normal permission/transport edit cannot roll back a password
+        // changed by another invocation.
+        next.owner_password_revision = previous
+            .as_ref()
+            .and_then(|previous| previous.owner_password_revision.clone())
+            .or_else(|| config.owner_password_revision.clone());
     }
 
-    if let Err(config_error) =
-        atomic_write_private(&path, &config_bytes, config_parent_is_dotlink_owned())
-    {
-        if key_changed {
-            let rollback = match existing_key {
-                Some(ref previous) => save_runtime_key(previous, profile),
-                None => remove_runtime_key_file(profile),
-            };
-            if let Err(rollback_error) = rollback {
-                return Err(config_error).context(format!(
-                    "profile config update failed and runtime-key rollback also failed: {rollback_error:#}"
-                ));
-            }
-        }
-        return Err(config_error);
+    if !desired_key.is_empty() && existing_key.as_deref() != Some(desired_key) {
+        let revision = uuid::Uuid::new_v4().simple().to_string();
+        let key_path = credential_revision_path(profile, &revision)?;
+        let mut bytes = desired_key
+            .trim_end_matches(['\r', '\n'])
+            .as_bytes()
+            .to_vec();
+        bytes.push(b'\n');
+        // A never-before-referenced file. On a failed or interrupted write it
+        // can be discarded without affecting the currently selected key.
+        atomic_write_private(&key_path, &bytes, true)?;
+        // Make the key's directory entry durable *before* the config points
+        // to it. Unlike the final rename, this is still a pre-commit error.
+        sync_parent_directory(&key_path)?;
+        next.runtime_key_revision = Some(revision);
     }
-
-    Ok(())
+    let bytes = serialize_jsonc(&next)?.into_bytes();
+    atomic_write_private(
+        &config_path(profile)?,
+        &bytes,
+        config_parent_is_dotlink_owned(),
+    )
 }
 
 fn parse_jsonc<T: DeserializeOwned>(text: &str) -> Result<T> {
@@ -2327,7 +2379,7 @@ pub fn show_profile(name: &str) -> Result<String> {
     if has_key {
         output.push_str("// Runtime API key: [existing key]\n");
     }
-    if oauth::owner_configured(target)? {
+    if oauth::owner_configured(target, config.owner_password_revision.as_deref())? {
         output.push_str("// OAuth owner credential: [existing credential]\n");
     }
     output.push_str(&serialize_jsonc(&config)?);
@@ -2387,9 +2439,13 @@ pub fn delete_profile(name: &str) -> Result<()> {
     if !config.exists() && !key.exists() && !oauth_state.exists() {
         bail!("profile {name:?} does not exist");
     }
+    let _profile_lock = profile_lock(target)?;
     if config.exists() || key.exists() {
         delete_profile_artifacts(name, &config, &key)?;
     }
+    // Config has been removed: no future load can select these generations.
+    // Keep deletion retryable; stale private generations are cleaned here.
+    delete_runtime_key_generations(target)?;
     oauth::delete_profile_state(target)
 }
 
@@ -2411,7 +2467,9 @@ pub fn mutate_profile_rule(
     path: PathBuf,
     remove: bool,
 ) -> Result<()> {
-    let (target, mut config) = require_profile(name)?;
+    let target = profile_target(name)?;
+    let _lock = profile_lock(target)?;
+    let (_, mut config) = require_profile(name)?;
     let paths = rule_paths_mut(&mut config, allow, kind);
     if remove {
         let before = paths.len();
@@ -2423,7 +2481,7 @@ pub fn mutate_profile_rule(
         paths.push(path);
     }
     validate_config(&config)?;
-    save_config(&config, target)
+    save_config_locked(&config, target, false)
 }
 
 fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: bool) -> Result<()> {
@@ -2534,7 +2592,9 @@ fn apply_profile_bool(config: &mut AppConfig, setting: ProfileBool, enabled: boo
 }
 
 pub fn set_profile_bool(name: &str, setting: ProfileBool, enabled: bool) -> Result<()> {
-    let (target, mut config) = require_profile(name)?;
+    let target = profile_target(name)?;
+    let _lock = profile_lock(target)?;
+    let (_, mut config) = require_profile(name)?;
     apply_profile_bool(&mut config, setting, enabled)?;
     if config.transports.openai
         && (config.tunnel_id.is_none() || config.runtime_api_key.trim().is_empty())
@@ -2543,45 +2603,81 @@ pub fn set_profile_bool(name: &str, setting: ProfileBool, enabled: bool) -> Resu
             "OpenAI is not fully configured for profile {name:?}; run dotlink profile edit {name} first"
         );
     }
-    if (config.oauth.enabled || config.transports.ngrok) && !oauth::owner_configured(target)? {
+    if (config.oauth.enabled || config.transports.ngrok)
+        && !oauth::owner_configured(target, config.owner_password_revision.as_deref())?
+    {
         bail!(
             "OAuth has no owner credential for profile {name:?}; run dotlink profile edit {name} first"
         );
     }
     validate_config(&config)?;
-    save_config(&config, target)
+    save_config_locked(&config, target, false)
 }
 
-fn remove_runtime_key_file(profile: Option<&str>) -> Result<()> {
-    let path = credential_path(profile)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+fn credential_revision_path(profile: Option<&str>, revision: &str) -> Result<PathBuf> {
+    if revision.len() != 32 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid runtime-key generation in profile");
     }
+    let dir = dotlink_config_dir()?;
+    let prefix = profile.map_or_else(|| "runtime".to_owned(), |name| format!("runtime.{name}"));
+    Ok(dir.join(format!("{prefix}.{revision}.key")))
 }
 
-fn save_runtime_key(key: &str, profile: Option<&str>) -> Result<()> {
-    let path = credential_path(profile)?;
-    let mut contents = key.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
-    contents.push(b'\n');
-    atomic_write_private(&path, &contents, config_parent_is_dotlink_owned())
+/// Delete only generated keys for this named profile; never touch other
+/// profiles or unrelated files in the private credential directory.
+fn delete_runtime_key_generations(profile: Option<&str>) -> Result<()> {
+    let dir = dotlink_config_dir()?;
+    if !dir.exists() {
+        return Ok(());
+    }
+    let prefix = profile.map_or_else(|| "runtime.".to_owned(), |name| format!("runtime.{name}."));
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(revision) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".key"))
+            && revision.len() == 32
+            && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("cannot remove private runtime key {}", name))?;
+        }
+    }
+    Ok(())
 }
 
 fn try_read_saved_runtime_key(profile: Option<&str>) -> Result<Option<String>> {
-    let path = credential_path(profile)?;
-    let key = match fs::read_to_string(&path) {
+    let config = read_profile_config(profile)?;
+    let requires_key = config
+        .as_ref()
+        .is_some_and(|config| config.transports.openai);
+    let path = match config.and_then(|config| config.runtime_key_revision) {
+        Some(revision) => credential_revision_path(profile, &revision)?,
+        None => credential_path(profile)?,
+    };
+    // A disabled OpenAI transport does not need its saved credential to
+    // exist. Re-enabling it validates the selected generation strictly.
+    read_runtime_key_file(&path, requires_key && path != credential_path(profile)?)
+}
+
+fn read_runtime_key_file(path: &Path, versioned: bool) -> Result<Option<String>> {
+    let key = match fs::read_to_string(path) {
         Ok(key) => key,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !versioned => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!("selected runtime key is missing: {}", path.display());
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", path.display()));
         }
     };
     let key = key.trim().to_owned();
-    if key.is_empty() {
-        return Ok(None);
+    if key.is_empty() && versioned {
+        bail!("selected runtime key is empty: {}", path.display());
     }
-    Ok(Some(key))
+    Ok((!key.is_empty()).then_some(key))
 }
 
 fn validate_profile(profile: Option<&str>) -> Result<()> {
@@ -2616,6 +2712,22 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
             config.version,
             config_version()
         );
+    }
+    for (name, revision) in [
+        (
+            "runtime_key_revision",
+            config.runtime_key_revision.as_deref(),
+        ),
+        (
+            "owner_password_revision",
+            config.owner_password_revision.as_deref(),
+        ),
+    ] {
+        if let Some(revision) = revision
+            && (revision.len() != 32 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            bail!("{name} must be a 32-character hexadecimal generation");
+        }
     }
 
     if config.permissions.allow_network && !config.permissions.allow_shell {
@@ -2890,6 +3002,8 @@ mod tests {
             caches: Vec::new(),
             tunnel_id: Some("tunnel_0123456789abcdef0123456789abcdef".to_owned()),
             runtime_api_key: "secret-runtime-key".to_owned(),
+            runtime_key_revision: None,
+            owner_password_revision: None,
             organization_id: None,
             base_url: DEFAULT_BASE_URL.to_owned(),
             max_shell_timeout_secs: 120,
@@ -3244,6 +3358,47 @@ mod tests {
         assert!(validate_tunnel_id("tunnel_bad id").is_err());
         assert!(validate_tunnel_id("tunnel_bad/path").is_err());
         assert!(validate_tunnel_id("nope").is_err());
+    }
+
+    #[test]
+    fn versioned_runtime_keys_do_not_fall_back_to_legacy_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("runtime.key");
+        let selected = temp.path().join("runtime.abcd.key");
+        std::fs::write(&legacy, "legacy-key\n").unwrap();
+        std::fs::write(&selected, "new-key\n").unwrap();
+        assert_eq!(
+            read_runtime_key_file(&legacy, false).unwrap().as_deref(),
+            Some("legacy-key")
+        );
+        assert_eq!(
+            read_runtime_key_file(&selected, true).unwrap().as_deref(),
+            Some("new-key")
+        );
+        std::fs::remove_file(&selected).unwrap();
+        assert!(read_runtime_key_file(&selected, true).is_err());
+        assert_eq!(
+            read_runtime_key_file(&legacy, false).unwrap().as_deref(),
+            Some("legacy-key")
+        );
+    }
+
+    #[test]
+    fn configuration_can_atomically_select_opaque_credential_generations() {
+        let mut config = example_config();
+        config.runtime_key_revision = Some("a".repeat(32));
+        config.owner_password_revision = Some("b".repeat(32));
+        let encoded = serialize_jsonc(&config).unwrap();
+        assert!(!encoded.contains("secret-runtime-key"));
+        let decoded: AppConfig = parse_jsonc(&encoded).unwrap();
+        assert_eq!(decoded.runtime_key_revision, config.runtime_key_revision);
+        assert_eq!(
+            decoded.owner_password_revision,
+            config.owner_password_revision
+        );
+        validate_config_structure(&decoded).unwrap();
+        config.runtime_key_revision = Some("../../escape".to_owned());
+        assert!(validate_config_structure(&config).is_err());
     }
 
     #[test]

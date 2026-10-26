@@ -35,9 +35,7 @@ use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use crate::bounded;
-use crate::setup::{
-    atomic_write_private, set_private_dir_permissions, set_private_file_permissions,
-};
+use crate::setup::{atomic_write_private, set_private_dir_permissions};
 
 const STATE_VERSION: u32 = 1;
 const ACCESS_TOKEN_TTL_SECS: i64 = 15 * 60;
@@ -134,6 +132,8 @@ struct RefreshGrant {
 struct PersistentState {
     version: u32,
     owner_password_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    owner_password_generations: BTreeMap<String, String>,
     #[serde(default)]
     clients: BTreeMap<String, RegisteredClient>,
     #[serde(default)]
@@ -145,6 +145,7 @@ impl Default for PersistentState {
         Self {
             version: STATE_VERSION,
             owner_password_hash: None,
+            owner_password_generations: BTreeMap::new(),
             clients: BTreeMap::new(),
             refresh_tokens: BTreeMap::new(),
         }
@@ -188,6 +189,7 @@ struct PendingAuthorization {
 
 struct RuntimeState {
     state_path: PathBuf,
+    owner_password_revision: Option<String>,
     persistent: Mutex<PersistentState>,
     pending_clients: Mutex<HashMap<String, RegisteredClient>>,
     access_tokens: Mutex<HashMap<String, AccessGrant>>,
@@ -220,7 +222,7 @@ pub struct Server {
 
 pub struct OwnerPasswordChange {
     path: PathBuf,
-    previous_hash: Option<String>,
+    revision: String,
     updated_hash: String,
 }
 
@@ -311,12 +313,10 @@ fn client_metadata(client: &RegisteredClient) -> ClientMetadata {
 }
 
 impl Runtime {
-    pub fn load(profile: Option<&str>) -> Result<Self> {
+    pub fn load(profile: Option<&str>, selected_revision: Option<&str>) -> Result<Self> {
         let path = state_path(profile)?;
         let persistent = read_state(&path)?;
-        let hash = persistent
-            .owner_password_hash
-            .as_deref()
+        let hash = active_owner_hash(&persistent, selected_revision)
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 anyhow!(
@@ -332,6 +332,7 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(RuntimeState {
                 state_path: path,
+                owner_password_revision: selected_revision.map(str::to_owned),
                 persistent: Mutex::new(persistent),
                 pending_clients: Mutex::new(HashMap::new()),
                 access_tokens: Mutex::new(HashMap::new()),
@@ -386,9 +387,8 @@ impl Runtime {
                 .persistent
                 .lock()
                 .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-            state
-                .owner_password_hash
-                .clone()
+            active_owner_hash(&state, self.inner.owner_password_revision.as_deref())
+                .map(str::to_owned)
                 .ok_or_else(|| anyhow!("OAuth owner password is not configured"))?
         };
 
@@ -804,11 +804,19 @@ fn validate_profile_component(profile: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn owner_configured(profile: Option<&str>) -> Result<bool> {
-    Ok(read_state(&state_path(profile)?)?
-        .owner_password_hash
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty()))
+fn active_owner_hash<'a>(state: &'a PersistentState, revision: Option<&str>) -> Option<&'a str> {
+    match revision {
+        Some(revision) => state
+            .owner_password_generations
+            .get(revision)
+            .map(String::as_str),
+        None => state.owner_password_hash.as_deref(),
+    }
+}
+
+pub fn owner_configured(profile: Option<&str>, revision: Option<&str>) -> Result<bool> {
+    let state = read_state(&state_path(profile)?)?;
+    Ok(active_owner_hash(&state, revision).is_some_and(|value| !value.trim().is_empty()))
 }
 
 pub fn prepare_owner_password(
@@ -817,8 +825,6 @@ pub fn prepare_owner_password(
 ) -> Result<OwnerPasswordChange> {
     validate_owner_password(password)?;
     let path = state_path(profile)?;
-    let previous_hash = read_state(&path)?.owner_password_hash;
-
     let mut salt_bytes = [0u8; 16];
     getrandom::fill(&mut salt_bytes)
         .map_err(|error| anyhow!("failed to generate OAuth password salt: {error}"))?;
@@ -831,27 +837,38 @@ pub fn prepare_owner_password(
 
     Ok(OwnerPasswordChange {
         path,
-        previous_hash,
+        revision: uuid::Uuid::new_v4().simple().to_string(),
         updated_hash,
     })
 }
 
 impl OwnerPasswordChange {
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// Stage an immutable password hash in the existing OAuth state. Neither
+    /// existing authorizations nor the legacy owner credential change until
+    /// the profile atomically selects this revision.
     pub fn apply(&self) -> Result<()> {
+        let revision = self.revision.clone();
         let updated = self.updated_hash.clone();
         update_state(&self.path, move |state| {
-            state.owner_password_hash = Some(updated);
+            if state.owner_password_generations.contains_key(&revision) {
+                bail!("duplicate OAuth owner generation");
+            }
+            state.owner_password_generations.insert(revision, updated);
             Ok(())
         })?;
         Ok(())
     }
 
     pub fn rollback(&self) -> Result<()> {
-        let previous = self.previous_hash.clone();
+        let revision = self.revision.clone();
         let updated = self.updated_hash.clone();
         let (state, ()) = update_state(&self.path, move |state| {
-            if state.owner_password_hash.as_deref() == Some(updated.as_str()) {
-                state.owner_password_hash = previous;
+            if state.owner_password_generations.get(&revision) == Some(&updated) {
+                state.owner_password_generations.remove(&revision);
             }
             Ok(())
         })?;
@@ -886,7 +903,8 @@ pub fn delete_profile_state(profile: Option<&str>) -> Result<()> {
 pub fn status(profile: Option<&str>) -> Result<String> {
     let path = state_path(profile)?;
     let state = read_state(&path)?;
-    let owner = state.owner_password_hash.is_some();
+    let selected = crate::setup::profile_owner_revision(profile)?;
+    let owner = active_owner_hash(&state, selected.as_deref()).is_some();
     Ok(format!(
         "OAuth state: {}\nOwner credential: {}\nDCR clients: {}\nRefresh grants: {}\n",
         path.display(),
@@ -1787,38 +1805,7 @@ fn state_lock_path(path: &Path) -> PathBuf {
 }
 
 fn open_state_lock(path: &Path) -> Result<fs::File> {
-    let lock_path = state_lock_path(path);
-    let parent = lock_path
-        .parent()
-        .ok_or_else(|| anyhow!("OAuth state lock path has no parent"))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    set_private_dir_permissions(parent)?;
-
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    set_private_file_permissions(&lock_path)?;
-    let deadline = Instant::now() + STATE_LOCK_TIMEOUT;
-    loop {
-        match lock.try_lock() {
-            Ok(()) => return Ok(lock),
-            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(fs::TryLockError::WouldBlock) => {
-                bail!("OAuth state is busy: {}; retry", lock_path.display());
-            }
-            Err(fs::TryLockError::Error(error)) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(fs::TryLockError::Error(error)) => {
-                return Err(error)
-                    .with_context(|| format!("failed to lock {}", lock_path.display()));
-            }
-        }
-    }
+    crate::private_state::acquire(&state_lock_path(path), STATE_LOCK_TIMEOUT)
 }
 
 fn update_state<T>(
@@ -2004,6 +1991,7 @@ mod tests {
             Runtime {
                 inner: Arc::new(RuntimeState {
                     state_path: PathBuf::from("/tmp/unused"),
+                    owner_password_revision: None,
                     persistent: Mutex::new(PersistentState {
                         owner_password_hash: Some(
                             "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$RmFrZUhhc2hUaGF0SXNOZXZlclVzZWQ".to_owned(),
@@ -2141,12 +2129,44 @@ mod tests {
     }
 
     #[test]
+    fn staged_owner_revision_does_not_change_active_legacy_password() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("oauth.json");
+        let original = PersistentState {
+            owner_password_hash: Some("old-hash".into()),
+            ..PersistentState::default()
+        };
+        write_state(&path, &original).unwrap();
+
+        let change = OwnerPasswordChange {
+            path: path.clone(),
+            revision: "000000000000000000000000000000ab".into(),
+            updated_hash: "new-hash".into(),
+        };
+        change.apply().unwrap();
+        let staged = read_state(&path).unwrap();
+        assert_eq!(active_owner_hash(&staged, None), Some("old-hash"));
+        assert_eq!(
+            active_owner_hash(&staged, Some(change.revision())),
+            Some("new-hash")
+        );
+        assert_eq!(active_owner_hash(&staged, Some("does-not-exist")), None);
+        change.rollback().unwrap();
+        let rolled_back = read_state(&path).unwrap();
+        assert_eq!(active_owner_hash(&rolled_back, None), Some("old-hash"));
+        assert_eq!(
+            active_owner_hash(&rolled_back, Some(change.revision())),
+            None
+        );
+    }
+
+    #[test]
     fn new_owner_password_rollback_removes_empty_state_file() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("oauth.json");
         let change = OwnerPasswordChange {
             path: path.clone(),
-            previous_hash: None,
+            revision: "00000000000000000000000000000001".to_owned(),
             updated_hash: "new-hash".to_owned(),
         };
 
@@ -2180,7 +2200,7 @@ mod tests {
 
         let change = OwnerPasswordChange {
             path: path.clone(),
-            previous_hash: Some("old-hash".to_owned()),
+            revision: "00000000000000000000000000000002".to_owned(),
             updated_hash: "new-hash".to_owned(),
         };
         change.apply().unwrap();
@@ -2284,6 +2304,7 @@ mod tests {
         let runtime = Runtime {
             inner: Arc::new(RuntimeState {
                 state_path,
+                owner_password_revision: None,
                 persistent: Mutex::new(persistent),
                 pending_clients: Mutex::new(HashMap::new()),
                 access_tokens: Mutex::new(HashMap::new()),
