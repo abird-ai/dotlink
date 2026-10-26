@@ -591,6 +591,15 @@ impl Runtime {
         scope: &str,
         issue_refresh: bool,
     ) -> Result<(String, Option<String>)> {
+        // Do every potentially failing token/lock step before the durable
+        // refresh-grant update. After that commit, publishing the already
+        // prepared access token is infallible.
+        let access = random_token()?;
+        let mut access_tokens = self
+            .inner
+            .access_tokens
+            .lock()
+            .map_err(|_| anyhow!("OAuth access-token lock poisoned"))?;
         let refresh = if issue_refresh {
             let refresh = random_token()?;
             let grant = RefreshGrant {
@@ -619,12 +628,6 @@ impl Runtime {
             None
         };
 
-        let access = random_token()?;
-        let mut access_tokens = self
-            .inner
-            .access_tokens
-            .lock()
-            .map_err(|_| anyhow!("OAuth access-token lock poisoned"))?;
         make_room_for_access_token(&mut access_tokens);
         access_tokens.insert(
             token_hash(&access),
@@ -649,6 +652,14 @@ impl Runtime {
     ) -> Result<Option<(String, String, String)>> {
         let hash = token_hash(raw);
         let current = now();
+        // A committed refresh rotation must never be followed by a fallible
+        // token generator or poisoned access-token mutex.
+        let access = random_token()?;
+        let mut access_tokens = self
+            .inner
+            .access_tokens
+            .lock()
+            .map_err(|_| anyhow!("OAuth access-token lock poisoned"))?;
         let rotated = self.update_persistent(|state| {
             let Some(grant) = state.refresh_tokens.get(&hash) else {
                 return Ok(None);
@@ -680,12 +691,6 @@ impl Runtime {
             return Ok(None);
         };
 
-        let access = random_token()?;
-        let mut access_tokens = self
-            .inner
-            .access_tokens
-            .lock()
-            .map_err(|_| anyhow!("OAuth access-token lock poisoned"))?;
         make_room_for_access_token(&mut access_tokens);
         access_tokens.insert(
             token_hash(&access),
@@ -1322,6 +1327,23 @@ async fn authorize_post(State(server): State<Server>, Form(form): Form<Authorize
     )
 }
 
+/// Distinguish an invalid grant from a temporary failure to persist an
+/// otherwise-valid token exchange. Clients may retry a 503 using the same code.
+#[derive(Debug)]
+struct TokenIssuanceFailure(anyhow::Error);
+
+impl std::fmt::Display for TokenIssuanceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "OAuth token issuance is temporarily unavailable")
+    }
+}
+
+impl std::error::Error for TokenIssuanceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 async fn token(State(server): State<Server>, Form(form): Form<TokenForm>) -> Response {
     if ensure_max_len("grant_type", &form.grant_type, 64).is_err() {
         return token_error("invalid_request", "grant_type is too long");
@@ -1340,6 +1362,13 @@ async fn token(State(server): State<Server>, Form(form): Form<TokenForm>) -> Res
 
     match result {
         Ok(value) => no_store_json(StatusCode::OK, value),
+        Err(error) if error.is::<TokenIssuanceFailure>() => no_store_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "error": "server_error",
+                "error_description": "OAuth token storage is unavailable; retry the same grant"
+            }),
+        ),
         Err(error) => token_error("invalid_grant", &bounded_text(&format!("{error:#}"), 400)),
     }
 }
@@ -1369,39 +1398,43 @@ fn exchange_authorization_code(server: &Server, form: TokenForm) -> Result<Value
     }
     validate_code_verifier(&verifier)?;
 
-    let record = {
-        let mut codes = server
-            .runtime
-            .inner
-            .authorization_codes
-            .lock()
-            .map_err(|_| anyhow!("OAuth authorization-code lock poisoned"))?;
-        let key = token_hash(&code);
-        let record = codes
-            .get(&key)
-            .ok_or_else(|| anyhow!("authorization code is invalid or already used"))?;
-        if record.expires_at <= now()
-            || record.client_id != client_id
-            || record.redirect_uri != redirect_uri
-            || record.issuer != server.issuer
-            || record.resource != server.resource
-            || pkce_challenge(&verifier) != record.code_challenge
-        {
-            bail!("authorization code validation failed");
-        }
-        codes
-            .remove(&key)
-            .ok_or_else(|| anyhow!("authorization code is invalid or already used"))?
-    };
+    // One lock serializes redemption of this in-memory code. Validate first,
+    // commit any persistent grant, *then* consume the code. A transient
+    // persistence failure keeps it retryable; a successful exchange cannot
+    // race with another request using the same code.
+    let mut codes = server
+        .runtime
+        .inner
+        .authorization_codes
+        .lock()
+        .map_err(|_| anyhow!("OAuth authorization-code lock poisoned"))?;
+    let key = token_hash(&code);
+    let record = codes
+        .get(&key)
+        .ok_or_else(|| anyhow!("authorization code is invalid or already used"))?;
+    if record.expires_at <= now()
+        || record.client_id != client_id
+        || record.redirect_uri != redirect_uri
+        || record.issuer != server.issuer
+        || record.resource != server.resource
+        || pkce_challenge(&verifier) != record.code_challenge
+    {
+        bail!("authorization code validation failed");
+    }
 
-    let (access, refresh) = server.runtime.issue_access_and_refresh(
-        &client_id,
-        &server.issuer,
-        &server.resource,
-        &record.scope,
-        record.issue_refresh,
-    )?;
-    Ok(token_response(access, refresh, record.scope))
+    let (access, refresh) = server
+        .runtime
+        .issue_access_and_refresh(
+            &client_id,
+            &server.issuer,
+            &server.resource,
+            &record.scope,
+            record.issue_refresh,
+        )
+        .map_err(|error| anyhow::Error::new(TokenIssuanceFailure(error)))?;
+    let scope = record.scope.clone();
+    codes.remove(&key);
+    Ok(token_response(access, refresh, scope))
 }
 
 fn exchange_refresh_token(server: &Server, form: TokenForm) -> Result<Value> {
@@ -1421,10 +1454,10 @@ fn exchange_refresh_token(server: &Server, form: TokenForm) -> Result<Value> {
         bail!("resource does not match this MCP server");
     }
 
-    let Some((access, new_refresh, scope)) =
-        server
-            .runtime
-            .rotate_refresh(&refresh, &client_id, &server.issuer, &server.resource)?
+    let Some((access, new_refresh, scope)) = server
+        .runtime
+        .rotate_refresh(&refresh, &client_id, &server.issuer, &server.resource)
+        .map_err(|error| anyhow::Error::new(TokenIssuanceFailure(error)))?
     else {
         bail!("refresh token is invalid or expired");
     };

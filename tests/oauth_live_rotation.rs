@@ -41,7 +41,7 @@ async fn approval(
     base: &str,
     client_id: &str,
     password: &str,
-) -> (StatusCode, String) {
+) -> (StatusCode, String, Option<String>) {
     let response = client
         .get(format!("{base}/oauth/authorize"))
         .query(&[
@@ -49,7 +49,7 @@ async fn approval(
             ("client_id", client_id),
             ("redirect_uri", "https://client.example/callback"),
             ("resource", &format!("{base}/mcp")),
-            ("scope", "mcp:access"),
+            ("scope", "mcp:access offline_access"),
             (
                 "code_challenge",
                 "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
@@ -77,8 +77,13 @@ async fn approval(
         .await
         .unwrap();
     let status = response.status();
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|header| header.to_str().ok())
+        .map(str::to_owned);
     let body = response.text().await.unwrap();
-    (status, body)
+    (status, body, location)
 }
 
 #[tokio::test]
@@ -178,7 +183,8 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
         .unwrap();
     let client_id = registration["client_id"].as_str().unwrap();
 
-    let (old_before, _) = approval(&client, &base, client_id, "first-valid-owner-password").await;
+    let (old_before, _, _) =
+        approval(&client, &base, client_id, "first-valid-owner-password").await;
     assert_eq!(old_before, StatusCode::SEE_OTHER);
 
     // Stage the new hash first, then commit the profile selector. Preserve
@@ -190,13 +196,15 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
     profile["owner_password_revision"] = json!(revision_two);
     replace_json(&config, &profile);
 
-    let (new_after, _) = approval(&client, &base, client_id, "second-valid-owner-password").await;
+    let (new_after, _, new_location) =
+        approval(&client, &base, client_id, "second-valid-owner-password").await;
     assert_eq!(
         new_after,
         StatusCode::SEE_OTHER,
         "rotated owner password was rejected"
     );
-    let (old_after, body) = approval(&client, &base, client_id, "first-valid-owner-password").await;
+    let (old_after, body, _) =
+        approval(&client, &base, client_id, "first-valid-owner-password").await;
     assert_eq!(
         old_after,
         StatusCode::OK,
@@ -204,12 +212,74 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
     );
     assert!(body.contains("Invalid owner password"), "{body}");
 
+    // A temporary persistence failure must not consume a valid authorization
+    // code. Once state can be written again, exactly one concurrent redemption
+    // succeeds; the second request must not issue another pair of tokens.
+    let callback = url::Url::parse(new_location.as_deref().unwrap()).unwrap();
+    let code = callback
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .unwrap();
+    let resource = format!("{base}/mcp");
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("client_id", client_id),
+        ("redirect_uri", "https://client.example/callback"),
+        ("resource", resource.as_str()),
+        (
+            "code_verifier",
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+        ),
+    ];
+    let lock = std::path::PathBuf::from(format!("{}.lock", state.display()));
+    fs::remove_file(&lock).unwrap();
+    fs::create_dir(&lock).unwrap();
+    let failed = client
+        .post(format!("{base}/oauth/token"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = failed.json().await.unwrap();
+    assert_eq!(body["error"], "server_error");
+    fs::remove_dir(&lock).unwrap();
+
+    let first = client
+        .post(format!("{base}/oauth/token"))
+        .form(&form)
+        .send();
+    let second = client
+        .post(format!("{base}/oauth/token"))
+        .form(&form)
+        .send();
+    let (first, second) = tokio::join!(first, second);
+    let statuses = [first.unwrap().status(), second.unwrap().status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        1,
+        "one exchange must succeed after the state lock becomes available"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::BAD_REQUEST)
+            .count(),
+        1,
+        "a successfully redeemed code must be one-time"
+    );
+
     // Deleting a previously persisted profile must never fall back to a
     // legacy hash, even if that hash remains in the OAuth state.
     saved["owner_password_hash"] = json!(owner_hash("first-valid-owner-password"));
     replace_json(&state, &saved);
     fs::remove_file(&config).unwrap();
-    let (deleted, _) = approval(&client, &base, client_id, "first-valid-owner-password").await;
+    let (deleted, _, _) = approval(&client, &base, client_id, "first-valid-owner-password").await;
     assert_ne!(
         deleted,
         StatusCode::SEE_OTHER,
