@@ -14,7 +14,11 @@ use rmcp::transport::streamable_http_server::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::Semaphore, task::JoinSet, time};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+    time,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -283,10 +287,37 @@ impl EmbeddedMcp {
         }
     }
 
+    // A convenience collector for tests; the runtime uses dispatch_stream
+    // below to forward progress as it is emitted, not after the tool returns.
+    #[cfg(test)]
     async fn dispatch(
         &self,
         command_headers: &BTreeMap<String, Vec<String>>,
         jsonrpc: &Value,
+    ) -> Result<LocalResponse> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let dispatch = self.dispatch_stream(command_headers, jsonrpc, tx);
+        tokio::pin!(dispatch);
+        let mut events = Vec::new();
+        let mut local = loop {
+            tokio::select! {
+                result = &mut dispatch => break result?,
+                Some(event) = rx.recv() => events.push(event),
+            }
+        };
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events.append(&mut local.messages);
+        local.messages = events;
+        Ok(local)
+    }
+
+    async fn dispatch_stream(
+        &self,
+        command_headers: &BTreeMap<String, Vec<String>>,
+        jsonrpc: &Value,
+        notifications: mpsc::Sender<Value>,
     ) -> Result<LocalResponse> {
         let body = serde_json::to_vec(jsonrpc).context("failed to serialize MCP command")?;
         let mut request = Request::builder()
@@ -322,21 +353,61 @@ impl EmbeddedMcp {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        let bytes = bounded::local_response(
-            response.into_body(),
-            self.max_response_bytes,
-            "local MCP response",
-        )
-        .await?;
+        let messages = if content_type.contains("text/event-stream") {
+            use http_body_util::BodyExt as _;
 
-        let messages = if bytes.is_empty() {
-            Vec::new()
-        } else if content_type.contains("text/event-stream") {
-            parse_sse_messages(&bytes)?
-        } else if content_type.contains("application/json") || looks_like_json(&bytes) {
-            vec![serde_json::from_slice(&bytes).context("local MCP returned invalid JSON")?]
+            let mut stream = response.into_body();
+            let mut parser = SseDecoder::default();
+            let mut total = 0_usize;
+            let mut terminal = Vec::new();
+            while let Some(frame) = stream.frame().await {
+                let frame = frame.context("failed reading local MCP stream")?;
+                let Some(bytes) = frame.data_ref() else {
+                    continue;
+                };
+                total = total.saturating_add(bytes.len());
+                if total > self.max_response_bytes {
+                    bail!(
+                        "local MCP response exceeded {} bytes",
+                        self.max_response_bytes
+                    );
+                }
+                for event in parser.feed(bytes)? {
+                    if is_jsonrpc_notification(&event) {
+                        notifications
+                            .send(event)
+                            .await
+                            .map_err(|_| anyhow!("MCP progress receiver closed"))?;
+                    } else {
+                        terminal.push(event);
+                    }
+                }
+            }
+            for event in parser.finish()? {
+                if is_jsonrpc_notification(&event) {
+                    notifications
+                        .send(event)
+                        .await
+                        .map_err(|_| anyhow!("MCP progress receiver closed"))?;
+                } else {
+                    terminal.push(event);
+                }
+            }
+            terminal
         } else {
-            bail!("local MCP returned unsupported Content-Type {content_type:?}");
+            let bytes = bounded::local_response(
+                response.into_body(),
+                self.max_response_bytes,
+                "local MCP response",
+            )
+            .await?;
+            if bytes.is_empty() {
+                Vec::new()
+            } else if content_type.contains("application/json") || looks_like_json(&bytes) {
+                vec![serde_json::from_slice(&bytes).context("local MCP returned invalid JSON")?]
+            } else {
+                bail!("local MCP returned unsupported Content-Type {content_type:?}");
+            }
         };
 
         Ok(LocalResponse {
@@ -388,44 +459,86 @@ fn looks_like_json(bytes: &[u8]) -> bool {
         .is_some_and(|b| b == b'{' || b == b'[')
 }
 
-fn parse_sse_messages(bytes: &[u8]) -> Result<Vec<Value>> {
-    let text = std::str::from_utf8(bytes).context("local MCP returned non-UTF-8 SSE")?;
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut messages = Vec::new();
-    let mut data_lines: Vec<&str> = Vec::new();
+/// Incremental SSE decoding: a progress event becomes available as soon as
+/// its blank-line delimiter arrives, independent of the terminal JSON-RPC reply.
+/// Overall memory is bounded by the caller's stream byte ceiling.
+#[derive(Default)]
+struct SseDecoder {
+    line: Vec<u8>,
+    data: Vec<String>,
+    after_cr: bool,
+}
 
-    let flush = |data_lines: &mut Vec<&str>, messages: &mut Vec<Value>| -> Result<()> {
-        if data_lines.is_empty() {
+impl SseDecoder {
+    fn flush(&mut self, events: &mut Vec<Value>) -> Result<()> {
+        if self.data.is_empty() {
             return Ok(());
         }
-        let payload = data_lines.join("\n");
-        data_lines.clear();
+        let payload = self.data.join("\n");
+        self.data.clear();
         if payload.trim().is_empty() {
             return Ok(());
         }
-        messages.push(serde_json::from_str(&payload).with_context(|| {
+        events.push(serde_json::from_str(&payload).with_context(|| {
             format!(
                 "invalid JSON in local MCP SSE event: {}",
                 bounded(&payload, 500)
             )
         })?);
         Ok(())
-    };
-
-    for line in normalized.lines() {
-        if line.is_empty() {
-            flush(&mut data_lines, &mut messages)?;
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.strip_prefix(' ').unwrap_or(data));
-        }
     }
-    flush(&mut data_lines, &mut messages)?;
-    Ok(messages)
+
+    fn finish_line(&mut self, events: &mut Vec<Value>) -> Result<()> {
+        let line = std::str::from_utf8(&self.line).context("local MCP returned non-UTF-8 SSE")?;
+        if line.is_empty() {
+            self.flush(events)?;
+        } else if let Some(data) = line.strip_prefix("data:") {
+            self.data
+                .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+        }
+        self.line.clear();
+        Ok(())
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        for &byte in chunk {
+            match byte {
+                b'\r' => {
+                    self.finish_line(&mut events)?;
+                    self.after_cr = true;
+                }
+                b'\n' => {
+                    if !self.after_cr {
+                        self.finish_line(&mut events)?;
+                    }
+                    self.after_cr = false;
+                }
+                byte => {
+                    self.after_cr = false;
+                    self.line.push(byte);
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish(mut self) -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        if !self.line.is_empty() {
+            self.finish_line(&mut events)?;
+        }
+        self.flush(&mut events)?;
+        Ok(events)
+    }
+}
+
+#[cfg(test)]
+fn parse_sse_messages(bytes: &[u8]) -> Result<Vec<Value>> {
+    let mut parser = SseDecoder::default();
+    let mut events = parser.feed(bytes)?;
+    events.extend(parser.finish()?);
+    Ok(events)
 }
 
 #[derive(Clone)]
@@ -746,6 +859,61 @@ impl TunnelClient {
         }
     }
 
+    async fn forward_notification(
+        &self,
+        command: &TunnelCommand,
+        message: Value,
+        deadline: Option<Instant>,
+    ) -> bool {
+        self.post_notification(
+            command,
+            TunnelResponse {
+                request_id: command.request_id.clone(),
+                channel: command.channel.clone(),
+                resp_json: Some(message),
+                resp_headers: BTreeMap::new(),
+                resp_code: 200,
+                resp_type: "jsonrpc_notify".to_owned(),
+            },
+            deadline,
+        )
+        .await
+    }
+
+    async fn dispatch_and_forward(
+        &self,
+        mcp: &EmbeddedMcp,
+        command: &TunnelCommand,
+        jsonrpc: &Value,
+        deadline: Option<Instant>,
+    ) -> Result<LocalResponse> {
+        // A bounded channel separates SSE body decoding from tunnel delivery.
+        // Neither the decoder nor the caller buffers an entire command's
+        // heartbeats waiting for its terminal response.
+        let (tx, mut events) = mpsc::channel(16);
+        let dispatch = mcp.dispatch_stream(&command.headers, jsonrpc, tx);
+        tokio::pin!(dispatch);
+        let mut deliverable = true;
+        let local = loop {
+            tokio::select! {
+                result = &mut dispatch => break result?,
+                Some(message) = events.recv() => {
+                    if deliverable {
+                        deliverable = self.forward_notification(command, message, deadline).await;
+                    }
+                }
+            }
+        };
+        // The body has finished; drain notifications queued with its last frame
+        // before posting the terminal response.
+        while let Ok(message) = events.try_recv() {
+            if deliverable {
+                deliverable = self.forward_notification(command, message, deadline).await;
+            }
+        }
+        Ok(local)
+    }
+
     async fn process_command(
         &self,
         mcp: EmbeddedMcp,
@@ -799,7 +967,8 @@ impl TunnelClient {
                 let has_request_id = jsonrpc.get("id").is_some();
                 let request_label = verbose_request_label(jsonrpc);
                 let started = self.log.request("openai", &request_label);
-                let dispatch = mcp.dispatch(&command.headers, jsonrpc);
+                let dispatch =
+                    self.dispatch_and_forward(&mcp, &command, jsonrpc, dispatch_deadline);
                 let local = match await_before_deadline(dispatch_deadline, dispatch).await {
                     Ok(Some(result)) => match result {
                         Ok(response) => response,
@@ -2121,7 +2290,24 @@ mod tests {
                 "_meta": {"progressToken": "beat"}
             }
         });
-        let result = mcp.dispatch(&BTreeMap::new(), &call).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let task =
+            tokio::spawn(async move { mcp.dispatch_stream(&BTreeMap::new(), &call, tx).await });
+        let first = tokio::time::timeout(Duration::from_millis(700), rx.recv())
+            .await
+            .expect("first progress must be emitted before the shell exits")
+            .expect("SSE stream closed without a progress event");
+        assert!(
+            !task.is_finished(),
+            "progress arrived only after command completion"
+        );
+        let mut messages = vec![first];
+        while let Some(event) = rx.recv().await {
+            messages.push(event);
+        }
+        let mut result = task.await.unwrap().unwrap();
+        messages.append(&mut result.messages);
+        result.messages = messages;
         assert_eq!(result.status, 200);
 
         let progress: Vec<&Value> = result
@@ -2207,6 +2393,22 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         let body = result.messages.first().unwrap().to_string();
         assert!(body.contains("timed out after 1 seconds"), "{body}");
+    }
+
+    #[test]
+    fn sse_decoder_handles_split_crlf_without_delaying_events() {
+        let mut parser = SseDecoder::default();
+        let mut first = parser
+            .feed(br#"data: {"jsonrpc":"2.0","method":"notifications/progress"}"#)
+            .unwrap();
+        assert!(first.is_empty());
+        first.extend(parser.feed(b"\r").unwrap());
+        assert!(first.is_empty());
+        first.extend(parser.feed(b"\n\r").unwrap());
+        assert_eq!(first.len(), 1, "event must complete at the blank line");
+        assert_eq!(first[0]["method"], "notifications/progress");
+        assert!(parser.feed(b"\n").unwrap().is_empty());
+        assert!(parser.finish().unwrap().is_empty());
     }
 
     #[test]
