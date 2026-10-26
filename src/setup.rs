@@ -554,8 +554,30 @@ fn read_profile_config_migrated(profile: Option<&str>) -> Result<Option<AppConfi
     Ok(Some(config))
 }
 
-pub(crate) fn profile_owner_revision(profile: Option<&str>) -> Result<Option<String>> {
-    Ok(read_profile_config(profile)?.and_then(|config| config.owner_password_revision))
+/// Selected owner credential for a persisted profile, or no saved profile.
+pub(crate) enum ProfileOwnerSelection {
+    Absent,
+    Legacy,
+    Revision(String),
+}
+
+impl ProfileOwnerSelection {
+    pub(crate) fn revision(&self) -> Option<&str> {
+        match self {
+            Self::Revision(revision) => Some(revision),
+            Self::Absent | Self::Legacy => None,
+        }
+    }
+}
+
+pub(crate) fn profile_owner_selection(profile: Option<&str>) -> Result<ProfileOwnerSelection> {
+    Ok(match read_profile_config(profile)? {
+        None => ProfileOwnerSelection::Absent,
+        Some(config) => match config.owner_password_revision {
+            Some(revision) => ProfileOwnerSelection::Revision(revision),
+            None => ProfileOwnerSelection::Legacy,
+        },
+    })
 }
 
 fn read_profile_config(profile: Option<&str>) -> Result<Option<AppConfig>> {
@@ -585,8 +607,13 @@ pub async fn load_or_setup(
 
     if !force_setup {
         if let Some(mut config) = read_profile_config(profile)? {
-            config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
+            // Explicit runtime credentials take precedence over persisted ones.
+            // An inactive OpenAI transport must never touch a dormant secret,
+            // and an explicit override can recover a missing selected key.
             apply_env_overrides(&mut config, profile.is_none())?;
+            if config.transports.openai && config.runtime_api_key.trim().is_empty() {
+                config.runtime_api_key = try_read_saved_runtime_key(profile)?.unwrap_or_default();
+            }
             validate_config(&config)?;
             let protected_paths = protected_paths_for_config(&config, profile)?;
             return Ok(Some(SetupResult {

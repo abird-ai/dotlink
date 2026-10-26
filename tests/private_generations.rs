@@ -9,6 +9,9 @@ fn run_with_profile(
         .env("DOTLINK_CONFIG", profile)
         .env("XDG_CONFIG_HOME", config_dir)
         .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
         .env_remove("CONTROL_PLANE_API_KEY")
         .output()
         .unwrap()
@@ -118,6 +121,9 @@ fn profile_cli(config_home: &std::path::Path, args: &[&str]) -> std::process::Ou
         .env("XDG_CONFIG_HOME", config_home)
         .env_remove("DOTLINK_CONFIG")
         .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
         .env_remove("CONTROL_PLANE_API_KEY")
         .output()
         .unwrap()
@@ -243,4 +249,104 @@ fn writable_sandbox_parent_prepares_both_private_xdg_directories() {
         assert!(metadata.is_dir());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
+}
+
+#[test]
+fn inactive_openai_does_not_open_unreadable_dormant_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("xdg");
+    let private = home.join("abird/dotlink");
+    fs::create_dir_all(&private).unwrap();
+    let config = private.join("config.jsonc");
+    let revision = "99887766554433221100ffeeddccbbaa";
+    fs::write(
+        &config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":false,"stdio":true}},"runtime_key_revision":"{revision}"}}"#
+        ),
+    )
+    .unwrap();
+    // A directory is always unreadable *as a credential*, even for root.
+    // This exercises the no-I/O invariant without relying on Unix chmod.
+    fs::create_dir(private.join(format!("runtime.{revision}.key"))).unwrap();
+
+    let result = run_with_profile(&home, &config);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    // An explicit tunnel/key pair may also activate a dormant OpenAI transport
+    // without consulting the unreadable saved credential.
+    let activated = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--list-tools")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("DOTLINK_ID", "tunnel_0123456789abcdef0123456789abcdef")
+        .env("DOTLINK_API_KEY", "synthetic-override-key")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        activated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&activated.stderr)
+    );
+}
+
+#[test]
+fn explicit_env_credentials_supersede_missing_persisted_runtime_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("xdg");
+    let private = home.join("abird/dotlink");
+    fs::create_dir_all(&private).unwrap();
+    let config = private.join("config.jsonc");
+    let id = "tunnel_0123456789abcdef0123456789abcdef";
+    let revision = "99887766554433221100ffeeddccbbaa";
+    fs::write(
+        &config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":true,"stdio":true}},"tunnel_id":"{id}","runtime_key_revision":"{revision}"}}"#
+        ),
+    )
+    .unwrap();
+
+    let missing = run_with_profile(&home, &config);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("selected runtime key is missing"));
+
+    let overridden = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--list-tools")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("DOTLINK_ID", id)
+        .env("DOTLINK_API_KEY", "synthetic-override-key")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+
+    let override_file = temp.path().join("credential");
+    fs::write(&override_file, "synthetic-file-key\n").unwrap();
+    let overridden_file = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--list-tools")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("DOTLINK_API_KEY_FILE", &override_file)
+        .env_remove("DOTLINK_ID")
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        overridden_file.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden_file.stderr)
+    );
 }
