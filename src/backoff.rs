@@ -24,7 +24,8 @@ impl Backoff {
         if self.jitter.is_zero() {
             return step;
         }
-        step + Duration::from_millis(fastrand::u64(0..=self.jitter.as_millis() as u64))
+        let jitter_nanos = self.jitter.as_nanos().min(u64::MAX as u128) as u64;
+        step.saturating_add(Duration::from_nanos(fastrand::u64(0..=jitter_nanos)))
     }
 }
 
@@ -65,6 +66,19 @@ mod tests {
         assert_eq!(wide.delay(1), Duration::from_millis(100));
         assert_eq!(wide.delay(10), Duration::from_millis(51_200));
         assert_eq!(wide.delay(11), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn sub_millisecond_jitter_is_not_silently_zero() {
+        let backoff = Backoff {
+            base: Duration::from_millis(100),
+            cap: Duration::from_secs(1),
+            jitter: Duration::from_nanos(1),
+        };
+        let delays: Vec<u64> = (0..100)
+            .map(|_| backoff.delay(1).as_nanos() as u64)
+            .collect();
+        assert!(delays.iter().any(|delay| *delay > 100_000_000));
     }
 
     #[test]
