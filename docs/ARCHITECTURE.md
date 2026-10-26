@@ -23,7 +23,7 @@ dotlink is one Tokio process with a transport-neutral MCP core.
                                          +-- optional ngrok
 ~~~
 
-The LocalMachine implementation and its dynamic tool router live in src/mcp.rs.
+LocalMachine, its access policy and the dynamic tool router live in `src/mcp.rs`; the tools themselves live one family per module under `src/mcp/tools/` (see [Tool layout](#tool-layout)).
 
 Transport code is isolated under:
 
@@ -133,7 +133,12 @@ Runtime override:
 --http-bind=<ADDR>
 ~~~
 
-HTTP uses `LocalSessionManager` for normal Streamable HTTP sessions.
+HTTP uses `LocalSessionManager` for normal Streamable HTTP sessions. The
+streamable-HTTP settings are built once, in `transports::streamable_config`,
+for both this server and the in-process tunnel service. That config owns the
+request-body ceiling: it is derived from `max_write_bytes` (six times that
+payload, for worst-case JSON escaping, plus 64 KiB of framing). rmcp's 4 MiB
+default would otherwise refuse a write the tools accept.
 
 When OAuth is enabled for a route, the Axum topology is deliberately split:
 
@@ -275,12 +280,30 @@ cross-mount traversal. Bubblewrap shell sandbox mounts use pinned source FDs
 preventing a concurrent symlink swap from redirecting an authorized mount.
 Read+write tools select the narrower pinned grant root, rather than relying
 only on the writable ancestor, and duplicate grants reuse the same inode.
+Native mutations share `src/mutation.rs`: 256 in-process shards followed by
+sorted hierarchical directory locks. Existing ancestors take shared intent
+locks; the deepest existing parent takes an exclusive lock across snapshot →
+commit. Missing parent creation is covered by that ancestor's exclusive lock,
+so another instance cannot bypass it by opening a newly created subdirectory.
+An unreadable directory fails closed rather than falling back to a different
+inode. Disjoint subdirectories remain concurrent across independent processes,
+while changes within a single directory serialize. Lock descriptors survive
+file replacement and release on task cancellation or process exit. Lock waits
+are bounded to 30 seconds; no workspace files, XDG coordination state or
+`/run/lock` service is needed. Windows retains a conservative in-process gate.
+External writers and shells remain outside advisory coordination.
+
+The tunnel polls, OAuth metadata fetches, and local MCP responses all use the
+same streaming byte-ceiling primitive (`src/bounded.rs`) before deserialization;
+OAuth metadata requests additionally use per-process admission and no proxies.
+
 Only the explicitly requested `-s/--serialize` runs all tool handlers through
-one exclusive gate. The non-Linux implementations
-retain the previous shared-read/exclusive-mutator gate by default while
-platform-specific descriptor-relative operations remain unimplemented.
-Serialization is not a security requirement on Linux and is not an OS-level
-transaction or cross-process coordinator.
+one exclusive gate. The non-Linux implementations retain the previous
+shared-read/exclusive-mutator gate by default while platform-specific
+descriptor-relative operations remain unimplemented. Serialization is not a
+security requirement on Linux and the per-path locks are not an OS-level
+transaction or cross-process coordinator; external writers are outside their
+scope.
 
 Developer caches are modeled separately from filesystem grants. A cache record stores its tool family, host source path, and RO/RW mode. At runtime the source is canonicalized and mounted only into the shell sandbox, typically below `/tmp/home` at the tool's expected path. Cache mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical cache sources before mounting.
 
@@ -351,7 +374,7 @@ The Nix daemon socket is intentionally not mounted by default: exposing it would
 `src/host_services.rs` discovers supported host integrations but never grants
 access implicitly. With explicit profile/CLI consent, it pins the Nix daemon
 or SSH-agent socket and selected Nix/Git config files at runtime startup.
-`src/mcp.rs` reuses its Bubblewrap FD-binding mechanism to expose only the
+`src/mcp/tools/shell.rs` reuses its Bubblewrap FD-binding mechanism to expose only the
 individual socket/file inside the private shell home (or the Nix daemon's
 conventional socket location). Host integration FDs remain CLOEXEC in the
 parent and are passed only to the sandbox startup child. SSH-agent
@@ -457,21 +480,109 @@ Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases
 
 ## Text tools
 
-- `read` returns a window of lines with `N<TAB>` numbering by default and one
-  `… truncated at line N of M` marker when the window is capped.
-- `write` replaces a whole file.
+- `read` streams line by line and returns a window with `N<TAB>` numbering by
+  default and one `… truncated at line N` marker when the window is capped.
+  It does not preload the whole file, so a small window works on a file larger
+  than `max_read_bytes`; that ceiling bounds the returned window and an
+  individual line, and a window that exceeds the byte ceiling stops at the last
+  line that fits. The reply — truncation marker included — stays inside the
+  ceiling: making room for the marker drops whole lines, never a line's tail,
+  from the single output buffer that holds the page. Lines before `offset` are
+  skipped by scanning for their newline, so reaching a window never buffers or
+  decodes what precedes it and a skipped line may exceed the ceiling. A line
+  inside the window that alone exceeds the ceiling is an error naming it: the
+  page never silently drops content it was asked for.
+  With `numbered: false` the window is returned byte for byte, so line endings
+  and a trailing newline survive a read → write round trip. An offset past the
+  end of the file is an error, never a silently empty answer.
 - `edit` takes an ordered `edits[]` array across up to 16 files, requires each
   `old_text` to be unique (or `replace_all`), and re-hashes every snapshot
-  before writing: any mismatch writes nothing.
+  before the first commit: a mismatch detected there writes nothing, while each
+  file replacement remains atomic and the commit sequence is not a transaction.
 - `patch` applies Codex `*** Begin Patch` / `*** Update File` / `*** Add File`
-  sections. Hunks are located by content, an ambiguous match fails, and the whole
-  call is atomic unless `best_effort` is set.
+  sections. Hunks are located by content, an ambiguous match fails, a path
+  claimed by two sections (including two spellings through a symlink) is refused
+  while planning, added lines inherit the target file's line ending, and the
+  Codex `*** End of File` marker is enforced: the hunk must end at the last line,
+  and no hunk may follow it in the same file. Strict
+  mode preflights every section before any commit and `best_effort` writes the
+  clean ones; each file replacement is atomic, but the commit sequence is not a
+  multi-file transaction.
 - `ls`, `grep`, `read`, `bread`, `write`, `bwrite`, `edit`, `patch` and `bedit`
   operate only inside canonicalized grants; denies and protected paths are
   dropped before patterns, sorts, or limits apply.
+- Directory enumeration is descriptor-rooted on Linux: the walk enumerates the
+  pinned FD through procfs and fails closed with an explicit error when procfs is
+  unavailable, rather than reopening the directory by pathname.
 - `grep` walks with the same descriptor-rooted enumerator as `ls`; regex, glob
   and `.gitignore` matching are pure matchers over paths and buffers already
-  held, and `.gitignore` files are read through the descriptor-rooted reader.
+  held, `.gitignore` files are read through the pinned directory handle, and
+  candidate file contents are re-opened one at a time through the
+  descriptor-rooted reader beneath the pinned grant root. Symlink entries are
+  listed by `ls` and never traversed or searched by `grep`.
+- `ls` and `grep` cap their JSON replies at `max_output_bytes` as well as their
+  entry/hit limits. The cap is applied by keeping the longest prefix whose
+  rendered JSON fits, found with one binary search over the prefix length, so a
+  pathologically escaped reply costs `O(log n)` renders instead of one render per
+  dropped entry. `grep output_mode=count` reports `page_total` (the sum of the
+  returned counts) so a paginated reply cannot be mistaken for a global total.
+  `grep content` pages over matching lines; context is clipped at the adjacent
+  matching lines outside the page so a later page does not repeat a hit as
+  context, the selected batch shrinks to the largest hit prefix that fits the
+  remaining byte budget, and the byte budget reserves room for the truncation
+  marker before a hit is accepted, so a page always ends with whole hit lines.
+- `ls` derives its default depth from the pattern: unbounded for `**`, one level
+  per path segment otherwise, because `*` and `?` never cross `/`. A deep pattern
+  therefore cannot silently return an empty listing.
+
+## Tool layout
+
+The machine and its policy live in `src/mcp.rs`; the tools live one family per
+module under `src/mcp/tools/`, each with its own `#[tool_router]`:
+
+~~~text
+src/mcp.rs              policy, pinned descriptors, capability table, ServerHandler
+src/staging.rs          staging mode/naming policy + cancellation-safe path backend
+src/mutation.rs         process shards + stable cross-process mutation locks
+src/secure_fs.rs        Linux descriptor-rooted IO and the fd-based staging backend
+src/mcp/tools/mod.rs    walk, glob grammar, limits, markers, snapshot commit
+src/mcp/tools/{ls,grep,text,edit,patch,binary,shell}.rs
+~~~
+
+Two shared rules keep the surface composed rather than copied:
+
+- `TOOL_SPECS` in `src/mcp.rs` is the only record of a tool's capability and
+  concurrency class; visibility, the platform operation gate, `--list-tools` and
+  the TOOL log all read it. A new tool is one module, one router, one line.
+- An existing-file text mutation is plan → verify → stage → commit.
+  `Snapshot::verify` re-reads the file and produces the only `Verified` token
+  that can stage an update, so an update cannot skip the re-check. Creates
+  (`write`, `bwrite`, `*** Add File`) have no prior content and stage directly.
+  Staging flushes the bytes to a sibling temporary; committing renames it over
+  the target, or uses a no-overwrite hard link / Windows move for creates. Tools that
+  write several files stage all of them before committing any.
+
+Writes never truncate in place: `write`, `bwrite`, `edit`, `patch` and `bedit`
+all go through `SecureFs::stage`/`stage_update`/`stage_create`/`StagedWrite::commit`,
+which writes a sibling temporary beneath the pinned parent directory and
+installs it atomically. `src/staging.rs` owns the rules both backends share — the
+temporary starts at the target's mode (never broader, so a private file is never
+briefly world-readable), and its name is recognized by the walk, which hides
+in-flight staging files from `ls`/`grep`. Updates carry the snapshot length and digest and re-check them
+immediately before commit; that is a best-effort external-writer check, because
+the final check and the rename are not one atomic compare-and-rename. Existing
+permission bits are preserved, while Linux ownership, extended attributes and
+hard links are not. Non-Linux uses the same staged shape under the legacy
+operation gate — the same mode and naming policy, implemented by the path
+backend in `src/staging.rs` — preserving the file mode and rejecting symlink or
+special-file targets by pathname checks; it does not have Linux's
+descriptor-rooted compare-before-rename guarantee.
+
+`ls` and `grep` collect at most `MAX_LIST_ENTRIES` / `MAX_GREP_FILES` matches
+before sorting, so on a tree larger than that bound the result is a correct but
+arbitrary subset of the collected matches, not a global path-order prefix or
+top-N. Those bounds limit collected results, not traversal: a pattern or filter
+that matches nothing can still walk the tree the caller named.
 
 ## Binary MCP content
 
@@ -486,5 +597,7 @@ base64 and hex modes return encoded text.
 bwrite decodes base64 or hex.
 
 bedit applies many byte ranges against original-file offsets, rejects overlaps
-and out-of-bounds ranges, supports an optional `sha256` precondition, and caps
-both the source and the result at the patchable file size.
+and out-of-bounds ranges, applies them in a deterministic order (offset, then
+span so an insert precedes a replacement at the same offset, then request
+position), supports an optional `sha256` precondition, and caps both the source
+and the result at `min(max_write_bytes, 64 MiB)`.

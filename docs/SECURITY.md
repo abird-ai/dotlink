@@ -6,6 +6,7 @@ Without write or shell flags, the visible tools are:
 
 ~~~text
 ls
+grep
 read
 bread
 ~~~
@@ -45,14 +46,21 @@ Native tools still check the lexical request (including denies) and the
 canonical target before access. On Linux, native IO then opens paths relative
 to pinned authorized directory descriptors using `openat2` with beneath,
 no-symlink and (except for explicit root grants) no-cross-mount constraints.
-Final file reads/writes/edits/patches use those opened handles rather than
-reopening a pathname. Edit and patch operations that require both read and
-write access use the narrower pinned grant root, and identical read/write
-grants share one pinned directory identity. Recursive enumeration is anchored to a pinned directory
-handle and never follows symlink entries. Filesystem operations fail closed if
-Linux does not support `openat2` or if a path cannot satisfy those constraints.
+Direct file reads/writes/edits/patches use those opened handles rather than
+reopening a pathname. Search holds paths, not one descriptor per candidate, and
+re-opens each candidate through the same descriptor-rooted reader beneath the
+pinned grant root, one file at a time. Edit and patch operations that require
+both read and write access use the narrower pinned grant root, and identical
+read/write grants share one pinned directory identity. Recursive enumeration is
+anchored to a pinned directory handle and never follows symlink entries.
+Filesystem operations fail closed if Linux does not support `openat2` or if a
+path cannot satisfy those constraints.
 Directory handles are capabilities, including if an unrelated process later
 moves the directory inode; this is not a snapshot or a filesystem transaction.
+Enumeration of a pinned directory goes through `/proc/self/fd/<n>`; if procfs is
+not mounted, `ls`/`grep` fail with an explicit error instead of reopening the
+directory by pathname, because a pathname reopen could be redirected by a
+concurrent rename outside the grant.
 Linux Bubblewrap mount sources for granted directories and developer caches
 are pinned with file descriptors rather than reopened by pathname; CLOEXEC
 is cleared for those FDs only in the forked child, avoiding cross-request FD
@@ -75,17 +83,93 @@ Tool requirements:
 
 Search never reaches shell-only grants (cache mounts, Nix runtime paths): `grep`
 walks with filesystem read authority only, through the same descriptor-rooted
-enumerator as `ls`. Glob, regex and `.gitignore` matching are pure matchers over
-already-authorized paths and bounded buffers; `.gitignore`, `.gitconfig`-like
-inputs are read through the descriptor-rooted reader, never the ambient path
-namespace. Search bounds are explicit: 1 MiB per file, 50 matches per file, 200
-hits, 1024-character patterns, regex size/DFA limits of 1 MiB, 8 context lines
-per side, and 64 KiB / 1024 lines per `.gitignore` file with invalid patterns
-failing closed.
+enumerator as `ls`. Authorization is decided once, for the search root; descent
+and `.gitignore` reads travel through pinned directory handles. Candidate file
+contents are re-opened through the descriptor-rooted reader beneath the pinned
+grant root, one file at a time, so a large tree cannot exhaust descriptors. A
+directory renamed inside the grant after the walk can change which inode a
+candidate path names; it cannot leave the grant. Symlink entries are listed by
+`ls` and never traversed or searched by `grep`. Glob, regex and `.gitignore`
+matching are pure matchers over already-authorized paths and bounded buffers.
+Search bounds are explicit: 1 MiB per file, 65536 candidate files, 50 matches
+per file per `content` page, 200 hits or files, 1024-character patterns, regex
+size/DFA limits of 1 MiB, 8 context lines per side, 64 KiB / 1024 lines per
+`.gitignore` file with invalid patterns failing closed, and a rendered-output
+budget that stops collection at `max_output_bytes` in every mode. `content`
+pages select matching lines and clip context at adjacent matching lines outside
+the page, so a later page does not repeat a hit as context. A `content` page
+reserves room for its truncation marker before accepting a hit, so it ends with
+whole hit lines only; a page that stops on the per-file cap says so in the
+marker, and an offset past the last hit answers with an explicit marker. The candidate bound
+limits collected results; traversal itself is bounded by the caller's path,
+depth and filters.
 
-Mutating text tools (edit, patch) plan against an in-memory snapshot and re-hash
-every affected file before the first write, so a concurrent change fails the
-call with nothing written.
+Native filesystem mutators (`write`, `bwrite`, `edit`, `patch`, `bedit`) take a
+bounded per-path mutation lock before reading a snapshot and hold it through
+commit, so two dotlink calls cannot both verify the same bytes and then
+overwrite one another. Multi-file edits acquire their shard locks in sorted
+order.
+
+Cross-process coordination uses hierarchical advisory `flock`. Each existing
+ancestor directory receives a shared intention lock; the deepest existing
+parent receives an exclusive lock for snapshot → commit. If a parent is not yet
+present, the nearest existing ancestor is exclusive until the directories and
+file are created. A concurrent writer must first lock that ancestor, so it
+cannot bypass a creator by discovering a newly created directory. A directory
+that exists but cannot be opened fails closed, never substituting a different
+lock identity. A rename does not change the directory inode. No workspace
+lockfile, XDG state, or `/run/lock` capability is required. Locks are ordered
+root-to-leaf, wait at most 30 seconds and release automatically on exit. The
+256 in-process shards retain concurrency between independent files. Writers in
+different directories remain concurrent across processes unless they need to
+change a common ancestor. Windows retains its conservative in-process gate.
+
+The locks are advisory, and network filesystems or independent mount
+namespaces require additional coordination. A shell command or another program
+that ignores the protocol can still race after the final snapshot check.
+Shell commands are outside native coordination because their write paths are
+arbitrary. Text tools (`edit`, `patch`, `bedit`) plan against an in-memory
+snapshot and re-hash every affected file before the first write, so an external
+concurrent change detected in that window fails the call with nothing written.
+An update can only be staged through the `Verified` token produced by that
+re-check, so the check cannot be skipped. The write itself is atomic: the new
+bytes go to a sibling temporary file beneath the same pinned parent directory
+and are installed at commit, so a reader sees the whole old file or the whole
+new one, a failing or interrupted write leaves the original intact, and an
+existing file keeps its permission bits. The temporary is created with a mode
+no broader than the target's from the first syscall — replacing a `0600` file
+never creates a group- or world-readable intermediate — and a new file keeps
+ordinary create semantics (0666 minus the umask). Staging temporaries are named
+`.dotlink-<pid>-<16 hex>.tmp` and are hidden from `ls`/`grep`, so a listing or a
+search never reports a half-installed file. The target and its bytes are re-checked
+immediately before the commit, so a name swapped for a symlink or special file,
+or a file changed by an external writer after verification, is refused. This is
+a best-effort check, not an atomic compare-and-rename: an external writer that
+does not participate in Dotlink's lock protocol can still race between the
+final check and rename. A multi-file call is not a transaction: a commit-stage failure can leave earlier files replaced, and the
+error names that consequence. Ownership,
+extended attributes and hard links are not preserved across the Linux rename.
+Data is synced before rename. Parent-directory `fsync` is best effort because
+the directory can be writable without being readable; Dotlink guarantees
+atomic visibility, not power-loss durability. A failed post-commit sync is
+logged, not reported as a failed write that a client might replay.
+On Windows, staging reads the original target's DACL and applies it to the
+still-empty temporary before writing any bytes; an existing target is installed
+with `ReplaceFileW` using an explicit sibling backup and no ACL-merge ignore
+flags. The original is restored from backup when Windows moved it before
+reporting failure. When recovery cannot be proven safe, the backup and staged
+files are retained for manual restoration, never blindly deleted. Successful
+replacements remove the backup where possible. The non-Linux staging backend
+owns the temporary file from creation through asynchronous write/sync: aborts
+and cancellations trigger RAII cleanup rather than leaving a half-written file
+behind. Windows runtime ACL behaviour
+still requires validation on a native Windows filesystem.
+`write`, `bwrite` and `*** Add File` create content without a prior snapshot.
+A create-only install refuses any name that already exists: Linux uses a
+descriptor-rooted hard link, Windows an atomic `MoveFileW` without replacement,
+and macOS a hard link. All leave the target absent until commit. The temporary has a `.dotlink-*.tmp` name
+beneath the target directory and is excluded from Dotlink `ls`/`grep`
+during the write.
 
 ## Opt-in host developer services
 
@@ -159,7 +243,7 @@ dotlink maps approved host caches into the sandbox's private home at the package
 
 Read-only sharing protects host cache integrity but cannot populate cache misses. Read+write sharing provides the normal package-manager experience and lets successful downloads/builds be reused later, but sandboxed code can also modify those shared host cache contents. Choose RW only when that tradeoff is acceptable.
 
-Filesystem deny rules remain authoritative: deny-read removes a matching cache mount and deny-write downgrades a matching RW cache to read-only.
+Filesystem deny rules remain authoritative: deny-read removes a matching cache mount and deny-write downgrades a matching RW cache to read-only. In the shell sandbox a deny-write root is rebound read-only whether it names a directory or a single file; a file deny is never passed to the directory-mount path.
 
 ## Transport security
 
@@ -237,7 +321,7 @@ $XDG_STATE_HOME/abird/dotlink/oauth.json
 $XDG_STATE_HOME/abird/dotlink/oauth.<profile>.json
 ~~~
 
-with the usual `~/.local/state/abird/dotlink` fallback on Unix. On Unix the directory is mode 0700 and state files are mode 0600. The state directory is part of dotlink's protected control-plane paths, so MCP filesystem tools and the normal sandboxed shell cannot read or modify it.
+with the usual `~/.local/state/abird/dotlink` fallback on Unix; an empty or relative `XDG_STATE_HOME` is ignored. On Unix the directory is mode 0700 and state files are mode 0600. The state directory is part of dotlink's protected control-plane paths, so MCP filesystem tools and the normal sandboxed shell cannot read or modify it.
 
 `dotlink oauth status/clients/revoke/revoke-all` provides the management surface. Revoking a refresh grant prevents future refresh immediately. Access tokens are short-lived/in-memory; restart dotlink (or `Ctrl+R`) when immediate invalidation of all outstanding access tokens is required.
 
@@ -323,19 +407,42 @@ For Windows, WSL2 is the recommended secure shell workflow: run dotlink inside W
 
 bread supports MCP typed media/blob content plus explicit base64 and hex.
 
-bwrite and bedit enforce write limits.
+bwrite and bedit enforce `max_write_bytes`; bedit caps binary planning at `min(max_write_bytes, 64 MiB)`.
 
 bedit applies at most 32 ranges at original-file offsets, rejects overlaps and
 out-of-bounds ranges, caps total file size processed in memory, and can require a
-`sha256` precondition before writing.
+`sha256` precondition. The precondition and the snapshot are re-checked against
+fresh bytes immediately before the atomic write.
 
 ## Terminal state safety
 
 Interactive runtime controls snapshot the terminal state before enabling raw key input. On Unix, dotlink preserves the original output flags while controls are active and restores the complete captured `termios` state on teardown. The guard is RAII-owned by the runtime-control object, so normal exit, `Ctrl+R`, transport failures, `?` error propagation, and unwinding all restore the terminal before returning control to the shell. stdio never enables runtime key capture.
 
+## External OAuth metadata and tunnel limits
+
+Anonymous OAuth metadata lookup is limited to four concurrent fetches and 24
+fetches per rolling minute across the process. DNS resolution has a 3-second
+limit; the HTTPS request has a 5-second timeout and a 64 KiB response ceiling.
+Proxy environment settings are disabled for the metadata HTTP client, so DNS
+pinning cannot silently be bypassed by a proxy resolving the target itself.
+Only public resolved addresses are allowed, and redirects are disabled.
+
+OpenAI tunnel polls are collected with a 64 MiB streaming ceiling before JSON
+deserialization; command count is also checked against the requested poll
+limit. Embedded MCP responses and HTTP error bodies use the same bounded-body
+primitive. A batch exceeding its ceiling is rejected rather than buffered
+without limit.
+
 ## Logging privacy
 
-At `-v`, TOOL logs show safe metadata such as paths, directories, flags, status, latency, and timestamps. Content/data fields are summarized by size instead of printing file contents or binary payloads.
+At `-v`, TOOL logs show metadata such as paths, directories, flags, status, latency, and timestamps. Arguments that carry a payload are reduced to a byte count — `content`, `stdin`, `data`, `old_text`, `new_text` and `patch` — so file contents, patches and piped input never reach the journal.
+
+`bash` and `powershell` commands also count as sensitive payloads: even a short
+command may embed a credential, so TOOL and REQ logs record `command_bytes`
+instead of an excerpt. Time, tool, working directory, outcome and latency
+remain available for operational auditing; the MCP client retains the command
+transcript for replay. Journald does not become a second, uncontrolled secret
+store.
 
 At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/protocol metadata is added. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the dotlink request logger.
 
@@ -345,7 +452,11 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 
 - tunnel concurrency is bounded;
 - shell stdout/stderr are drained continuously with bounded retained output;
-- text/binary reads and writes are bounded;
+- shell stdin is written concurrently with process execution after the output drains start, so a child that writes before reading its input cannot deadlock both pipes;
+- `max_output_bytes`, `max_read_bytes` and `max_write_bytes` are hard ceilings: a value below the supported minimum is rejected at configuration time, never silently widened at startup;
+- text/binary reads and writes are bounded; `read` streams a line window instead of preloading the whole file, builds the page in one output buffer, and its reply — truncation marker included — fits `max_read_bytes`; lines skipped to reach `offset` are scanned for their newline without being buffered or decoded, so a preceding line larger than the ceiling cannot block the requested window;
+- the streamable-HTTP request-body ceiling is derived from the profile, not from the transport's default: a request body may be six times `max_write_bytes` (the worst-case JSON escaping of a payload the tools accept) plus 64 KiB of framing, for the local HTTP server and the OpenAI tunnel alike;
+- local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes` (sixfold JSON-escape headroom plus framing); unlike a fixed 16 MiB tunnel cap, a larger configured read can be returned consistently via HTTP, stdio, and the embedded tunnel;
 - shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants), chosen per call by the client, bounded by the tunnel client's own `response_timeout` window when present, and clamped to the profile `max_shell_timeout_secs` ceiling; a timeout still returns a bounded, non-secret error result with any partial output;
 - HTTP and transport lifecycles share cancellation;
 - OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded;

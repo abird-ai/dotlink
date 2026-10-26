@@ -104,7 +104,7 @@ Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity
 [10:59:19.194] TOOL read       ← ok  9ms
 ~~~
 
-`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` without restarting. Each change emits a compact `LOG verbosity …` line. `Ctrl+R` fully reloads the profile/policy/transports; `Ctrl+C` exits. Runtime key controls are disabled when stdio MCP is active so protocol stdin is never intercepted. File contents, binary payloads, API keys, and raw request bodies are not intentionally logged.
+`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` without restarting. Each change emits a compact `LOG verbosity …` line. `Ctrl+R` fully reloads the profile/policy/transports; `Ctrl+C` exits. Runtime key controls are disabled when stdio MCP is active so protocol stdin is never intercepted. File contents, binary payloads, shell command bodies, API keys, and raw request bodies are not intentionally logged.
 
 ## Connect dotlink to ChatGPT
 
@@ -329,17 +329,43 @@ Targets are canonicalized before checks; create targets canonicalize their neare
 | `grep` | read | Regex search with `content`/`files`/`count` output, context, glob and `.gitignore` filters |
 | `read` | read | Read numbered lines from a UTF-8 file |
 | `write` | write | Create or replace a text file |
-| `edit` | read+write | Apply an ordered `edits[]` array across files, all or nothing |
-| `patch` | read+write | Apply a Codex-format patch atomically |
+| `edit` | read+write | Apply an ordered `edits[]` array with preflight and per-file atomic commits |
+| `patch` | read+write | Apply a Codex-format patch with strict preflight and per-file atomic commits |
 | `bread` | read | Read binary content as MCP typed content, base64, or hex |
 | `bwrite` | write | Create or replace a binary file |
 | `bedit` | read+write | Apply byte ranges against original-file offsets |
+
 | `bash` / `powershell` | shell | Run a command inside the sandbox |
 
 One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
-`{a,b}` stay within one path segment and `**` recurses. Every list/search tool
-has a documented `limit` and reports `truncated`; `read` ends a capped result
-with a single marker line instead.
+`{a,b}` stay within one path segment and `**` recurses without a level cap.
+Every list/search tool has a documented `limit` and reports `truncated`; `read`
+ends a capped result with a single marker line instead. `ls` and `grep` also
+bound their JSON replies at `max_output_bytes`, keeping the longest prefix that
+fits; `ls` derives its default depth from the pattern (one level per segment,
+unbounded for `**`) so a deep pattern never silently returns nothing, and
+`grep` pages only ever contain whole matching lines. `grep count` reports
+`page_total` for the returned page. `read` streams a line window, so
+`max_read_bytes` bounds the returned window, its marker and one line rather than
+rejecting a large file outright; the page is assembled in one buffer, and lines
+skipped to reach `offset` are scanned rather than buffered, so a long first line
+never blocks a later window; a single returned line larger than the ceiling is
+an error naming it, since cutting it silently would hide content.
+
+Every write is atomic: the new bytes go beside the target and are installed only
+at commit, so a failed or interrupted write leaves the old file intact and a
+reader never sees a half-written one. The native filesystem mutators (`write`,
+`bwrite`, `edit`, `patch`, `bedit`) coordinate from snapshot read through
+commit with directory locks on Unix: shared ancestor intent locks and an
+exclusive lock on the deepest existing parent. Missing parent creation is also
+covered; unreadable directories fail closed. Independent subdirectories remain
+concurrent, with no lock service or workspace lockfiles. Shell commands are
+outside that coordination because their write paths are arbitrary. Existing-file writes keep their permission
+bits; create-only writes are absent until commit. `read` with `numbered: false`
+returns the text byte for byte, so a read → write round trip preserves line
+endings, and `patch` uses the target file's line ending for added lines.
+Multi-file calls preflight every file and replace each atomically, but the
+commit sequence is not a transaction.
 
 ~~~bash
 dotlink --list-tools
@@ -441,7 +467,7 @@ With `-vv`, transport diagnostics are added:
 [01:06:47.427] REQ  stdio      → tools/call
 ~~~
 
-Logs include safe metadata such as paths, methods, status, and latency; file contents, binary payloads, runtime keys, and raw request bodies are not intentionally logged.
+Logs include safe metadata such as paths, methods, status, and latency. Shell commands (including short ones) and other payload arguments are logged only as byte counts, so inline credentials are not copied into the journal.
 
 Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
 
