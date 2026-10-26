@@ -31,6 +31,24 @@ const MAX_CONTROL_PLANE_ERROR_BYTES: usize = 2_000;
 // A poll may contain multiple commands; limit the whole external envelope
 // before serde deserializes it. Large transfers can use later polls.
 const MAX_POLL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// A deliberate process-memory bound: even an oversized configured write must
+/// not make one remote envelope consume arbitrary memory.
+const MAX_SAFE_POLL_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+/// Tunnel command wrappers (request id, shard token, headers, JSONRPC framing).
+const TUNNEL_COMMAND_OVERHEAD_BYTES: usize = 1024 * 1024;
+
+fn poll_response_ceiling(max_request_bytes: usize) -> Result<usize> {
+    let needed = max_request_bytes
+        .checked_add(TUNNEL_COMMAND_OVERHEAD_BYTES)
+        .ok_or_else(|| anyhow!("OpenAI tunnel request ceiling overflows the address space"))?;
+    if needed > MAX_SAFE_POLL_RESPONSE_BYTES {
+        bail!(
+            "OpenAI tunnel cannot carry a configured single request of {max_request_bytes} bytes              inside the {} MiB safe poll envelope; lower max_write_bytes or use local HTTP/stdio",
+            MAX_SAFE_POLL_RESPONSE_BYTES / (1024 * 1024),
+        );
+    }
+    Ok(MAX_POLL_RESPONSE_BYTES.max(needed))
+}
 
 const REQUEST_HEADER_ALLOWLIST: &[&str] = &[
     "mcp-session-id",
@@ -219,10 +237,12 @@ async fn run_with_tuning(
     tuning: TunnelTuning,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    let max_request_bytes = machine.max_request_body_bytes();
+    let poll_ceiling = poll_response_ceiling(max_request_bytes)?;
     let embedded = EmbeddedMcp::new(machine, cancellation.child_token());
     let tunnel = TunnelClient::new(config, tuning, cancellation)?;
 
-    match tunnel.run(embedded).await? {
+    match tunnel.run(embedded, poll_ceiling).await? {
         TunnelRunOutcome::Cancelled => Ok(()),
         TunnelRunOutcome::RestartRuntime {
             error,
@@ -527,7 +547,7 @@ impl TunnelClient {
         })
     }
 
-    async fn run(self, mcp: EmbeddedMcp) -> Result<TunnelRunOutcome> {
+    async fn run(self, mcp: EmbeddedMcp, poll_ceiling: usize) -> Result<TunnelRunOutcome> {
         debug!(?self.tuning, "tunnel tuning");
         let mut tasks = JoinSet::new();
         let mut failures = 0_u32;
@@ -544,7 +564,7 @@ impl TunnelClient {
 
             let batch = tokio::select! {
                 _ = self.cancellation.cancelled() => break,
-                result = self.poll_once() => {
+                result = self.poll_once(poll_ceiling) => {
                     match result {
                         Ok(batch) => {
                             failures = 0;
@@ -661,7 +681,10 @@ impl TunnelClient {
         ]
     }
 
-    async fn poll_once(&self) -> std::result::Result<PolledBatch, PollFailure> {
+    async fn poll_once(
+        &self,
+        poll_ceiling: usize,
+    ) -> std::result::Result<PolledBatch, PollFailure> {
         let url = format!("{}/v1/tunnels/{}/poll", self.base_url, self.tunnel_id);
         let response = self
             .common_headers(self.http.get(url).query(&self.poll_query()))
@@ -678,15 +701,11 @@ impl TunnelClient {
             });
         }
         if status == StatusCode::OK {
-            let bytes = bounded::reqwest_response(
-                response,
-                MAX_POLL_RESPONSE_BYTES,
-                "tunnel poll response",
-            )
-            .await
-            .map_err(|error| {
-                PollFailure::Transient(error.context("failed reading poll response"))
-            })?;
+            let bytes = bounded::reqwest_response(response, poll_ceiling, "tunnel poll response")
+                .await
+                .map_err(|error| {
+                    PollFailure::Transient(error.context("failed reading poll response"))
+                })?;
             let envelope: PollEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
                 PollFailure::Transient(anyhow!(error).context("invalid poll response"))
             })?;
@@ -1669,6 +1688,21 @@ mod tests {
         ] {
             assert!(!retryable_response_status(status), "{status}");
         }
+    }
+
+    #[test]
+    fn poll_ceiling_covers_a_configured_single_request_and_fails_closed_for_oversize() {
+        assert_eq!(
+            poll_response_ceiling(1_000_000).unwrap(),
+            MAX_POLL_RESPONSE_BYTES
+        );
+        // 12 MiB of control characters can expand to 72 MiB of JSON: the
+        // previous fixed 64 MiB ceiling rejected a valid tool request.
+        let large_request = 12 * 1024 * 1024 * 6 + 64 * 1024;
+        let raised = poll_response_ceiling(large_request).unwrap();
+        assert!(raised > MAX_POLL_RESPONSE_BYTES);
+        assert!(raised >= large_request + TUNNEL_COMMAND_OVERHEAD_BYTES);
+        assert!(poll_response_ceiling(MAX_SAFE_POLL_RESPONSE_BYTES).is_err());
     }
 
     #[test]
