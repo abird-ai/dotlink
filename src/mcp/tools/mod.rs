@@ -17,6 +17,7 @@ pub(crate) mod test_support;
 pub(crate) mod text;
 
 use std::{
+    collections::BinaryHeap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::Arc,
@@ -523,6 +524,21 @@ pub(crate) fn marker_bytes(bytes: usize) -> String {
     format!("… truncated at {bytes} bytes")
 }
 
+/// Retain the globally best K entries in bounded memory. The heap's root is
+/// always the worst retained item, independent of discovery order.
+/// Returns true when more than K candidates have been examined.
+pub(crate) fn retain_best<T: Ord>(heap: &mut BinaryHeap<T>, candidate: T, limit: usize) -> bool {
+    if heap.len() < limit {
+        heap.push(candidate);
+        return false;
+    }
+    if heap.peek().is_some_and(|worst| candidate < *worst) {
+        heap.pop();
+        heap.push(candidate);
+    }
+    true
+}
+
 /// Keep the longest prefix of `records` whose rendered JSON fits the ceiling.
 /// The caller's renderer is the exact reply shape, including every derived
 /// field, so the measured size and the returned size cannot drift. Rendered
@@ -678,6 +694,17 @@ impl Verified {
 mod tests {
     use super::*;
     use crate::mcp::tools::test_support::test_machine;
+
+    #[test]
+    fn top_k_remains_globally_sorted_with_arbitrary_discovery_order() {
+        let mut heap = BinaryHeap::new();
+        let mut truncated = false;
+        for number in (0..100).rev() {
+            truncated |= retain_best(&mut heap, number, 8);
+        }
+        assert!(truncated);
+        assert_eq!(heap.into_sorted_vec(), (0..8).collect::<Vec<_>>());
+    }
 
     #[test]
     fn glob_grammar_covers_stars_classes_alternation_and_separators() {

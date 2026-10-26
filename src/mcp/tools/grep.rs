@@ -1,6 +1,9 @@
 //! `grep`: descriptor-rooted search with one glob grammar and bounded output.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BinaryHeap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use rmcp::{
@@ -10,7 +13,7 @@ use serde::Deserialize;
 
 use super::{
     GlobFilter, LocalMachine, WalkFilter, dot, marker_bytes, marker_files, marker_hits, ok_text,
-    tool_error, trim_to_ceiling,
+    retain_best, tool_error, trim_to_ceiling,
 };
 use crate::mcp::AccessNeed;
 
@@ -190,11 +193,10 @@ impl LocalMachine {
         let numbered = args.numbered.unwrap_or(true);
         let ceiling = self.config.max_output_bytes;
 
-        // Candidate paths first, so paging and output are path-ordered rather
-        // than dependent on directory enumeration order. Only paths are kept:
-        // holding one directory handle per candidate would exhaust descriptors
-        // on a large tree.
-        let mut candidates: Vec<PathBuf> = Vec::new();
+        // A bounded heap retains the lexically first candidate paths over the
+        // complete walk, not an arbitrary enumeration-order prefix. Only paths
+        // are retained; files are opened individually after the walk.
+        let mut candidates = BinaryHeap::<PathBuf>::new();
         let mut candidates_capped = false;
         self.walk_entries(
             &root,
@@ -213,16 +215,12 @@ impl LocalMachine {
                 {
                     return true;
                 }
-                if candidates.len() >= MAX_GREP_FILES {
-                    candidates_capped = true;
-                    return false;
-                }
-                candidates.push(entry.path);
+                candidates_capped |= retain_best(&mut candidates, entry.path, MAX_GREP_FILES);
                 true
             },
         )
         .await?;
-        candidates.sort();
+        let candidates = candidates.into_sorted_vec();
 
         let mut paging = Paging {
             offset,

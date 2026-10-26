@@ -1,5 +1,7 @@
 //! `ls`: descriptor-rooted discovery with one glob grammar.
 
+use std::{cmp::Ordering, collections::BinaryHeap};
+
 use anyhow::Result;
 use rmcp::{
     handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
@@ -7,7 +9,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use super::{GlobFilter, LocalMachine, WalkFilter, dot, ok_text, tool_error, trim_to_ceiling};
+use super::{
+    GlobFilter, LocalMachine, WalkFilter, dot, ok_text, retain_best, tool_error, trim_to_ceiling,
+};
 use crate::mcp::AccessNeed;
 
 const DEFAULT_MAX_LIST_ENTRIES: usize = 4 * 1024;
@@ -76,7 +80,9 @@ impl ListKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ListSort {
     #[default]
@@ -92,6 +98,36 @@ struct FsEntry {
     /// Ordering input only; never serialized.
     #[serde(skip)]
     mtime: Option<std::time::SystemTime>,
+}
+
+/// Heap ordering: the worst retained result compares greatest.
+struct RankedEntry {
+    entry: FsEntry,
+    sort: ListSort,
+}
+
+impl PartialEq for RankedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for RankedEntry {}
+impl PartialOrd for RankedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RankedEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sort.cmp(&other.sort).then_with(|| match self.sort {
+            ListSort::Path => self.entry.path.cmp(&other.entry.path),
+            ListSort::Mtime => other
+                .entry
+                .mtime
+                .cmp(&self.entry.mtime)
+                .then_with(|| self.entry.path.cmp(&other.entry.path)),
+        })
+    }
 }
 
 fn list_entry_limit(requested: Option<usize>) -> usize {
@@ -127,9 +163,11 @@ impl LocalMachine {
         let depth = list_depth(args.depth, args.pattern.as_deref());
         let pattern = GlobFilter::optional(args.pattern.as_deref())?;
         let limit = list_entry_limit(args.limit);
-        let mut output: Vec<FsEntry> = Vec::new();
+        let mut selected = BinaryHeap::with_capacity(limit);
         let mut truncated = false;
 
+        // Scanning completes before sorting, so any cap selects the actual
+        // global path/newest prefix rather than the first entries enumerated.
         self.walk_entries(&root, depth, WalkFilter::default(), |entry| {
             if pattern
                 .as_ref()
@@ -140,30 +178,29 @@ impl LocalMachine {
             if !args.kind.accepts(entry.kind) {
                 return true;
             }
-            if output.len() >= MAX_LIST_ENTRIES {
-                truncated = true;
-                return false;
-            }
-            output.push(FsEntry {
-                path: self.config.access.relative_display(&entry.path),
-                kind: entry.kind,
-                size: entry.size,
-                mtime: entry.mtime,
-            });
+            truncated |= retain_best(
+                &mut selected,
+                RankedEntry {
+                    entry: FsEntry {
+                        path: self.config.access.relative_display(&entry.path),
+                        kind: entry.kind,
+                        size: entry.size,
+                        mtime: entry.mtime,
+                    },
+                    sort: args.sort,
+                },
+                limit,
+            );
             true
         })
         .await?;
 
+        let mut output: Vec<FsEntry> = selected.into_iter().map(|item| item.entry).collect();
         match args.sort {
             ListSort::Path => output.sort_by(|a, b| a.path.cmp(&b.path)),
-            // Newest first; entries without a timestamp sort after dated ones.
             ListSort::Mtime => {
                 output.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)))
             }
-        }
-        if output.len() > limit {
-            output.truncate(limit);
-            truncated = true;
         }
         // The profile byte ceiling bounds the reply itself, not only the entry
         // count. The renderer is the exact handler shape so the measured and
@@ -271,6 +308,27 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 2);
         assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn ls_limit_preserves_newest_file_even_if_enumerated_later() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("old.txt"), "older").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::fs::write(root.join("new.txt"), "newer").unwrap();
+        let machine = test_machine(root);
+        let (entries, truncated) = machine
+            .list_impl(ListArgs {
+                path: ".".into(),
+                sort: ListSort::Mtime,
+                limit: Some(1),
+                ..ListArgs::default()
+            })
+            .await
+            .unwrap();
+        assert!(truncated);
+        assert_eq!(entries[0].path, "new.txt");
     }
 
     #[tokio::test]
