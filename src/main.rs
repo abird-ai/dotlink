@@ -1093,10 +1093,7 @@ async fn run_runtime(
 
     let http_auth = resolve_http_auth(args, &setup.config.oauth, &local_transports, http_bind)?;
     let oauth_runtime = if http_auth.local_oauth || http_auth.ngrok_oauth {
-        Some(oauth::Runtime::load(
-            args.profile.as_deref(),
-            setup.config.owner_password_revision.as_deref(),
-        )?)
+        Some(oauth::Runtime::load(args.profile.as_deref())?)
     } else {
         None
     };

@@ -187,9 +187,19 @@ struct PendingAuthorization {
     expires_at: i64,
 }
 
+enum OwnerSelection {
+    Profile {
+        name: Option<String>,
+        /// A deleted persisted profile must not downgrade to its legacy hash.
+        required: bool,
+    },
+    #[cfg(test)]
+    Fixed(Option<String>),
+}
+
 struct RuntimeState {
     state_path: PathBuf,
-    owner_password_revision: Option<String>,
+    owner_selection: OwnerSelection,
     persistent: Mutex<PersistentState>,
     pending_clients: Mutex<HashMap<String, RegisteredClient>>,
     access_tokens: Mutex<HashMap<String, AccessGrant>>,
@@ -313,10 +323,11 @@ fn client_metadata(client: &RegisteredClient) -> ClientMetadata {
 }
 
 impl Runtime {
-    pub fn load(profile: Option<&str>, selected_revision: Option<&str>) -> Result<Self> {
+    pub fn load(profile: Option<&str>) -> Result<Self> {
         let path = state_path(profile)?;
+        let selection = crate::setup::profile_owner_selection(profile)?;
         let persistent = read_state(&path)?;
-        let hash = active_owner_hash(&persistent, selected_revision)
+        let hash = active_owner_hash(&persistent, selection.revision())
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| {
                 anyhow!(
@@ -332,7 +343,10 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(RuntimeState {
                 state_path: path,
-                owner_password_revision: selected_revision.map(str::to_owned),
+                owner_selection: OwnerSelection::Profile {
+                    name: profile.map(str::to_owned),
+                    required: !matches!(selection, crate::setup::ProfileOwnerSelection::Absent),
+                },
                 persistent: Mutex::new(persistent),
                 pending_clients: Mutex::new(HashMap::new()),
                 access_tokens: Mutex::new(HashMap::new()),
@@ -374,12 +388,34 @@ impl Runtime {
         })
     }
 
+    /// Resolve the *current* committed profile selector. A live HTTP server
+    /// observes password rotation without restarting, and profile deletion
+    /// cannot silently re-enable an old legacy owner password.
+    fn selected_owner_revision(&self) -> Result<Option<String>> {
+        match &self.inner.owner_selection {
+            OwnerSelection::Profile { name, required } => {
+                let selected = crate::setup::profile_owner_selection(name.as_deref())?;
+                match selected {
+                    crate::setup::ProfileOwnerSelection::Revision(revision) => Ok(Some(revision)),
+                    crate::setup::ProfileOwnerSelection::Legacy => Ok(None),
+                    crate::setup::ProfileOwnerSelection::Absent if *required => {
+                        bail!("OAuth profile was removed; owner authorization is disabled")
+                    }
+                    crate::setup::ProfileOwnerSelection::Absent => Ok(None),
+                }
+            }
+            #[cfg(test)]
+            OwnerSelection::Fixed(revision) => Ok(revision.clone()),
+        }
+    }
+
     async fn verify_owner_password(&self, password: &str) -> Result<bool> {
         if password.len() > 1024 {
             tokio::time::sleep(FAILED_PASSWORD_DELAY).await;
             return Ok(false);
         }
 
+        let revision = self.selected_owner_revision()?;
         self.reload_persistent()?;
         let hash = {
             let state = self
@@ -387,7 +423,7 @@ impl Runtime {
                 .persistent
                 .lock()
                 .map_err(|_| anyhow!("OAuth state lock poisoned"))?;
-            active_owner_hash(&state, self.inner.owner_password_revision.as_deref())
+            active_owner_hash(&state, revision.as_deref())
                 .map(str::to_owned)
                 .ok_or_else(|| anyhow!("OAuth owner password is not configured"))?
         };
@@ -411,6 +447,9 @@ impl Runtime {
         })
         .await
         .context("OAuth password verifier task failed")??;
+        // A password rotated during the Argon2 computation must not become a
+        // successful authorization with the superseded generation.
+        let valid = valid && self.selected_owner_revision()? == revision;
         if !valid {
             tokio::time::sleep(FAILED_PASSWORD_DELAY).await;
         }
@@ -942,8 +981,9 @@ pub fn delete_profile_state(profile: Option<&str>) -> Result<()> {
 pub fn status(profile: Option<&str>) -> Result<String> {
     let path = state_path(profile)?;
     let state = read_state(&path)?;
-    let selected = crate::setup::profile_owner_revision(profile)?;
-    let owner = active_owner_hash(&state, selected.as_deref()).is_some();
+    let selection = crate::setup::profile_owner_selection(profile)?;
+    let selected = selection.revision();
+    let owner = active_owner_hash(&state, selected).is_some();
     Ok(format!(
         "OAuth state: {}\nOwner credential: {}\nDCR clients: {}\nRefresh grants: {}\n",
         path.display(),
@@ -2036,7 +2076,7 @@ mod tests {
             Runtime {
                 inner: Arc::new(RuntimeState {
                     state_path: PathBuf::from("/tmp/unused"),
-                    owner_password_revision: None,
+                    owner_selection: OwnerSelection::Fixed(None),
                     persistent: Mutex::new(PersistentState {
                         owner_password_hash: Some(
                             "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$RmFrZUhhc2hUaGF0SXNOZXZlclVzZWQ".to_owned(),
@@ -2414,7 +2454,7 @@ mod tests {
         let runtime = Runtime {
             inner: Arc::new(RuntimeState {
                 state_path,
-                owner_password_revision: None,
+                owner_selection: OwnerSelection::Fixed(None),
                 persistent: Mutex::new(persistent),
                 pending_clients: Mutex::new(HashMap::new()),
                 access_tokens: Mutex::new(HashMap::new()),
