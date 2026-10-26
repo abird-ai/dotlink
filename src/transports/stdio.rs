@@ -114,20 +114,8 @@ fn request_label(line: &[u8], overflow: bool) -> String {
         return "large JSON-RPC request".to_owned();
     }
     serde_json::from_slice::<Value>(line)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("method")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .filter(|method| {
-            method.len() <= 96
-                && method.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
-                })
-        })
-        .unwrap_or_else(|| "unknown JSON-RPC method".to_owned())
+        .map(|value| crate::logging::jsonrpc_request_label(&value, false))
+        .unwrap_or_else(|_| "unknown JSON-RPC method".to_owned())
 }
 
 pub async fn run(machine: LocalMachine, cancellation: CancellationToken) -> Result<()> {

@@ -1300,16 +1300,7 @@ fn apply_response_window(jsonrpc: &mut Value, window: Duration, reserve: Duratio
 }
 
 fn verbose_request_label(jsonrpc: &Value) -> String {
-    let method = jsonrpc
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("jsonrpc");
-    if method == "tools/call"
-        && let Some(name) = jsonrpc.pointer("/params/name").and_then(Value::as_str)
-    {
-        return name.to_owned();
-    }
-    method.to_owned()
+    crate::logging::jsonrpc_request_label(jsonrpc, true)
 }
 
 #[cfg(test)]

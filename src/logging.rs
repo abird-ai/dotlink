@@ -245,6 +245,35 @@ pub fn summarize_arguments<'a>(
     parts.join(" ")
 }
 
+/// Names from a JSON-RPC envelope are untrusted input even at diagnostic
+/// verbosity. Permit only short, ASCII, single-line protocol identifiers.
+pub(crate) fn protocol_identifier<'a>(value: Option<&'a str>, fallback: &'static str) -> &'a str {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 96
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+                })
+        })
+        .unwrap_or(fallback)
+}
+
+pub(crate) fn jsonrpc_request_label(value: &Value, include_tool: bool) -> String {
+    let method = protocol_identifier(
+        value.get("method").and_then(Value::as_str),
+        "unknown JSON-RPC method",
+    );
+    if include_tool && method == "tools/call" {
+        return protocol_identifier(
+            value.pointer("/params/name").and_then(Value::as_str),
+            "tools/call",
+        )
+        .to_owned();
+    }
+    method.to_owned()
+}
+
 pub fn truncate(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
@@ -258,6 +287,43 @@ pub fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonrpc_identifiers_are_bounded_and_sanitized_for_every_transport() {
+        use serde_json::json;
+        assert_eq!(
+            jsonrpc_request_label(
+                &json!({"method":"tools/call","params":{"name":"read"}}),
+                true
+            ),
+            "read"
+        );
+        assert_eq!(
+            jsonrpc_request_label(
+                &json!({"method":"tools/call","params":{"name":"read"}}),
+                false
+            ),
+            "tools/call"
+        );
+        for value in [
+            "read\ninjected",
+            "read\rESC",
+            "a".repeat(97).as_str(),
+            "access_token:secret",
+        ] {
+            let envelope = json!({"method":"tools/call","params":{"name":value}});
+            assert_eq!(jsonrpc_request_label(&envelope, true), "tools/call");
+            let envelope = json!({"method":value});
+            assert_eq!(
+                jsonrpc_request_label(&envelope, false),
+                "unknown JSON-RPC method"
+            );
+        }
+        assert_eq!(
+            jsonrpc_request_label(&json!({"params":{"method":"payload-secret"}}), false),
+            "unknown JSON-RPC method"
+        );
+    }
 
     #[test]
     fn argument_summaries_redact_bulk_values_and_keep_scalars() {
