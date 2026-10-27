@@ -1621,15 +1621,15 @@ mod walk_tests {
     async fn grep_json_modes_stay_inside_the_byte_ceiling() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        // Escaped characters make the rendered path much longer than its byte
-        // length, which is what used to break the ceiling. Windows rejects a
-        // control byte in a file name, so use the quote it must still escape.
+        // A path whose JSON rendering is much longer than its bytes on disk is
+        // what used to break the ceiling. Windows rejects a control byte in a file
+        // name, so it inflates with more, longer legal names instead.
         #[cfg(not(windows))]
-        let padding = "\u{1}";
+        let (files, padding) = (5u32, "\u{1}".repeat(150));
         #[cfg(windows)]
-        let padding = "\"";
-        for index in 0..5 {
-            let name = format!("e{index}{}", padding.repeat(150));
+        let (files, padding) = (6u32, "n".repeat(180));
+        for index in 0..files {
+            let name = format!("e{index}{padding}");
             std::fs::write(root.join(&name), "hit\n").unwrap();
         }
         let machine = crate::mcp::tools::test_support::test_machine_with(root, |config| {
