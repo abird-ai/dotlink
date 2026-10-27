@@ -301,13 +301,36 @@ pub struct CacheGrant {
     pub mode: CacheMode,
 }
 
+/// Cache mounts live inside the Linux sandbox home, a POSIX path, whatever host
+/// build produced them. Joining with the host separator would yield
+/// `/tmp/home\.cargo` on Windows and stop matching the sandbox rule that keeps
+/// every cache target below `/tmp/home`.
+fn sandbox_join(relative: &Path) -> PathBuf {
+    let mut value = String::from("/tmp/home");
+    for component in relative.components() {
+        value.push('/');
+        value.push_str(&component.as_os_str().to_string_lossy());
+    }
+    PathBuf::from(value)
+}
+
+/// Parent of a sandbox path, spelled with the same POSIX separator so
+/// `CARGO_HOME` and `GRADLE_USER_HOME` stay inside the sandbox home.
+fn sandbox_parent(sandbox_path: &Path) -> String {
+    let value = sandbox_path.to_string_lossy();
+    match value.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent.to_owned(),
+        _ => value.to_string(),
+    }
+}
+
 impl CacheGrant {
     pub fn sandbox_path(&self) -> Result<PathBuf> {
         let home = home_dir()?;
         let home = fs::canonicalize(&home).unwrap_or(home);
         let path = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
         if let Ok(relative) = path.strip_prefix(&home) {
-            return Ok(Path::new("/tmp/home").join(relative));
+            return Ok(sandbox_join(relative));
         }
         Ok(self.kind.fallback_sandbox_path())
     }
@@ -315,12 +338,9 @@ impl CacheGrant {
     pub fn shell_env(&self, sandbox_path: &Path) -> Option<(String, String)> {
         let value = sandbox_path.to_string_lossy().to_string();
         match self.kind {
-            CacheKind::CargoRegistry | CacheKind::CargoGit => sandbox_path.parent().map(|parent| {
-                (
-                    "CARGO_HOME".to_owned(),
-                    parent.to_string_lossy().to_string(),
-                )
-            }),
+            CacheKind::CargoRegistry | CacheKind::CargoGit => {
+                Some(("CARGO_HOME".to_owned(), sandbox_parent(sandbox_path)))
+            }
             CacheKind::Npm => Some(("NPM_CONFIG_CACHE".to_owned(), value)),
             CacheKind::Pnpm => Some(("npm_config_store_dir".to_owned(), value)),
             CacheKind::Yarn => Some(("YARN_CACHE_FOLDER".to_owned(), value)),
@@ -328,12 +348,9 @@ impl CacheGrant {
             CacheKind::Uv => Some(("UV_CACHE_DIR".to_owned(), value)),
             CacheKind::GoMod => Some(("GOMODCACHE".to_owned(), value)),
             CacheKind::GoBuild => Some(("GOCACHE".to_owned(), value)),
-            CacheKind::Gradle => sandbox_path.parent().map(|parent| {
-                (
-                    "GRADLE_USER_HOME".to_owned(),
-                    parent.to_string_lossy().to_string(),
-                )
-            }),
+            CacheKind::Gradle => {
+                Some(("GRADLE_USER_HOME".to_owned(), sandbox_parent(sandbox_path)))
+            }
             CacheKind::Sccache => Some(("SCCACHE_DIR".to_owned(), value)),
             CacheKind::Ccache => Some(("CCACHE_DIR".to_owned(), value)),
             CacheKind::Maven => None,
@@ -3562,7 +3579,12 @@ mod tests {
         add_cache_candidate(&mut found, CacheKind::Npm, home.join("not-a-dir"), home);
         add_cache_candidate(&mut found, CacheKind::Uv, home.join("missing"), home);
 
-        assert_eq!(found.get(&CacheKind::CargoRegistry), Some(&existing));
+        // A discovered cache is recorded in its resolved spelling: macOS resolves
+        // `/var` to `/private/var`, and Windows adds a verbatim prefix.
+        assert_eq!(
+            found.get(&CacheKind::CargoRegistry),
+            Some(&existing.canonicalize().unwrap())
+        );
         assert!(!found.contains_key(&CacheKind::Npm));
         assert!(!found.contains_key(&CacheKind::Uv));
     }

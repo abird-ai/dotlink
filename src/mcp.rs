@@ -156,17 +156,25 @@ fn checked_limit<T: PartialOrd + std::fmt::Display>(name: &str, value: T, minimu
     Ok(value)
 }
 
-/// True for the shell tool this platform advertises. Tool visibility, the
-/// schema-limit rewrite, the tunnel's delivery reserve and the TOOL log all ask
-/// this one question, so a new shell variant cannot be missed in one of them.
-pub fn is_shell_tool(name: &str) -> bool {
+/// Name of the shell tool this platform advertises. Derived from `TOOL_SPECS`
+/// through [`Capabilities::allows`], so a new shell variant cannot be added to
+/// the table and missed here.
+pub fn shell_tool_name() -> &'static str {
     let shell = Capabilities {
         shell: true,
         ..Capabilities::default()
     };
     TOOL_SPECS
         .iter()
-        .any(|spec| spec.name == name && shell.allows(spec.capability))
+        .find(|spec| shell.allows(spec.capability))
+        .map_or("bash", |spec| spec.name)
+}
+
+/// True for the shell tool this platform advertises. Tool visibility, the
+/// schema-limit rewrite, the tunnel's delivery reserve and the TOOL log all ask
+/// this one question, so a new shell variant cannot be missed in one of them.
+pub fn is_shell_tool(name: &str) -> bool {
+    name == shell_tool_name()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -606,8 +614,12 @@ impl AccessPolicy {
         Ok(resolved)
     }
 
+    /// Tool output names paths with `/` on every platform, so one request, one
+    /// reply and one transcript read the same on Linux, macOS and Windows. The
+    /// runtime still resolves the host spelling internally.
     fn relative_display(&self, path: &Path) -> String {
-        path.strip_prefix(&self.base_dir)
+        let value = path
+            .strip_prefix(&self.base_dir)
             .map(|relative| {
                 let value = relative.to_string_lossy().to_string();
                 if value.is_empty() {
@@ -616,7 +628,11 @@ impl AccessPolicy {
                     value
                 }
             })
-            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+        if std::path::MAIN_SEPARATOR == '/' {
+            return value;
+        }
+        value.replace(std::path::MAIN_SEPARATOR, "/")
     }
 
     fn sandbox_mounts(&self) -> Vec<(PathBuf, bool)> {
@@ -928,7 +944,10 @@ impl LocalMachine {
         let mut cache_mounts = Vec::with_capacity(args.cache_mounts.len());
         let mut cache_targets = BTreeSet::new();
         for mount in args.cache_mounts {
-            if !mount.target.is_absolute()
+            // The target lives in the sandbox's own namespace, not on this
+            // host: judge it as a rooted POSIX path so the same profile is
+            // valid on a Windows build, which has no drive prefix to satisfy.
+            if !mount.target.has_root()
                 || !mount.target.starts_with("/tmp/home")
                 || mount
                     .target

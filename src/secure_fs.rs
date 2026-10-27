@@ -854,10 +854,19 @@ impl SecureFs {
 mod tests {
     use super::*;
 
+    /// A temporary tree whose base is already in its resolved spelling. The policy
+    /// resolves every authorized root before it reaches this layer, and macOS
+    /// reaches `$TMPDIR` through the `/var` symlink, so a raw `tempdir()` path is
+    /// refused by the pinned-root walk on purpose.
+    fn resolved_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        (temp, base)
+    }
+
     #[test]
     fn portable_openat_walk_rejects_symlink_swaps() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let (_temp, root) = resolved_tempdir();
         let allowed = root.join("allowed");
         let other = root.join("other");
         fs::create_dir_all(&allowed).unwrap();
@@ -899,9 +908,9 @@ mod tests {
 
     #[test]
     fn securely_denies_redirected_symlinks_and_writes_inside_grant() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let outside = temp.path().join("outside");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
+        let outside = base.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("secret"), "secret").unwrap();
@@ -927,9 +936,9 @@ mod tests {
         use std::io::Read;
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("granted");
-        let outside = temp.path().join("outside");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("granted");
+        let outside = base.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         let selected = root.join("target");
@@ -966,8 +975,8 @@ mod tests {
 
     #[test]
     fn edit_requires_both_pinned_read_and_write_grants() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
         let readable = root.join("readable");
         fs::create_dir_all(&readable).unwrap();
         fs::write(readable.join("visible"), b"visible").unwrap();
@@ -1004,9 +1013,9 @@ mod tests {
 
     #[test]
     fn create_only_write_refuses_existing_and_symlinked_targets() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let outside = temp.path().join("outside");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
+        let outside = base.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("secret"), b"secret").unwrap();
@@ -1032,9 +1041,9 @@ mod tests {
 
     #[test]
     fn atomic_write_replaces_content_keeps_mode_and_refuses_symlinks() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let outside = temp.path().join("outside");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
+        let outside = base.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("secret"), b"secret").unwrap();
@@ -1112,8 +1121,8 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         };
 
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
         fs::create_dir(&root).unwrap();
         // A traversable parent is what makes the temporary observable at all.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1171,8 +1180,8 @@ mod tests {
 
     #[test]
     fn staged_update_refuses_bytes_changed_after_preflight() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
         fs::create_dir(&root).unwrap();
         let path = root.join("target");
         fs::write(&path, b"old").unwrap();
@@ -1195,9 +1204,9 @@ mod tests {
 
     #[test]
     fn staged_replacement_rechecks_a_target_swapped_for_a_symlink() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let outside = temp.path().join("outside");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
+        let outside = base.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(root.join("target"), b"old").unwrap();
@@ -1227,9 +1236,9 @@ mod tests {
     fn child_opens_stay_inside_the_pinned_directory() {
         use std::io::Read;
 
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let outside = temp.path().join("outside");
+        let (_temp, base) = resolved_tempdir();
+        let root = base.join("root");
+        let outside = base.join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(root.join("a.txt"), b"a").unwrap();
@@ -1298,9 +1307,9 @@ mod tests {
 
     #[test]
     fn root_capability_cannot_operate_outside_itself() {
-        let temp = tempfile::tempdir().unwrap();
-        let one = temp.path().join("one");
-        let two = temp.path().join("two");
+        let (_temp, base) = resolved_tempdir();
+        let one = base.join("one");
+        let two = base.join("two");
         fs::create_dir(&one).unwrap();
         fs::create_dir(&two).unwrap();
         let secure = SecureFs::new(std::slice::from_ref(&one), std::slice::from_ref(&one)).unwrap();

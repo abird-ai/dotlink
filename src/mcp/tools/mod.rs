@@ -19,6 +19,7 @@ pub(crate) mod text;
 use std::{
     collections::BinaryHeap,
     ffi::{OsStr, OsString},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -323,6 +324,139 @@ struct PendingDir {
     ignores: Vec<Arc<Gitignore>>,
 }
 
+/// One directory's entry names, taken from the pinned descriptor rather than
+/// from its path. Linux and Windows can read the descriptor path directly;
+/// macOS must buffer because `fdopendir` owns the descriptor it enumerates.
+struct DirectoryEntries {
+    source: DirectorySource,
+    truncated: bool,
+}
+
+enum DirectorySource {
+    Streaming(fs::ReadDir),
+    #[cfg(target_os = "macos")]
+    Buffered(std::vec::IntoIter<OsString>),
+}
+
+impl DirectoryEntries {
+    /// True when a `DirectoryEntries` ceiling, not the caller's budget, ended
+    /// this directory: the caller must not present the listing as complete.
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    async fn next_name(&mut self) -> io::Result<Option<OsString>> {
+        match &mut self.source {
+            DirectorySource::Streaming(reader) => {
+                Ok(reader.next_entry().await?.map(|entry| entry.file_name()))
+            }
+            #[cfg(target_os = "macos")]
+            DirectorySource::Buffered(names) => Ok(names.next()),
+        }
+    }
+}
+
+/// errno accessor: the two `libc` spellings of the same thread-local.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn errno_location() -> *mut libc::c_int {
+    #[cfg(target_os = "macos")]
+    // SAFETY: macOS exposes errno as a thread-local through `__error`.
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: every other Unix in scope exposes errno through `__errno_location`.
+    unsafe {
+        libc::__errno_location()
+    }
+}
+
+/// Name a directory's entries through the descriptor itself, buffered. macOS has
+/// no `/proc`, and its `/dev/fd` nodes are character devices, so `read_dir` on the
+/// descriptor path fails with `ENOTDIR`; `fdopendir` is the only enumeration that
+/// never names the path. It takes ownership of the descriptor it enumerates, so
+/// enumerate one duplicate and leave the pinned original untouched. Names are
+/// buffered because `readdir` is not reentrant and the walk is shared by
+/// concurrent requests; `limit` keeps that buffer inside the walk's own ceiling.
+/// Non-macOS builds reach this only from tests, which drive the same loop against
+/// a real directory.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn read_dir_names(
+    descriptor: std::os::fd::RawFd,
+    limit: usize,
+) -> io::Result<(Vec<OsString>, bool)> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // SAFETY: `descriptor` is a live directory descriptor owned by the caller.
+    let duplicate = unsafe { libc::dup(descriptor) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `dup` shares the open file description's offset, so rewind first: a second
+    // enumeration of the same pinned handle must not come back empty.
+    // SAFETY: `duplicate` is a live descriptor.
+    if unsafe { libc::lseek(duplicate, 0, libc::SEEK_SET) } < 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: nothing else owns `duplicate` yet.
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    // SAFETY: `duplicate` is a fresh descriptor; `fdopendir` takes ownership of it.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `duplicate` is still owned here.
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    let mut truncated = false;
+    loop {
+        if names.len() > limit {
+            names.truncate(limit);
+            truncated = true;
+            break;
+        }
+        // SAFETY: clearing errno first is the only way to tell a read error from
+        // the end of the directory.
+        unsafe { *errno_location() = 0 };
+        // SAFETY: `stream` is a live DIR; the entry it returns is owned by it.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            // SAFETY: reading errno is always sound on this thread.
+            let code = unsafe { *errno_location() };
+            if code != 0 {
+                // SAFETY: `stream` came from fdopendir and is closed exactly once.
+                unsafe { libc::closedir(stream) };
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            break;
+        }
+        // SAFETY: `readdir` returned a live entry whose `d_name` is a
+        // NUL-terminated buffer valid until the next call.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        names.push(OsString::from(OsStr::from_bytes(name)));
+    }
+    // SAFETY: `stream` came from fdopendir and is closed exactly once.
+    unsafe { libc::closedir(stream) };
+    Ok((names, truncated))
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_directory(handle: &DirHandle, path: &Path) -> Result<(Vec<OsString>, bool)> {
+    read_dir_names(std::os::fd::AsRawFd::as_raw_fd(&handle.fd), MAX_WALK_VISITS).with_context(
+        || {
+            format!(
+                "descriptor-rooted enumeration cannot list pinned directory {}",
+                path.display()
+            )
+        },
+    )
+}
+
 impl LocalMachine {
     /// Pin the caller-named root. A root that cannot be opened is a tool error,
     /// never a silently empty result.
@@ -373,12 +507,17 @@ impl LocalMachine {
         }
     }
 
-    /// Enumerate exactly the pinned directory. Linux has no `read_dir` over a
-    /// descriptor, so the pinned FD is reached through procfs; if that is not
-    /// available the walk fails closed rather than reopening a pathname that a
-    /// concurrent rename could have redirected.
-    async fn read_directory(&self, handle: Option<&DirHandle>, path: &Path) -> Result<fs::ReadDir> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Enumerate exactly the pinned directory. Neither macOS nor Linux can
+    /// `read_dir` a descriptor through the standard library, so the pinned FD is
+    /// reached through procfs (Linux) or driven with `fdopendir` (macOS). If that
+    /// is not available the walk fails closed rather than reopening a pathname
+    /// that a concurrent rename could have redirected.
+    async fn read_directory(
+        &self,
+        handle: Option<&DirHandle>,
+        path: &Path,
+    ) -> Result<DirectoryEntries> {
+        #[cfg(target_os = "linux")]
         {
             let Some(handle) = handle else {
                 bail!(
@@ -386,13 +525,8 @@ impl LocalMachine {
                     path.display()
                 );
             };
-            #[cfg(target_os = "linux")]
-            let fd_root = "/proc/self/fd";
-            #[cfg(target_os = "macos")]
-            let fd_root = "/dev/fd";
             let pinned = PathBuf::from(format!(
-                "{}/{}",
-                fd_root,
+                "/proc/self/fd/{}",
                 std::os::fd::AsRawFd::as_raw_fd(&handle.fd)
             ));
             let reader = fs::read_dir(&pinned).await.with_context(|| {
@@ -401,7 +535,27 @@ impl LocalMachine {
                     path.display()
                 )
             })?;
-            Ok(reader)
+            Ok(DirectoryEntries {
+                source: DirectorySource::Streaming(reader),
+                truncated: false,
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(handle) = handle else {
+                bail!(
+                    "descriptor-rooted enumeration requires a pinned directory handle for {}",
+                    path.display()
+                );
+            };
+            // macOS `fdesc` files are not directories, so `/dev/fd/<fd>` cannot
+            // be opened as one: `fdopendir` on a duplicate of the pinned
+            // descriptor is the only enumeration that never names the path.
+            let (names, truncated) = read_macos_directory(handle, path)?;
+            Ok(DirectoryEntries {
+                source: DirectorySource::Buffered(names.into_iter()),
+                truncated,
+            })
         }
         #[cfg(windows)]
         {
@@ -410,7 +564,10 @@ impl LocalMachine {
             }
             // All ancestors and this directory remain open without delete
             // sharing for the entire walk; the path cannot be redirected.
-            Ok(fs::read_dir(path).await?)
+            Ok(DirectoryEntries {
+                source: DirectorySource::Streaming(fs::read_dir(path).await?),
+                truncated: false,
+            })
         }
     }
 
@@ -674,10 +831,13 @@ impl LocalMachine {
             {
                 ignores.push(Arc::new(ignore));
             }
+            // A directory this platform had to buffer may have stopped at its
+            // own ceiling, which still means the listing is not exhaustive.
+            progress.traversal_incomplete |= reader.truncated();
 
             loop {
-                let entry = match reader.next_entry().await {
-                    Ok(Some(entry)) => entry,
+                let name = match reader.next_name().await {
+                    Ok(Some(name)) => name,
                     Ok(None) => break,
                     // Stop this directory, keep the rest of the walk.
                     Err(error) if skippable_io_error(&error) => {
@@ -692,7 +852,6 @@ impl LocalMachine {
                     return Ok(progress);
                 }
                 progress.visited += 1;
-                let name = entry.file_name();
                 // In-flight staged bytes are not a file the caller can see.
                 if crate::staging::is_staging_temporary(&name) {
                     continue;
@@ -711,7 +870,7 @@ impl LocalMachine {
                 // Inspect the already opened directory rather than reopening the
                 // containing path. Entries may disappear while other tools work
                 // concurrently; skip them rather than failing the listing.
-                let metadata = match fs::symlink_metadata(entry.path()).await {
+                let metadata = match fs::symlink_metadata(&path).await {
                     Ok(metadata) => metadata,
                     Err(error) if skippable_io_error(&error) => {
                         progress.traversal_incomplete = true;
@@ -992,6 +1151,30 @@ mod tests {
         )));
         assert!(skippable_io_error(&Error::from(ErrorKind::NotFound)));
         assert!(!skippable_io_error(&Error::from(ErrorKind::InvalidData)));
+    }
+
+    /// The buffered enumeration macOS needs must name exactly what the directory
+    /// holds, skip the dot entries, and stop at its ceiling instead of buffering
+    /// an unbounded directory.
+    #[cfg(unix)]
+    #[test]
+    fn buffered_descriptor_enumeration_lists_names_and_respects_its_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::write(root.join(name), b"x").unwrap();
+        }
+        let directory = std::fs::File::open(&root).unwrap();
+        let descriptor = std::os::fd::AsRawFd::as_raw_fd(&directory);
+
+        let (mut names, truncated) = read_dir_names(descriptor, 10).unwrap();
+        assert!(!truncated);
+        names.sort();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+
+        let (names, truncated) = read_dir_names(descriptor, 2).unwrap();
+        assert!(truncated);
+        assert_eq!(names.len(), 2);
     }
 
     #[test]

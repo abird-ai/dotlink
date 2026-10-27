@@ -1885,6 +1885,9 @@ mod tests {
         assert!(Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).is_err());
     }
 
+    /// The sandboxed shell is Linux-only, so its readable-directory requirement is
+    /// only reachable there; the non-Linux rejection is asserted separately.
+    #[cfg(target_os = "linux")]
     #[test]
     fn shell_requires_a_readable_directory() {
         let args =
@@ -1905,6 +1908,21 @@ mod tests {
         let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap();
         assert!(policy.allow_shell);
         assert_eq!(policy.read_roots, [PathBuf::from("/project")]);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn native_shell_requires_an_explicit_no_sandbox() {
+        let args =
+            Args::try_parse_from(["dotlink", "--no-default-allow", "--allow-shell"]).unwrap();
+        let error =
+            Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("sandboxed shell execution is unavailable on this OS"),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "linux")]

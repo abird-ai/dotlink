@@ -1092,8 +1092,11 @@ mod tests {
 
     #[test]
     fn shell_tool_schema_reports_configured_ceilings() {
-        let bash = LocalMachine::all_tools().get("bash").cloned().unwrap();
-        let patched = with_profile_limits(bash.clone(), 42, 2048);
+        let shell = LocalMachine::all_tools()
+            .get(crate::mcp::shell_tool_name())
+            .cloned()
+            .unwrap();
+        let patched = with_profile_limits(shell.clone(), 42, 2048);
         let properties = patched.input_schema["properties"].as_object().unwrap();
         let timeout = properties["timeout_secs"]["description"].as_str().unwrap();
         let output = properties["max_output_bytes"]["description"]

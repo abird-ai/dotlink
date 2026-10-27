@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.12.0] - 2026-10-27
 
+### Fixed
+
+- Native macOS filesystem tools enumerate directories through the pinned descriptor
+  with `fdopendir` instead of `/dev/fd`, which macOS rejects with `ENOTDIR`; the
+  buffered names stay inside the walk's own entry ceiling.
+- Tool replies name paths with `/` on every platform, so the same request produces the
+  same `ls`, `grep`, `edit` and `patch` output on Linux, macOS and Windows.
+- Cache sandbox targets and their `CARGO_HOME`/`GRADLE_USER_HOME` values keep their
+  POSIX spelling inside `/tmp/home` on every build, and a profile cache target is
+  validated as a sandbox path rather than as a host path.
+
 ### Changed
 
 - Unconfigured services stop cleanly. A service with no saved profile, no explicit

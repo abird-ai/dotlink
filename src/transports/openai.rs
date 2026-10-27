@@ -2863,7 +2863,8 @@ mod tests {
         assert_eq!(shell_timeout_within(window, reserve), 115);
         assert_eq!(shell_timeout_within(Duration::from_secs(3), reserve), 1);
 
-        let shell = |arguments: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":arguments}});
+        let shell_name = crate::mcp::shell_tool_name();
+        let shell = |arguments: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":shell_name,"arguments":arguments}});
 
         // Omitted -> derived from the client window.
         let mut call = shell(json!({"command":"cargo build --release"}));

@@ -414,12 +414,19 @@ For unrestricted filesystem access while keeping Linux sandboxing, use `--allow-
 
 Rust filesystem tools enforce allow/deny policy on Windows and macOS.
 On macOS the pinned-root Unix backend uses a component-wise openat/O_NOFOLLOW
-walk where Linux openat2 is unavailable. Windows pins ancestor directories
+walk where Linux openat2 is unavailable. Directory enumeration stays
+rooted in the descriptor too: macOS `/dev/fd` nodes are character devices, so
+entries come from `fdopendir` on a duplicate of the pinned directory and are
+buffered within the walk's own entry ceiling. Windows pins ancestor directories
 against rename, refuses reparse points during file opens, and coordinates
 same-path writers across processes with a named Global kernel mutex. The
 acquiring thread releases the mutex when its guard drops; a process crash
 abandons it automatically. Failure to pin a directory or open the mutex fails
 closed. Native Windows/macOS behavior still requires target-host validation.
+
+Tool replies name paths with `/` on every platform, so one request produces one
+reply on Linux, macOS and Windows. The host spelling is still what the runtime
+resolves internally.
 
 Bubblewrap is Linux-only. Native Windows/macOS shell execution therefore requires `--allow-all --no-sandbox`.
 

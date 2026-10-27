@@ -59,6 +59,13 @@ mod tests {
 
     use super::*;
 
+    /// One absolute path this host actually accepts. The literal POSIX examples
+    /// in these tests are not absolute on Windows, where only a drive-qualified
+    /// path is.
+    fn absolute(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     #[test]
     fn relative_and_empty_overrides_are_ignored() {
         assert_eq!(absolute_override(None), None);
@@ -67,9 +74,10 @@ mod tests {
             absolute_override(Some(OsString::from("relative-config"))),
             None
         );
+        let absolute = absolute("xdg");
         assert_eq!(
-            absolute_override(Some(OsString::from("/tmp/xdg"))),
-            Some(PathBuf::from("/tmp/xdg"))
+            absolute_override(Some(absolute.clone().into_os_string())),
+            Some(absolute)
         );
     }
 
@@ -78,9 +86,10 @@ mod tests {
         assert!(home_path(None).is_err());
         assert!(home_path(Some(OsString::new())).is_err());
         assert!(home_path(Some(OsString::from("relative-home"))).is_err());
+        let home = absolute("user");
         assert_eq!(
-            home_path(Some(OsString::from("/home/user"))).unwrap(),
-            Path::new("/home/user")
+            home_path(Some(home.clone().into_os_string())).unwrap(),
+            Path::new(&home)
         );
     }
 }

@@ -3234,7 +3234,19 @@ fn update_state<T>(
     path: &Path,
     update: impl FnOnce(&mut PersistentState) -> Result<T>,
 ) -> Result<(PersistentState, T)> {
-    let _lock = open_state_lock(path)?;
+    update_state_within(path, STATE_LOCK_TIMEOUT, update)
+}
+
+/// Same read-modify-write with an explicit lock budget. The configured budget is
+/// short so a contended caller gives up quickly; a test that deliberately
+/// serializes many writers needs to wait out their real, host-dependent work
+/// instead of failing on a deadline that only suits one machine.
+fn update_state_within<T>(
+    path: &Path,
+    timeout: Duration,
+    update: impl FnOnce(&mut PersistentState) -> Result<T>,
+) -> Result<(PersistentState, T)> {
+    let _lock = crate::private_state::acquire(&state_lock_path(path), timeout)?;
     let mut state = read_state(path)?;
     let before = state.clone();
     let value = update(&mut state)?;
@@ -4657,7 +4669,7 @@ mod tests {
             let path = path.clone();
             threads.push(std::thread::spawn(move || {
                 let client_id = format!("client-{index}");
-                update_state(&path, |state| {
+                update_state_within(&path, Duration::from_secs(30), |state| {
                     state.clients.insert(
                         client_id.clone(),
                         RegisteredClient {

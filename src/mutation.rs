@@ -372,17 +372,19 @@ mod tests {
             windows_mutex_name(Path::new("C:\\Repo\\DATA.TXT")).unwrap(),
             windows_mutex_name(Path::new("c:\\repo\\data.txt")).unwrap()
         );
+        // Greek final sigma is *not* a case pair in the invariant upcase table
+        // Windows and NTFS share, so use Cyrillic, which every table folds.
         assert_eq!(
-            windows_mutex_name(Path::new("C:\\Repo\\Σ.txt")).unwrap(),
-            windows_mutex_name(Path::new("c:\\repo\\ς.TXT")).unwrap()
+            windows_mutex_name(Path::new("C:\\Repo\\Д.txt")).unwrap(),
+            windows_mutex_name(Path::new("c:\\repo\\д.TXT")).unwrap()
         );
         assert_ne!(
             windows_mutex_name(Path::new("C:\\Repo\\a.txt")).unwrap(),
             windows_mutex_name(Path::new("C:\\Repo\\b.txt")).unwrap()
         );
         let plan = windows_lock_plan(&[
-            Path::new("C:\\Repo\\Σ.txt"),
-            Path::new("c:\\repo\\ς.TXT"),
+            Path::new("C:\\Repo\\Д.txt"),
+            Path::new("c:\\repo\\д.TXT"),
             Path::new("C:\\Repo\\other.txt"),
         ])
         .unwrap();
