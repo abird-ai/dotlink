@@ -6,18 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-10-27
+## [0.13.0] - 2026-10-27
+
+Native macOS and Windows filesystem tools are the focus: macOS directory
+enumeration never worked, and tool output depended on the host separator.
 
 ### Fixed
 
 - Native macOS filesystem tools enumerate directories through the pinned descriptor
   with `fdopendir` instead of `/dev/fd`, which macOS rejects with `ENOTDIR`; the
-  buffered names stay inside the walk's own entry ceiling.
+  buffered names stay inside the walk's own entry ceiling. `grep` and `ls` were
+  unusable on macOS before this.
 - Tool replies name paths with `/` on every platform, so the same request produces the
   same `ls`, `grep`, `edit` and `patch` output on Linux, macOS and Windows.
 - Cache sandbox targets and their `CARGO_HOME`/`GRADLE_USER_HOME` values keep their
   POSIX spelling inside `/tmp/home` on every build, and a profile cache target is
   validated as a sandbox path rather than as a host path.
+
+### Added
+
+- `mcp::shell_tool_name()` is the single answer to which shell tool this platform
+  advertises, so a new shell variant cannot be missed by the schema rewrite, the
+  tunnel's delivery reserve or the TOOL log.
+
+### Changed
+
+- Native platform tests now run to completion on macOS and Windows, so a tag produces
+  a published release instead of stalling on a failed platform job.
+
+## [0.12.0] - 2026-10-27
 
 ### Changed
 
@@ -372,7 +389,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/abird-ai/dotlink/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/abird-ai/dotlink/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/abird-ai/dotlink/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/abird-ai/dotlink/compare/v0.9.1...v0.10.0

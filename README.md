@@ -85,7 +85,7 @@ Default runs are quiet. Add `-v` to see tool activity:
 ~~~text
 $ dotlink -v -p aw
 
-abird dotlink 0.12.0
+abird dotlink 0.13.0
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
