@@ -17,6 +17,53 @@ fn run_with_profile(
         .unwrap()
 }
 
+fn run_execution_with_profile(
+    config_dir: &std::path::Path,
+    profile: &std::path::Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--no-stdio")
+        .env("DOTLINK_CONFIG", profile)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .output()
+        .unwrap()
+}
+
+fn run_to_post_credential_failure(
+    config_dir: &std::path::Path,
+    profile: &std::path::Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--no-default-allow")
+        .env("DOTLINK_CONFIG", profile)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .output()
+        .unwrap()
+}
+
+fn assert_post_credential_policy_failure(output: &std::process::Output) {
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no effective local capability remains"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("selected runtime key is missing"),
+        "persisted key was consulted instead of reaching the post-credential failure: {stderr}"
+    );
+}
+
 #[test]
 fn persisted_key_generation_is_required_and_never_falls_back() {
     let temp = tempfile::tempdir().unwrap();
@@ -44,7 +91,7 @@ fn persisted_key_generation_is_required_and_never_falls_back() {
     );
 
     fs::remove_file(&selected).unwrap();
-    let missing = run_with_profile(&config_dir, &jsonc);
+    let missing = run_execution_with_profile(&config_dir, &jsonc);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("selected runtime key is missing"));
 
@@ -119,6 +166,7 @@ fn profile_cli(config_home: &std::path::Path, args: &[&str]) -> std::process::Ou
         .arg("profile")
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", config_home.join("state"))
         .env_remove("DOTLINK_CONFIG")
         .env_remove("DOTLINK_API_KEY")
         .env_remove("DOTLINK_API_KEY_FILE")
@@ -148,9 +196,93 @@ fn missing_selected_key_does_not_block_profile_inspection_or_recovery() {
         String::from_utf8_lossy(&show.stderr)
     );
     assert!(String::from_utf8_lossy(&show.stdout).contains("missing"));
-    let execution = run_with_profile(&home, &path);
+    let execution = run_execution_with_profile(&home, &path);
     assert!(!execution.status.success());
     assert!(String::from_utf8_lossy(&execution.stderr).contains("selected runtime key is missing"));
+}
+
+#[test]
+fn unusable_selected_keys_fail_execution_but_not_management_or_replacement() {
+    for case in ["malformed", "oversized", "unreadable"] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("xdg");
+        let private = home.join("abird/dotlink");
+        fs::create_dir_all(&private).unwrap();
+        let config = private.join("config.jsonc");
+        let revision = "0123456789abcdef0123456789abcdef";
+        fs::write(
+            &config,
+            format!(
+                r#"{{"version":10,"transports":{{"openai":true,"stdio":true}},"tunnel_id":"tunnel_0123456789abcdef0123456789abcdef","runtime_key_revision":"{revision}"}}"#
+            ),
+        )
+        .unwrap();
+        let selected = private.join(format!("runtime.{revision}.key"));
+        match case {
+            "malformed" => fs::write(&selected, [0xff]).unwrap(),
+            "oversized" => fs::write(&selected, vec![b'x'; 16 * 1024 + 1]).unwrap(),
+            "unreadable" => fs::create_dir(&selected).unwrap(),
+            _ => unreachable!(),
+        }
+
+        let execution = run_execution_with_profile(&home, &config);
+        let stderr = String::from_utf8_lossy(&execution.stderr);
+        assert!(!execution.status.success(), "case={case}");
+        assert!(
+            stderr.contains("selected runtime key is unusable"),
+            "case={case}: {stderr}"
+        );
+
+        let show = profile_cli(&home, &["show", "default"]);
+        assert!(
+            show.status.success(),
+            "case={case}: {}",
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(String::from_utf8_lossy(&show.stdout).contains("replace"));
+
+        let allowed = temp.path().join("allowed");
+        fs::create_dir(&allowed).unwrap();
+        let mutate = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+            .args(["profile", "allow", "default", "read"])
+            .arg(&allowed)
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env_remove("DOTLINK_CONFIG")
+            .env_remove("DOTLINK_API_KEY")
+            .env_remove("DOTLINK_API_KEY_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            mutate.status.success(),
+            "case={case}: {}",
+            String::from_utf8_lossy(&mutate.stderr)
+        );
+        let remove = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+            .args(["profile", "remove-allow", "default", "read"])
+            .arg(&allowed)
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env_remove("DOTLINK_CONFIG")
+            .env_remove("DOTLINK_API_KEY")
+            .env_remove("DOTLINK_API_KEY_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            remove.status.success(),
+            "case={case}: {}",
+            String::from_utf8_lossy(&remove.stderr)
+        );
+
+        // Replacing the selected contents proves management preserved the
+        // selector and did not silently disable OpenAI execution.
+        if selected.is_dir() {
+            fs::remove_dir(&selected).unwrap();
+        }
+        fs::write(&selected, "replacement-key\n").unwrap();
+        let repaired = run_to_post_credential_failure(&home, &config);
+        assert_post_credential_policy_failure(&repaired);
+    }
 }
 
 #[test]
@@ -241,10 +373,45 @@ fn writable_sandbox_parent_prepares_both_private_xdg_directories() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    for private in [
+    let owned = [
         config_home.join("abird/dotlink"),
         state_home.join("abird/dotlink"),
-    ] {
+    ];
+    // Inspection is pure: it must not create private state or mount targets.
+    for private in &owned {
+        assert!(
+            !private.exists(),
+            "inspection created {}",
+            private.display()
+        );
+    }
+    // Runtime activation prepares the directories before exposing writable
+    // sandbox ancestors. Supply inert discovery fixtures so this test is
+    // independent of the build sandbox's PATH; no shell command executes.
+    let fake_bin = root.join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    for executable in ["bash", "bwrap"] {
+        let path = fake_bin.join(executable);
+        fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let runtime = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--stdio")
+        .env("DOTLINK_CONFIG", &custom_config)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HOME", root)
+        .env("PATH", &fake_bin)
+        .env_remove("DOTLINK_API_KEY")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    // EOF before the MCP initialize frame is a protocol error, not a startup
+    // failure. The runtime has already prepared its protected directories.
+    assert!(
+        String::from_utf8_lossy(&runtime.stderr).contains("connection closed: initialize request")
+    );
+    for private in owned {
         let metadata = fs::metadata(&private).unwrap();
         assert!(metadata.is_dir());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
@@ -270,6 +437,7 @@ fn inactive_openai_does_not_open_unreadable_dormant_credentials() {
     // This exercises the no-I/O invariant without relying on Unix chmod.
     fs::create_dir(private.join(format!("runtime.{revision}.key"))).unwrap();
 
+    // Configuration-only inspection must remain pure.
     let result = run_with_profile(&home, &config);
     assert!(
         result.status.success(),
@@ -277,22 +445,61 @@ fn inactive_openai_does_not_open_unreadable_dormant_credentials() {
         String::from_utf8_lossy(&result.stderr)
     );
 
-    // An explicit tunnel/key pair may also activate a dormant OpenAI transport
-    // without consulting the unreadable saved credential.
-    let activated = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+    // Normal startup also leaves a dormant OpenAI credential untouched. Force
+    // a deterministic policy error after credential loading, before any
+    // transport can contact the network.
+    let dormant_runtime = run_to_post_credential_failure(&home, &config);
+    assert_post_credential_policy_failure(&dormant_runtime);
+
+    // Explicit file variables are also dormant until their transport is
+    // selected. A directory is a deterministic invalid credential on every OS.
+    let invalid_explicit = temp.path().join("invalid-explicit-credential");
+    fs::create_dir(&invalid_explicit).unwrap();
+    let dormant_explicit = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--no-default-allow")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("DOTLINK_API_KEY_FILE", &invalid_explicit)
+        .env("NGROK_AUTHTOKEN_FILE", &invalid_explicit)
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .output()
+        .unwrap();
+    assert_post_credential_policy_failure(&dormant_explicit);
+
+    let pure_listing = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--list-tools")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("DOTLINK_API_KEY_FILE", &invalid_explicit)
+        .env("NGROK_AUTHTOKEN_FILE", &invalid_explicit)
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_ID")
+        .output()
+        .unwrap();
+    assert!(
+        pure_listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pure_listing.stderr)
+    );
+
+    // An explicit tunnel/key pair activates the dormant OpenAI transport
+    // without consulting the unreadable saved credential. The same later
+    // policy error proves normal startup accepted the override.
+    let activated = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--no-default-allow")
         .env("DOTLINK_CONFIG", &config)
         .env("XDG_CONFIG_HOME", &home)
         .env("DOTLINK_ID", "tunnel_0123456789abcdef0123456789abcdef")
         .env("DOTLINK_API_KEY", "synthetic-override-key")
         .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
         .output()
         .unwrap();
-    assert!(
-        activated.status.success(),
-        "{}",
-        String::from_utf8_lossy(&activated.stderr)
-    );
+    assert_post_credential_policy_failure(&activated);
 }
 
 #[test]
@@ -312,43 +519,39 @@ fn explicit_env_credentials_supersede_missing_persisted_runtime_keys() {
     )
     .unwrap();
 
-    let missing = run_with_profile(&home, &config);
+    let missing = run_execution_with_profile(&home, &config);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("selected runtime key is missing"));
 
+    // Force normal startup to fail deterministically after credentials have
+    // been resolved, but before the OpenAI transport can use the network.
     let overridden = Command::new(env!("CARGO_BIN_EXE_dotlink"))
-        .arg("--list-tools")
+        .arg("--no-default-allow")
         .env("DOTLINK_CONFIG", &config)
         .env("XDG_CONFIG_HOME", &home)
         .env("DOTLINK_ID", id)
         .env("DOTLINK_API_KEY", "synthetic-override-key")
         .env_remove("DOTLINK_API_KEY_FILE")
-        .output()
-        .unwrap();
-    assert!(
-        overridden.status.success(),
-        "{}",
-        String::from_utf8_lossy(&overridden.stderr)
-    );
-
-    let override_file = temp.path().join("credential");
-    fs::write(&override_file, "synthetic-file-key\n").unwrap();
-    let overridden_file = Command::new(env!("CARGO_BIN_EXE_dotlink"))
-        .arg("--list-tools")
-        .env("DOTLINK_CONFIG", &config)
-        .env("XDG_CONFIG_HOME", &home)
-        .env("DOTLINK_API_KEY_FILE", &override_file)
-        .env_remove("DOTLINK_ID")
-        .env_remove("DOTLINK_API_KEY")
         .env_remove("CONTROL_PLANE_TUNNEL_ID")
         .env_remove("CONTROL_PLANE_API_KEY")
         .output()
         .unwrap();
-    assert!(
-        overridden_file.status.success(),
-        "{}",
-        String::from_utf8_lossy(&overridden_file.stderr)
-    );
+    assert_post_credential_policy_failure(&overridden);
+
+    let override_file = temp.path().join("credential");
+    fs::write(&override_file, "synthetic-file-key\n").unwrap();
+    let overridden_file = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--no-default-allow")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("DOTLINK_API_KEY_FILE", &override_file)
+        .env("DOTLINK_API_KEY", "lower-priority-plaintext-key")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .output()
+        .unwrap();
+    assert_post_credential_policy_failure(&overridden_file);
 }
 
 #[test]
@@ -385,7 +588,7 @@ fn print_id_inspects_config_without_requiring_saved_runtime_credentials() {
     );
     assert_eq!(String::from_utf8_lossy(&inspect.stdout).trim(), id);
     // A malformed/missing runtime key still fails actual tool execution.
-    let runtime = run_with_profile(&config_home, &config);
+    let runtime = run_execution_with_profile(&config_home, &config);
     assert!(!runtime.status.success());
     assert!(String::from_utf8_lossy(&runtime.stderr).contains("selected runtime key is missing"));
 
@@ -400,4 +603,78 @@ fn print_id_inspects_config_without_requiring_saved_runtime_credentials() {
         .unwrap();
     assert!(overridden.status.success());
     assert_eq!(String::from_utf8_lossy(&overridden.stdout).trim(), env_id);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tool_listing_needs_neither_runtime_keys_nor_host_agent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let config = root.join("profile.jsonc");
+    fs::write(&config, format!(
+        r#"{{"version":10,"transports":{{"openai":true,"stdio":true}},"tunnel_id":"tunnel_0123456789abcdef0123456789abcdef","runtime_key_revision":"{}","permissions":{{"allow_rw":["{}"],"allow_shell":true,"allow_ssh_agent":true}}}}"#,
+        "b".repeat(32), root.display()
+    )).unwrap();
+    let listed = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--list-tools")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("DOTLINK_SSH_AGENT_SOCKET", root.join("no-such-agent"))
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let output = String::from_utf8_lossy(&listed.stdout);
+    assert!(output.contains("bash"), "{output}");
+    assert!(output.contains("edit"), "{output}");
+    // Execution without an override still enforces the selected key first.
+    let missing_key = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--no-stdio")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("DOTLINK_SSH_AGENT_SOCKET", root.join("no-such-agent"))
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("DOTLINK_ID")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .output()
+        .unwrap();
+    let missing_key_stderr = String::from_utf8_lossy(&missing_key.stderr);
+    assert!(!missing_key.status.success());
+    assert!(
+        missing_key_stderr.contains("selected runtime key is missing"),
+        "{missing_key_stderr}"
+    );
+
+    // Supplying a complete credential override gets past key resolution and
+    // proves runtime startup independently enforces the requested host agent.
+    let missing_agent = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--no-stdio")
+        .env("DOTLINK_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("DOTLINK_SSH_AGENT_SOCKET", root.join("no-such-agent"))
+        .env("DOTLINK_ID", "tunnel_0123456789abcdef0123456789abcdef")
+        .env("DOTLINK_API_KEY", "synthetic-override-key")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .env_remove("CONTROL_PLANE_TUNNEL_ID")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .output()
+        .unwrap();
+    let missing_agent_stderr = String::from_utf8_lossy(&missing_agent.stderr);
+    assert!(!missing_agent.status.success());
+    assert!(
+        missing_agent_stderr
+            .contains("DOTLINK_SSH_AGENT_SOCKET is not an accessible Unix-domain socket"),
+        "{missing_agent_stderr}"
+    );
+    assert!(
+        !missing_agent_stderr.contains("selected runtime key is missing"),
+        "credential override did not reach host-agent enforcement: {missing_agent_stderr}"
+    );
 }

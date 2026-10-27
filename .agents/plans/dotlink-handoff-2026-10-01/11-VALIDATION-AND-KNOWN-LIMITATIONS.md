@@ -123,6 +123,16 @@ The repository version and the live GitHub Release can diverge until a release
 is explicitly published and verified. Do not claim a version is released until
 the live GitHub state confirms it.
 
+### 12. Anonymous OAuth admission is network-scoped
+
+Requester identity is abuse accounting, not authentication. NAT users and
+clients behind an ordinary reverse proxy share one allowance because forwarded
+client-IP headers are intentionally ignored. IPv6 prefixes, VPNs, proxy pools,
+or a botnet can provide multiple real requester identities, and admission state
+is process-local/reset on restart. Built-in ngrok preserves authenticated edge
+peer metadata; other public deployments should add distributed admission at
+their trusted edge when that threat is material.
+
 ## Validation rule for future agents
 
 Do not say "fully validated" after only running Cargo tests if the change

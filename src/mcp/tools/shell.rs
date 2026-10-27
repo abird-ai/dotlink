@@ -1,9 +1,8 @@
 //! `bash` / `powershell`: the sandboxed shell, its mounts and its heartbeat.
 
 use std::{
-    collections::BTreeSet,
     env,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
@@ -27,12 +26,16 @@ use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    time::{Instant, timeout_at},
+    time::{Instant, sleep_until, timeout_at},
 };
 use tokio_util::task::AbortOnDropHandle;
 
 use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
-use crate::mcp::{AccessNeed, AccessPolicy};
+use crate::mcp::AccessNeed;
+#[cfg(target_os = "linux")]
+use crate::mcp::AccessPolicy;
+#[cfg(target_os = "linux")]
+use std::{collections::BTreeSet, path::Component};
 
 /// The client picks `timeout_secs`; the profile ceiling only bounds it and is
 /// the fallback when the caller omits it.
@@ -69,8 +72,26 @@ const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Progress is advisory; a stalled transport must never stall command timeout
+/// enforcement or child reaping. No detached heartbeat tasks or queues.
+const PROGRESS_SEND_BUDGET: Duration = Duration::from_millis(100);
+
 /// Salvage window for partial output after a killed child.
 const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+
+/// Cancellation drops a pending notification; no progress worker outlives its
+/// command and no transport backpressure can cross the command's deadline.
+async fn deliver_heartbeat_bounded<F: std::future::Future<Output = ()>>(
+    command_deadline: Instant,
+    delivery: F,
+) {
+    let send_deadline = command_deadline.min(Instant::now() + PROGRESS_SEND_BUDGET);
+    tokio::select! {
+        biased;
+        () = sleep_until(send_deadline) => {}
+        () = delivery => {}
+    }
+}
 
 /// Heartbeat sink for one `tools/call` that carried a progress token.
 struct ProgressHeartbeat {
@@ -90,10 +111,13 @@ impl ProgressHeartbeat {
     }
 
     /// Monotonic progress counter with no total and no message.
-    async fn report(&self) {
+    async fn report(&self, command_deadline: Instant) {
         let progress = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
         let param = ProgressNotificationParam::new(self.token.clone(), progress as f64);
-        let _ = self.peer.notify_progress(param).await;
+        deliver_heartbeat_bounded(command_deadline, async {
+            let _ = self.peer.notify_progress(param).await;
+        })
+        .await;
     }
 }
 
@@ -384,6 +408,7 @@ impl LocalMachine {
             tokio::pin!(wait);
             loop {
                 tokio::select! {
+                    biased;
                     result = &mut wait => break match result {
                         Ok(result) => WaitOutcome::Child(result),
                         Err(_) => WaitOutcome::Timeout,
@@ -411,11 +436,12 @@ impl LocalMachine {
                             }
                         }
                     }
-                    () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
+                    () = async {
+                        heartbeat_tick(heartbeat.as_ref()).await;
                         if let Some(heartbeat) = heartbeat.as_ref() {
-                            heartbeat.report().await;
+                            heartbeat.report(deadline).await;
                         }
-                    }
+                    }, if heartbeat.is_some() => {}
                 }
             }
         };
@@ -978,7 +1004,7 @@ mod tests {
             operation_gate: Arc::new(RwLock::new(())),
             router: std::sync::OnceLock::new(),
             serialize: false,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs,
         }
     }
@@ -1033,6 +1059,22 @@ mod tests {
         assert_eq!(
             with_profile_limits(read.clone(), 42, 2048).input_schema,
             read.input_schema
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_delivery_never_crosses_the_command_deadline() {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivery_polled = polled.clone();
+        let delivery = async move {
+            delivery_polled.store(true, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        };
+
+        deliver_heartbeat_bounded(Instant::now() - Duration::from_secs(1), delivery).await;
+        assert!(
+            !polled.load(Ordering::Relaxed),
+            "an expired command deadline must win before delivery is polled"
         );
     }
 
@@ -1601,7 +1643,7 @@ mod tests {
             operation_gate: Arc::new(RwLock::new(())),
             router: std::sync::OnceLock::new(),
             serialize: false,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs: Arc::new(crate::secure_fs::SecureFs::new(&[], &[]).unwrap()),
         };
 
@@ -1671,7 +1713,7 @@ mod tests {
             operation_gate: Arc::new(RwLock::new(())),
             router: std::sync::OnceLock::new(),
             serialize: false,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs: Arc::new(crate::secure_fs::SecureFs::new(&[], &[]).unwrap()),
         };
 

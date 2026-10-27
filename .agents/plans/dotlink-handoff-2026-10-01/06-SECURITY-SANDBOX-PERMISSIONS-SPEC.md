@@ -436,9 +436,10 @@ Never run it directly on Tokio workers.
 Current behavior:
 
 - `spawn_blocking`;
-- semaphore cap: two concurrent checks;
+- process-wide semaphore cap: two concurrent checks across runtime generations;
 - bounded wait for a verifier slot;
 - failed attempt delay;
+- six rolling-minute starts per trusted requester in a 256-row non-evicting table, charging both consent creator and password POST source;
 - no global lockout that a remote attacker can force against the owner.
 
 ## OAuth public-state bounds
@@ -454,7 +455,7 @@ Explicit caps exist for:
 - metadata body size;
 - request body size.
 
-Pending unauthenticated structures use bounded eviction rather than allowing unbounded memory growth.
+Pending unauthenticated structures prune only expired entries and never evict live work. DCR registrations and owner authorizations have aggregate, redirect/client, requester-within-redirect/client, and overall trusted-requester shares; excess work receives HTTP 429. Client display names neutralize terminal controls, line separators, and Unicode bidi controls before UI/management output. Authorization-code, access-token, and refresh-grant stores likewise prune expired entries but reject overload without evicting live credentials or consuming the original code/grant. Access tokens have a 64-entry per-client share within the 512-entry process bound; duplicate code/refresh exchanges shed before global work admission. Requester identity comes from accepted TCP or authenticated ngrok connection metadata, never OAuth values or forwarded headers.
 
 ## CIMD SSRF protection
 
@@ -468,15 +469,18 @@ Client metadata URL requirements:
 
 Fetch:
 
-- DNS resolve;
+- cancellable async system DNS with immediate lease release on timeout/cancellation;
 - every address must be public;
 - validated full address set pinned into reqwest;
 - redirects disabled;
 - timeout;
 - body-size cap;
-- client_id in document must match requested URL.
+- client_id in document must match requested URL;
+- 12 rolling-minute starts and two in-flight operations per requester;
+- four in-flight operations process-wide;
+- bounded requester history with no live-history eviction.
 
-Private/link-local/documentation/etc addresses are rejected.
+Private/link-local/documentation/etc addresses are rejected. Caller-selected destination hosts do not define fairness or consume another requester's rolling allowance.
 
 ## Redirect URI policy
 

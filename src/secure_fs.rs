@@ -686,6 +686,8 @@ impl SecureFs {
         let written = (|| -> Result<()> {
             file.write_all(bytes)?;
             if let Some(mode) = existing_mode {
+                let mode = libc::mode_t::try_from(mode)
+                    .expect("masked Unix permission bits must fit mode_t");
                 // SAFETY: `file` is an open descriptor owned by this scope.
                 if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
                     return Err(io::Error::last_os_error()).context("failed preserving file mode");

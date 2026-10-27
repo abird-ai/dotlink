@@ -12,7 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::bail;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[cfg(unix)]
@@ -187,25 +189,87 @@ impl Drop for WindowsMutationLock {
 }
 
 #[cfg(windows)]
-fn windows_mutex_name(path: &Path) -> String {
+fn windows_mutex_name(path: &Path) -> Result<String> {
+    use std::{os::windows::ffi::OsStrExt as _, ptr};
+
+    use anyhow::Context as _;
     use sha2::{Digest as _, Sha256};
-    // NTFS is case-insensitive by default, unlike the Linux path namespace.
-    // Hash the entire canonical path: an atomic rename changes the inode, not
-    // the path-based lock identity.
-    let canonical = path.to_string_lossy().to_lowercase();
-    let digest = Sha256::digest(canonical.as_bytes());
-    format!("Global\\abird-dotlink-path-{}", hex::encode(digest))
+    use windows_sys::Win32::Globalization::{
+        LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT,
+    };
+
+    // Use Windows' invariant UTF-16 case mapping rather than Rust Unicode
+    // lowercasing so case-equivalent NTFS spellings select one kernel mutex.
+    let source = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let source_len = i32::try_from(source.len()).context("mutation path is too long")?;
+    // SAFETY: source is a valid fixed-length UTF-16 slice; the first call asks
+    // Windows for the required destination length and writes no output.
+    let mapped_len = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            ptr::null_mut(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
+    if mapped_len == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to case-map mutation path");
+    }
+    let mut mapped = vec![0_u16; mapped_len as usize];
+    // SAFETY: destination has exactly the length returned by the sizing call.
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            mapped.as_mut_ptr(),
+            mapped_len,
+            ptr::null(),
+            ptr::null(),
+            0,
+        )
+    };
+    if written != mapped_len {
+        return Err(std::io::Error::last_os_error()).context("failed to case-map mutation path");
+    }
+
+    let mut digest = Sha256::new();
+    for code_unit in mapped {
+        digest.update(code_unit.to_le_bytes());
+    }
+    Ok(format!(
+        "Global\\abird-dotlink-path-{}",
+        hex::encode(digest.finalize())
+    ))
+}
+
+#[cfg(windows)]
+fn windows_lock_plan(
+    paths: &[&Path],
+) -> Result<std::collections::BTreeMap<String, std::path::PathBuf>> {
+    let mut targets = std::collections::BTreeMap::new();
+    for path in paths {
+        targets
+            .entry(windows_mutex_name(path)?)
+            .or_insert_with(|| path.to_path_buf());
+    }
+    Ok(targets)
 }
 
 #[cfg(windows)]
 impl WindowsMutationLock {
-    async fn acquire(path: &Path, deadline: Instant) -> Result<Self> {
+    async fn acquire(path: &Path, identity: String, deadline: Instant) -> Result<Self> {
         use windows_sys::Win32::{
             Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
             System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
         };
-        let identity = windows_mutex_name(path);
-        let display = path.display().to_string();
+        let path_label = path.display().to_string();
         let timeout = deadline.saturating_duration_since(Instant::now());
         let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         let (ready, wait) = tokio::sync::oneshot::channel::<Result<std::sync::mpsc::Sender<()>>>();
@@ -232,11 +296,16 @@ impl WindowsMutationLock {
                     }
                     // SAFETY: the mutex belongs to the current OS thread.
                     if unsafe { ReleaseMutex(handle) } == 0 {
-                        tracing::warn!(path = %display, "failed releasing Windows mutation mutex");
+                        let error = std::io::Error::last_os_error();
+                        tracing::warn!(
+                            path = ?path_label,
+                            %error,
+                            "failed releasing Windows mutation mutex"
+                        );
                     }
                 } else {
                     let reason = if code == WAIT_TIMEOUT {
-                        anyhow::anyhow!("another process is mutating {display}; retry")
+                        anyhow::anyhow!("another process is mutating {path_label}; retry")
                     } else {
                         std::io::Error::last_os_error().into()
                     };
@@ -279,12 +348,8 @@ pub(crate) async fn lock<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Resul
     #[cfg(windows)]
     {
         let deadline = Instant::now() + LOCK_TIMEOUT;
-        let targets = paths
-            .iter()
-            .map(|path| path.to_path_buf())
-            .collect::<BTreeSet<_>>();
-        for path in targets {
-            windows.push(WindowsMutationLock::acquire(&path, deadline).await?);
+        for (identity, path) in windows_lock_plan(&paths)? {
+            windows.push(WindowsMutationLock::acquire(&path, identity, deadline).await?);
         }
     }
     Ok(MutationGuard {
@@ -304,13 +369,24 @@ mod tests {
     #[test]
     fn windows_lock_keys_are_case_insensitive_and_stable() {
         assert_eq!(
-            windows_mutex_name(Path::new("C:\\Repo\\DATA.TXT")),
-            windows_mutex_name(Path::new("c:\\repo\\data.txt"))
+            windows_mutex_name(Path::new("C:\\Repo\\DATA.TXT")).unwrap(),
+            windows_mutex_name(Path::new("c:\\repo\\data.txt")).unwrap()
+        );
+        assert_eq!(
+            windows_mutex_name(Path::new("C:\\Repo\\Σ.txt")).unwrap(),
+            windows_mutex_name(Path::new("c:\\repo\\ς.TXT")).unwrap()
         );
         assert_ne!(
-            windows_mutex_name(Path::new("C:\\Repo\\a.txt")),
-            windows_mutex_name(Path::new("C:\\Repo\\b.txt"))
+            windows_mutex_name(Path::new("C:\\Repo\\a.txt")).unwrap(),
+            windows_mutex_name(Path::new("C:\\Repo\\b.txt")).unwrap()
         );
+        let plan = windows_lock_plan(&[
+            Path::new("C:\\Repo\\Σ.txt"),
+            Path::new("c:\\repo\\ς.TXT"),
+            Path::new("C:\\Repo\\other.txt"),
+        ])
+        .unwrap();
+        assert_eq!(plan.len(), 2);
     }
 
     #[cfg(unix)]

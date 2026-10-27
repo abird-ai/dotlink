@@ -5,6 +5,8 @@
 //! primitives, the advertised-tool table and the MCP server handler.
 
 mod tools;
+#[cfg(test)]
+pub(crate) use tools::test_support::test_machine;
 
 use std::{
     collections::BTreeSet,
@@ -134,6 +136,9 @@ pub const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
 /// `\u00XX`. Payloads bounded by `max_write_bytes` therefore never need a body
 /// larger than this multiple of it.
 const MAX_JSON_ESCAPE: usize = 6;
+/// A control byte encoded in an inner JSON string needs one more outer escape.
+const MAX_NESTED_JSON_ESCAPE: usize = 7;
+const SHELL_OUTPUT_STREAMS: usize = 2;
 /// Room for what surrounds a payload: paths, patterns, edit anchors, framing.
 const MAX_REQUEST_FRAMING_BYTES: usize = 64 * 1024;
 
@@ -580,16 +585,17 @@ impl AccessPolicy {
     }
 }
 
-impl LocalMachine {
-    pub async fn new(args: MachineConfig) -> Result<Self> {
-        let base_dir = fs::canonicalize(&args.access.base_dir)
-            .await
-            .with_context(|| {
-                format!(
-                    "launch/base directory does not exist: {}",
-                    args.access.base_dir.display()
-                )
-            })?;
+impl AccessPolicy {
+    /// Resolve exactly the same filesystem policy for execution and inspection.
+    /// Only filesystem names are resolved here: no secrets, executable discovery,
+    /// sandbox initialization or host integrations are involved.
+    async fn resolve(spec: AccessSpec) -> Result<Self> {
+        let base_dir = fs::canonicalize(&spec.base_dir).await.with_context(|| {
+            format!(
+                "launch/base directory does not exist: {}",
+                spec.base_dir.display()
+            )
+        })?;
         if !fs::metadata(&base_dir).await?.is_dir() {
             bail!(
                 "launch/base directory is not a directory: {}",
@@ -597,20 +603,20 @@ impl LocalMachine {
             );
         }
 
-        let mut read_roots = Vec::with_capacity(args.access.read_roots.len());
-        for path in &args.access.read_roots {
+        let mut read_roots = Vec::with_capacity(spec.read_roots.len());
+        for path in &spec.read_roots {
             read_roots.push(canonicalize_grant(&base_dir, path).await?);
         }
-        let mut write_roots = Vec::with_capacity(args.access.write_roots.len());
-        for path in &args.access.write_roots {
+        let mut write_roots = Vec::with_capacity(spec.write_roots.len());
+        for path in &spec.write_roots {
             write_roots.push(canonicalize_grant(&base_dir, path).await?);
         }
-        let mut deny_read_roots = Vec::with_capacity(args.access.deny_read_roots.len());
-        for path in &args.access.deny_read_roots {
+        let mut deny_read_roots = Vec::with_capacity(spec.deny_read_roots.len());
+        for path in &spec.deny_read_roots {
             deny_read_roots.push(canonicalize_deny(&base_dir, path).await?);
         }
-        let mut deny_write_roots = Vec::with_capacity(args.access.deny_write_roots.len());
-        for path in &args.access.deny_write_roots {
+        let mut deny_write_roots = Vec::with_capacity(spec.deny_write_roots.len());
+        for path in &spec.deny_write_roots {
             deny_write_roots.push(canonicalize_deny(&base_dir, path).await?);
         }
 
@@ -624,14 +630,31 @@ impl LocalMachine {
             roots.dedup();
         }
 
-        let access = AccessPolicy::from_spec(AccessSpec {
+        let access = Self::from_spec(AccessSpec {
             base_dir,
             read_roots,
             write_roots,
             deny_read_roots,
             deny_write_roots,
-            unrestricted_fs: args.access.unrestricted_fs,
+            unrestricted_fs: spec.unrestricted_fs,
         })?;
+
+        Ok(access)
+    }
+
+    fn capabilities(&self, allow_shell: bool) -> Capabilities {
+        Capabilities {
+            read: self.has_read_capability(),
+            write: self.has_write_capability(),
+            read_write: self.has_read_write_capability(),
+            shell: allow_shell,
+        }
+    }
+}
+
+impl LocalMachine {
+    pub async fn new(args: MachineConfig) -> Result<Self> {
+        let access = AccessPolicy::resolve(args.access).await?;
 
         let mut cache_mounts = Vec::with_capacity(args.cache_mounts.len());
         let mut cache_targets = BTreeSet::new();
@@ -896,16 +919,18 @@ impl LocalMachine {
     }
 
     /// Bound the embedded MCP response at the *same* configured read/output
-    /// ceilings as stdio and HTTP. Serialized JSON can expand a source byte to
-    /// six ASCII bytes (`\\u00XX`), so the ceiling must include that expansion
-    /// as well as protocol framing. There is no hidden 16 MiB tunnel limit:
-    /// users choosing larger read limits intentionally allow larger responses.
+    /// ceilings as stdio and HTTP. Ordinary tool text can expand sixfold in
+    /// JSON. Shell has two independently capped streams inside a JSON string,
+    /// so one source byte can occupy seven outer-JSON bytes. There is no hidden
+    /// 16 MiB tunnel limit: larger configured limits raise this ceiling too.
     pub(crate) fn max_response_body_bytes(&self) -> usize {
-        self.config
-            .max_read_bytes
-            .max(self.config.max_output_bytes)
-            .saturating_mul(MAX_JSON_ESCAPE)
-            .saturating_add(MAX_REQUEST_FRAMING_BYTES)
+        let read = self.config.max_read_bytes.saturating_mul(MAX_JSON_ESCAPE);
+        let shell = self
+            .config
+            .max_output_bytes
+            .saturating_mul(SHELL_OUTPUT_STREAMS)
+            .saturating_mul(MAX_NESTED_JSON_ESCAPE);
+        read.max(shell).saturating_add(MAX_REQUEST_FRAMING_BYTES)
     }
 
     pub fn access_summary(&self) -> String {
@@ -1120,17 +1145,18 @@ impl LocalMachine {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            read: self.config.access.has_read_capability(),
-            write: self.config.access.has_write_capability(),
-            read_write: self.config.access.has_read_write_capability(),
-            shell: self.config.allow_shell,
-        }
+        self.config.access.capabilities(self.config.allow_shell)
     }
 
     fn policy_tool_router(&self) -> &ToolRouter<Self> {
         self.router
             .get_or_init(|| Arc::new(Self::tool_router_for_policy(self.capabilities())))
+    }
+
+    /// Non-caching policy lookup used by HTTP transports before rmcp's
+    /// SEP-2243 schema cache sees an untrusted tool name.
+    pub(crate) fn has_tool_for_policy(&self, name: &str) -> bool {
+        self.policy_tool_router().get(name).is_some()
     }
 
     /// Pure reads may overlap each other; everything else takes the operation
@@ -1142,9 +1168,8 @@ impl LocalMachine {
             .any(|spec| spec.name == name && spec.concurrent_read)
     }
 
-    pub fn visible_tool_descriptions(&self) -> Vec<(String, String)> {
-        self.policy_tool_router()
-            .list_all()
+    fn describe_tools(tools: impl IntoIterator<Item = Tool>) -> Vec<(String, String)> {
+        tools
             .into_iter()
             .map(|tool| {
                 let title = tool
@@ -1157,6 +1182,20 @@ impl LocalMachine {
                 (tool.name.to_string(), title)
             })
             .collect()
+    }
+
+    /// An inspection-only path: same canonical policy, same tool router, but
+    /// no machine/runtime or transport side effects.
+    pub async fn inspect_tool_descriptions(
+        access: AccessSpec,
+        allow_shell: bool,
+    ) -> Result<Vec<(String, String)>> {
+        let capabilities = AccessPolicy::resolve(access)
+            .await?
+            .capabilities(allow_shell);
+        Ok(Self::describe_tools(
+            Self::tool_router_for_policy(capabilities).list_all(),
+        ))
     }
 
     /// The tool's own argument names, in schema order. The TOOL log renders
@@ -1291,7 +1330,32 @@ mod tests {
     use tokio::io::AsyncSeekExt;
 
     use super::*;
+
     use crate::mcp::tools::test_support::access;
+
+    #[tokio::test]
+    async fn inspection_and_runtime_advertise_the_same_policy_tool_surface() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine(root.clone());
+        let inspect = LocalMachine::inspect_tool_descriptions(
+            AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inspect,
+            LocalMachine::describe_tools(machine.policy_tool_router().list_all())
+        );
+    }
 
     #[test]
     fn default_access_is_read_only() {
@@ -1759,6 +1823,33 @@ mod tests {
         assert!(
             config.max_request_body_bytes > 4 * 1024 * 1024,
             "the transport must not keep rmcp's smaller default"
+        );
+        assert!(
+            config.sse_keep_alive.is_some(),
+            "network HTTP needs keepalives"
+        );
+        let embedded = crate::transports::embedded_streamable_config(
+            &machine,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert!(embedded.sse_keep_alive.is_none());
+        assert!(embedded.sse_retry.is_none());
+    }
+
+    #[test]
+    fn embedded_response_ceiling_covers_both_nested_shell_streams() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let output_ceiling = 2 * 1024 * 1024;
+        let machine = crate::mcp::tools::test_support::test_machine_with(root, |config| {
+            config.max_read_bytes = 1024;
+            config.max_output_bytes = output_ceiling;
+        });
+
+        assert_eq!(
+            machine.max_response_body_bytes(),
+            output_ceiling * 2 * 7 + 64 * 1024,
+            "stdout and stderr are independently capped and nested in JSON"
         );
     }
 

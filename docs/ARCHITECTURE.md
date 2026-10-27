@@ -35,11 +35,37 @@ src/transports/
   http.rs
 ~~~
 
-No transport owns filesystem policy.
+No transport owns filesystem policy. `--list-tools` resolves the same canonical access policy and tool router without building a `LocalMachine` or loading keys/host integrations; execution alone owns those resources.
 
 ## NixOS service
 
 The flake exports `nixosModules.default` (`nixosModules.dotlink`). The thin module in `nix/module.nix` runs the unchanged binary through systemd and delegates authority/OAuth to the normal runtime. With only `user` and `workingDirectory` configured, it intentionally sets no `DOTLINK_CONFIG` or credential overrides: startup reads that Unix user's saved XDG profile/key/OAuth state. Optional declarative `settings` generate a read-only schema-v10 JSON file in the Nix store, while optional `LoadCredential` files override only the relevant secret. Named instances create independent systemd units with named-profile defaults. Service mode always suppresses stdio MCP, uses stderr/journald logging, and handles SIGTERM with normal bounded transport cancellation. See `.agents/docs/nixos-service.md`.
+
+## Public OAuth admission
+
+Pending client registrations and owner consent use one non-evicting capacity
+policy: reclaim expired state; cap the total, per-client/redirect, trusted
+requester, and requester-within-client/redirect shares; and return HTTP 429
+rather than invalidate a live request. The requester comes only from the direct
+TCP peer or authenticated ngrok tunnel metadata; self-declared OAuth values and
+forwarded headers never establish it. Source ports are discarded, IPv6 groups
+by /48, and loopback is one identity. Owner consent POSTs hold an exclusive
+claim across password and storage work. The claim resets on cancellation/error,
+is re-keyed on a wrong-password retry, and is consumed after success or denial.
+Password verification allows six rolling-minute starts per requester under two
+process-wide workers; it charges both the consent creator and POST source, and
+active rows in its bounded requester table are not evicted. Expired/full DCR promotions terminate with actionable errors; storage
+failures preserve the claim. Authorization-code, access-token, and refresh-grant
+stores prune expired entries but reject overload rather than evict live entries;
+access tokens also have a 64-entry per-client share within the 512-entry process
+bound, and failed issuance preserves the original code/grant. CIMD fetches reject
+disallowed literal IPs before accounting, then allow 12 rolling-minute starts
+and two in-flight operations per requester under a process-wide concurrency of
+four. Its bounded requester table prunes only expired inactive rows and never
+erases live rate history. Cancellable async system DNS makes timeout/request
+cancellation release the complete lease immediately; missing system DNS
+disables CIMD only, not registered-client OAuth. No anonymous global minute
+counter is used.
 
 ## Profiles and persisted defaults
 
@@ -81,10 +107,13 @@ and immediately preceding secrets; unrelated profile edits leave these secrets
 intact for older running dotlink processes. Failed cleanup retries on the
 next credential rotation.
 At runtime, environment or credential-file overrides take precedence before
-reading a saved Runtime key. A disabled OpenAI transport never reads dormant
-keys; an enabled transport with no usable override fails closed if its selected
-key is absent. Profile inspection/editing stays usable for recovery. `--print-id` is a
-configuration-only inspection path that never resolves a Runtime secret.
+reading a saved Runtime key. Active file credentials are read once from a regular
+descriptor whose identity is verified against its protected target; Runtime and
+ngrok transports consume that snapshot instead of resolving the path again. A
+disabled transport never opens dormant files; execution with no usable override
+fails closed for any unusable selected key, while profile inspection/editing stays
+usable for replacement. `--print-id` and `--list-tools` are configuration-only
+inspection paths that never resolve a Runtime secret.
 OAuth owner authorization resolves the currently committed profile generation
 on each password check (with a post-verify recheck); a deleted persisted
 profile cannot fall back to a legacy hash. Interrupted deletion can be
@@ -122,6 +151,36 @@ Clean termination of one transport does not terminate the others. For example, s
 
 A transport error cancels the remaining active transports.
 
+Filesystem discovery builds one `WalkProgress` that records entry budget,
+unreadable descendants/metadata, and missing ignore rules. Both `ls` and `grep`
+derive completeness from this result; `grep` additionally records unreadable
+content candidates. JSON keeps the singular compatibility reason and an ordered
+`incomplete_reasons` array so concurrent causes are not lost. Permission denies
+and explicit ignore/hidden filters are intentional exclusions, never mistaken
+for traversal failures. Paged reads place their 32 MiB skipped-input limiter
+under the buffer, so prefetch counts while selected-window bytes remain usable.
+
+Anonymous OAuth grant checks first consult an inexpensive, version-checked
+read-only index of hashed refresh tokens and approved DCR clients, or the
+in-memory authorization-code map. Definite misses are rejected before admission;
+contention/version races fall through to the serialized authoritative transaction,
+while a stable malformed snapshot returns retryable unavailability without being
+reparsed per request. The same `StateIndex` invalidates by inode identity on Unix
+or file index on Windows. Authorization-code redemption uses a short claim plus
+notification rather than retaining its mutex across durable I/O. Access-token
+validation remains independent of disk locks and shares recoverable poison
+semantics with publication/revocation. Private state serialization and profile/key
+saves enforce the same ceilings as their bounded readers before atomic replacement.
+
+One outer HTTP Host allowlist wraps the merged MCP and OAuth router. It accepts
+only exact listener/public-origin authorities, ignores forwarded headers,
+normalizes mapped IPs, and rejects conflicting Host and URI/HTTP2 authorities
+while preserving explicit/default-port semantics across reverse proxies. Ngrok
+connections are served directly and accept only the tunnel's public authority;
+OAuth issuer/resource identity stays bound to configured public origins.
+
+The ngrok HTTP supervisor owns both HTTP server tasks in a `JoinSet`, rather than detaching their handles. Axum receives the direct peer from TCP accept metadata and the public peer from ngrok's authenticated connection metadata; its redacted `Debug` form prevents framework tracing from logging network identities, and HTTP forwarding headers are not an identity source. Tunnel EOF/error, cancellation, or a supervisor panic cancels the MCP token and remaining tasks. Outermost route middleware drops in-flight MCP/OAuth handlers and body extraction on cancellation; normal exit then allows up to five seconds for graceful server shutdown. Accepted TCP/ngrok IO is force-close-aware if detached Axum connection tasks exceed that bound, and bounded ngrok tunnel/session close RPCs run concurrently with draining. The parent transport budget is six seconds, leaving a one-second reserve around the five-second HTTP shutdown budget. A drain timeout is itself a cleanup failure because synchronous handler work cannot be preempted by closing IO. Cleanup failures take precedence over restart requests and propagate through peer and runtime teardown, preventing a replacement runtime from overlapping old ingress. A restarted runtime cannot retain old listeners, tunnel connections, or active MCP calls.
+
 Interactive non-stdio runs also start a terminal-control loop: `v` mutates shared logging verbosity live, `Ctrl+R` cancels/drains the active transports and rebuilds the runtime from the current profile/CLI state, and `Ctrl+C` exits. stdio disables key capture so protocol stdin remains exclusive.
 
 ## stdio
@@ -157,7 +216,7 @@ streamable-HTTP settings are built once, in `transports::streamable_config`,
 for both this server and the in-process tunnel service. That config owns the
 request-body ceiling: it is derived from `max_write_bytes` (six times that
 payload, for worst-case JSON escaping, plus 64 KiB of framing). rmcp's 4 MiB
-default would otherwise refuse a write the tools accept.
+default would otherwise refuse a write the tools accept. Network HTTP/ngrok keeps rmcp's SSE keepalives for intermediary idle timeouts; only the in-process OpenAI adapter disables wire keepalive/retry events. For SEP-2243 calls, network HTTP and the embedded adapter reject unknown policy tool names before rmcp's schema cache; the network preflight buffers under the same exact request-body ceiling.
 
 When OAuth is enabled for a route, the Axum topology is deliberately split:
 
@@ -190,7 +249,7 @@ The embedded OAuth server is single-owner and uses:
 - DCR fallback;
 - opaque in-memory access tokens;
 - rotating refresh tokens persisted only as hashes and issued only to clients that advertise the refresh grant;
-- an Argon2id owner-password hash with bounded `spawn_blocking` verification;
+- an Argon2id owner-password hash with process-wide bounded `spawn_blocking` verification across runtime generations;
 - cross-process file locking around OAuth state read/modify/write operations so setup, a live server, and management commands compose without lost updates; lock acquisition times out, and synchronous transactions release Tokio workers via a cancellation-safe blocking section.
 
 Unauthenticated DCR registrations stay bounded/in-memory until successful owner consent; only approved clients are persisted.
@@ -208,7 +267,7 @@ ngrok_ephemeral_url
 
 --http-ephemeral-url and --ngrok-ephemeral-url are per-transport overrides and accept explicit =false.
 
-Local HTTP and ngrok are genuinely isolated: ngrok uses a second loopback-only MCP backend listener. This lets one side expose `/mcp` while the other uses `/mcp/<random-token>` without accidentally mounting both routes on the same externally reachable listener.
+Local HTTP and ngrok are genuinely isolated: the TCP listener and direct ngrok tunnel use separate Axum routers. This lets one side expose `/mcp` while the other uses `/mcp/<random-token>` without accidentally mounting both routes on the same externally reachable ingress.
 
 Each ephemeral path is generated independently on process start.
 
@@ -217,11 +276,10 @@ Each ephemeral path is generated independently on process start.
 When `--http --ngrok` is selected:
 
 1. the normal local HTTP listener is bound;
-2. a second loopback-only backend listener is created for ngrok;
-3. the ngrok Rust SDK opens a public HTTPS endpoint, optionally requesting `transports.ngrok_domain`;
-4. dotlink verifies that a requested stable domain matches the hostname ngrok actually returned;
-5. a separate OAuth server instance is bound to the exact public issuer/resource URL;
-6. ngrok forwards to its private backend and dotlink prints the public MCP URL.
+2. the ngrok Rust SDK opens a public HTTPS tunnel, optionally requesting `transports.ngrok_domain`;
+3. dotlink verifies that a requested stable domain matches the hostname ngrok actually returned;
+4. a separate Axum router and OAuth server are bound to the exact public authority/issuer/resource URL;
+5. dotlink serves accepted ngrok connections directly, using authenticated tunnel peer metadata for requester admission, and prints the public MCP URL.
 
 Public ngrok is OAuth-protected automatically, even when local HTTP OAuth is disabled. Only the explicit one-run `--allow-public-no-auth` flag suppresses that protection.
 
@@ -251,7 +309,7 @@ When OpenAI is disabled, setup skips these fields and no runtime key is loaded.
 
 Transient tunnel poll failures are retried with per-poll backoff. At normal log level the retry message stays concise; the underlying request error and URL are DEBUG details available with `-v`.
 
-After 10 consecutive transient poll failures, the OpenAI transport emits a typed runtime-restart request instead of retrying the same client/runtime state indefinitely. The shared transport supervisor cancels every active transport and gives peer tasks up to 5 seconds to shut down cleanly before force-aborting anything still running.
+After 10 consecutive transient poll failures, the OpenAI transport emits a typed runtime-restart request instead of retrying the same client/runtime state indefinitely. The shared transport supervisor cancels every active transport and gives peer tasks up to 6 seconds to shut down cleanly before force-aborting anything still running.
 
 The top-level runtime then reloads the selected profile, reconstructs the permission policy, cache mounts, `LocalMachine`, embedded MCP service, and all configured transports. Repeated unhealthy runtimes restart with exponential backoff capped at 30 seconds. If a runtime had connected successfully before becoming unhealthy, the restart backoff resets to its initial 1-second delay.
 
@@ -319,7 +377,7 @@ External writers and shells remain outside advisory coordination.
 
 The tunnel polls, OAuth metadata fetches, and local MCP responses all use the
 same streaming byte-ceiling primitive (`src/bounded.rs`) before deserialization;
-OAuth metadata requests additionally use per-process admission and no proxies.
+OAuth metadata requests additionally use trusted-requester rolling/in-flight admission, a process-wide concurrent-fetch limit, native IP validation and no proxies.
 OpenAI tunnel poll bodies are bounded dynamically by the configured largest
 accepted single request plus framing (64 MiB minimum, 256 MiB maximum);
 profiles exceeding this safe capacity fail when starting the tunnel.
@@ -327,16 +385,19 @@ profiles exceeding this safe capacity fail when starting the tunnel.
 Only -s/--serialize runs all handlers through one exclusive gate. Linux
 uses openat2; macOS uses pinned-root, component-wise openat with O_NOFOLLOW.
 Both permit independent native requests to run concurrently. Windows retains
-its operation gate and uses named cross-process mutation mutexes with
-thread-affine release and automatic crash abandonment. Ancestor directory
+its operation gate and uses named cross-process mutation mutexes deduplicated
+and ordered by Windows invariant UTF-16 case-mapped identity, with thread-affine
+release and automatic crash abandonment. Ancestor directory
 handles are pinned against rename and reparse points refused. External
 writers remain outside these advisory locks.
 
 Native Unix writes and OAuth state transactions execute their synchronous,
 descriptor-safe stages within a cancellation-safe Tokio blocking section. This
 does not detach a write after its mutation guard has been dropped. Private
-configuration and OAuth file replacement has one commit boundary: post-rename
-directory-sync failures are warnings, never grounds to roll back a paired key.
+configuration and OAuth file replacement has one commit boundary: every byte is
+serialized and bounded before staging, and post-rename directory-sync failures
+are warnings, never grounds to roll back a paired key. Unix private-file readers
+use nonblocking opens and reject non-regular descriptors before reading.
 
 Developer caches are modeled separately from filesystem grants. A cache record stores its tool family, host source path, and RO/RW mode. At runtime the source is canonicalized and mounted only into the shell sandbox, typically below `/tmp/home` at the tool's expected path. Cache mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical cache sources before mounting.
 
@@ -480,7 +541,7 @@ Then add --allow-shell and/or --allow-network separately.
 Logging has two layers:
 
 - normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP all produce the same timestamped TOOL start/completion lines;
-- REQ logging records incoming request metadata at the transport boundary without dumping request bodies.
+- REQ logging records incoming request metadata at the transport boundary without dumping request bodies; all scopes are ASCII-sanitized/capped, HTTP method/path labels are bounded and control-character sanitized, ephemeral MCP paths are redacted, OpenAI command metadata uses strict protocol identifiers, and grep patterns are logged only as byte counts. Control-plane error bodies and malformed SSE payloads are excluded from propagated errors. rmcp tracing is suppressed independently of `RUST_LOG` because its debug events render complete protocol payloads.
 
 Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. In interactive non-stdio runs, `v` cycles `quiet → TOOL → TOOL + REQ → quiet` immediately across all logger clones. `-q/--quiet` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
 

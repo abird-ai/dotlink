@@ -7,12 +7,14 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
 };
 use serde::Deserialize;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use super::{LocalMachine, marker_lines, ok_text, tool_error};
 use crate::mcp::AccessNeed;
 
 const DEFAULT_READ_LINES: usize = 4 * 1024;
+/// Limit work before a requested line window, independently of output size.
+const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(super) struct ReadArgs {
@@ -76,18 +78,23 @@ where
     }
 }
 
-/// Skip one line without buffering it. Skipped lines must not need to fit the
-/// read ceiling: a window selected by `offset` is independent of what precedes
-/// it. Inspect binary-control bytes while scanning, without buffering or
-/// decoding skipped lines.
-async fn skip_line<R>(reader: &mut R) -> io::Result<bool>
+/// Skip one line without buffering it. `Take` limits actual source I/O, so a
+/// `BufReader` fill can never prefetch past the scan budget. Its buffer remains
+/// in place when the limit is lifted for the selected window.
+async fn skip_line<R>(reader: &mut BufReader<tokio::io::Take<R>>) -> io::Result<bool>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
 {
     let mut consumed = false;
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
+            if reader.get_ref().limit() == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "read scan budget exceeded; narrow the file or use grep to locate the text",
+                ));
+            }
             // An unterminated final line still counts as a line.
             return Ok(consumed);
         }
@@ -112,6 +119,36 @@ where
     }
 }
 
+/// Position a buffered reader at `offset` under an exact source-I/O ceiling.
+/// Lifting `Take`'s limit in place retains bytes prefetched from the selected
+/// line and lets the ordinary page reader continue from the same buffer.
+async fn reader_at_line<R>(
+    source: R,
+    offset: usize,
+    scan_budget: usize,
+) -> Result<(BufReader<tokio::io::Take<R>>, usize)>
+where
+    R: AsyncRead + Unpin,
+{
+    let offset = offset.max(1);
+    let mut reader = BufReader::new(source.take(scan_budget as u64));
+    let mut line_number = 0_usize;
+    while line_number + 1 < offset {
+        if !skip_line(&mut reader)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+        {
+            break;
+        }
+        line_number += 1;
+    }
+    if line_number + 1 < offset {
+        anyhow::bail!("offset {offset} is beyond end of file ({line_number} lines)");
+    }
+    reader.get_mut().set_limit(u64::MAX);
+    Ok((reader, line_number))
+}
+
 /// Drop the last whole line of a buffer that holds only lines. Each line ends
 /// with its terminator, except possibly the file's last one.
 fn drop_last_line(buffer: &mut Vec<u8>) -> bool {
@@ -133,29 +170,24 @@ fn drop_last_line(buffer: &mut Vec<u8>) -> bool {
 
 impl LocalMachine {
     async fn read_impl(&self, args: ReadArgs) -> Result<String> {
+        self.read_impl_with_scan_budget(args, MAX_READ_SCAN_BYTES)
+            .await
+    }
+
+    async fn read_impl_with_scan_budget(
+        &self,
+        args: ReadArgs,
+        scan_budget: usize,
+    ) -> Result<String> {
         let path = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         let file = self.open_read_file(&path).await?;
-        let mut reader = BufReader::new(file);
 
         let offset = args.offset.unwrap_or(1).max(1);
         // A zero window would render a nonsense marker ("truncated at line 0").
         let limit = args.limit.unwrap_or(DEFAULT_READ_LINES).max(1);
         let numbered = args.numbered.unwrap_or(true);
         let byte_limit = self.config.max_read_bytes;
-
-        let mut line_number = 0_usize;
-        while line_number + 1 < offset {
-            if !skip_line(&mut reader)
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?
-            {
-                break;
-            }
-            line_number += 1;
-        }
-        if line_number + 1 < offset {
-            anyhow::bail!("offset {offset} is beyond end of file ({line_number} lines)");
-        }
+        let (mut reader, mut line_number) = reader_at_line(file, offset, scan_budget).await?;
         // A trailing newline terminates the preceding line; it does not create
         // another line. Only an actually empty file is readable at offset 1.
         if reader.fill_buf().await?.is_empty() {
@@ -277,7 +309,7 @@ impl LocalMachine {
 #[tool_router(router = "text_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Read a UTF-8 text file as numbered lines. `offset` is the 1-based first line (default 1), `limit` the line count (default 4096), and each line is prefixed with its number and a tab unless `numbered` is false, which returns the text exactly. A capped window ends with one truncation marker. An offset past the end of the file is an error.",
+        description = "Read a UTF-8 text file as numbered lines. `offset` is the 1-based first line (default 1), `limit` the line count (default 4096), and each line is prefixed with its number and a tab unless `numbered` is false, which returns the text exactly. A capped window ends with one truncation marker. Skipping to an offset scans at most 32 MiB per call; use grep or a narrower file if exceeded. An offset past the end of the file is an error.",
         annotations(
             title = "Read text file",
             read_only_hint = true,
@@ -315,6 +347,111 @@ impl LocalMachine {
 mod tests {
     use super::*;
     use crate::mcp::tools::test_support::{test_machine, test_machine_with};
+
+    #[tokio::test]
+    async fn skipped_read_bytes_have_a_separate_work_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lines.txt"), b"alpha\nbeta\ngamma\n").unwrap();
+        let machine = test_machine(root);
+        let args = || ReadArgs {
+            path: "lines.txt".to_owned(),
+            offset: Some(3),
+            limit: Some(1),
+            numbered: Some(false),
+        };
+        let error = machine
+            .read_impl_with_scan_budget(args(), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("read scan budget exceeded"),
+            "{error}"
+        );
+        assert_eq!(
+            machine
+                .read_impl_with_scan_budget(args(), 11)
+                .await
+                .unwrap(),
+            "gamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_budget_caps_source_io_without_losing_prefetched_window_bytes() {
+        use std::{
+            pin::Pin,
+            sync::{Arc, Mutex},
+            task::{Context, Poll},
+        };
+        use tokio::io::ReadBuf;
+
+        #[derive(Debug)]
+        struct CountingReader {
+            bytes: Vec<u8>,
+            position: usize,
+            reads: Arc<Mutex<Vec<usize>>>,
+        }
+
+        impl AsyncRead for CountingReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let available = &self.bytes[self.position..];
+                let count = available.len().min(buffer.remaining());
+                if count > 0 {
+                    buffer.put_slice(&available[..count]);
+                    self.position += count;
+                    self.reads.lock().unwrap().push(count);
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let source = b"alpha\nbeta\ngamma\n";
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let error = reader_at_line(
+            CountingReader {
+                bytes: source.to_vec(),
+                position: 0,
+                reads: reads.clone(),
+            },
+            3,
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("read scan budget exceeded"));
+        assert_eq!(reads.lock().unwrap().iter().sum::<usize>(), 10);
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut reader, line_number) = reader_at_line(
+            CountingReader {
+                bytes: source.to_vec(),
+                position: 0,
+                reads: reads.clone(),
+            },
+            3,
+            16,
+        )
+        .await
+        .unwrap();
+        assert_eq!(line_number, 2);
+        assert_eq!(reads.lock().unwrap().iter().sum::<usize>(), 16);
+
+        let mut line = Vec::new();
+        assert!(
+            read_line_bounded(&mut reader, &mut line, 1024)
+                .await
+                .unwrap()
+        );
+        assert_eq!(line, b"gamma\n");
+        // Five selected-line bytes were already buffered under the cap; only
+        // its final newline required more source I/O after lifting the limit.
+        assert_eq!(reads.lock().unwrap().iter().sum::<usize>(), 17);
+    }
 
     #[tokio::test]
     async fn read_refuses_to_replace_the_only_line_with_line_zero_marker() {

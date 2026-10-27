@@ -179,10 +179,11 @@ Argon2id hash only
 Verification:
 
 - re-read latest persisted owner hash;
-- bounded semaphore;
+- process-wide semaphore shared across runtime generations;
 - Argon2 in `spawn_blocking`;
 - short bounded wait;
 - failed-attempt delay;
+- six rolling-minute starts per trusted requester in a 256-row non-evicting table, charging both consent creator and password POST source;
 - no remotely triggerable global lockout.
 
 ## Consent
@@ -220,10 +221,13 @@ Fetch safety:
 - no redirects;
 - short timeout;
 - max body;
-- DNS resolution;
+- cancellable async system DNS with immediate lease release on timeout/cancellation; missing system DNS disables CIMD without blocking DCR OAuth;
 - all addresses must be public;
 - validated addresses pinned for actual connection;
-- metadata client_id exact match.
+- metadata client_id exact match;
+- 12 rolling-minute starts and two in-flight operations per trusted requester;
+- four in-flight network operations process-wide;
+- non-evicting 256-row requester history.
 
 Client metadata must support:
 
@@ -257,7 +261,9 @@ POST /oauth/register
 → client promoted atomically to persistent approved state
 ```
 
-Pending DCR lifetime is short (~15 minutes) and bounded.
+Pending DCR lifetime is short (~15 minutes) and bounded. Aggregate, redirect/client, requester-within-redirect/client, and overall requester shares reject overload without evicting live requests.
+
+Authorization-code, access-token, and refresh-grant stores prune expired entries but reject overload without evicting live credentials; access tokens have a 64-entry per-client share within the 512-entry process bound, duplicate code/refresh exchanges shed before global admission, and failed issuance leaves the original code/grant retryable. An authoritative revoked-DCR result consumes the terminal authorization code. Client display names neutralize terminal controls, line separators, and Unicode bidi controls before UI/management output.
 
 Approved client count is bounded.
 
@@ -413,18 +419,19 @@ Automatic hostname and/or ephemeral path:
 - identity changes on restart/change;
 - remote OAuth client must reconnect/re-authorize.
 
-## Separate ngrok backend
+## Separate ngrok router and direct tunnel
 
-Local HTTP and ngrok do not share the same externally visible listener.
+Local HTTP and ngrok do not share the same externally visible listener or router.
 
-ngrok uses a separate loopback-only backend.
+Ngrok connections are served directly from the authenticated SDK tunnel. This preserves trusted remote-peer metadata without accepting forwarded client-IP headers or exposing a loopback forwarding backend.
 
 Benefits:
 
 - local/public path policies can differ;
 - local/public OAuth policies can differ;
 - local token cannot be replayed against public resource;
-- public token cannot be replayed against local resource.
+- public token cannot be replayed against local resource;
+- anonymous admission uses the authenticated edge peer rather than a caller-selected HTTP header.
 
 Both server instances may share the same OAuth runtime/state store, but grants/tokens are bound to exact issuer/resource.
 

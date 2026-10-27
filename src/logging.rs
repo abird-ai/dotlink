@@ -186,6 +186,7 @@ impl LogConfig {
 
     fn line(&self, level: &str, scope: &str, message: &str, color_code: &str) {
         let timestamp = Local::now().format("%H:%M:%S%.3f");
+        let scope = sanitize_log_scope(scope);
         if self.color {
             eprintln!(
                 "\x1b[2m[{timestamp}]\x1b[0m \x1b[{color_code}m{level:<4}\x1b[0m \x1b[1m{scope:<10}\x1b[0m {message}"
@@ -196,23 +197,47 @@ impl LogConfig {
     }
 }
 
+const LOG_SCOPE_CHARS: usize = 48;
+
+/// Log scopes include MCP tool names. Keep every caller on one strict,
+/// single-line, bounded representation before terminal styling is applied.
+fn sanitize_log_scope(scope: &str) -> String {
+    let mut chars = scope.chars();
+    let mut sanitized: String = chars
+        .by_ref()
+        .take(LOG_SCOPE_CHARS)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '/' | '-' | '_' | '.') {
+                character
+            } else {
+                '�'
+            }
+        })
+        .collect();
+    if chars.next().is_some() {
+        sanitized.pop();
+        sanitized.push('…');
+    }
+    sanitized
+}
+
 /// Widest scalar argument rendered literally in a tool-call summary.
 const SUMMARY_VALUE_CHARS: usize = 120;
 
 /// Arguments that carry whole payloads. Their values are always logged as a byte
-/// count, never as text: file content, patches and stdin must not reach a
-/// journal. Shell commands can include inline credentials and are payloads,
-/// too. This is a semantic list (which arguments are payloads) that no
+/// count, never as text: file content, patches, stdin and search patterns must
+/// not reach a journal. Shell commands can include inline credentials and are
+/// payloads, too. This is a semantic list (which arguments are payloads) that no
 /// schema can express, and it is shared by every caller.
 const PAYLOAD_ARGUMENTS: &[&str] = &[
-    "content", "stdin", "data", "old_text", "new_text", "patch", "command",
+    "content", "stdin", "data", "old_text", "new_text", "patch", "command", "pattern",
 ];
 
 /// One-line rendering of tool-call arguments for the TOOL and REQ logs.
 ///
 /// `keys` is the tool's own argument order, taken from its JSON schema, so a new
 /// argument cannot silently go unlogged. Strings wider than a preview become a
-/// byte count, which keeps file content, shell commands, patches and stdin out of logs.
+/// byte count, which keeps content, commands, patches, patterns and stdin out of logs.
 pub fn summarize_arguments<'a>(
     arguments: &Map<String, Value>,
     keys: impl IntoIterator<Item = &'a str>,
@@ -308,6 +333,7 @@ mod tests {
         for value in [
             "read\ninjected",
             "read\rESC",
+            "read\u{1b}[31mred",
             "a".repeat(97).as_str(),
             "access_token:secret",
         ] {
@@ -332,6 +358,7 @@ mod tests {
             "command": "curl -H 'Authorization: Bearer FAKE_TEST_SECRET' https://example.org",
             "content": "x".repeat(200),
             "old_text": "short secret",
+            "pattern": "FAKE_GREP_SECRET",
             "edits": [{"old_text": "a"}, {"old_text": "b"}],
             "literal": true,
             "limit": 20,
@@ -340,8 +367,8 @@ mod tests {
         let summary = summarize_arguments(
             arguments.as_object().unwrap(),
             [
-                "path", "command", "content", "old_text", "edits", "literal", "limit", "absent",
-                "missing",
+                "path", "command", "content", "old_text", "pattern", "edits", "literal", "limit",
+                "absent", "missing",
             ],
         );
         assert!(summary.contains("path=\"src/main.rs\""), "{summary}");
@@ -351,10 +378,28 @@ mod tests {
         // A payload stays a byte count even when it is short.
         assert!(summary.contains("old_text_bytes=12"), "{summary}");
         assert!(!summary.contains("short secret"), "{summary}");
+        assert!(summary.contains("pattern_bytes=16"), "{summary}");
+        assert!(!summary.contains("FAKE_GREP_SECRET"), "{summary}");
         assert!(summary.contains("edits=2"), "{summary}");
         assert!(summary.contains("literal=true"), "{summary}");
         assert!(summary.contains("limit=20"), "{summary}");
         assert!(!summary.contains("xxxx"), "{summary}");
+    }
+
+    #[test]
+    fn generic_log_scopes_are_single_line_strict_and_bounded() {
+        assert_eq!(sanitize_log_scope("grep"), "grep");
+        let malicious = format!("tool\n\r\u{1b}[31m/{}", "x".repeat(200));
+        let sanitized = sanitize_log_scope(&malicious);
+        assert!(sanitized.chars().count() <= LOG_SCOPE_CHARS);
+        assert!(sanitized.ends_with('…'));
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(sanitized.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '-' | '_' | '.' | '�' | '…')
+        }));
     }
 
     #[test]

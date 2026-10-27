@@ -302,13 +302,16 @@ Bearer validation is outside/in front of rmcp.
 
 ### ngrok isolation
 
-ngrok gets a second loopback backend listener.
+Ngrok gets a separate Axum router served directly on authenticated SDK tunnel connections.
 
-Do not simply expose the same local HTTP listener because:
+Do not expose the local TCP router through a forwarding backend because:
 
 - local/public path can differ;
 - local/public OAuth can differ;
-- separate exact resources improve token isolation.
+- separate exact resources improve token isolation;
+- direct tunnel metadata preserves a trusted requester boundary without forwarded headers.
+
+Network HTTP/ngrok retains Streamable HTTP SSE keepalives for intermediary idle timeouts. SEP-2243 network and embedded calls reject unknown policy tool names before rmcp's negative schema cache; HTTP preflight uses the same request-body ceiling. Only the in-process OpenAI adapter disables wire keepalive/retry events. Shutdown cancels route futures, force-closes accepted IO after the five-second graceful drain bound, and overlaps bounded ngrok tunnel/session close; the parent transport budget is six seconds. A drain timeout is cleanup failure, and cleanup failures take precedence over restart requests.
 
 ## Ephemeral paths
 
@@ -428,17 +431,17 @@ TOOL + REQ
 
 Arguments are summarized.
 
-Bulk content is represented as byte/encoded-character counts, not raw content.
+Bulk content and grep patterns are represented as byte/encoded-character counts, not raw content. Log scopes are ASCII-sanitized and capped.
 
 ### REQ logging
 
 Transport/request metadata:
 
-- HTTP method/path/status;
+- bounded/control-sanitized HTTP method/path/status, with ephemeral MCP paths redacted;
 - stdio JSON-RPC method;
-- OpenAI MCP request labels.
+- strict bounded OpenAI MCP protocol labels.
 
-No raw bodies.
+No raw bodies. Control-plane response bodies and malformed local SSE payloads do not enter propagated errors. rmcp tracing is suppressed regardless of `RUST_LOG` because upstream debug events render complete payloads.
 
 ## Startup banner
 

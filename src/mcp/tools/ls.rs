@@ -42,8 +42,8 @@ pub(crate) struct ListArgs {
     #[serde(default)]
     pub(super) pattern: Option<String>,
 
-    /// Directory levels to descend: 1, or unbounded when `pattern` contains
-    /// `**` (4 for a pattern with `/`). An explicit value always wins.
+    /// Directory levels to descend: 1, the pattern's path-segment count, or
+    /// unbounded when `pattern` contains `**`. An explicit value always wins.
     /// Symlinked directories are never traversed.
     #[serde(default)]
     pub(super) depth: Option<usize>,
@@ -154,7 +154,7 @@ fn list_depth(requested: Option<usize>, pattern: Option<&str>) -> usize {
 }
 
 impl LocalMachine {
-    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool, bool)> {
+    async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool, super::WalkProgress)> {
         let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         if !fs::metadata(&root).await?.is_dir() {
             anyhow::bail!("not a directory: {}", args.path);
@@ -215,24 +215,26 @@ impl LocalMachine {
         let render = |entries: &[FsEntry], truncated: bool| {
             serde_json::json!({
                 "entries": entries, "truncated": truncated,
-                "scan_incomplete": progress.incomplete
+                "scan_incomplete": progress.scan_incomplete(),
+                "incomplete_reason": progress.incomplete_reason(),
+                "incomplete_reasons": progress.incomplete_reasons(),
             })
             .to_string()
         };
         let (output, truncated) = trim_to_ceiling(
             output,
             self.config.max_output_bytes,
-            truncated || progress.incomplete,
+            truncated || progress.scan_incomplete(),
             render,
         );
-        Ok((output, truncated, progress.incomplete))
+        Ok((output, truncated, progress))
     }
 }
 
 #[tool_router(router = "discovery_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "List files and directories. `depth` defaults to 1, to the pattern's own path-segment count, or to unbounded when the pattern contains `**`; an explicit `depth` always wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Returns {\"entries\":[{\"path\",\"kind\",\"size\"}],\"truncated\":bool,\"scan_incomplete\":bool}. A traversal over 100000 entries ends with scan_incomplete=true: results are sorted among scanned entries, not claimed globally sorted; narrow path/pattern. The reply also respects `max_output_bytes`.",
+        description = "List files and directories. `depth` defaults to 1, to the pattern's own path-segment count, or to unbounded when the pattern contains `**`; an explicit `depth` always wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Returns {\"entries\":[{\"path\",\"kind\",\"size\"}],\"truncated\":bool,\"scan_incomplete\":bool,\"incomplete_reason\":string|null,\"incomplete_reasons\":string[]}. Incomplete causes are directory_budget/traversal_error; incomplete_reason retains the first cause for compatibility while incomplete_reasons preserves concurrent causes. Results are sorted only among scanned entries; narrow path/pattern. The reply also respects `max_output_bytes`.",
         annotations(
             title = "List files",
             read_only_hint = true,
@@ -243,11 +245,13 @@ impl LocalMachine {
     )]
     pub(super) async fn ls(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
         match self.list_impl(args).await {
-            Ok((entries, truncated, scan_incomplete)) => {
+            Ok((entries, truncated, progress)) => {
                 let payload = serde_json::json!({
                     "entries": entries,
                     "truncated": truncated,
-                    "scan_incomplete": scan_incomplete,
+                    "scan_incomplete": progress.scan_incomplete(),
+                    "incomplete_reason": progress.incomplete_reason(),
+                    "incomplete_reasons": progress.incomplete_reasons(),
                 });
                 ok_text(payload.to_string())
             }
@@ -271,6 +275,14 @@ mod tests {
         std::fs::write(root.join("src/nested/deep.rs"), "x").unwrap();
         std::fs::write(root.join("README.md"), "x").unwrap();
         let machine = test_machine(root);
+
+        let reply = machine.ls(Parameters(ListArgs::default())).await;
+        let reply = serde_json::to_value(reply).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["scan_incomplete"], false);
+        assert_eq!(payload["incomplete_reason"], serde_json::Value::Null);
+        assert_eq!(payload["incomplete_reasons"], serde_json::json!([]));
 
         // Default depth 1: this directory only.
         let (entries, truncated, _) = machine
@@ -327,6 +339,33 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 2);
         assert!(truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_descendant_marks_shared_discovery_incomplete() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden.txt"), "secret").unwrap();
+        let machine = test_machine(root);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let (_, _, progress) = machine
+            .list_impl(ListArgs {
+                depth: Some(3),
+                ..ListArgs::default()
+            })
+            .await
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if unreadable {
+            assert!(progress.scan_incomplete());
+            assert_eq!(progress.incomplete_reason(), Some("traversal_error"));
+            assert_eq!(progress.incomplete_reasons(), ["traversal_error"]);
+        }
     }
 
     #[tokio::test]

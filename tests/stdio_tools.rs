@@ -66,7 +66,15 @@ impl Probe {
         let config_dir = workdir.join(".state");
         std::fs::create_dir_all(&config_dir).unwrap();
         let config = config_dir.join("config.jsonc");
-        std::fs::write(&config, config_json()).unwrap();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&config)
+        {
+            Ok(mut file) => file.write_all(config_json().as_bytes()).unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create test profile {}: {error}", config.display()),
+        }
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_dotlink"))
             .arg("--stdio")

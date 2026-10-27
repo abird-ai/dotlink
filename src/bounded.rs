@@ -1,10 +1,74 @@
-//! Byte ceilings for external HTTP bodies. Enforce during streaming, before
-//! deserialization or decoding; headers and post-hoc string slicing are not caps.
+//! Shared byte ceilings for untrusted external bodies and private state files.
+//! Enforce while reading, before decoding or deserialization.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body::Body as HttpBody;
 use http_body_util::BodyExt as _;
+use std::{
+    fs,
+    io::{self, Read as _},
+    path::Path,
+};
+
+pub(crate) const PROFILE_CONFIG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const RUNTIME_KEY_MAX_BYTES: u64 = 16 * 1024;
+
+pub(crate) fn ensure_file_size(contents: &[u8], limit: u64, label: &'static str) -> Result<()> {
+    if u64::try_from(contents.len()).map_or(true, |length| length > limit) {
+        bail!("{label} exceeds {limit} bytes");
+    }
+    Ok(())
+}
+
+/// Open one private control-plane file without blocking on Unix special files.
+/// Validate the opened descriptor rather than a raceable pathname.
+pub(crate) fn open_regular_file(path: &Path, label: &'static str) -> Result<Option<fs::File>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot open {label}: {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {label}: {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} must be a regular file: {}", path.display());
+    }
+    Ok(Some(file))
+}
+
+/// Read a private control-plane UTF-8 file with the same streaming limit
+/// discipline as HTTP bodies. A missing path is not an error; callers decide
+/// whether absence is expected. Reject files grown mid-read.
+pub(crate) fn text_file(path: &Path, limit: u64, label: &'static str) -> Result<Option<String>> {
+    let Some(file) = open_regular_file(path, label)? else {
+        return Ok(None);
+    };
+    if file.metadata()?.len() > limit {
+        bail!(
+            "{label} must be a regular file of at most {limit} bytes: {}",
+            path.display()
+        );
+    }
+    let mut contents = String::new();
+    file.take(limit.saturating_add(1))
+        .read_to_string(&mut contents)
+        .with_context(|| format!("cannot read {label}: {}", path.display()))?;
+    if contents.len() as u64 > limit {
+        bail!("{label} exceeds {limit} bytes: {}", path.display());
+    }
+    Ok(Some(contents))
+}
 
 struct Buffer {
     bytes: Vec<u8>,
@@ -71,6 +135,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_file_reads_are_stream_bounded_and_explain_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state");
+        assert_eq!(text_file(&path, 5, "state").unwrap(), None);
+        fs::write(&path, "abcde").unwrap();
+        assert_eq!(text_file(&path, 5, "state").unwrap().unwrap(), "abcde");
+        assert!(text_file(&path, 4, "state").is_err());
+        assert!(text_file(temp.path(), 5, "state").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_fifo_and_device_reads_are_rejected_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt as _, sync::mpsc, thread, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("state.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a live, NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = mpsc::channel();
+        let reader_path = fifo.clone();
+        let reader = thread::spawn(move || {
+            let _ = sender.send(text_file(&reader_path, 5, "state"));
+        });
+        let result = match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Keep this regression test from hanging even if O_NONBLOCK is
+                // accidentally removed: pair with the blocked FIFO reader.
+                let _ = fs::OpenOptions::new().write(true).open(&fifo);
+                let _ = reader.join();
+                panic!("opening a FIFO for a bounded read blocked");
+            }
+            Err(error) => panic!("FIFO reader stopped unexpectedly: {error}"),
+        };
+        reader.join().unwrap();
+        assert!(result.is_err());
+        assert!(text_file(Path::new("/dev/null"), 5, "state").is_err());
+    }
 
     #[test]
     fn checks_each_chunk_and_preserves_exact_limit() {

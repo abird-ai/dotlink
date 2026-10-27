@@ -12,6 +12,7 @@ mod mcp;
 mod mutation;
 mod oauth;
 mod private_state;
+mod requester;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod secure_fs;
 mod setup;
@@ -37,7 +38,12 @@ use clap::{
     builder::styling::{AnsiColor, Styles},
 };
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer,
+    filter::{FilterExt, filter_fn},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::{
     backoff::Backoff,
@@ -889,6 +895,13 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
+fn dependency_trace_is_safe(target: &str) -> bool {
+    // rmcp debug/trace events render complete requests and responses, including
+    // tool payloads. Keep RUST_LOG useful for dotlink without bypassing the
+    // application's payload-redaction boundary.
+    target != "rmcp" && !target.starts_with("rmcp::")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args();
@@ -897,12 +910,18 @@ async fn main() -> Result<()> {
     let log = LogConfig::new(args.verbose, args.quiet, args.color);
     let setup_color = args.color.stdout_enabled();
     let default_filter = "dotlink=warn";
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_filter))
+        .and(filter_fn(|metadata| {
+            dependency_trace_is_safe(metadata.target())
+        }));
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(log.color_enabled())
+                .with_filter(filter),
         )
-        .with_writer(std::io::stderr)
-        .with_ansi(log.color_enabled())
         .init();
 
     if let Some(command) = &args.command {
@@ -1060,7 +1079,27 @@ async fn run_runtime(
         return Ok(RuntimeOutcome::Exit);
     }
 
-    let Some(setup) = load_or_setup(args.setup, args.profile.as_deref(), setup_color).await? else {
+    if args.list_tools && !args.setup {
+        let defaults = setup::inspection_permissions(args.profile.as_deref())?;
+        let policy = Policy::from_args(args, launch_dir.to_path_buf(), &defaults)?;
+        let descriptions = LocalMachine::inspect_tool_descriptions(
+            AccessSpec {
+                base_dir: policy.base_dir,
+                read_roots: policy.read_roots,
+                write_roots: policy.write_roots,
+                deny_read_roots: policy.deny_read_roots,
+                deny_write_roots: policy.deny_write_roots,
+                unrestricted_fs: policy.unrestricted_fs,
+            },
+            policy.allow_shell,
+        )
+        .await?;
+        print_tools(descriptions);
+        return Ok(RuntimeOutcome::Exit);
+    }
+
+    let Some(mut setup) = load_or_setup(args.setup, args.profile.as_deref(), setup_color).await?
+    else {
         return Ok(RuntimeOutcome::Exit);
     };
 
@@ -1071,6 +1110,20 @@ async fn run_runtime(
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
+
+    // An explicit ngrok credential is selected only when ngrok is active. Read
+    // it once and carry both its value and descriptor-verified protected path
+    // into the HTTP runtime and filesystem policy.
+    let ngrok_credential = if local_transports.ngrok {
+        credentials::from_env("NGROK_AUTHTOKEN_FILE")?
+    } else {
+        None
+    };
+    if let Some(source) = ngrok_credential.as_ref() {
+        source.extend_protected_paths(&mut setup.protected_paths);
+        setup.protected_paths.sort();
+        setup.protected_paths.dedup();
+    }
 
     let http_bind = if local_transports.http {
         Some(match args.http_bind {
@@ -1125,6 +1178,9 @@ async fn run_runtime(
             ngrok_oauth: http_auth.ngrok_oauth,
             oauth_public_url: http_auth.public_url,
             ngrok_no_auth: http_auth.ngrok_no_auth,
+            ngrok_authtoken: ngrok_credential
+                .as_ref()
+                .map(|source| source.secret().to_owned()),
             log: log.clone(),
         }),
     };
@@ -1182,11 +1238,6 @@ async fn run_runtime(
         protected_paths: setup.protected_paths.clone(),
     })
     .await?;
-
-    if args.list_tools {
-        print_tools(&machine);
-        return Ok(RuntimeOutcome::Exit);
-    }
 
     if active_transports.is_empty() {
         bail!("no MCP transport is active; enable one in setup or add --stdio/--http for this run");
@@ -1249,12 +1300,12 @@ async fn run_runtime(
             Ok(RuntimeOutcome::Exit)
         }
         RuntimeEvent::Exit => {
-            stop_runtime_transports(&mut transport_task, &cancellation).await;
+            stop_runtime_transports(&mut transport_task, &cancellation).await?;
             eprintln!("\ndotlink stopped.");
             Ok(RuntimeOutcome::Exit)
         }
         RuntimeEvent::Restart => {
-            stop_runtime_transports(&mut transport_task, &cancellation).await;
+            stop_runtime_transports(&mut transport_task, &cancellation).await?;
             Ok(RuntimeOutcome::Restart)
         }
     }
@@ -1263,14 +1314,20 @@ async fn run_runtime(
 async fn stop_runtime_transports(
     task: &mut tokio::task::JoinHandle<Result<()>>,
     cancellation: &CancellationToken,
-) {
+) -> Result<()> {
     cancellation.cancel();
-    if tokio::time::timeout(std::time::Duration::from_secs(6), &mut *task)
-        .await
-        .is_err()
-    {
-        task.abort();
-        let _ = task.await;
+    match tokio::time::timeout(std::time::Duration::from_secs(6), &mut *task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(anyhow!(
+            "transport supervisor task failed during shutdown: {error}"
+        )),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(anyhow!(
+                "transport supervisor exceeded the shutdown deadline"
+            ))
+        }
     }
 }
 
@@ -1368,7 +1425,13 @@ fn resolve_http_auth(
     }
 
     let bind = http_bind.ok_or_else(|| anyhow::anyhow!("HTTP bind is missing"))?;
-    let non_loopback_http = !bind.ip().is_loopback();
+    let bind_ip = transports::http::normalize_ip(bind.ip());
+    let non_loopback_http = !bind_ip.is_loopback();
+    if args.allow_public_no_auth && bind_ip.is_unspecified() {
+        bail!(
+            "unauthenticated HTTP cannot use a wildcard bind: choose a concrete interface IP so the MCP Host allowlist can protect against DNS rebinding"
+        );
+    }
     if args.allow_public_no_auth && !transports.ngrok && !non_loopback_http {
         bail!("--allow-public-no-auth is valid only for ngrok or a non-loopback HTTP listener");
     }
@@ -1470,7 +1533,7 @@ fn print_banner(
         }
         if http.local_oauth {
             eprintln!("• OAuth      local HTTP protected");
-        } else if !http.bind.ip().is_loopback() {
+        } else if !transports::http::normalize_ip(http.bind.ip()).is_loopback() {
             eprintln!("• OAuth      WARNING: non-loopback HTTP is unauthenticated");
         }
         if http.ngrok {
@@ -1537,10 +1600,10 @@ fn print_banner(
     eprintln!();
 }
 
-fn print_tools(machine: &LocalMachine) {
+fn print_tools(descriptions: Vec<(String, String)>) {
     println!("abird dotlink tools");
     println!("────────────────────────────────────────────────────────");
-    for (name, title) in machine.visible_tool_descriptions() {
+    for (name, title) in descriptions {
         println!("• {name:<16} {title}");
     }
 }
@@ -1911,6 +1974,52 @@ mod tests {
     }
 
     #[test]
+    fn unauthenticated_wildcard_bind_fails_instead_of_rejecting_every_real_host() {
+        let args = Args::try_parse_from(["dotlink", "--allow-public-no-auth"]).unwrap();
+        let defaults = TransportConfig {
+            openai: false,
+            http: true,
+            ..TransportConfig::default()
+        };
+        let transports = resolve_local_transports(&args, &defaults).unwrap();
+        for bind in ["0.0.0.0:3000", "[::ffff:0.0.0.0]:3000"] {
+            let error = resolve_http_auth(
+                &args,
+                &oauth::OAuthConfig::default(),
+                &transports,
+                Some(bind.parse().unwrap()),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("wildcard bind"), "bind={bind}: {error}");
+        }
+        assert!(
+            resolve_http_auth(
+                &args,
+                &oauth::OAuthConfig::default(),
+                &transports,
+                Some("192.0.2.1:3000".parse().unwrap()),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_is_classified_as_loopback_for_http_auth() {
+        let args = Args::try_parse_from(["dotlink", "--http"]).unwrap();
+        let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig::default(),
+            &transports,
+            Some("[::ffff:127.0.0.1]:3000".parse().unwrap()),
+        )
+        .unwrap();
+        assert!(!auth.local_oauth);
+        assert!(!auth.ngrok_oauth);
+    }
+
+    #[test]
     fn local_oauth_can_coexist_with_ngrok_no_auth_override() {
         let args = Args::try_parse_from(["dotlink", "--oauth", "--allow-public-no-auth"]).unwrap();
         let defaults = TransportConfig {
@@ -2001,6 +2110,7 @@ mod tests {
     #[test]
     fn non_loopback_http_requires_oauth_or_explicit_opt_out() {
         let bind = Some("0.0.0.0:3000".parse().unwrap());
+        let concrete_bind = Some("192.0.2.1:3000".parse().unwrap());
 
         let args = Args::try_parse_from(["dotlink", "--http"]).unwrap();
         let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
@@ -2010,8 +2120,13 @@ mod tests {
 
         let args = Args::try_parse_from(["dotlink", "--http", "--allow-public-no-auth"]).unwrap();
         let transports = resolve_local_transports(&args, &TransportConfig::default()).unwrap();
-        let auth =
-            resolve_http_auth(&args, &oauth::OAuthConfig::default(), &transports, bind).unwrap();
+        let auth = resolve_http_auth(
+            &args,
+            &oauth::OAuthConfig::default(),
+            &transports,
+            concrete_bind,
+        )
+        .unwrap();
         assert!(!auth.local_oauth);
 
         let auth = resolve_http_auth(
@@ -2021,7 +2136,7 @@ mod tests {
                 public_url: Some("https://mcp.example.com".to_owned()),
             },
             &transports,
-            bind,
+            concrete_bind,
         )
         .unwrap();
         assert!(!auth.local_oauth);
@@ -2380,6 +2495,25 @@ mod tests {
 
         let args = Args::try_parse_from(["dotlink", "profile", "list", "--color=never"]).unwrap();
         assert_eq!(args.color, ColorMode::Never);
+    }
+
+    #[tokio::test]
+    async fn runtime_restart_refuses_failed_transport_cleanup() {
+        let cancellation = CancellationToken::new();
+        let mut task = tokio::spawn(async { Err(anyhow!("cleanup failed")) });
+        let error = stop_runtime_transports(&mut task, &cancellation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cleanup failed"));
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn dependency_tracing_cannot_bypass_payload_redaction() {
+        assert!(!dependency_trace_is_safe("rmcp"));
+        assert!(!dependency_trace_is_safe("rmcp::service"));
+        assert!(dependency_trace_is_safe("dotlink::mcp"));
+        assert!(dependency_trace_is_safe("hyper::proto"));
     }
 
     #[test]

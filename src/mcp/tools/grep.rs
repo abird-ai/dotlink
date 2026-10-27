@@ -10,7 +10,7 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
 };
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{
     GlobFilter, LocalMachine, WalkFilter, dot, marker_bytes, marker_files, marker_hits, ok_text,
@@ -44,6 +44,8 @@ enum StopReason {
 
 /// Suffix that names the per-file cap as the reason a content page stopped, so a
 /// reader does not mistake it for the call's own `limit`.
+const IGNORE_INCOMPLETE_MARKER: &str =
+    "… ignore rules unavailable; results may include or omit matches";
 const PER_FILE_CAP_SUFFIX: &str = " (per-file cap)";
 
 /// The longest marker a `content` page can end with. Bytes are reserved for it
@@ -153,7 +155,48 @@ impl OutputBudget {
 enum SearchRead {
     Text(String, usize),
     Skipped(usize),
+    Unreadable(usize),
     WorkBudgetExceeded,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SearchSize {
+    Read(usize),
+    Skip,
+    WorkBudgetExceeded,
+}
+
+fn classify_search_size(bytes: u64, remaining: usize) -> SearchSize {
+    if bytes > MAX_GREP_FILE_BYTES as u64 {
+        SearchSize::Skip
+    } else if bytes > remaining as u64 {
+        SearchSize::WorkBudgetExceeded
+    } else {
+        SearchSize::Read(bytes as usize)
+    }
+}
+
+fn verify_search_size(declared: u64, observed: u64, remaining: usize) -> Option<SearchSize> {
+    match classify_search_size(observed, remaining) {
+        SearchSize::Read(_) if observed != declared => None,
+        decision => Some(decision),
+    }
+}
+
+/// Read only the bytes proved by descriptor metadata. There is deliberately no
+/// probe read: callers verify descriptor metadata again before accepting the
+/// bytes, so exact ceilings work while growth and uncertainty fail closed.
+async fn read_declared_bytes<R: AsyncRead + Unpin>(
+    reader: R,
+    expected_len: usize,
+) -> (Vec<u8>, bool) {
+    let mut bytes = Vec::with_capacity(expected_len.min(64 * 1024));
+    let result = reader
+        .take(expected_len as u64)
+        .read_to_end(&mut bytes)
+        .await;
+    let complete = result.is_ok() && bytes.len() == expected_len;
+    (bytes, complete)
 }
 
 impl LocalMachine {
@@ -162,30 +205,34 @@ impl LocalMachine {
     /// candidate ends the lexically ordered search rather than silently
     /// skipping it and returning misleading later matches.
     async fn read_search_file(&self, path: &Path, remaining: usize) -> SearchRead {
-        let Ok(file) = self.open_read_file(path).await else {
-            return SearchRead::Skipped(0);
+        let Ok(mut file) = self.open_read_file(path).await else {
+            return SearchRead::Unreadable(0);
         };
-        let Ok(metadata) = file.metadata().await else {
-            return SearchRead::Skipped(0);
+        let before = match file.metadata().await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) | Err(_) => return SearchRead::Unreadable(0),
         };
-        if metadata.len() > MAX_GREP_FILE_BYTES as u64 {
-            return SearchRead::Skipped(0);
-        }
-        if metadata.len() > remaining as u64 {
-            return SearchRead::WorkBudgetExceeded;
-        }
-        let limit = remaining.min(MAX_GREP_FILE_BYTES);
-        let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-        let read_result = file
-            .take((limit as u64).saturating_add(1))
-            .read_to_end(&mut bytes)
-            .await;
-        if bytes.len() > remaining {
-            return SearchRead::WorkBudgetExceeded;
-        }
+        let expected_len = match classify_search_size(before.len(), remaining) {
+            SearchSize::Read(bytes) => bytes,
+            SearchSize::Skip => return SearchRead::Skipped(0),
+            SearchSize::WorkBudgetExceeded => return SearchRead::WorkBudgetExceeded,
+        };
+        let (bytes, complete) = read_declared_bytes(&mut file, expected_len).await;
         let scanned = bytes.len();
-        if read_result.is_err() || scanned > MAX_GREP_FILE_BYTES {
-            return SearchRead::Skipped(scanned);
+        if !complete {
+            return SearchRead::Unreadable(scanned);
+        }
+        let after = match file.metadata().await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) | Err(_) => return SearchRead::Unreadable(scanned),
+        };
+        match verify_search_size(before.len(), after.len(), remaining) {
+            Some(SearchSize::Skip) => return SearchRead::Skipped(scanned),
+            Some(SearchSize::WorkBudgetExceeded) => {
+                return SearchRead::WorkBudgetExceeded;
+            }
+            None => return SearchRead::Unreadable(scanned),
+            Some(SearchSize::Read(_)) => {}
         }
         match super::text_bytes(&bytes) {
             Some(text) => SearchRead::Text(text.to_owned(), scanned),
@@ -282,7 +329,13 @@ impl LocalMachine {
         let mut counts: Vec<(String, usize)> = Vec::new();
         let mut content = String::new();
         let reserve = match args.output_mode {
-            GrepOutputMode::Content => marker_reserve(),
+            GrepOutputMode::Content => {
+                marker_reserve()
+                    + IGNORE_INCOMPLETE_MARKER.len()
+                    + 1
+                    + "… unreadable entries; search results incomplete".len()
+                    + 1
+            }
             GrepOutputMode::Files | GrepOutputMode::Count => 0,
         };
         let mut budget = OutputBudget::new(ceiling.saturating_sub(reserve));
@@ -292,6 +345,7 @@ impl LocalMachine {
         let mut stop: Option<StopReason> = None;
         let mut remaining_bytes = max_scanned_bytes;
         let mut remaining_files = max_scanned_files;
+        let mut unreadable_files = false;
 
         for path in &candidates {
             if stop.is_some() {
@@ -309,6 +363,11 @@ impl LocalMachine {
                 }
                 SearchRead::Skipped(scanned) => {
                     remaining_bytes -= scanned;
+                    continue;
+                }
+                SearchRead::Unreadable(scanned) => {
+                    remaining_bytes -= scanned;
+                    unreadable_files = true;
                     continue;
                 }
                 SearchRead::WorkBudgetExceeded => {
@@ -417,14 +476,18 @@ impl LocalMachine {
             }
         }
         let work_incomplete = stop == Some(StopReason::WorkBudget);
-        let scan_incomplete = work_incomplete || progress.incomplete;
-        let incomplete_reason = if work_incomplete {
-            Some("content_budget")
-        } else if progress.incomplete {
-            Some("directory_budget")
-        } else {
-            None
-        };
+        let mut incomplete_reasons = Vec::new();
+        if work_incomplete {
+            incomplete_reasons.push("content_budget");
+        }
+        incomplete_reasons.extend(progress.incomplete_reasons());
+        if unreadable_files {
+            incomplete_reasons.push("unreadable_files");
+        }
+        let scan_incomplete = !incomplete_reasons.is_empty();
+        // Keep the established priority for clients that only understand the
+        // singular field; the array retains every concurrent cause.
+        let incomplete_reason = incomplete_reasons.first().copied();
         if progress.incomplete && !work_incomplete {
             stop = Some(StopReason::ScanBudget);
         } else if stop.is_none() && candidates_capped {
@@ -465,6 +528,18 @@ impl LocalMachine {
                     }
                     content.push_str(&marker);
                 }
+                if progress.ignore_incomplete {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(IGNORE_INCOMPLETE_MARKER);
+                }
+                if progress.traversal_incomplete || unreadable_files {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str("… unreadable entries; search results incomplete");
+                }
                 Ok(content)
             }
             GrepOutputMode::Files => {
@@ -473,6 +548,7 @@ impl LocalMachine {
                         "files": files, "truncated": truncated,
                         "scan_incomplete": scan_incomplete,
                         "incomplete_reason": incomplete_reason,
+                        "incomplete_reasons": incomplete_reasons,
                     })
                     .to_string()
                 };
@@ -481,6 +557,7 @@ impl LocalMachine {
                     "files": files, "truncated": truncated,
                     "scan_incomplete": scan_incomplete,
                     "incomplete_reason": incomplete_reason,
+                    "incomplete_reasons": incomplete_reasons,
                 })
                 .to_string())
             }
@@ -496,6 +573,7 @@ impl LocalMachine {
                         "truncated": truncated,
                         "scan_incomplete": scan_incomplete,
                         "incomplete_reason": incomplete_reason,
+                        "incomplete_reasons": incomplete_reasons,
                     })
                     .to_string()
                 };
@@ -601,7 +679,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 text files recursively. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry an explicit text marker or JSON `scan_incomplete` and `incomplete_reason` (directory_budget/content_budget). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
+        description = "Search UTF-8 text files recursively. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry explicit text markers or JSON `scan_incomplete`, compatibility `incomplete_reason`, and `incomplete_reasons` with every concurrent cause (directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
         annotations(
             title = "Search files",
             read_only_hint = true,
@@ -623,6 +701,108 @@ mod tests {
     use super::*;
     use crate::mcp::tools::test_support::{grep_args, grep_tree, test_machine};
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn grep_source_reads_never_probe_past_declared_or_aggregate_limits() {
+        use std::{
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll},
+        };
+        use tokio::io::ReadBuf;
+
+        struct CountingReader {
+            bytes: &'static [u8],
+            position: usize,
+            read: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for CountingReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let count = (self.bytes.len() - self.position).min(buffer.remaining());
+                if count > 0 {
+                    buffer.put_slice(&self.bytes[self.position..self.position + count]);
+                    self.position += count;
+                    self.read.fetch_add(count, Ordering::Relaxed);
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let read = Arc::new(AtomicUsize::new(0));
+        let (bytes, complete) = read_declared_bytes(
+            CountingReader {
+                bytes: b"abcdprobe",
+                position: 0,
+                read: read.clone(),
+            },
+            4,
+        )
+        .await;
+        assert!(complete);
+        assert_eq!(bytes, b"abcd");
+        assert_eq!(read.load(Ordering::Relaxed), 4);
+
+        struct PartialThenError(bool);
+
+        impl AsyncRead for PartialThenError {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.0 {
+                    Poll::Ready(Err(std::io::Error::other("injected read failure")))
+                } else {
+                    self.0 = true;
+                    buffer.put_slice(b"abc");
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        let (bytes, complete) = read_declared_bytes(PartialThenError(false), 4).await;
+        assert!(!complete);
+        assert_eq!(bytes, b"abc", "partial bytes remain available to charge");
+
+        assert_eq!(classify_search_size(4, 4), SearchSize::Read(4));
+        assert_eq!(classify_search_size(5, 4), SearchSize::WorkBudgetExceeded);
+        assert_eq!(verify_search_size(4, 4, 4), Some(SearchSize::Read(4)));
+        assert_eq!(verify_search_size(4, 5, 10), None, "growth is uncertain");
+        assert_eq!(verify_search_size(4, 3, 10), None, "shrink is uncertain");
+        assert_eq!(
+            classify_search_size(MAX_GREP_FILE_BYTES as u64, MAX_GREP_FILE_BYTES),
+            SearchSize::Read(MAX_GREP_FILE_BYTES)
+        );
+        assert_eq!(
+            classify_search_size(MAX_GREP_FILE_BYTES as u64 + 1, usize::MAX),
+            SearchSize::Skip
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("exact.txt");
+        std::fs::write(&path, "needle\n").unwrap();
+        let machine = test_machine(root);
+        match machine.read_search_file(&path, 7).await {
+            SearchRead::Text(text, scanned) => {
+                assert_eq!(text, "needle\n");
+                assert_eq!(scanned, 7);
+            }
+            _ => panic!("a stable regular file exactly at the aggregate limit must be accepted"),
+        }
+        assert!(matches!(
+            machine.read_search_file(&path, 6).await,
+            SearchRead::WorkBudgetExceeded
+        ));
+    }
 
     #[tokio::test]
     async fn grep_work_budgets_report_incomplete_ordered_results() {
@@ -650,6 +830,10 @@ mod tests {
                     let value: Value = serde_json::from_str(&output).unwrap();
                     assert_eq!(value["scan_incomplete"], true);
                     assert_eq!(value["incomplete_reason"], "content_budget");
+                    assert_eq!(
+                        value["incomplete_reasons"],
+                        serde_json::json!(["content_budget"])
+                    );
                     assert_eq!(value["truncated"], true);
                     assert!(!output.contains("b.txt"), "{output}");
                 }
@@ -662,6 +846,10 @@ mod tests {
                 .unwrap();
         assert_eq!(value["scan_incomplete"], true);
         assert_eq!(value["incomplete_reason"], "content_budget");
+        assert_eq!(
+            value["incomplete_reasons"],
+            serde_json::json!(["content_budget"])
+        );
         assert_eq!(value["files"], serde_json::json!(["a.txt"]));
     }
 
@@ -683,6 +871,23 @@ mod tests {
             assert!(output.contains("b.txt"), "{output}");
             assert!(!output.contains("a.bin"), "{output}");
         }
+    }
+
+    #[tokio::test]
+    async fn grep_accepts_exact_per_file_limit_and_skips_one_byte_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut exact = vec![b'x'; MAX_GREP_FILE_BYTES];
+        exact[..7].copy_from_slice(b"needle\n");
+        std::fs::write(root.join("exact.txt"), exact).unwrap();
+        let mut over = vec![b'x'; MAX_GREP_FILE_BYTES + 1];
+        over[..7].copy_from_slice(b"needle\n");
+        std::fs::write(root.join("over.txt"), over).unwrap();
+        let machine = test_machine(root);
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(files["files"], serde_json::json!(["exact.txt"]));
     }
 
     #[tokio::test]
@@ -766,6 +971,8 @@ mod tests {
             ])
         );
         assert_eq!(files["truncated"], Value::Bool(false));
+        assert_eq!(files["incomplete_reason"], Value::Null);
+        assert_eq!(files["incomplete_reasons"], serde_json::json!([]));
 
         let mut args = grep_args("needle");
         args.output_mode = GrepOutputMode::Files;
@@ -782,6 +989,8 @@ mod tests {
         args.output_mode = GrepOutputMode::Count;
         let counts: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
         assert_eq!(counts["page_total"], serde_json::json!(6));
+        assert_eq!(counts["incomplete_reason"], Value::Null);
+        assert_eq!(counts["incomplete_reasons"], serde_json::json!([]));
         assert_eq!(
             counts["counts"][2],
             serde_json::json!({"path": "src/lib.rs", "count": 2})
@@ -942,9 +1151,140 @@ mod tests {
 #[cfg(test)]
 mod walk_tests {
     use super::*;
+    #[cfg(unix)]
     use crate::mcp::tools::ls::ListArgs;
     use crate::mcp::tools::test_support::{grep_args, test_machine};
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn oversized_gitignore_never_silently_widens_search() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("match.txt"), "needle\n").unwrap();
+        let machine = test_machine(root.clone());
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        args.gitignore = true;
+
+        std::fs::write(root.join(".gitignore"), "match.txt\n").unwrap();
+        let clean: Value =
+            serde_json::from_str(&machine.grep_impl(args.clone()).await.unwrap()).unwrap();
+        assert_eq!(clean["files"], serde_json::json!([]));
+
+        std::fs::write(
+            root.join(".gitignore"),
+            format!(
+                "#{}",
+                "x".repeat(crate::mcp::tools::GITIGNORE_MAX_BYTES - 1)
+            ),
+        )
+        .unwrap();
+        let exact: Value =
+            serde_json::from_str(&machine.grep_impl(args.clone()).await.unwrap()).unwrap();
+        assert_eq!(exact["files"], serde_json::json!(["match.txt"]));
+
+        std::fs::write(
+            root.join(".gitignore"),
+            format!("{}match.txt\n", "unused-pattern\n".repeat(1024)),
+        )
+        .unwrap();
+        let error = machine
+            .grep_impl(args.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1024 line .gitignore limit"), "{error}");
+
+        std::fs::write(root.join(".gitignore"), "x".repeat(64 * 1024 + 1)).unwrap();
+        let error = machine.grep_impl(args).await.unwrap_err().to_string();
+        assert!(error.contains("byte .gitignore limit"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_tree_and_candidates_report_incomplete_searches() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("readable.txt"), "needle\n").unwrap();
+        let machine = test_machine(root.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let actually_unreadable = std::fs::read_dir(&locked).is_err();
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value =
+            serde_json::from_str(&machine.grep_impl(args.clone()).await.unwrap()).unwrap();
+        args.output_mode = GrepOutputMode::Content;
+        let content = machine.grep_impl(args).await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if actually_unreadable {
+            assert_eq!(files["incomplete_reason"], "traversal_error");
+            assert_eq!(
+                files["incomplete_reasons"],
+                serde_json::json!(["traversal_error"])
+            );
+            assert_eq!(files["scan_incomplete"], true);
+            assert!(content.contains("unreadable entries; search results incomplete"));
+        }
+
+        let restricted = root.join("restricted.txt");
+        std::fs::write(&restricted, "needle\n").unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable_file = std::fs::File::open(&restricted).is_err();
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if unreadable_file {
+            assert_eq!(files["scan_incomplete"], true);
+            assert_eq!(files["incomplete_reason"], "unreadable_files");
+            assert_eq!(
+                files["incomplete_reasons"],
+                serde_json::json!(["unreadable_files"])
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ignore_unavailability_marks_json_and_text_results() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ignore = root.join(".gitignore");
+        std::fs::write(&ignore, "match.txt\n").unwrap();
+        std::fs::write(root.join("match.txt"), "needle\n").unwrap();
+        let machine = test_machine(root);
+        std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::File::open(&ignore).is_err();
+        let mut args = grep_args("needle");
+        args.gitignore = true;
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value =
+            serde_json::from_str(&machine.grep_impl(args.clone()).await.unwrap()).unwrap();
+        args.output_mode = GrepOutputMode::Content;
+        let content = machine.grep_impl(args).await.unwrap();
+        std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if unreadable {
+            assert_eq!(files["scan_incomplete"], true);
+            assert_eq!(files["incomplete_reason"], "ignore_rules");
+            assert_eq!(
+                files["incomplete_reasons"],
+                serde_json::json!(["ignore_rules", "unreadable_files"])
+            );
+            assert!(
+                content.contains("ignore rules unavailable; results may include or omit matches"),
+                "{content}"
+            );
+            assert!(
+                content.contains("unreadable entries; search results incomplete"),
+                "{content}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn grep_does_not_read_a_denied_gitignore() {
@@ -966,9 +1306,32 @@ mod walk_tests {
             files["files"],
             serde_json::json!(["build/out.rs", "src.rs"])
         );
+        assert_eq!(files["scan_incomplete"], true);
+        assert_eq!(files["incomplete_reason"], "ignore_rules");
+        assert_eq!(
+            files["incomplete_reasons"],
+            serde_json::json!(["ignore_rules"])
+        );
+
+        let mut args = grep_args("needle");
+        args.output_mode = GrepOutputMode::Files;
+        args.gitignore = true;
+        let concurrent: Value = serde_json::from_str(
+            &machine
+                .grep_impl_with_budget(args, 8, MAX_GREP_SCAN_FILES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(concurrent["incomplete_reason"], "content_budget");
+        assert_eq!(
+            concurrent["incomplete_reasons"],
+            serde_json::json!(["content_budget", "ignore_rules"])
+        );
     }
 
     /// `ls` and `grep` share the walk, so one probe covers both.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unreadable_named_root_is_an_error_but_unreadable_children_are_skipped() {
         use std::os::unix::fs::PermissionsExt;
@@ -999,6 +1362,7 @@ mod walk_tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn walk_skips_an_unreadable_directory_instead_of_failing() {
         use std::os::unix::fs::PermissionsExt;

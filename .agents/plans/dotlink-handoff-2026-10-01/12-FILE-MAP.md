@@ -543,14 +543,21 @@ HTTP/ngrok runtime.
 
 Owns:
 
-- local listener;
-- ngrok backend listener;
+- local TCP listener;
+- direct ngrok tunnel listener;
+- trusted requester propagation from accepted connections;
 - stable/ephemeral paths;
 - OAuth Server wiring;
 - bearer middleware composition;
 - request logs;
 - ngrok domain verification;
 - public OAuth warning/status.
+
+## src/requester.rs
+
+Network abuse-accounting identity shared by HTTP ingress and OAuth admission.
+Normalizes mapped addresses, discards source ports, groups IPv6 prefixes, and
+never trusts request headers.
 
 ## docs/
 

@@ -338,14 +338,16 @@ Rationale:
 - protocol is still Streamable HTTP;
 - simpler model.
 
-## Separate local/ngrok backend listeners
+## Separate local/ngrok routers with direct tunnel serving
 
-**Decision:** public ngrok uses distinct loopback backend.
+**Decision:** public ngrok uses a distinct Axum router served directly on authenticated SDK tunnel connections.
 
 Rationale:
 
 - path/auth/resource policies can differ cleanly;
-- avoids route leakage between local/public surfaces.
+- avoids route leakage between local/public surfaces;
+- retains authenticated remote-peer metadata for anonymous-work admission;
+- avoids trusting forwarded client-IP headers or a loopback proxy boundary.
 
 ## Ephemeral paths are not authentication
 
@@ -459,11 +461,12 @@ Rationale:
 
 ## No global password lockout
 
-**Decision:** Argon2 in bounded blocking workers + delay rather than global failure counter/lockout.
+**Decision:** Argon2 in bounded blocking workers + delay, with a rolling trusted-requester start budget rather than a global failure lockout.
 
 Rationale:
 
-- avoid remote DoS that locks legitimate owner out;
+- one requester cannot create sustained Argon2 work;
+- avoid a global remote-DoS lockout against the legitimate owner;
 - protect Tokio worker pool.
 
 ## Stable ngrok domain supported

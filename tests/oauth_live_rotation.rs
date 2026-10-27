@@ -3,6 +3,7 @@
 
 use std::{
     fs,
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::Path,
     process::{Child, Command, Stdio},
@@ -134,7 +135,7 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
         .env_remove("CONTROL_PLANE_API_KEY")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut server = Server(process);
@@ -147,10 +148,17 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
 
     let mut started = false;
     for _ in 0..80 {
-        assert!(
-            server.0.try_wait().unwrap().is_none(),
-            "dotlink exited prematurely"
-        );
+        if let Some(status) = server.0.try_wait().unwrap() {
+            let mut stderr = String::new();
+            server
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("dotlink exited prematurely ({status}): {stderr}");
+        }
         if let Ok(response) = client
             .get(format!("{base}/.well-known/oauth-authorization-server"))
             .send()
@@ -268,9 +276,25 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
     assert_eq!(
         statuses
             .iter()
-            .filter(|status| **status == StatusCode::BAD_REQUEST)
+            .filter(|status| {
+                matches!(
+                    **status,
+                    StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE
+                )
+            })
             .count(),
         1,
+        "the duplicate must be rejected or told to retry while redemption is busy"
+    );
+    let replay = client
+        .post(format!("{base}/oauth/token"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        StatusCode::BAD_REQUEST,
         "a successfully redeemed code must be one-time"
     );
 

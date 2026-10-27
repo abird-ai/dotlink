@@ -23,7 +23,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{backoff::Backoff, bounded, logging::LogConfig, mcp::LocalMachine};
+use crate::{
+    backoff::Backoff,
+    bounded,
+    logging::{self, LogConfig},
+    mcp::LocalMachine,
+};
 
 /// Headroom over the poll hold for the HTTP request timeout, so an idle
 /// long-poll is never cut short by the client timeout.
@@ -31,7 +36,6 @@ const REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
 const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
 const SERVER_INFO: &str =
     r#"{"version":2,"channels":[{"name":"main","stateless":true,"proc_affinity":true}]}"#;
-const MAX_CONTROL_PLANE_ERROR_BYTES: usize = 2_000;
 // A poll may contain multiple commands; limit the whole external envelope
 // before serde deserializes it. Large transfers can use later polls.
 const MAX_POLL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -261,7 +265,9 @@ async fn run_with_tuning(
 
 #[derive(Clone)]
 pub(crate) struct EmbeddedMcp {
+    machine: LocalMachine,
     service: StreamableHttpService<LocalMachine, NeverSessionManager>,
+    max_request_bytes: usize,
     max_response_bytes: usize,
 }
 
@@ -274,15 +280,19 @@ struct LocalResponse {
 
 impl EmbeddedMcp {
     pub(crate) fn new(machine: LocalMachine, cancellation: CancellationToken) -> Self {
+        let max_request_bytes = machine.max_request_body_bytes();
         let max_response_bytes = machine.max_response_body_bytes();
-        let config = super::streamable_config(&machine, cancellation);
+        let config = super::embedded_streamable_config(&machine, cancellation);
+        let service_machine = machine.clone();
         let service = StreamableHttpService::new(
-            move || Ok(machine.clone()),
+            move || Ok(service_machine.clone()),
             NeverSessionManager::default().into(),
             config,
         );
         Self {
+            machine,
             service,
+            max_request_bytes,
             max_response_bytes,
         }
     }
@@ -319,6 +329,7 @@ impl EmbeddedMcp {
         jsonrpc: &Value,
         notifications: mpsc::Sender<Value>,
     ) -> Result<LocalResponse> {
+        let mut message = jsonrpc.clone();
         let body = serde_json::to_vec(jsonrpc).context("failed to serialize MCP command")?;
         let mut request = Request::builder()
             .method("POST")
@@ -340,9 +351,22 @@ impl EmbeddedMcp {
             }
         }
 
-        let request = request
+        let body_len = body.len();
+        let mut request = request
             .body(Full::new(Bytes::from(body)))
             .context("failed to build in-process MCP request")?;
+        if body_len <= self.max_request_bytes
+            && super::canonicalize_unknown_standard_tool(
+                request.headers_mut(),
+                &mut message,
+                &self.machine,
+            )
+        {
+            *request.body_mut() = Full::new(Bytes::from(
+                serde_json::to_vec(&message)
+                    .context("failed to canonicalize unknown MCP tool request")?,
+            ));
+        }
         let response = self.service.handle(request).await;
         let status = response.status().as_u16();
         let response_headers = filtered_response_headers(response.headers());
@@ -479,12 +503,7 @@ impl SseDecoder {
         if payload.trim().is_empty() {
             return Ok(());
         }
-        events.push(serde_json::from_str(&payload).with_context(|| {
-            format!(
-                "invalid JSON in local MCP SSE event: {}",
-                bounded(&payload, 500)
-            )
-        })?);
+        events.push(serde_json::from_str(&payload).context("invalid JSON in local MCP SSE event")?);
         Ok(())
     }
 
@@ -575,6 +594,23 @@ struct TunnelCommand {
     headers: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     jsonrpc: Option<Value>,
+}
+
+impl TunnelCommand {
+    fn request_id_label(&self) -> &str {
+        logging::protocol_identifier(Some(&self.request_id), "invalid-request-id")
+    }
+
+    fn channel_label(&self) -> &str {
+        logging::protocol_identifier(
+            Some(self.channel.as_deref().unwrap_or("main")),
+            "invalid-channel",
+        )
+    }
+
+    fn command_type_label(&self) -> &str {
+        logging::protocol_identifier(Some(&self.command_type), "invalid-command-type")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -767,7 +803,8 @@ impl TunnelClient {
                         return;
                     };
                     if let Err(error) = client.process_command(mcp, command, received_at).await {
-                        warn!(%error, "tunnel command failed");
+                        warn!("tunnel command failed");
+                        debug!(%error, "tunnel command failure detail");
                     }
                 });
             }
@@ -835,8 +872,7 @@ impl TunnelClient {
             });
         }
 
-        let message = response_error_text(response).await;
-        let error = anyhow!("OpenAI tunnel poll failed ({status}): {message}");
+        let error = control_plane_status_error("poll", status);
         let in_activation_grace = self
             .activation_grace_until
             .is_some_and(|until| Instant::now() < until);
@@ -920,11 +956,14 @@ impl TunnelClient {
         mut command: TunnelCommand,
         received_at: Instant,
     ) -> Result<()> {
+        let request_id_label = command.request_id_label().to_owned();
+        let channel_label = command.channel_label().to_owned();
+        let command_type_label = command.command_type_label().to_owned();
         let deadline = parse_response_timeout(command.response_timeout.as_ref())
             .and_then(|duration| received_at.checked_add(duration));
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             warn!(
-                request_id = %command.request_id,
+                request_id = %request_id_label,
                 "dropping command the client had already expired; no response is deliverable"
             );
             return Ok(());
@@ -932,7 +971,7 @@ impl TunnelClient {
 
         let channel = command.channel.clone().unwrap_or_else(|| "main".to_owned());
         if channel != "main" {
-            warn!(request_id = %command.request_id, %channel, "ignoring unsupported tunnel channel");
+            warn!(request_id = %request_id_label, channel = %channel_label, "ignoring unsupported tunnel channel");
             return Ok(());
         }
 
@@ -951,7 +990,7 @@ impl TunnelClient {
                 apply_response_window(jsonrpc, remaining, self.tuning.delivery_reserve)
         {
             debug!(
-                request_id = %command.request_id,
+                request_id = %request_id_label,
                 window_secs = remaining.as_secs_f32(),
                 timeout_secs = secs,
                 "bounded shell timeout to the client response window"
@@ -961,7 +1000,7 @@ impl TunnelClient {
         match command.command_type.as_str() {
             "jsonrpc" => {
                 let Some(jsonrpc) = command.jsonrpc.as_ref() else {
-                    warn!(request_id = %command.request_id, "jsonrpc command had no jsonrpc payload");
+                    warn!(request_id = %request_id_label, "jsonrpc command had no jsonrpc payload");
                     return Ok(());
                 };
                 let has_request_id = jsonrpc.get("id").is_some();
@@ -976,7 +1015,8 @@ impl TunnelClient {
                             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                                 return Ok(());
                             }
-                            warn!(request_id = %command.request_id, %error, "local MCP dispatch failed");
+                            warn!(request_id = %request_id_label, "local MCP dispatch failed");
+                            debug!(request_id = %request_id_label, %error, "local MCP dispatch failure detail");
                             if has_request_id {
                                 let response = TunnelResponse {
                                     request_id: command.request_id.clone(),
@@ -1006,7 +1046,7 @@ impl TunnelClient {
                     },
                     Ok(None) => {
                         warn!(
-                            request_id = %command.request_id,
+                            request_id = %request_id_label,
                             request = %request_label,
                             "client response window expired mid-call; result was not deliverable"
                         );
@@ -1051,7 +1091,7 @@ impl TunnelClient {
                                 .await;
                         }
                     } else {
-                        debug!(request_id = %command.request_id, "ignoring unsupported nonterminal MCP stream message");
+                        debug!(request_id = %request_id_label, "ignoring unsupported nonterminal MCP stream message");
                     }
                 }
 
@@ -1083,8 +1123,8 @@ impl TunnelClient {
                 };
                 self.post_terminal(&command, response, deadline).await?;
             }
-            other => {
-                warn!(request_id = %command.request_id, command_type = other, "ignoring unknown tunnel command type");
+            _ => {
+                warn!(request_id = %request_id_label, command_type = %command_type_label, "ignoring unknown tunnel command type");
             }
         }
 
@@ -1103,7 +1143,8 @@ impl TunnelClient {
         match self.post_once(command, &response, deadline).await {
             Ok(PostOutcome::Delivered) => true,
             Ok(PostOutcome::Retry(error)) | Ok(PostOutcome::Fatal(error)) | Err(error) => {
-                warn!(request_id = %command.request_id, %error, "dropping intermediate tunnel notification after send failure");
+                warn!(request_id = %command.request_id_label(), "dropping intermediate tunnel notification after send failure");
+                debug!(request_id = %command.request_id_label(), %error, "intermediate tunnel notification failure detail");
                 false
             }
         }
@@ -1119,7 +1160,7 @@ impl TunnelClient {
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 warn!(
-                    request_id = %command.request_id,
+                    request_id = %command.request_id_label(),
                     "client response window expired before the response could be posted"
                 );
                 return Ok(());
@@ -1175,8 +1216,7 @@ impl TunnelClient {
             // fulfilled or expired. The protocol treats that command as terminal.
             return Ok(PostOutcome::Delivered);
         }
-        let message = response_error_text(response).await;
-        let error = anyhow!("OpenAI tunnel response failed ({status}): {message}");
+        let error = control_plane_status_error("response", status);
         if retryable_response_status(status) {
             Ok(PostOutcome::Retry(error))
         } else {
@@ -1379,31 +1419,8 @@ fn retryable_response_status(status: StatusCode) -> bool {
         )
 }
 
-async fn response_error_text(response: reqwest::Response) -> String {
-    match bounded::reqwest_response(
-        response,
-        MAX_CONTROL_PLANE_ERROR_BYTES,
-        "control-plane error",
-    )
-    .await
-    {
-        Ok(bytes) => bounded(
-            &String::from_utf8_lossy(&bytes),
-            MAX_CONTROL_PLANE_ERROR_BYTES,
-        ),
-        Err(error) => error.to_string(),
-    }
-}
-
-fn bounded(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
+fn control_plane_status_error(operation: &'static str, status: StatusCode) -> anyhow::Error {
+    anyhow!("OpenAI tunnel {operation} failed with HTTP status {status}")
 }
 
 #[cfg(test)]
@@ -1826,6 +1843,130 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("16 bytes"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn embedded_standard_unknown_tool_is_canonicalized_before_rmcp() {
+        use base64::{Engine as _, prelude::BASE64_STANDARD};
+
+        const VERSION: &str = "2026-07-28";
+        let temp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::test_machine(temp.path().canonicalize().unwrap());
+        let embedded = EmbeddedMcp::new(machine, CancellationToken::new());
+        let unknown_name = "attacker controlled ☃";
+        let encoded_name = format!("=?base64?{}?=", BASE64_STANDARD.encode(unknown_name));
+        let headers = BTreeMap::from([
+            ("mcp-protocol-version".to_owned(), vec![VERSION.to_owned()]),
+            ("mcp-method".to_owned(), vec!["tools/call".to_owned()]),
+            ("mcp-name".to_owned(), vec![encoded_name]),
+        ]);
+        let response = embedded
+            .dispatch(
+                &headers,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "original-id",
+                    "method": "tools/call",
+                    "params": {
+                        "name": unknown_name,
+                        "arguments": {},
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": VERSION,
+                            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1.0"},
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        let error = response
+            .messages
+            .iter()
+            .find(|message| message.get("id") == Some(&json!("original-id")))
+            .expect("rmcp correlated unknown-tool response");
+        assert_eq!(error["error"]["code"], -32602);
+        assert!(
+            !serde_json::to_string(&response.messages)
+                .unwrap()
+                .contains(unknown_name)
+        );
+
+        // Missing SEP metadata is still rmcp's header-mismatch response; the
+        // adapter must not synthesize or bypass it during canonicalization.
+        let missing_name = BTreeMap::from([
+            ("mcp-protocol-version".to_owned(), vec![VERSION.to_owned()]),
+            ("mcp-method".to_owned(), vec!["tools/call".to_owned()]),
+        ]);
+        let response = embedded
+            .dispatch(
+                &missing_name,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": unknown_name,
+                        "arguments": {},
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": VERSION,
+                            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1.0"},
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(response.messages[0]["id"], 2);
+        assert_eq!(response.messages[0]["error"]["code"], -32020);
+    }
+
+    #[test]
+    fn tunnel_metadata_labels_reject_control_sequences_and_oversize_values() {
+        let malicious = format!("prefix\n\u{1b}[31m{}", "x".repeat(200));
+        let command = TunnelCommand {
+            request_id: malicious.clone(),
+            shard_token: "not-logged".to_owned(),
+            command_type: malicious.clone(),
+            channel: Some(malicious.clone()),
+            response_timeout: None,
+            headers: BTreeMap::new(),
+            jsonrpc: None,
+        };
+        assert_eq!(command.request_id_label(), "invalid-request-id");
+        assert_eq!(command.channel_label(), "invalid-channel");
+        assert_eq!(command.command_type_label(), "invalid-command-type");
+        for label in [
+            command.request_id_label(),
+            command.channel_label(),
+            command.command_type_label(),
+        ] {
+            assert!(!label.contains('\n'));
+            assert!(!label.contains('\u{1b}'));
+            assert!(!label.contains("prefix"));
+            assert!(label.len() <= 96);
+        }
+    }
+
+    #[test]
+    fn malformed_sse_and_control_plane_errors_do_not_echo_bodies() {
+        let body = b"data: SECRET\x1b[31mCONTROL\n\n";
+        let error = parse_sse_messages(body).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid JSON in local MCP SSE event"));
+        assert!(!message.contains("SECRET"));
+        assert!(!message.contains("CONTROL"));
+        assert!(!message.contains('\u{1b}'));
+
+        let message = control_plane_status_error("poll", StatusCode::BAD_GATEWAY).to_string();
+        assert_eq!(
+            message,
+            "OpenAI tunnel poll failed with HTTP status 502 Bad Gateway"
+        );
     }
 
     #[test]

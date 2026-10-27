@@ -24,7 +24,7 @@ pub(crate) fn test_machine_with(
     root: PathBuf,
     configure: impl FnOnce(&mut RuntimeConfig),
 ) -> LocalMachine {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let root_for_secure_fs = root.clone();
     let mut config = RuntimeConfig {
         access: AccessPolicy::from_spec(AccessSpec {
@@ -58,7 +58,7 @@ pub(crate) fn test_machine_with(
         operation_gate: Arc::new(RwLock::new(())),
         router: std::sync::OnceLock::new(),
         serialize: false,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         secure_fs: Arc::new(
             crate::secure_fs::SecureFs::new(
                 std::slice::from_ref(&root_for_secure_fs),

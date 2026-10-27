@@ -1348,6 +1348,7 @@ mod tests {
         assert!(error.contains("already exists"), "{error}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn patch_write_failure_leaves_every_file_unchanged() {
         let temp = tempfile::tempdir().unwrap();
@@ -1412,6 +1413,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn patch_refuses_two_spellings_of_one_symlinked_file() {
         use std::os::unix::fs::symlink;
@@ -1523,6 +1525,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn patch_undoes_a_claimed_add_when_a_later_file_fails() {
         let temp = tempfile::tempdir().unwrap();

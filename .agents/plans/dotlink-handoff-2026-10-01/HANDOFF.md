@@ -559,7 +559,7 @@ After 10 consecutive transient poll failures:
 
 - OpenAI transport returns a typed runtime restart request;
 - all transports cancel;
-- peers get up to five seconds to drain;
+- peers get up to six seconds to drain;
 - unresponsive peers are aborted;
 - profile/policy/LocalMachine/transports are rebuilt.
 
@@ -615,7 +615,7 @@ dotlink --http --ngrok
 
 Public ngrok OAuth is automatic.
 
-ngrok uses a separate loopback backend listener.
+ngrok uses a separate Axum router served directly on authenticated tunnel connections. Its requester identity comes from ngrok connection metadata, never forwarding headers. Shutdown cancels route futures, force-closes accepted IO after the drain bound, and runs bounded tunnel/session close concurrently with the five-second drain; the parent budget is six seconds. A drain timeout is a cleanup failure, and cleanup failures take precedence over restart requests to prevent overlap.
 
 Optional stable domain:
 
@@ -674,11 +674,16 @@ Requirements:
 - no query;
 - no fragment;
 - redirects disabled;
+- cancellable async system DNS releases admission immediately on timeout/cancellation; missing system DNS disables CIMD without blocking DCR OAuth;
 - all resolved addresses public;
 - vetted address set pinned;
 - bounded body;
 - metadata client_id exact match;
-- modern plural token-auth method list authoritative when present.
+- modern plural token-auth method list authoritative when present;
+- 12 rolling-minute starts and two in-flight operations per trusted requester;
+- four in-flight operations process-wide;
+- no caller-selected destination-host fairness identity;
+- bounded requester history never evicts an unexpired row.
 
 ### DCR
 
@@ -688,9 +693,10 @@ Unauthenticated registrations are:
 
 - memory-only;
 - bounded;
-- short-lived.
+- short-lived;
+- capped at eight per trusted requester and four per requester within one redirect, as well as per-redirect/aggregate limits.
 
-Owner consent promotes approved DCR client into persistent state.
+Pending owner authorizations are likewise capped at eight per requester, four per requester/client pair, and eight per client. Direct TCP peer or authenticated ngrok connection metadata supplies the requester; source ports are ignored, IPv6 groups by /48, loopback is one identity, and forwarded headers are never trusted. Client display names neutralize terminal controls, line separators, and bidi controls before UI/management output. Owner consent promotes an approved DCR client into persistent state.
 
 ### Token lifecycle
 
@@ -701,6 +707,8 @@ refresh token       random client value, SHA-256 persisted, ~90d
 ~~~
 
 Refresh tokens rotate.
+
+Authorization-code, access-token, and refresh-grant stores prune expired records but reject overload rather than evicting live credentials. Access tokens have a 64-entry per-client share within the 512-entry process bound. Duplicate code/refresh exchanges shed before global work admission. Failed issuance leaves the original code/grant retryable; an authoritative revoked-DCR result consumes the terminal code.
 
 Replay rejected.
 
@@ -717,9 +725,11 @@ Verification:
 - reload current durable hash;
 - bounded semaphore;
 - spawn_blocking;
-- two concurrent checks;
+- two concurrent checks process-wide across runtime generations;
 - bounded wait;
 - failed attempt delay;
+- six rolling-minute starts per trusted requester, charging both consent creator and POST source;
+- 256 non-evicting requester-history rows;
 - no global attacker-triggered lockout.
 
 ### Durable OAuth state
@@ -786,11 +796,11 @@ Default quiet.
 -q -vv  REQ only
 ~~~
 
-TOOL logs safe arguments/status/latency.
+TOOL logs safe arguments/status/latency. Scopes are ASCII-sanitized and capped.
 
-Bulk content is represented by sizes.
+Bulk content and grep patterns are represented by sizes.
 
-REQ logs transport/protocol metadata, not raw bodies.
+REQ logs bounded transport/protocol metadata, not raw bodies or control-plane error bodies. rmcp tracing remains suppressed regardless of `RUST_LOG` because upstream debug events render complete payloads.
 
 Do not intentionally log file contents, passwords, keys, bearer tokens or refresh tokens.
 

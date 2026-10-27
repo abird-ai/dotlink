@@ -85,7 +85,7 @@ Default runs are quiet. Add `-v` to see tool activity:
 ~~~text
 $ dotlink -v -p aw
 
-abird dotlink 0.9.1
+abird dotlink 0.10.0
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
@@ -226,17 +226,17 @@ dotlink --http --oauth --http-bind=127.0.0.1:3000 \
   --public-url=https://mcp.example.com
 ~~~
 
-Never derive the OAuth issuer from proxy/Host headers; `--public-url` is the explicit trust boundary.
+Never derive the OAuth issuer from proxy/Host headers; `--public-url` is the explicit trust boundary. Anonymous OAuth work is also bounded by a trusted network requester identity: direct HTTP uses the TCP peer, while built-in ngrok uses authenticated tunnel connection metadata. Forwarded client-IP headers are ignored. A generic reverse proxy therefore shares one requester allowance unless it applies its own edge admission controls.
 
 Public ngrok ingress is OAuth-protected by default. Direct non-loopback HTTP binds are also refused unless OAuth is enabled with an explicit HTTPS public origin. The only way to intentionally expose either form of public ingress without application-layer authentication is the explicit one-run escape hatch:
 
 ~~~bash
 dotlink --http --ngrok --allow-public-no-auth
-# or, for an intentionally unauthenticated LAN listener:
-dotlink --http --http-bind=0.0.0.0:3000 --allow-public-no-auth
+# Or use this machine's concrete LAN interface address (replace as needed):
+dotlink --http --http-bind=192.168.1.50:3000 --allow-public-no-auth
 ~~~
 
-That mode exposes every MCP capability granted to the process to anyone who can reach the endpoint and is not recommended.
+For LAN use, replace the example address with the machine's actual interface address; wildcard binds such as `0.0.0.0`, `::`, and their IPv4-mapped IPv6 forms do not identify that address for Host allowlisting. Conflicting HTTP `Host` and URI/HTTP2 authorities are rejected. This mode exposes every MCP capability granted to the process to anyone who can reach the endpoint and is not recommended.
 
 ## Use dotlink as a local sandboxed MCP server
 
@@ -342,11 +342,18 @@ One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
 Every list/search tool has a documented `limit` and reports `truncated`. Walks
 stop after 100,000 visited entries; `scan_incomplete` explicitly marks partial
 results, which are sorted only among the visited entries. `grep` also limits
-file-content work to 32 MiB across at most 4096 candidates per request;
-`incomplete_reason` distinguishes `directory_budget` and `content_budget`. Narrow `path` or
-`glob`/`pattern` for large trees. `read` returns an error rather than a misleading
-line-zero truncation marker if the first complete line plus marker cannot fit.
-Otherwise, `read` ends a capped result with a single marker. `ls` and `grep`
+file-content work to 32 MiB across at most 4096 candidates per request. When
+`gitignore` is enabled, inaccessible/denied ignore files include
+`ignore_rules` in `incomplete_reasons` (or a neutral text warning), not silently
+interpreted as absent. The singular `incomplete_reason` remains for compatible
+clients; the array preserves simultaneous directory, content, traversal,
+ignore-rule, and unreadable-file causes. Ignore processing is separately bounded to 256 non-absent
+file reads/4 MiB, including partial failed reads, and rejects any file beyond 64 KiB
+or 1024 lines. Narrow `path` or `glob`/`pattern` for large trees. `read` errors
+rather than emitting a misleading line-zero marker if the first complete line
+plus marker cannot fit. Skipping to a distant line offset is separately limited
+to exactly 32 MiB of source I/O per call, including buffered prefetch. Otherwise,
+`read` ends a capped result with a single marker. `ls` and `grep`
 retain the best sorted candidates within the scanned entries in bounded memory.
 Both bound their JSON replies at `max_output_bytes`, keeping the longest prefix
 that fits. `ls` derives its default depth from the pattern (one level per segment,
@@ -382,6 +389,8 @@ commit sequence is not a transaction.
 dotlink --list-tools
 dotlink --allow-rw --allow-shell --list-tools
 ~~~
+
+Tool inspection resolves the effective filesystem permissions without initializing transports, loading Runtime credentials, requiring a live SSH agent or preparing the sandbox. Execution still enforces all those prerequisites.
 
 ### Linux sandbox
 
@@ -451,7 +460,7 @@ deleting a profile is retryable after an interrupted cleanup.
 
 Transient OpenAI poll failures retry with backoff. Normal warnings stay concise; full transport diagnostics are available with `-vv`.
 
-After **10 consecutive transient poll failures**, dotlink stops retrying the same runtime state. It cancels all active transports, gives them up to 5 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
+After **10 consecutive transient poll failures**, dotlink stops retrying the same runtime state. It cancels all active transports, gives them up to 6 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
 
 If a freshly restarted runtime keeps failing, restarts back off from 1 second up to a 30-second cap. Once a runtime has connected successfully, that restart backoff resets. Fatal control-plane errors such as an invalid Tunnel ID or invalid Runtime API key still fail immediately rather than entering a restart loop.
 

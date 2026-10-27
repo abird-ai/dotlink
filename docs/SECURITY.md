@@ -296,11 +296,13 @@ For durable OAuth, configure a reserved/stable ngrok hostname with `--ngrok-doma
 
 `--allow-public-no-auth` is the only runtime escape hatch for externally reachable HTTP without OAuth, whether that exposure is ngrok or a direct non-loopback bind. It is intentionally one-run-only and should be treated as full exposure of every MCP capability granted to that process.
 
-The ngrok backend remains a separate loopback-only listener from the local HTTP listener, so local and public MCP path/auth policies cannot accidentally share a route.
+The authenticated ngrok tunnel and local TCP listener use separate routers, so local and public MCP path/auth policies cannot accidentally share a route. Ngrok connections are served directly rather than through a loopback forwarding backend. One outer allowlist protects MCP and every OAuth route after routing is merged. Ngrok trusts only its exact public tunnel authority; direct/reverse-proxied HTTP trusts only exact loopback, bound-IP and configured-public-origin authorities, including port semantics, and ignores forwarded headers. Malformed, missing, duplicate, or conflicting `Host` and HTTP/2/absolute-form URI authorities receive HTTP 400; well-formed non-allowlisted authorities receive HTTP 403. An omitted public port remains valid across an HTTPS edge and plaintext backend. IPv4-mapped IPv6 addresses are normalized before wildcard/loopback classification. Host never determines the OAuth issuer or resource. An unauthenticated direct listener must bind a concrete interface IP (not `0.0.0.0`/`::` or mapped equivalents), so its Host allowlist can accept IP connections without permitting arbitrary DNS-rebinding hostnames.
 
 ### Embedded OAuth
 
 dotlink's HTTP OAuth mode is intentionally single-owner rather than a general identity provider.
+
+Anonymous-work admission uses a trusted network requester boundary, never a caller-supplied client ID, redirect URI, hostname, or HTTP forwarding header. Direct HTTP uses the immediate TCP peer; built-in ngrok uses the remote address authenticated by its tunnel protocol. Source ports are discarded, IPv4-mapped addresses normalize to IPv4, IPv6 groups by /48, and loopback is one local identity. This identity is memory-only abuse accounting, not authentication or token binding, and its `Debug` representation is redacted so framework tracing cannot disclose source addresses. NAT users and generic reverse proxies share an allowance; operators of other proxies should enforce distributed abuse controls at that edge. Multiple real source networks can still exhaust finite public capacity, as with any anonymous endpoint, but one requester cannot rotate self-declared OAuth values to do so.
 
 Protocol/security properties:
 
@@ -308,21 +310,21 @@ Protocol/security properties:
 - Protected Resource Metadata and OAuth Authorization Server Metadata discovery;
 - exact `resource` binding on authorization, token exchange, refresh, and bearer validation;
 - RFC 9207 `iss` on authorization responses;
-- CIMD client metadata with HTTPS-only fetches, redirects disabled, public-IP/DNS checks, response-size limits, and DNS pinning to reduce SSRF/rebinding risk;
+- CIMD client metadata with HTTPS-only fetches, redirects disabled, public-IP/DNS checks, response-size limits, and DNS pinning to reduce SSRF/rebinding risk. Nonpublic literal IPs are rejected before admission. Each trusted requester gets 12 starts per rolling minute and at most two in flight, with four concurrent fetches process-wide. The 256-row requester table never evicts unexpired history: unseen requesters receive 429 while it is full, while known rows keep their own progress. DNS uses a cancellable async system resolver; timeout/request cancellation drops the lookup and releases the complete admission lease immediately;
 - DCR fallback for clients that still require dynamic registration;
 - HTTPS redirect URIs, with loopback HTTP allowed for native/local callbacks;
 - short-lived opaque access tokens kept only in memory;
-- rotating opaque refresh tokens persisted only as SHA-256 hashes;
+- rotating opaque refresh tokens persisted only as SHA-256 hashes; token issuance uses bounded concurrent admission and performs durable grant changes without holding the in-memory access-token validation mutex;
 - one-time authorization codes held only in memory;
-- owner password persisted only as an Argon2id hash, with each live authorization resolving the current committed profile revision and rechecking it after successful Argon2 verification; a deleted saved profile cannot reactivate an older legacy hash;
-- bounded pending registrations, authorization requests/codes, access tokens, refresh grants, and DCR clients;
+- owner password persisted only as an Argon2id hash, with each live authorization resolving the current committed profile revision and rechecking it after successful Argon2 verification; a deleted saved profile cannot reactivate an older legacy hash. Verification allows six rolling-minute starts per trusted requester under a two-check process-wide concurrency bound; the consent creator and password POST source are both charged, deduplicated when equal, and the 256-row requester history does not evict active limits;
+- bounded pending registrations and owner authorizations reject excess requests with HTTP 429 rather than evicting another live request; every redirect URI/client share, a four-entry per-requester share within each redirect/client group, and an eight-entry overall trusted-requester share are enforced, so caller-chosen identifiers cannot let one requester consume either 256-entry store or target all capacity for another requester. In-flight owner consent retains a claim until completion or cancellation, so retry and one-time redemption are both safe. Authorization codes, access tokens, and refresh grants prune expired entries but never evict live entries for new issuance; access tokens enforce a 64-entry per-client share within the 512-entry process bound, and overload leaves the original authorization code or refresh grant retryable. Approved DCR clients retain their own limit;
 - Argon2 verification offloaded to blocking workers that **own** their two-check concurrency permits through completion, including after the HTTP request is cancelled; failed attempts are delayed without a remotely triggerable global lockout;
-- OAuth refresh grants and authorization codes are checked for correct client/resource/PKCE bindings before consumption; code redemption retains the one-time-code lock until issuance commits, so temporary storage failure returns retryable HTTP 503 rather than burning a code;
+- OAuth refresh grants and authorization codes are checked for correct client/resource/PKCE bindings before consumption; code redemption uses a short exclusive claim rather than retaining a mutex across durable I/O, so duplicates shed without consuming global admission and temporary storage failure releases the claim for retry instead of burning the code. An authoritative post-issuance check finding a revoked DCR client consumes the now-terminal code;
 - cross-process locked OAuth state mutations so a live server, setup, and `dotlink oauth` management command cannot lose each other's approved-client/refresh/password changes;
 - refresh tokens issued only when the approved client advertises the `refresh_token` grant; `offline_access` requires that capability;
 - no JWT signing key or external auth service.
 
-Unauthenticated DCR registrations are bounded and memory-only. A DCR client is persisted only after the owner successfully approves it. Approved DCR clients and hashed refresh grants live in the profile-specific OAuth state file.
+Unauthenticated DCR registrations are bounded and memory-only. Client display names are length-bounded and neutralize terminal controls, line separators, and Unicode bidi controls before owner UI or management output. A DCR client is persisted only after the owner successfully approves it. Approved DCR clients and hashed refresh grants live in the profile-specific OAuth state file.
 
 OAuth state lives under the Abird XDG state namespace:
 
@@ -352,13 +354,13 @@ Canonical JSONC config files are `config.jsonc` or `config.<profile>.jsonc`. On 
 
 The Admin key used to create a tunnel is never persisted. A profile with OpenAI disabled does not require a runtime key.
 
-Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are removed from child shell environments.
+Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are removed from child shell environments. Active file-supplied Runtime/ngrok credentials are opened once; the descriptor identity must match the resolved protected target, and the captured value is carried into transport startup without a second pathname read. Dormant credential-file variables are not opened.
 
 ## Automatic transport recovery
 
 Transient OpenAI tunnel failures can trigger an automatic full runtime restart after 10 consecutive failed polls. Recovery does not grant new authority: dotlink reloads the same selected profile and reapplies the same CLI permission/deny flags before reconstructing `LocalMachine`, cache mounts, MCP state, and transports.
 
-All peer transports are cancelled during recovery. They receive up to 5 seconds to stop cleanly before remaining tasks are force-aborted. Repeated unhealthy runtimes use bounded restart backoff, while fatal authentication/tunnel errors remain fatal.
+All peer transports are cancelled during recovery. They receive up to 6 seconds to stop cleanly before remaining tasks are force-aborted. Repeated unhealthy runtimes use bounded restart backoff, while fatal authentication/tunnel errors remain fatal.
 
 Recovery must never bypass path canonicalization, deny precedence, protected credential paths, Bubblewrap policy, or shell-network policy.
 
@@ -437,9 +439,14 @@ Interactive runtime controls snapshot the terminal state before enabling raw key
 
 ## External OAuth metadata and tunnel limits
 
-Anonymous OAuth metadata lookup is limited to four concurrent fetches and 24
-fetches per rolling minute across the process. DNS resolution has a 3-second
-limit; the HTTPS request has a 5-second timeout and a 64 KiB response ceiling.
+Anonymous OAuth metadata lookup is limited to four concurrent fetches and 12
+starts per rolling minute for each trusted requester; there is no anonymously
+exhaustible global rolling-minute quota. Cancellable async system DNS has a
+3-second timeout; timeout/request cancellation drops the lookup and releases
+its complete admission lease immediately. Missing system DNS configuration
+disables CIMD fetches without preventing registered-client OAuth from starting.
+The HTTPS request has a 5-second
+timeout and a 64 KiB response ceiling.
 Proxy environment settings are disabled for the metadata HTTP client, so DNS
 pinning cannot silently be bypassed by a proxy resolving the target itself.
 Only public resolved addresses are allowed, and redirects are disabled.
@@ -462,7 +469,7 @@ remain available for operational auditing; the MCP client retains the command
 transcript for replay. Journald does not become a second, uncontrolled secret
 store.
 
-At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/protocol metadata is added. HTTP logs method/path/status, stdio logs JSON-RPC method names, and OpenAI Tunnel logs MCP request labels. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the dotlink request logger.
+At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/protocol metadata is added. HTTP logs bounded, control-character-sanitized method/path labels (with ephemeral MCP paths redacted) and status; stdio logs JSON-RPC method names; OpenAI Tunnel logs strict bounded protocol labels. Generic log scopes are ASCII-sanitized and capped, and grep patterns join commands/content/stdin as byte counts rather than literal text. OpenAI control-plane response bodies and malformed local SSE payloads are not copied into errors. rmcp tracing targets are always suppressed—even when `RUST_LOG` requests them—because upstream debug events render complete MCP request/response payloads. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the dotlink request logger.
 
 `--quiet` suppresses TOOL activity. With `-vv`, it leaves REQ diagnostics visible while hiding TOOL lines.
 
@@ -472,17 +479,19 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - shell stdout/stderr are drained continuously with bounded retained output;
 - shell stdin is written concurrently with process execution after the output drains start, so a child that writes before reading its input cannot deadlock both pipes;
 - `max_output_bytes`, `max_read_bytes` and `max_write_bytes` are hard ceilings: a value below the supported minimum is rejected at configuration time, never silently widened at startup;
-- UTF-8 text tools share binary-control rejection, and grep skips non-text candidates; byte-oriented files use bread/bwrite/bedit; grep caps a request at 32 MiB content I/O and 4096 candidate files, reporting incomplete search coverage;
-- text/binary reads and writes are bounded; `read` streams a line window instead of preloading the whole file, builds the page in one output buffer, and its reply — truncation marker included — fits `max_read_bytes`; lines skipped to reach `offset` are scanned for their newline without being buffered or decoded, so a preceding line larger than the ceiling cannot block the requested window;
+- the shared traversal boundary records unreadable descendant directories and metadata errors (including races with deletions), exposes `traversal_error` to `ls` and `grep`, and distinguishes intentionally filtered entries; grep also marks individually unreadable discovered files. JSON keeps compatibility `incomplete_reason` and adds `incomplete_reasons` so simultaneous causes remain visible;
+- UTF-8 text tools share binary-control rejection, and grep skips non-text candidates; byte-oriented files use bread/bwrite/bedit; grep caps a request at 32 MiB content I/O and 4096 candidate files, reporting incomplete search coverage; optional gitignore work is separately capped at 4 MiB and 256 non-absent file reads, charging bytes returned before failed reads and rejecting any per-file overflow of 64 KiB or 1024 lines instead of silently discarding rules; unreadable or policy-denied ignore files mark discovery incomplete (`ignore_rules`) without reading denied bytes;
+- text/binary reads and writes are bounded; `read` streams a line window instead of preloading the whole file, builds the page in one output buffer, and its reply — truncation marker included — fits `max_read_bytes`; a source-level limiter ensures buffered prefetch cannot exceed the separate 32 MiB skipped-line I/O budget, while preserving already-prefetched selected-window bytes; a preceding line larger than the output ceiling still works within that budget;
 - the streamable-HTTP request-body ceiling is derived from the profile, not from the transport's default: a request body may be six times `max_write_bytes` (the worst-case JSON escaping of a payload the tools accept) plus 64 KiB of framing, for the local HTTP server and the OpenAI tunnel alike;
-- local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes` (sixfold JSON-escape headroom plus framing); unlike a fixed 16 MiB tunnel cap, a larger configured read can be returned consistently via HTTP, stdio, and the embedded tunnel;
+- local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes`: ordinary text gets sixfold JSON-escape headroom, while shell reserves sevenfold nested-JSON headroom for each independently capped stdout/stderr stream, plus framing; unlike a fixed 16 MiB tunnel cap, larger configured limits can be returned consistently via HTTP, stdio, and the embedded tunnel;
+- shell progress heartbeats are best-effort with a 100 ms delivery budget clipped to the command's absolute deadline, never an unbounded wait or delayed timeout inside the child-process supervision loop;
 - shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants), chosen per call by the client, bounded by the tunnel client's own `response_timeout` window when present, and clamped to the profile `max_shell_timeout_secs` ceiling; a timeout still returns a bounded, non-secret error result with any partial output;
 - protected paths beneath writable shell mounts must exist before Bubblewrap assembles them: dotlink privately reserves its own OAuth state directory, and missing other protected paths fail closed instead of creating host-side placeholders. Existing paths are masked by inaccessible tmpfs or /dev/null;
 - shell cancellation and timeout abort request-owned pipe tasks and terminate the associated Unix process group or Windows Job Object; Windows creates the process suspended until it joins the Job Object. Unsandboxed Unix descendants that call `setsid` can escape process-group cleanup by design; Bubblewrap's PID namespace provides the stronger default boundary. Successful commands can deliberately start background work;
-- HTTP and transport lifecycles share cancellation;
-- OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded;
-- recovery teardown waits at most 5 seconds before aborting unresponsive peer transport tasks;
-- ngrok forwarding terminates with the HTTP transport/process lifecycle.
+- HTTP and transport lifecycles share cancellation; outer middleware drops every accepted MCP/OAuth route future (including body extraction) during shutdown, force-close-aware accepted IO wakes detached Axum connection tasks at the drain bound, and the ngrok HTTP supervisor owns the local listener and direct tunnel server tasks, explicitly closes the public tunnel and parent session with bounded RPCs concurrent with connection draining, treats a drain timeout as cleanup failure because synchronous handler work cannot be preempted, gives cleanup failures precedence over restart requests, and aborts tasks on unexpected termination;
+- OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded; SEP-2243 HTTP/OpenAI tool calls preflight unknown names against the fixed policy router before rmcp's schema cache, with the network preflight enforcing the same exact request-body ceiling; public revocation rejects malformed tokens before disk I/O and admits at most two concurrent calls without an anonymous minute quota that could deny legitimate revocation; public token exchange admits at most four concurrent calls; the shared read-only state index also caches approved client metadata, using the separate namespaces of DCR IDs and CIMD URLs to avoid touching private state for arbitrary public URL requests. Definite misses are rejected, contention/version races fall through to authoritative work, and a stable malformed snapshot returns retryable 503 without repeated parsing. OAuth state (16 MiB), saved profile JSONC (4 MiB), and Runtime/explicit key files (16 KiB) share symmetric read/write ceilings, with serialization checked before replacement and Unix FIFOs/devices rejected through nonblocking descriptor validation; on Windows the OAuth state index uses native volume/file identity to recognize atomic replacements; public responses never echo private filesystem error details; pending owner authorizations use one bounded store that restores claimed requests after transient internal errors, while expired/full DCR promotions return actionable terminal errors; access-token poison recovery is consistent across publication, validation and revocation;
+- recovery teardown waits at most 6 seconds before aborting unresponsive peer transport tasks;
+- the directly served ngrok tunnel and all accepted HTTP connections terminate with the HTTP transport/process lifecycle.
 
 ## Recommended use
 

@@ -286,7 +286,7 @@ Runtime recovery:
 - transient polls retry;
 - 10 consecutive transient poll failures request full runtime restart;
 - all transports tear down;
-- peers get up to 5 seconds to drain;
+- peers get up to 6 seconds to drain;
 - runtime rebuilt;
 - unhealthy restarts back off up to 30s;
 - prior successful connection resets backoff;
@@ -319,7 +319,7 @@ Direct non-loopback HTTP is treated as public ingress:
 ngrok is an HTTP publication enhancer, not a separate MCP protocol.
 
 - public ngrok is OAuth-protected automatically;
-- ngrok backend is a separate loopback listener;
+- ngrok uses a separate router served directly on authenticated SDK tunnel connections;
 - optional stable `ngrok_domain`;
 - local and public paths can have independent ephemeral settings;
 - exact public hostname is verified when a domain was requested;
@@ -398,7 +398,8 @@ Durable state mutations use a private lock file and cross-process file locking s
 Argon2 verification:
 
 - offloaded with `spawn_blocking`;
-- max two concurrent checks;
+- max two concurrent checks process-wide across runtime generations;
+- six rolling-minute starts per trusted requester, charging consent and POST sources;
 - bounded wait;
 - failed attempts delayed;
 - no attacker-triggerable global owner lockout.
@@ -410,6 +411,7 @@ CIMD:
 - no credentials/query/fragment;
 - redirects disabled;
 - all resolved addresses must be public;
+- cancellable async system DNS under requester/process admission;
 - validated full address set pinned into reqwest;
 - response body bounded;
 - client_id must match document;
@@ -422,6 +424,7 @@ DCR:
 - response type code;
 - refresh optional;
 - pending registration memory-only until owner approves;
+- client display names neutralized for UI/terminal output;
 - approved client persisted.
 
 Management:

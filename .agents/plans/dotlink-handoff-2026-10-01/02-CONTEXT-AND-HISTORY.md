@@ -275,7 +275,7 @@ Current recovery model:
 - transient poll failures retry;
 - after 10 consecutive transient poll failures, the OpenAI transport requests a **full runtime restart**;
 - all transports are cancelled;
-- peers get up to 5 seconds to drain;
+- peers get up to 6 seconds to drain;
 - remaining tasks are force-aborted;
 - profile/policy/LocalMachine/transports are reconstructed;
 - unhealthy restarts back off 1s → capped 30s;

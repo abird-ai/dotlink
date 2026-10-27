@@ -34,6 +34,71 @@ use super::LocalMachine;
 /// Shared bounds. Per-tool bounds live with the tool that owns them.
 pub(crate) const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const GITIGNORE_MAX_LINES: usize = 1024;
+/// Aggregate independent of grep's content budget: ignore files are also I/O
+/// and matcher-construction work, not free side effects of directory walking.
+const MAX_IGNORE_SCAN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IGNORE_SCAN_FILES: usize = 256;
+
+#[derive(Default)]
+struct IgnoreWork {
+    bytes: usize,
+    files: usize,
+    incomplete: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum IgnoreSizeVerification {
+    Stable,
+    PerFileLimit,
+    AggregateLimit,
+    Changed,
+}
+
+fn verify_ignore_size(
+    declared: u64,
+    observed: u64,
+    aggregate_remaining: usize,
+) -> IgnoreSizeVerification {
+    if observed > GITIGNORE_MAX_BYTES as u64 {
+        IgnoreSizeVerification::PerFileLimit
+    } else if observed > aggregate_remaining as u64 {
+        IgnoreSizeVerification::AggregateLimit
+    } else if observed != declared {
+        IgnoreSizeVerification::Changed
+    } else {
+        IgnoreSizeVerification::Stable
+    }
+}
+
+impl IgnoreWork {
+    /// Charge a non-absent, policy-allowed ignore-file attempt before reading.
+    fn begin_file(&mut self) -> Result<usize> {
+        if self.files >= MAX_IGNORE_SCAN_FILES {
+            bail!(
+                "gitignore search work exceeded {MAX_IGNORE_SCAN_FILES} files; narrow path or disable gitignore"
+            );
+        }
+        self.files += 1;
+        Ok(MAX_IGNORE_SCAN_BYTES.saturating_sub(self.bytes))
+    }
+
+    /// Account for bytes yielded before success or failure. The ceiling check
+    /// is an invariant backstop; bounded readers should never trigger it.
+    fn finish_read(&mut self, bytes: usize, succeeded: bool) -> Result<bool> {
+        let remaining = MAX_IGNORE_SCAN_BYTES.saturating_sub(self.bytes);
+        self.bytes += bytes.min(remaining);
+        if !succeeded {
+            self.incomplete = true;
+        }
+        if bytes > remaining {
+            bail!(
+                "gitignore search work exceeded {MAX_IGNORE_SCAN_BYTES} bytes; narrow path or disable gitignore"
+            );
+        }
+        Ok(succeeded)
+    }
+}
+
 /// Per-call discovery work, not a cap on model-directed concurrency.
 /// A truncated traversal is explicitly marked partial: top-K ordering is
 /// global only when the walk completes.
@@ -42,7 +107,46 @@ pub(crate) const MAX_WALK_VISITS: usize = 100_000;
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct WalkProgress {
     pub visited: usize,
+    /// Requested discovery exhausted its entry budget.
     pub incomplete: bool,
+    /// Requested descendants could not be opened, listed, or inspected.
+    pub traversal_incomplete: bool,
+    /// An opt-in ignore file could not be applied.
+    pub ignore_incomplete: bool,
+}
+
+impl WalkProgress {
+    pub fn scan_incomplete(&self) -> bool {
+        self.incomplete || self.traversal_incomplete || self.ignore_incomplete
+    }
+
+    /// Every independent cause in compatibility-priority order. New causes can
+    /// be appended without changing the legacy singular reason.
+    pub fn incomplete_reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::with_capacity(3);
+        if self.incomplete {
+            reasons.push("directory_budget");
+        }
+        if self.traversal_incomplete {
+            reasons.push("traversal_error");
+        }
+        if self.ignore_incomplete {
+            reasons.push("ignore_rules");
+        }
+        reasons
+    }
+
+    pub fn incomplete_reason(&self) -> Option<&'static str> {
+        if self.incomplete {
+            Some("directory_budget")
+        } else if self.traversal_incomplete {
+            Some("traversal_error")
+        } else if self.ignore_incomplete {
+            Some("ignore_rules")
+        } else {
+            None
+        }
+    }
 }
 
 /// Text tools accept UTF-8 without binary control bytes. Keep this predicate
@@ -171,16 +275,22 @@ fn starts_with_dot(name: &OsStr) -> bool {
 /// wall or a directory that vanished mid-walk is not a tool failure. Policy
 /// denies never reach here — they are applied before a directory is queued.
 fn skippable_io_error(error: &std::io::Error) -> bool {
-    // EXDEV is a mount point the grant does not allow crossing, ELOOP a symlink
-    // or mount loop; neither is a reason to abandon the rest of the tree.
-    const EXDEV: i32 = 18;
-    const ELOOP: i32 = 40;
-    matches!(
+    // These errno values vary between Linux and macOS; the libc target owns
+    // them. Windows keeps the portable error classifications below.
+    let portable = matches!(
         error.kind(),
         std::io::ErrorKind::NotFound
             | std::io::ErrorKind::PermissionDenied
             | std::io::ErrorKind::NotADirectory
-    ) || matches!(error.raw_os_error(), Some(EXDEV) | Some(ELOOP))
+    );
+    #[cfg(unix)]
+    {
+        portable || matches!(error.raw_os_error(), Some(libc::EXDEV) | Some(libc::ELOOP))
+    }
+    #[cfg(windows)]
+    {
+        portable
+    }
 }
 
 fn skippable_directory_error(error: &anyhow::Error) -> bool {
@@ -304,6 +414,81 @@ impl LocalMachine {
         }
     }
 
+    /// Distinguish an absent .gitignore from an unreadable/unsafe one while
+    /// staying beneath the directory's pinned descriptor. Other child reads
+    /// intentionally have a lossy Option API; ignore completeness needs errors.
+    async fn open_ignore_file(
+        &self,
+        handle: Option<&DirHandle>,
+        path: &Path,
+    ) -> Result<Option<fs::File>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(parent) = handle {
+            return match self.secure_fs.open_child_read(
+                &parent.fd,
+                OsStr::new(".gitignore"),
+                parent.resolve,
+            ) {
+                Ok(file) => Ok(Some(fs::File::from_std(file))),
+                Err(error)
+                    if error
+                        .chain()
+                        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                        .any(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            };
+        }
+        // Windows parent directories are pinned through their handles; the
+        // platform's open_read_file refuses reparse points. Tests also use
+        // this fallback when no handle is passed explicitly.
+        #[cfg(windows)]
+        let _pinned_parent = handle;
+        match self.open_read_file(path).await {
+            Ok(file) => Ok(Some(file)),
+            Err(error)
+                if error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(|cause| cause.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read exactly the descriptor's declared bytes without probing past either
+    /// I/O ceiling. A short read or read error is incomplete, and every byte
+    /// obtained before that uncertainty is still charged.
+    async fn read_ignore_bytes<R: tokio::io::AsyncRead + Unpin>(
+        reader: R,
+        expected_len: usize,
+        work: &mut IgnoreWork,
+    ) -> Result<Option<Vec<u8>>> {
+        let remaining = work.begin_file()?;
+        if expected_len > GITIGNORE_MAX_BYTES {
+            bail!("file exceeds the {GITIGNORE_MAX_BYTES} byte .gitignore limit");
+        }
+        if expected_len > remaining {
+            bail!(
+                "gitignore search work exceeded {MAX_IGNORE_SCAN_BYTES} bytes; narrow path or disable gitignore"
+            );
+        }
+        let mut bytes = Vec::with_capacity(expected_len.min(8 * 1024));
+        let result = reader
+            .take(expected_len as u64)
+            .read_to_end(&mut bytes)
+            .await;
+        let complete = result.is_ok() && bytes.len() == expected_len;
+        if !work.finish_read(bytes.len(), complete)? {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
     /// Read this directory's `.gitignore` through the pinned handle and turn it
     /// into a matcher rooted at its own directory. Bounded at 64 KiB and 1024
     /// lines; an invalid pattern fails the whole call (fail closed).
@@ -311,33 +496,86 @@ impl LocalMachine {
         &self,
         dir: &Path,
         handle: Option<&DirHandle>,
+        work: &mut IgnoreWork,
     ) -> Result<Option<Gitignore>> {
         let path = dir.join(".gitignore");
         // The walk drops denied entries, but this open is separate: a deny rule
         // or protected path on the ignore file itself must still win.
         if self.config.access.denied_read(&path) || self.ensure_not_protected(&path).is_err() {
+            // A denied ignore file is never read. Conservatively flag the
+            // resulting search as partial rather than asserting full ignores.
+            work.incomplete = true;
             return Ok(None);
         }
-        let Some(file) = self
-            .open_directory_child(handle, OsStr::new(".gitignore"), &path)
-            .await
-        else {
+        let mut file = match self.open_ignore_file(handle, &path).await {
+            Ok(Some(file)) => file,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                // The path was not absent and policy allowed the attempt. It
+                // therefore consumes one file even though no bytes arrived.
+                work.begin_file()?;
+                work.incomplete = true;
+                return Ok(None);
+            }
+        };
+        let before = match file.metadata().await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) | Err(_) => {
+                work.begin_file()?;
+                work.incomplete = true;
+                return Ok(None);
+            }
+        };
+        if before.len() > GITIGNORE_MAX_BYTES as u64 {
+            work.begin_file()?;
+            bail!(
+                "{} exceeds the {} byte .gitignore limit",
+                path.display(),
+                GITIGNORE_MAX_BYTES
+            );
+        }
+        let remaining = MAX_IGNORE_SCAN_BYTES.saturating_sub(work.bytes);
+        let expected_len = before.len() as usize;
+        let Some(bytes) = Self::read_ignore_bytes(&mut file, expected_len, work).await? else {
             return Ok(None);
         };
-        let mut bytes = Vec::new();
-        // An ignore file that disappears or fails mid-read widens the search
-        // (like `rg`) instead of failing it; an invalid pattern still fails.
-        if file
-            .take(GITIGNORE_MAX_BYTES as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .is_err()
-        {
-            return Ok(None);
+        let after = match file.metadata().await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) | Err(_) => {
+                work.incomplete = true;
+                return Ok(None);
+            }
+        };
+        match verify_ignore_size(before.len(), after.len(), remaining) {
+            IgnoreSizeVerification::PerFileLimit => {
+                bail!(
+                    "{} exceeds the {} byte .gitignore limit",
+                    path.display(),
+                    GITIGNORE_MAX_BYTES
+                );
+            }
+            IgnoreSizeVerification::AggregateLimit => {
+                bail!(
+                    "gitignore search work exceeded {MAX_IGNORE_SCAN_BYTES} bytes; narrow path or disable gitignore"
+                );
+            }
+            IgnoreSizeVerification::Changed => {
+                work.incomplete = true;
+                return Ok(None);
+            }
+            IgnoreSizeVerification::Stable => {}
         }
-        let text = String::from_utf8_lossy(&bytes);
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!(".gitignore is not UTF-8: {}", path.display()))?;
+        if text.lines().count() > GITIGNORE_MAX_LINES {
+            bail!(
+                "{} exceeds the {} line .gitignore limit",
+                path.display(),
+                GITIGNORE_MAX_LINES
+            );
+        }
         let mut builder = GitignoreBuilder::new(dir);
-        for (index, line) in text.lines().take(GITIGNORE_MAX_LINES).enumerate() {
+        for (index, line) in text.lines().enumerate() {
             builder
                 .add_line(Some(path.clone()), line)
                 .map_err(|error| {
@@ -357,30 +595,6 @@ impl LocalMachine {
 use tokio::io::AsyncReadExt;
 
 impl LocalMachine {
-    /// Open a member of an already-pinned directory, never by ambient path.
-    /// `None` means the entry is absent or unreadable, which callers treat as
-    /// "not there" rather than as a tool failure.
-    async fn open_directory_child(
-        &self,
-        handle: Option<&DirHandle>,
-        name: &OsStr,
-        path: &Path,
-    ) -> Option<fs::File> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(handle) = handle {
-            return self
-                .secure_fs
-                .open_child_read(&handle.fd, name, handle.resolve)
-                .ok()
-                .map(fs::File::from_std);
-        }
-        #[cfg(windows)]
-        if handle.is_none() {
-            return None;
-        }
-        self.open_read_file(path).await.ok()
-    }
-
     /// Descriptor-rooted directory walk shared by `ls` and `grep`.
     ///
     /// Authorization is decided once, for the root the caller named; descent
@@ -417,6 +631,7 @@ impl LocalMachine {
         mut on_entry: impl FnMut(WalkedEntry) -> bool,
     ) -> Result<WalkProgress> {
         let mut progress = WalkProgress::default();
+        let mut ignore_work = IgnoreWork::default();
         let mut pending: Vec<PendingDir> = vec![PendingDir {
             parent: None,
             name: OsString::new(),
@@ -436,18 +651,26 @@ impl LocalMachine {
             let is_root = dir == root;
             let handle = match self.pin_child_directory(parent.as_ref(), &name, &dir) {
                 Ok(handle) => handle,
-                Err(error) if !is_root && skippable_directory_error(&error) => continue,
+                Err(error) if !is_root && skippable_directory_error(&error) => {
+                    progress.traversal_incomplete = true;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             let mut reader = match self.read_directory(handle.as_ref(), &dir).await {
                 Ok(reader) => reader,
-                Err(error) if !is_root && skippable_directory_error(&error) => continue,
+                Err(error) if !is_root && skippable_directory_error(&error) => {
+                    progress.traversal_incomplete = true;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             // Only a directory we can actually enumerate contributes ignore
             // rules, so an unreadable subtree cannot fail the whole search.
             if filter.gitignore
-                && let Some(ignore) = self.load_gitignore(&dir, handle.as_ref()).await?
+                && let Some(ignore) = self
+                    .load_gitignore(&dir, handle.as_ref(), &mut ignore_work)
+                    .await?
             {
                 ignores.push(Arc::new(ignore));
             }
@@ -457,11 +680,15 @@ impl LocalMachine {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
                     // Stop this directory, keep the rest of the walk.
-                    Err(error) if skippable_io_error(&error) => break,
+                    Err(error) if skippable_io_error(&error) => {
+                        progress.traversal_incomplete = true;
+                        break;
+                    }
                     Err(error) => return Err(error.into()),
                 };
                 if progress.visited >= max_visits {
                     progress.incomplete = true;
+                    progress.ignore_incomplete = ignore_work.incomplete;
                     return Ok(progress);
                 }
                 progress.visited += 1;
@@ -486,7 +713,10 @@ impl LocalMachine {
                 // concurrently; skip them rather than failing the listing.
                 let metadata = match fs::symlink_metadata(entry.path()).await {
                     Ok(metadata) => metadata,
-                    Err(error) if skippable_io_error(&error) => continue,
+                    Err(error) if skippable_io_error(&error) => {
+                        progress.traversal_incomplete = true;
+                        continue;
+                    }
                     Err(error) => return Err(error.into()),
                 };
                 let file_type = metadata.file_type();
@@ -516,6 +746,7 @@ impl LocalMachine {
                     mtime: metadata.modified().ok(),
                 };
                 if !on_entry(walked) {
+                    progress.ignore_incomplete = ignore_work.incomplete;
                     return Ok(progress);
                 }
                 if descend {
@@ -530,6 +761,7 @@ impl LocalMachine {
             }
         }
 
+        progress.ignore_incomplete = ignore_work.incomplete;
         Ok(progress)
     }
 }
@@ -749,6 +981,35 @@ mod tests {
     use super::*;
     use crate::mcp::tools::test_support::test_machine;
 
+    #[cfg(unix)]
+    #[test]
+    fn skippable_errors_use_the_native_errno_values() {
+        use std::io::{Error, ErrorKind};
+        assert!(skippable_io_error(&Error::from_raw_os_error(libc::EXDEV)));
+        assert!(skippable_io_error(&Error::from_raw_os_error(libc::ELOOP)));
+        assert!(skippable_io_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(skippable_io_error(&Error::from(ErrorKind::NotFound)));
+        assert!(!skippable_io_error(&Error::from(ErrorKind::InvalidData)));
+    }
+
+    #[test]
+    fn concurrent_walk_incompleteness_retains_every_reason() {
+        let progress = WalkProgress {
+            visited: 42,
+            incomplete: true,
+            traversal_incomplete: true,
+            ignore_incomplete: true,
+        };
+        assert!(progress.scan_incomplete());
+        assert_eq!(progress.incomplete_reason(), Some("directory_budget"));
+        assert_eq!(
+            progress.incomplete_reasons(),
+            ["directory_budget", "traversal_error", "ignore_rules"]
+        );
+    }
+
     #[tokio::test]
     async fn discovery_scan_budget_is_enforced_before_candidate_filters() {
         let temp = tempfile::tempdir().unwrap();
@@ -874,6 +1135,7 @@ mod tests {
         paths
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn walk_skips_entries_whose_metadata_cannot_be_read() {
         use std::os::unix::fs::PermissionsExt;
@@ -904,6 +1166,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlink_swapped_in_after_the_walk_is_never_followed() {
         let temp = tempfile::tempdir().unwrap();
@@ -940,6 +1203,261 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_ignore_file_is_reported_as_incomplete_not_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ignore = root.join(".gitignore");
+        std::fs::write(&ignore, "match.txt\n").unwrap();
+        let machine = test_machine(root.clone());
+        let mut work = IgnoreWork::default();
+        assert!(
+            machine
+                .load_gitignore(&root, None, &mut work)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!work.incomplete);
+        std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::File::open(&ignore).is_err();
+        let mut work = IgnoreWork::default();
+        let loaded = machine
+            .load_gitignore(&root, None, &mut work)
+            .await
+            .unwrap();
+        std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if unreadable {
+            assert!(loaded.is_none());
+            assert!(work.incomplete);
+        }
+        std::fs::remove_file(&ignore).unwrap();
+        let mut work = IgnoreWork::default();
+        assert!(
+            machine
+                .load_gitignore(&root, None, &mut work)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!work.incomplete);
+    }
+
+    #[tokio::test]
+    async fn failed_ignore_read_charges_attempt_and_partial_bytes() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct PartialThenError(bool);
+
+        impl AsyncRead for PartialThenError {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if !self.0 {
+                    self.0 = true;
+                    buffer.put_slice(b"abc");
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(std::io::Error::other("injected read failure")))
+                }
+            }
+        }
+
+        let mut work = IgnoreWork::default();
+        let bytes = LocalMachine::read_ignore_bytes(PartialThenError(false), 4, &mut work)
+            .await
+            .unwrap();
+        assert!(bytes.is_none());
+        assert_eq!(work.files, 1);
+        assert_eq!(work.bytes, 3);
+        assert!(work.incomplete);
+
+        let mut capped = IgnoreWork {
+            bytes: MAX_IGNORE_SCAN_BYTES - 2,
+            ..IgnoreWork::default()
+        };
+        let error = LocalMachine::read_ignore_bytes(PartialThenError(false), 3, &mut capped)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gitignore search work exceeded"), "{error}");
+        assert_eq!(capped.files, 1);
+        assert_eq!(capped.bytes, MAX_IGNORE_SCAN_BYTES - 2);
+
+        work.files = MAX_IGNORE_SCAN_FILES;
+        let error = LocalMachine::read_ignore_bytes(PartialThenError(false), 4, &mut work)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gitignore search work exceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn ignore_aggregate_budget_never_reads_a_probe_byte() {
+        use std::{
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct CountingReader {
+            bytes: &'static [u8],
+            position: usize,
+            read: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for CountingReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let count = (self.bytes.len() - self.position).min(buffer.remaining());
+                if count > 0 {
+                    buffer.put_slice(&self.bytes[self.position..self.position + count]);
+                    self.position += count;
+                    self.read.fetch_add(count, Ordering::Relaxed);
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let read = Arc::new(AtomicUsize::new(0));
+        let mut exact = IgnoreWork {
+            bytes: MAX_IGNORE_SCAN_BYTES - 4,
+            ..IgnoreWork::default()
+        };
+        let bytes = LocalMachine::read_ignore_bytes(
+            CountingReader {
+                bytes: b"abcdextra",
+                position: 0,
+                read: read.clone(),
+            },
+            4,
+            &mut exact,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"abcd");
+        assert_eq!(read.load(Ordering::Relaxed), 4);
+        assert_eq!(exact.bytes, MAX_IGNORE_SCAN_BYTES);
+
+        read.store(0, Ordering::Relaxed);
+        let mut over = IgnoreWork {
+            bytes: MAX_IGNORE_SCAN_BYTES - 4,
+            ..IgnoreWork::default()
+        };
+        let error = LocalMachine::read_ignore_bytes(
+            CountingReader {
+                bytes: b"abcde",
+                position: 0,
+                read: read.clone(),
+            },
+            5,
+            &mut over,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("gitignore search work exceeded"), "{error}");
+        assert_eq!(read.load(Ordering::Relaxed), 0);
+        assert_eq!(over.bytes, MAX_IGNORE_SCAN_BYTES - 4);
+
+        assert_eq!(verify_ignore_size(4, 4, 4), IgnoreSizeVerification::Stable);
+        assert_eq!(
+            verify_ignore_size(4, 5, 10),
+            IgnoreSizeVerification::Changed,
+            "growth below both ceilings is still uncertain"
+        );
+        assert_eq!(
+            verify_ignore_size(4, 3, 10),
+            IgnoreSizeVerification::Changed,
+            "shrink is also uncertain"
+        );
+    }
+
+    #[tokio::test]
+    async fn cumulative_ignore_work_budget_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ignore = root.join(".gitignore");
+        std::fs::write(&ignore, "#\n").unwrap();
+        let machine = test_machine(root.clone());
+        let mut exact = IgnoreWork {
+            bytes: MAX_IGNORE_SCAN_BYTES - 2,
+            files: 0,
+            incomplete: false,
+        };
+        assert!(
+            machine
+                .load_gitignore(&root, None, &mut exact)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(exact.bytes, MAX_IGNORE_SCAN_BYTES);
+
+        std::fs::write(&ignore, "match.txt\n").unwrap();
+        let mut work = IgnoreWork {
+            bytes: MAX_IGNORE_SCAN_BYTES - 2,
+            files: 0,
+            incomplete: false,
+        };
+        let error = machine
+            .load_gitignore(&root, None, &mut work)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gitignore search work exceeded"), "{error}");
+        let mut work = IgnoreWork {
+            bytes: 0,
+            files: MAX_IGNORE_SCAN_FILES,
+            incomplete: false,
+        };
+        let error = machine
+            .load_gitignore(&root, None, &mut work)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gitignore search work exceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn denied_ignore_file_is_not_read_or_charged() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ignore = root.join(".gitignore");
+        std::fs::write(&ignore, "match.txt\n").unwrap();
+        let mut machine = test_machine(root.clone());
+        machine.config.access.deny_read_roots = vec![ignore];
+        let mut work = IgnoreWork::default();
+
+        assert!(
+            machine
+                .load_gitignore(&root, None, &mut work)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(work.files, 0);
+        assert_eq!(work.bytes, 0);
+        assert!(work.incomplete);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn unreadable_subtree_gitignore_does_not_fail_the_walk() {
         use std::os::unix::fs::PermissionsExt;
@@ -1122,6 +1640,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlink_loop_is_skipped_instead_of_failing_the_walk() {
         let temp = tempfile::tempdir().unwrap();

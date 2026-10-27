@@ -289,8 +289,10 @@ override the setting. See the README for the non-Linux fallback.
 
 These map to normal CLI output, `-v`, and `-vv`. `RUST_LOG` is separately
 configurable using `environment.RUST_LOG`. Logs may include filesystem paths,
-the first part of tool command strings, tunnel IDs, public MCP URLs and request
-metadata. Journald retention/access remains under the host's policy. Avoid
+tunnel IDs, public MCP URLs and bounded request metadata; commands, grep
+patterns and bulk payloads are represented only by size. rmcp tracing remains
+suppressed regardless of `RUST_LOG` because upstream debug events render full
+MCP payloads. Journald retention/access remains under the host's policy. Avoid
 request logging on shared systems unless needed.
 
 systemd hardening must preserve dotlink's Bubblewrap namespaces, user-owned
