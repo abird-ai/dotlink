@@ -33,6 +33,8 @@ use crate::{
 /// Headroom over the poll hold for the HTTP request timeout, so an idle
 /// long-poll is never cut short by the client timeout.
 const REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
+/// The control plane rejects larger poll batches with HTTP 400.
+const CONTROL_PLANE_MAX_POLL_LIMIT: usize = 25;
 const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
 const SERVER_INFO: &str =
     r#"{"version":2,"channels":[{"name":"main","stateless":true,"proc_affinity":true}]}"#;
@@ -85,9 +87,10 @@ const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
 pub(crate) struct TunnelTuning {
     /// Long-poll hold; the server releases it as soon as a command is ready.
     pub poll_hold: Duration,
-    /// Commands requested per poll, kept in `max_in_flight ..= 3 * max_in_flight`:
-    /// a batch drains into tasks that queue on one semaphore while their client
-    /// window keeps running, so a limit far above the capacity expires the tail.
+    /// Commands requested per poll, kept between `max_in_flight` and both the
+    /// queueing ratio and the control-plane maximum. A batch drains into tasks
+    /// that queue on one semaphore while their client window keeps running, so
+    /// a limit far above the capacity expires the tail.
     pub poll_limit: usize,
     /// Command tasks allowed to run concurrently.
     pub max_in_flight: usize,
@@ -154,6 +157,12 @@ impl TunnelTuning {
                 self.poll_limit
             );
         }
+        if self.poll_limit > CONTROL_PLANE_MAX_POLL_LIMIT {
+            bail!(
+                "tunnel tuning: poll_limit ({}) must not exceed the control-plane maximum ({CONTROL_PLANE_MAX_POLL_LIMIT})",
+                self.poll_limit
+            );
+        }
         if self.activation_retry.is_zero() {
             bail!("tunnel tuning: activation_retry must be non-zero");
         }
@@ -195,12 +204,12 @@ impl TunnelTuning {
 
 impl Default for TunnelTuning {
     fn default() -> Self {
-        let poll_hold = Duration::from_secs(15);
+        let poll_hold = Duration::from_secs(30);
         let activation_retry = Duration::from_secs(2);
         let activation_checks: u32 = 30;
         Self {
             poll_hold,
-            poll_limit: 32,
+            poll_limit: CONTROL_PLANE_MAX_POLL_LIMIT,
             max_in_flight: 16,
             connect_timeout: Duration::from_secs(10),
             request_timeout: poll_hold + REQUEST_TIMEOUT_MARGIN,
@@ -2133,12 +2142,13 @@ mod tests {
     fn tunnel_tuning_defaults_are_valid() {
         assert!(TunnelTuning::default().validated().is_ok());
         let tuning = TunnelTuning::default();
-        assert_eq!(tuning.poll_hold, Duration::from_secs(15));
-        assert_eq!(tuning.request_timeout, Duration::from_secs(25));
-        assert_eq!(tuning.poll_limit, 32);
+        assert_eq!(tuning.poll_hold, Duration::from_secs(30));
+        assert_eq!(tuning.request_timeout, Duration::from_secs(40));
+        assert_eq!(tuning.poll_limit, CONTROL_PLANE_MAX_POLL_LIMIT);
         assert_eq!(tuning.max_in_flight, 16);
-        // The validated band: 16 <= 32 <= 3 * 16.
+        // The validated band: 16 <= 25 <= 3 * 16 and the wire maximum.
         assert!(tuning.poll_limit <= 3 * tuning.max_in_flight);
+        assert!(tuning.poll_limit <= CONTROL_PLANE_MAX_POLL_LIMIT);
         assert_eq!(tuning.activation_retry, Duration::from_secs(2));
         assert_eq!(tuning.activation_checks, 30);
         assert_eq!(tuning.activation_grace, Duration::from_secs(62));
@@ -2154,14 +2164,14 @@ mod tests {
             (
                 "request_timeout at the poll hold",
                 TunnelTuning {
-                    request_timeout: Duration::from_secs(15),
+                    request_timeout: Duration::from_secs(30),
                     ..base()
                 },
             ),
             (
                 "request_timeout without the margin",
                 TunnelTuning {
-                    request_timeout: Duration::from_secs(20),
+                    request_timeout: Duration::from_secs(35),
                     ..base()
                 },
             ),
@@ -2190,6 +2200,13 @@ mod tests {
                 "poll_limit above 3 * max_in_flight",
                 TunnelTuning {
                     poll_limit: 49,
+                    ..base()
+                },
+            ),
+            (
+                "poll_limit above the control-plane maximum",
+                TunnelTuning {
+                    poll_limit: CONTROL_PLANE_MAX_POLL_LIMIT + 1,
                     ..base()
                 },
             ),
@@ -2242,8 +2259,7 @@ mod tests {
                 "backoff cap plus jitter exceeds the request timeout",
                 TunnelTuning {
                     backoff: Backoff {
-                        cap: Duration::from_secs(30),
-                        jitter: Duration::ZERO,
+                        cap: base().request_timeout,
                         ..base().backoff
                     },
                     ..base()
@@ -2259,7 +2275,7 @@ mod tests {
             (
                 "delivery reserve at the request timeout",
                 TunnelTuning {
-                    delivery_reserve: Duration::from_secs(25),
+                    delivery_reserve: base().request_timeout,
                     ..base()
                 },
             ),

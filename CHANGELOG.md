@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- OpenAI tunnel polls hold for 30 s instead of 15 s (`timeout_ms=30000`), halving idle poll churn; the HTTP request timeout stays derived from the hold and rises from 25 s to 40 s.
+
+### Fixed
+
+- OpenAI tunnel polls stay within the control plane's 25-command batch maximum; larger internal tuning is rejected before startup instead of making every poll fail with HTTP 400.
+
 ## [0.10.0] - 2026-10-27
 
 ### Added
