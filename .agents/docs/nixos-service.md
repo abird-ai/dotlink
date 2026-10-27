@@ -260,10 +260,68 @@ Named profiles keep their persistent OAuth state independent.
 
 ## systemd lifecycle and logging
 
-The service waits for `network-online.target`, restarts on failure, and
-handles SIGTERM gracefully, cancelling transports before exit. It disables
-stdio MCP to keep systemd's stdin and journal separate from the protocol.
-Service stdout/stderr flow to journald with color disabled.
+The service waits for `network-online.target` and handles SIGTERM gracefully,
+cancelling transports within dotlink's bounded shutdown budget before exit. It
+disables stdio MCP to keep systemd's stdin and journal separate from the
+protocol. Service stdout/stderr flow to journald with color disabled.
+
+Dotlink retries OpenAI tunnel outages in-process. When the process does end,
+systemd applies this policy:
+
+| Exit | Cause | systemd |
+| --- | --- | --- |
+| 2 (usage) | Unknown or invalid flags, e.g. an older binary than the module expects | Leaves the unit failed |
+| 78 (`CONFIG`) | Profile, policy or credential content fails to resolve, including a selector-pinned Runtime key generation that is missing (selected generations are immutable, so it cannot appear later); a sandbox policy the shell cannot enforce (a protected or deny path in a writable shell mount without an immutable boundary, or an opted-in host integration that is denied/protected); a resource limit below its minimum; OpenAI keeps rejecting the Runtime key (401/403) or tunnel ID (404) for 60 s, counted across in-process runtime restarts | Leaves the unit failed |
+| 0 or a clean signal | The long-running service ended cleanly outside a systemd stop/restart job | Restarts with backoff |
+| Any other status or signal | Unreadable local state, or absent state that may still appear: late mounts, explicit credential files (`DOTLINK_API_KEY_FILE`, `LoadCredential`) not yet provisioned or swapped, grant or deny paths not created yet; listener address unavailable, network or ngrok outage, host socket/device missing, transport lost, cleanup timeout, panic, crash | Restarts with backoff |
+
+The generated unit uses `Restart=always` with
+`RestartPreventExitStatus=2 CONFIG`. A stop or restart job issued through
+systemd suppresses automatic restart, so `systemctl stop` remains stopped and
+`systemctl restart` performs its one deliberate stop/start. A clean exit or
+clean signal outside such a job is unexpected for this long-running service and
+is restarted.
+
+- **Fail-safe default.** 78 is reserved for failures that retrying unchanged
+  cannot fix; unclassified failures and I/O-caused planning errors restart. One
+  OpenAI rejection does not stop the service: an auth outage or edge block can
+  return 401/403/404 too, so dotlink retries for 60 s before it counts as
+  permanent. Only an accepted poll or a changed endpoint, tunnel, key or
+  organization resets that window; interleaved 5xx runtime restarts do not. Ngrok rejections stay restartable because ngrok also rejects
+  transient conditions, such as a lingering prior session.
+- **Recovering from 78.** The journal says so after the error. Fix the
+  declarative configuration, or the saved profile with `dotlink profile` /
+  `dotlink --setup`, then run `systemctl restart dotlink`.
+- **Supported systemd.** The module requires systemd 255 or newer and fails
+  evaluation on older releases. The backoff directives `RestartSteps` and
+  `RestartMaxDelaySec` require 254; `SetLoginEnvironment` requires 255.
+- **Backoff.** Restarts follow after approximately 2, 4, 8, 17, 35, 71, 144 and
+  294 seconds, then every 10 minutes, with no hard start-rate fuse.
+- **Backoff reset.** After ten minutes of uptime dotlink sends `RESTART_RESET=1`,
+  so the next unrelated termination starts again at two seconds. This needs
+  systemd 258 or newer; supported versions 255–257 emit a module warning and
+  retain the delay until an explicit restart.
+- **Supervisor variables.** The unit sets `DOTLINK_SUPERVISOR=systemd`. Dotlink
+  removes it and `NOTIFY_SOCKET` from its environment at startup, so tool
+  commands never inherit them.
+
+One-shot commands (`dotlink profile`, `--setup`, `--print-id`,
+`--list-tools`) exit 1 on failure.
+
+After initial profile planning, SIGTERM and Ctrl+C register once and stay
+latched for the process: a signal arriving while a runtime is rebuilt, stopped
+or restarted in-process exits gracefully instead of waiting for systemd's stop
+timeout. Initial interactive first-run setup retains the OS's ordinary Ctrl+C
+behavior.
+
+A NixOS switch stop/starts a changed unit, so a new package or declarative
+configuration is attempted immediately and resets the crash backoff. An
+explicit `systemctl restart` behaves the same way. Both use SIGTERM and retain
+the 15-second stop timeout; `systemctl stop` is never undone by `Restart=`.
+NixOS also inspects changed/new units at the end of activation, so an immediate
+controlled failure remains failed and is reported. This is not a readiness
+protocol: a failure after that final inspection cannot retroactively fail the
+activation.
 
 ```bash
 systemctl status dotlink

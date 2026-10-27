@@ -93,6 +93,7 @@ fn persisted_key_generation_is_required_and_never_falls_back() {
     fs::remove_file(&selected).unwrap();
     let missing = run_execution_with_profile(&config_dir, &jsonc);
     assert!(!missing.status.success());
+    assert_eq!(missing.status.code(), Some(78));
     assert!(String::from_utf8_lossy(&missing.stderr).contains("selected runtime key is missing"));
 
     // A disabled OpenAI transport does not need any runtime key; no unrelated
@@ -347,8 +348,7 @@ fn unrelated_profile_edits_do_not_retire_running_process_credentials() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn writable_sandbox_parent_prepares_both_private_xdg_directories() {
-    use std::os::unix::fs::PermissionsExt;
+fn writable_sandbox_parent_cannot_contain_control_plane_paths() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let config_home = root.join("cfg");
@@ -385,36 +385,28 @@ fn writable_sandbox_parent_prepares_both_private_xdg_directories() {
             private.display()
         );
     }
-    // Runtime activation prepares the directories before exposing writable
-    // sandbox ancestors. Supply inert discovery fixtures so this test is
-    // independent of the build sandbox's PATH; no shell command executes.
-    let fake_bin = root.join("bin");
-    fs::create_dir(&fake_bin).unwrap();
-    for executable in ["bash", "bwrap"] {
-        let path = fake_bin.join(executable);
-        fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    // A path mask follows a renamed ancestor, so exposing any control-plane
+    // path through a broader writable bind must fail before Bubblewrap starts.
+    // The conflict is deterministic: a supervisor must not restart it forever.
     let runtime = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--stdio")
         .env("DOTLINK_CONFIG", &custom_config)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", root)
-        .env("PATH", &fake_bin)
         .env_remove("DOTLINK_API_KEY")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
-    // EOF before the MCP initialize frame is a protocol error, not a startup
-    // failure. The runtime has already prepared its protected directories.
-    assert!(
-        String::from_utf8_lossy(&runtime.stderr).contains("connection closed: initialize request")
-    );
+    let stderr = String::from_utf8_lossy(&runtime.stderr);
+    assert_eq!(runtime.status.code(), Some(78), "{stderr}");
+    assert!(stderr.contains("overlaps writable shell mount"), "{stderr}");
     for private in owned {
-        let metadata = fs::metadata(&private).unwrap();
-        assert!(metadata.is_dir());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(
+            !private.exists(),
+            "failed startup created {}",
+            private.display()
+        );
     }
 }
 

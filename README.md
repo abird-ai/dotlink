@@ -85,7 +85,7 @@ Default runs are quiet. Add `-v` to see tool activity:
 ~~~text
 $ dotlink -v -p aw
 
-abird dotlink 0.10.0
+abird dotlink 0.11.0
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
@@ -460,9 +460,9 @@ deleting a profile is retryable after an interrupted cleanup.
 
 Transient OpenAI poll failures retry with backoff. Normal warnings stay concise; full transport diagnostics are available with `-vv`.
 
-After **10 consecutive transient poll failures**, dotlink stops retrying the same runtime state. It cancels all active transports, gives them up to 6 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
+After **10 transient poll failures without an accepted poll**, dotlink stops retrying the same runtime state. Intervening 401/403/404 responses do not falsely reset that health counter. Dotlink cancels all active transports, gives them up to 6 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
 
-If a freshly restarted runtime keeps failing, restarts back off from 1 second up to a 30-second cap. Once a runtime has connected successfully, that restart backoff resets. Fatal control-plane errors such as an invalid Tunnel ID or invalid Runtime API key still fail immediately rather than entering a restart loop.
+If a freshly restarted runtime keeps failing, restarts back off from 1 second up to a 30-second cap. Once a runtime has connected successfully, that restart backoff resets. A rejected Tunnel ID or Runtime API key retries for 60 seconds before requiring operator action, so a single auth outage or edge rejection cannot stop the service.
 
 Useful locations:
 
@@ -787,7 +787,7 @@ services.dotlink.credentials.runtimeApiKeyFile =
   config.sops.secrets.dotlink-runtime.path;
 ~~~
 
-Omitting this option retains the user's saved Runtime key. `credentials.ngrokAuthTokenFile` works similarly. There are also `instances.<name>` for independent named services, `extraPackages` for shell tools, and `logging.verbosity = "lifecycle" | "tools" | "requests"` (default: lifecycle). The service disables stdio MCP, gracefully handles SIGTERM, and logs to journald:
+Omitting this option retains the user's saved Runtime key. `credentials.ngrokAuthTokenFile` works similarly. There are also `instances.<name>` for independent named services, `extraPackages` for shell tools, and `logging.verbosity = "lifecycle" | "tools" | "requests"` (default: lifecycle). The service disables stdio MCP, gracefully handles SIGTERM, and logs to journald. Exits 2 and 78 stay stopped until fixed and explicitly restarted; any other termination, including exit 0 or a clean signal outside a systemd stop/restart job, restarts with exponential backoff up to 10 minutes. Explicit `systemctl stop` remains stopped. The module requires systemd 255 or newer and warns on 255–257 because backoff reset notifications require 258:
 
 ~~~bash
 systemctl status dotlink

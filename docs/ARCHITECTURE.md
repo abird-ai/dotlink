@@ -39,7 +39,7 @@ No transport owns filesystem policy. `--list-tools` resolves the same canonical 
 
 ## NixOS service
 
-The flake exports `nixosModules.default` (`nixosModules.dotlink`). The thin module in `nix/module.nix` runs the unchanged binary through systemd and delegates authority/OAuth to the normal runtime. With only `user` and `workingDirectory` configured, it intentionally sets no `DOTLINK_CONFIG` or credential overrides: startup reads that Unix user's saved XDG profile/key/OAuth state. Optional declarative `settings` generate a read-only schema-v10 JSON file in the Nix store, while optional `LoadCredential` files override only the relevant secret. Named instances create independent systemd units with named-profile defaults. Service mode always suppresses stdio MCP, uses stderr/journald logging, and handles SIGTERM with normal bounded transport cancellation. See `.agents/docs/nixos-service.md`.
+The flake exports `nixosModules.default` (`nixosModules.dotlink`). The thin module in `nix/module.nix` runs the unchanged binary through systemd and delegates authority/OAuth to the normal runtime. With only `user` and `workingDirectory` configured, it intentionally sets no `DOTLINK_CONFIG` or credential overrides: startup reads that Unix user's saved XDG profile/key/OAuth state. Optional declarative `settings` generate a read-only schema-v10 JSON file in the Nix store, while optional `LoadCredential` files override only the relevant secret. Named instances create independent systemd units with named-profile defaults. Service mode always suppresses stdio MCP, uses stderr/journald logging, and handles SIGTERM with normal bounded transport cancellation. Dotlink retries OpenAI tunnel outages in-process; `src/recovery.rs` is the one failure taxonomy, applied at each failure's source. Only exit 2 and failures that retrying unchanged cannot fix stop the unit: planning content (policy, profile and credential validation) exits `CONFIG`/78, OpenAI key/tunnel rejections only after persisting for 60 s, and command-line usage errors exit 2. `Restart=always` restarts every other process termination, including exit 0 and systemd-clean signals outside an explicit stop/restart job; systemd jobs suppress that automatic restart. Unclassified failures, I/O-caused planning errors and lost classifications exit 1 and restart with exponential backoff up to ten minutes. Cleanup failures override the primary failure's class because live resources forbid an in-process restart. The module requires systemd 255 (`RestartSteps`/`RestartMaxDelaySec` require 254 and `SetLoginEnvironment` requires 255). `DOTLINK_SUPERVISOR=systemd` enables the operator hint and a `RESTART_RESET=1` notification after ten minutes of uptime; releases 255–257 are supported with a warning because reset notifications require 258. `src/supervisor.rs` removes `DOTLINK_SUPERVISOR` and `NOTIFY_SOCKET` from the environment before any thread starts. `src/shutdown.rs` latches Ctrl+C and SIGTERM once for the whole process, so a signal is never lost across runtime restarts. See `.agents/docs/nixos-service.md`.
 
 ## Public OAuth admission
 
@@ -309,11 +309,11 @@ When OpenAI is disabled, setup skips these fields and no runtime key is loaded.
 
 Transient tunnel poll failures are retried with per-poll backoff. At normal log level the retry message stays concise; the underlying request error and URL are DEBUG details available with `-v`.
 
-After 10 consecutive transient poll failures, the OpenAI transport emits a typed runtime-restart request instead of retrying the same client/runtime state indefinitely. The shared transport supervisor cancels every active transport and gives peer tasks up to 6 seconds to shut down cleanly before force-aborting anything still running.
+After 10 transient poll failures without an accepted poll, the OpenAI transport emits a typed runtime-restart request instead of retrying the same client/runtime state indefinitely. Rejection responses between transient failures do not reset this counter. The shared transport supervisor cancels every active transport and gives peer tasks up to 6 seconds to shut down cleanly before force-aborting anything still running.
 
 The top-level runtime then reloads the selected profile, reconstructs the permission policy, cache mounts, `LocalMachine`, embedded MCP service, and all configured transports. Repeated unhealthy runtimes restart with exponential backoff capped at 30 seconds. If a runtime had connected successfully before becoming unhealthy, the restart backoff resets to its initial 1-second delay.
 
-Fatal control-plane failures, such as invalid credentials or a missing tunnel outside activation grace, remain fatal and do not enter this recovery loop.
+A rejected Runtime key or missing/rejected tunnel retries for a 60-second confirmation window before exiting with `CONFIG`/78. One 401/403/404 therefore cannot stop the service during an auth outage or edge rejection.
 
 ## Permission model
 
@@ -360,6 +360,9 @@ validated host paths. The unrestricted `/` grant intentionally permits
 cross-mount traversal. Bubblewrap shell sandbox mounts use pinned source FDs
 (`--bind-fd` / `--ro-bind-fd`) and pass them only to the forked child,
 preventing a concurrent symlink swap from redirecting an authorized mount.
+Runtime and network paths are bound once at their canonical path; an alias
+such as `/bin -> usr/bin` becomes a sandbox symlink, so deny and protected
+masks, applied to canonical objects, cover every spelling.
 Read+write tools select the narrower pinned grant root, rather than relying
 only on the writable ancestor, and duplicate grants reuse the same inode.
 Native mutations share `src/mutation.rs`: 256 in-process shards followed by

@@ -119,6 +119,19 @@
       cacheAccess."unsupported-kind" = "ro";
     };
   };
+  atSystemdVersion = version:
+    eval {
+      systemd.package = pkgs.systemd // {inherit version;};
+      services.dotlink = {
+        enable = true;
+        user = "alice";
+        workingDirectory = "/home/alice/projects";
+      };
+    };
+  systemd254 = atSystemdVersion "254.17";
+  systemd255 = atSystemdVersion "255.13";
+  systemd257 = atSystemdVersion "257.9";
+  systemd258 = atSystemdVersion "258.1";
   invalidWorkingDirectory = eval {
     services.dotlink = {
       enable = true;
@@ -133,6 +146,22 @@
     (a: a.assertion || !lib.hasInfix "dotlink" a.message)
     cfg.config.assertions;
 
+  dotlinkWarnings = cfg: lib.filter (lib.hasInfix "services.dotlink") cfg.config.warnings;
+
+  hasSupervisionPolicy = service:
+    (service.startLimitIntervalSec == 0)
+    && service.serviceConfig.Restart == "always"
+    && service.serviceConfig.RestartPreventExitStatus == "2 CONFIG"
+    && service.serviceConfig.RestartSec == "2s"
+    && service.serviceConfig.RestartSteps == 8
+    && service.serviceConfig.RestartMaxDelaySec == "10min"
+    && service.serviceConfig.NotifyAccess == "main"
+    && service.serviceConfig.TimeoutStopSec == "15s"
+    && service.serviceConfig.KillMode == "control-group"
+    && service.serviceConfig.KillSignal == "SIGTERM"
+    && !(service.serviceConfig ? OOMPolicy)
+    && service.environment.DOTLINK_SUPERVISOR == "systemd";
+
   checks = [
     (valid normal)
     (normal.config.systemd.services.dotlink.serviceConfig.User == "alice")
@@ -141,6 +170,23 @@
     (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_API_KEY_FILE))
     (lib.hasInfix "--no-stdio --color=never" normal.config.systemd.services.dotlink.serviceConfig.ExecStart)
     (!lib.hasInfix "--serialize" normal.config.systemd.services.dotlink.serviceConfig.ExecStart)
+    (hasSupervisionPolicy normal.config.systemd.services.dotlink)
+    (dotlinkWarnings normal == [])
+
+    (!valid systemd254)
+    (lib.any (
+        a:
+          !a.assertion
+          && lib.hasInfix "requires systemd 255 or newer" a.message
+      )
+      systemd254.config.assertions)
+    (dotlinkWarnings systemd254 == [])
+    (valid systemd255)
+    (lib.any (lib.hasInfix "RESTART_RESET") (dotlinkWarnings systemd255))
+    (valid systemd257)
+    (lib.any (lib.hasInfix "RESTART_RESET") (dotlinkWarnings systemd257))
+    (valid systemd258)
+    (dotlinkWarnings systemd258 == [])
 
     (valid managed)
     (managed.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG)
@@ -153,6 +199,13 @@
       ])
     (lib.hasInfix "DOTLINK_API_KEY_FILE=%d/dotlink-api-key" managedUnitText)
     (lib.hasInfix "LoadCredential=dotlink-api-key:/run/secrets/dotlink-key" managedUnitText)
+    (lib.hasInfix "StartLimitIntervalSec=0" managedUnitText)
+    (lib.hasInfix "Restart=always" managedUnitText)
+    (lib.hasInfix "RestartPreventExitStatus=2 CONFIG" managedUnitText)
+    (lib.hasInfix "RestartSec=2s" managedUnitText)
+    (lib.hasInfix "RestartSteps=8" managedUnitText)
+    (lib.hasInfix "RestartMaxDelaySec=10min" managedUnitText)
+    (lib.hasInfix "SetLoginEnvironment=true" managedUnitText)
     (lib.hasInfix "--allow-nix-daemon" managed.config.systemd.services.dotlink.serviceConfig.ExecStart)
     (lib.hasInfix "--allow-nix-config" managed.config.systemd.services.dotlink.serviceConfig.ExecStart)
     (lib.hasInfix "--allow-git-config" managed.config.systemd.services.dotlink.serviceConfig.ExecStart)
@@ -172,6 +225,7 @@
     (lib.hasInfix "--profile=work" managed.config.systemd.services.dotlink-work.serviceConfig.ExecStart)
     (lib.hasSuffix " -vv" managed.config.systemd.services.dotlink-work.serviceConfig.ExecStart)
     (!(managed.config.systemd.services.dotlink-work.environment ? DOTLINK_CONFIG))
+    (hasSupervisionPolicy managed.config.systemd.services.dotlink-work)
     (lib.hasInfix "--profile=test" managed.config.systemd.services.dotlink-test.serviceConfig.ExecStart)
     (managed.config.systemd.services.dotlink-test.environment ? DOTLINK_CONFIG)
     (!(disabled.config.systemd.services ? dotlink))

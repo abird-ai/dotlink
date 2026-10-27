@@ -3,23 +3,86 @@
 
 use std::{
     fs,
-    io::Read,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    io::{BufRead, BufReader},
     path::Path,
     process::{Child, Command, Stdio},
-    time::Duration,
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use reqwest::{Client, StatusCode, redirect::Policy};
 use serde_json::{Value, json};
 
-struct Server(Child);
+struct Server {
+    child: Child,
+    stderr: mpsc::Receiver<String>,
+    /// Stderr lines consumed so far, for failure reports.
+    seen: Vec<String>,
+}
+
+impl Server {
+    fn new(mut child: Child) -> Self {
+        let pipe = child.stderr.take().expect("server stderr must be piped");
+        let (sender, stderr) = mpsc::channel();
+        // Ends at EOF, once the server exits.
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            stderr,
+            seen: Vec::new(),
+        }
+    }
+
+    /// The origin dotlink announces once its listener is bound. Binding port
+    /// 0 and reading the address back leaves no window in which another
+    /// process could take a port chosen in advance.
+    fn announced_origin(&mut self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(line) = self.stderr.recv_timeout(remaining) else {
+                let status = self.child.try_wait().unwrap();
+                panic!(
+                    "dotlink announced no HTTP listener ({status:?}):\n{}",
+                    self.seen.join("\n")
+                );
+            };
+            let origin = line
+                .strip_prefix("✓ HTTP MCP: ")
+                .and_then(|url| url.strip_suffix("/mcp"))
+                .map(str::to_owned);
+            self.seen.push(line);
+            if let Some(origin) = origin {
+                return origin;
+            }
+        }
+    }
+
+    /// Everything the server wrote to stderr, once it has exited: lines up
+    /// to EOF, waiting a bounded time for the reader to drain.
+    fn take_stderr(&mut self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Ok(line) = self
+            .stderr
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            self.seen.push(line);
+        }
+        self.seen.join("\n")
+    }
+}
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -42,6 +105,7 @@ async fn approval(
     base: &str,
     client_id: &str,
     password: &str,
+    phase: &str,
 ) -> (StatusCode, String, Option<String>) {
     let response = client
         .get(format!("{base}/oauth/authorize"))
@@ -59,7 +123,7 @@ async fn approval(
         ])
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{phase}: authorization GET failed: {error}"));
     assert_eq!(response.status(), StatusCode::OK);
     let html = response.text().await.unwrap();
     let id = html
@@ -76,7 +140,7 @@ async fn approval(
         ])
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{phase}: authorization POST failed: {error}"));
     let status = response.status();
     let location = response
         .headers()
@@ -93,10 +157,6 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
     let root = temp.path();
     let revision_one = "11111111111111111111111111111111";
     let revision_two = "22222222222222222222222222222222";
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let base = format!("http://127.0.0.1:{port}");
     let config = root.join("profile.jsonc");
     let state = root.join("state/abird/dotlink/oauth.json");
     fs::create_dir_all(state.parent().unwrap()).unwrap();
@@ -105,7 +165,7 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
         "version": 10,
         "transports": {
             "openai": false, "stdio": false, "http": true,
-            "http_bind": format!("127.0.0.1:{port}")
+            "http_bind": "127.0.0.1:0"
         },
         "oauth": { "enabled": true },
         "owner_password_revision": revision_one
@@ -138,28 +198,30 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut server = Server(process);
+    let mut server = Server::new(process);
+    let base = server.announced_origin();
+    let probe_client = Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    // Password verification may wait for an admission slot before doing
+    // variable-cost Argon2 work and applying the failed-attempt delay.
     let client = Client::builder()
         .no_proxy()
         .redirect(Policy::none())
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(15))
         .build()
         .unwrap();
 
     let mut started = false;
     for _ in 0..80 {
-        if let Some(status) = server.0.try_wait().unwrap() {
-            let mut stderr = String::new();
-            server
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
+        if let Some(status) = server.child.try_wait().unwrap() {
+            let stderr = server.take_stderr();
             panic!("dotlink exited prematurely ({status}): {stderr}");
         }
-        if let Ok(response) = client
+        if let Ok(response) = probe_client
             .get(format!("{base}/.well-known/oauth-authorization-server"))
             .send()
             .await
@@ -191,8 +253,14 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
         .unwrap();
     let client_id = registration["client_id"].as_str().unwrap();
 
-    let (old_before, _, _) =
-        approval(&client, &base, client_id, "first-valid-owner-password").await;
+    let (old_before, _, _) = approval(
+        &client,
+        &base,
+        client_id,
+        "first-valid-owner-password",
+        "initial password",
+    )
+    .await;
     assert_eq!(old_before, StatusCode::SEE_OTHER);
 
     // Stage the new hash first, then commit the profile selector. Preserve
@@ -204,15 +272,27 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
     profile["owner_password_revision"] = json!(revision_two);
     replace_json(&config, &profile);
 
-    let (new_after, _, new_location) =
-        approval(&client, &base, client_id, "second-valid-owner-password").await;
+    let (new_after, _, new_location) = approval(
+        &client,
+        &base,
+        client_id,
+        "second-valid-owner-password",
+        "rotated password",
+    )
+    .await;
     assert_eq!(
         new_after,
         StatusCode::SEE_OTHER,
         "rotated owner password was rejected"
     );
-    let (old_after, body, _) =
-        approval(&client, &base, client_id, "first-valid-owner-password").await;
+    let (old_after, body, _) = approval(
+        &client,
+        &base,
+        client_id,
+        "first-valid-owner-password",
+        "superseded password",
+    )
+    .await;
     assert_eq!(
         old_after,
         StatusCode::OK,
@@ -303,7 +383,14 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
     saved["owner_password_hash"] = json!(owner_hash("first-valid-owner-password"));
     replace_json(&state, &saved);
     fs::remove_file(&config).unwrap();
-    let (deleted, _, _) = approval(&client, &base, client_id, "first-valid-owner-password").await;
+    let (deleted, _, _) = approval(
+        &client,
+        &base,
+        client_id,
+        "first-valid-owner-password",
+        "deleted profile",
+    )
+    .await;
     assert_ne!(
         deleted,
         StatusCode::SEE_OTHER,

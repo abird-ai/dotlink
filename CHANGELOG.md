@@ -6,13 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-27
+
 ### Changed
 
 - OpenAI tunnel polls hold for 30 s instead of 15 s (`timeout_ms=30000`), halving idle poll churn; the HTTP request timeout stays derived from the hold and rises from 25 s to 40 s.
+- Runtime failures that retrying unchanged cannot fix exit with their standard status: 78 (`CONFIG`) for configuration, policy and credential content, and 2 for command-line usage errors. An OpenAI Runtime key or tunnel rejection counts as permanent only after persisting for 60 s; a single 401/403/404 keeps retrying, like an auth outage. NixOS services leave 2/78 stopped and journal how to recover; every other process termination, including exit 0 or clean signals outside an explicit systemd stop/restart job, restarts after 2 s doubling to 10 minutes. The module requires systemd 255 or newer; ten minutes of uptime reset backoff on 258 or newer, while 255–257 emit a warning. One-shot commands keep exit status 1.
 
 ### Fixed
 
 - OpenAI tunnel polls stay within the control plane's 25-command batch maximum; larger internal tuning is rejected before startup instead of making every poll fail with HTTP 400.
+- Ngrok connection errors name the token only when ngrok answers the authentication step with a rejection, not for a network failure on the way.
+- After initial profile planning, Ctrl+C and SIGTERM register once for the process, so a signal arriving while a runtime is rebuilt, stopped or restarted in-process exits gracefully instead of being lost; initial interactive setup retains ordinary Ctrl+C behavior.
+- NixOS supervision no longer leaves the long-running service inactive after a handled exit 0 or clean signal; explicit systemd stops and restarts remain authoritative.
+- Cache-discovery probes no longer inherit dotlink credential variables, and no child inherits systemd notification variables.
+- Protected control-plane paths and deny rules keep lexical and resolved identities, including dangling-symlink targets resolved in kernel order; unlinking or retargeting a deny alias no longer frees its name. Writable sandbox ancestors, cache/host remapping, and runtime aliases such as `/bin -> usr/bin` can no longer bypass protection or filesystem denies: guarded paths in writable binds need an immutable deny boundary, runtime and network paths are bound once by pinned descriptor at their canonical path, and deny-write now blocks socket integrations such as the SSH agent.
+- Sandbox policy conflicts and resource limits below their minimum exit 78 (`CONFIG`) instead of restarting forever under systemd.
+- An OpenAI key or tunnel rejection keeps its 60 s confirmation window across in-process runtime restarts, so interleaved 5xx failures cannot postpone operator action indefinitely.
+- Interactive setup and profile creation now derive editor defaults and their commit baseline from one profile snapshot, so a concurrent edit cannot become the baseline for stale answers.
 
 ## [0.10.0] - 2026-10-27
 
@@ -337,7 +348,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/abird-ai/dotlink/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/abird-ai/dotlink/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/abird-ai/dotlink/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/abird-ai/dotlink/compare/v0.8.1...v0.9.0

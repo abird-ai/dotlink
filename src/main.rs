@@ -12,12 +12,15 @@ mod mcp;
 mod mutation;
 mod oauth;
 mod private_state;
+mod recovery;
 mod requester;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod secure_fs;
 mod setup;
 mod shell_process;
+mod shutdown;
 mod staging;
+mod supervisor;
 mod transports;
 #[cfg(windows)]
 mod windows_fs;
@@ -29,10 +32,11 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::ExitCode,
     time::Duration,
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{
     ArgAction, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand,
     builder::styling::{AnsiColor, Styles},
@@ -50,12 +54,15 @@ use crate::{
     controls::{RuntimeControl, RuntimeControls, StdioInterruptGuard},
     logging::{ColorMode, LogConfig},
     mcp::{AccessSpec, LocalMachine, MachineConfig, SandboxCacheMount},
+    recovery::Recovery,
     setup::{
         CacheKind, CacheMode, GpuVendor, PermissionConfig, ProfileBool, ProfileRuleKind,
-        TransportConfig, cache_grants_for_cli, create_profile, delete_profile, edit_profile,
-        list_profiles, load_or_setup, mutate_profile_rule, set_profile_bool, show_profile,
-        validate_ngrok_domain,
+        SetupResult, TransportConfig, cache_grants_for_cli, create_profile, delete_profile,
+        edit_profile, list_profiles, load_or_setup, mutate_profile_rule, set_profile_bool,
+        show_profile, validate_ngrok_domain,
     },
+    shutdown::Shutdown,
+    supervisor::Supervisor,
     transports::ActiveTransports,
 };
 
@@ -878,23 +885,6 @@ fn parse_args() -> Args {
     Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
 
-// systemd sends SIGTERM by default. Treat it exactly like Ctrl+C so we
-// cancel transports and allow the existing bounded shutdown to run.
-async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
-}
-
 fn dependency_trace_is_safe(target: &str) -> bool {
     // rmcp debug/trace events render complete requests and responses, including
     // tool payloads. Keep RUST_LOG useful for dotlink without bypassing the
@@ -902,8 +892,29 @@ fn dependency_trace_is_safe(target: &str) -> bool {
     target != "rmcp" && !target.starts_with("rmcp::")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> ExitCode {
+    // SAFETY: no other thread exists before the async runtime starts.
+    let supervisor = unsafe { Supervisor::take_from_env() };
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")
+        .and_then(|runtime| runtime.block_on(run_main(&supervisor)));
+    let Err(error) = result else {
+        return ExitCode::SUCCESS;
+    };
+
+    eprintln!("Error: {error:?}");
+    let recovery = Recovery::of(&error);
+    if recovery == Recovery::Operator
+        && let Some(hint) = supervisor.operator_hint()
+    {
+        eprintln!("{hint}");
+    }
+    recovery.exit_code()
+}
+
+async fn run_main(supervisor: &Supervisor) -> Result<()> {
     let args = parse_args();
     let launch_dir = std::env::current_dir()?;
 
@@ -925,25 +936,41 @@ async fn main() -> Result<()> {
         .init();
 
     if let Some(command) = &args.command {
-        run_command(command, setup_color).await?;
-        return Ok(());
+        return run_command(command, setup_color).await;
+    }
+    if args.setup || args.print_id || args.list_tools {
+        return run_one_shot(&args, &launch_dir, setup_color).await;
     }
 
+    supervisor.schedule_restart_reset();
+
+    // Both outlive any one runtime: a signal or an unresolved OpenAI
+    // rejection must survive an in-process restart.
+    let mut shutdown = Shutdown::default();
+    let rejections = transports::openai::RejectionLedger::default();
     let mut runtime_restarts = 0_u32;
     loop {
-        match run_runtime(&args, &launch_dir, &log, setup_color).await {
+        match run_runtime(
+            &args,
+            &launch_dir,
+            &log,
+            setup_color,
+            &mut shutdown,
+            &rejections,
+        )
+        .await
+        {
             Ok(RuntimeOutcome::Exit) => return Ok(()),
             Ok(RuntimeOutcome::Restart) => {
                 runtime_restarts = 0;
                 log.notice("runtime", "restarting");
             }
             Err(error) => {
-                let Some(restart) = transports::runtime_restart_request(&error) else {
+                let Recovery::Runtime { reset_backoff } = Recovery::of(&error) else {
                     return Err(error);
                 };
 
-                runtime_restarts =
-                    next_runtime_restart_attempt(runtime_restarts, restart.reset_backoff());
+                runtime_restarts = next_runtime_restart_attempt(runtime_restarts, reset_backoff);
                 let delay = RUNTIME_RESTART_BACKOFF.delay(runtime_restarts);
 
                 tracing::warn!(
@@ -958,9 +985,10 @@ async fn main() -> Result<()> {
                     delay.as_secs()
                 );
 
+                let shutdown_requested = shutdown.requested()?;
                 tokio::select! {
-                    signal = shutdown_signal() => {
-                        signal?;
+                    biased;
+                    _ = shutdown_requested => {
                         eprintln!("\ndotlink stopped.");
                         return Ok(());
                     }
@@ -1066,20 +1094,16 @@ fn oauth_profile_target(name: &str) -> Option<&str> {
     }
 }
 
-async fn run_runtime(
-    args: &Args,
-    launch_dir: &Path,
-    log: &LogConfig,
-    setup_color: bool,
-) -> Result<RuntimeOutcome> {
-    if args.print_id && !args.setup {
+/// Inspection and setup modes never start transports, so their failures are
+/// ordinary command failures.
+async fn run_one_shot(args: &Args, launch_dir: &Path, setup_color: bool) -> Result<()> {
+    if args.setup {
+        load_or_setup(true, args.profile.as_deref(), setup_color).await?;
+    } else if args.print_id {
         let tunnel_id = setup::configured_tunnel_id(args.profile.as_deref())?
             .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
         println!("{tunnel_id}");
-        return Ok(RuntimeOutcome::Exit);
-    }
-
-    if args.list_tools && !args.setup {
+    } else {
         let defaults = setup::inspection_permissions(args.profile.as_deref())?;
         let policy = Policy::from_args(args, launch_dir.to_path_buf(), &defaults)?;
         let descriptions = LocalMachine::inspect_tool_descriptions(
@@ -1095,17 +1119,29 @@ async fn run_runtime(
         )
         .await?;
         print_tools(descriptions);
-        return Ok(RuntimeOutcome::Exit);
     }
+    Ok(())
+}
 
-    let Some(mut setup) = load_or_setup(args.setup, args.profile.as_deref(), setup_color).await?
-    else {
-        return Ok(RuntimeOutcome::Exit);
+/// The runtime as determined by profile, environment, credentials and flags.
+struct RuntimePlan {
+    setup: SetupResult,
+    policy: Policy,
+    transports: ActiveTransports,
+}
+
+/// Resolve configuration from local state, without host devices or the network
+/// (first-run interactive setup aside). `None` means that setup was cancelled.
+async fn plan_runtime(
+    args: &Args,
+    launch_dir: &Path,
+    log: &LogConfig,
+    setup_color: bool,
+    rejections: &transports::openai::RejectionLedger,
+) -> Result<Option<RuntimePlan>> {
+    let Some(mut setup) = load_or_setup(false, args.profile.as_deref(), setup_color).await? else {
+        return Ok(None);
     };
-
-    if args.setup {
-        return Ok(RuntimeOutcome::Exit);
-    }
 
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
 
@@ -1159,12 +1195,13 @@ async fn run_runtime(
             organization_id: setup.config.organization_id.clone(),
             new_tunnel: setup.new_tunnel,
             log: log.clone(),
+            rejections: rejections.clone(),
         })
     } else {
         None
     };
 
-    let active_transports = ActiveTransports {
+    let transports = ActiveTransports {
         openai,
         stdio: local_transports.stdio,
         http: http_bind.map(|bind| transports::http::Config {
@@ -1184,7 +1221,31 @@ async fn run_runtime(
             log: log.clone(),
         }),
     };
+    if transports.is_empty() {
+        bail!("no MCP transport is active; enable one in setup or add --stdio/--http for this run");
+    }
 
+    Ok(Some(RuntimePlan {
+        setup,
+        policy,
+        transports,
+    }))
+}
+
+async fn prepare_runtime(
+    args: &Args,
+    log: &LogConfig,
+    plan: RuntimePlan,
+) -> Result<(ActiveTransports, LocalMachine)> {
+    let RuntimePlan {
+        setup,
+        policy,
+        transports,
+    } = plan;
+
+    // Startup depends on the host (devices, caches and filesystem state), so
+    // its failures restart by default. A policy the sandbox provably cannot
+    // enforce (`LocalMachine::new`) is tagged `Operator` where it is found.
     let mut cache_mounts = Vec::new();
     let mut shell_env = BTreeMap::new();
     #[cfg(target_os = "linux")]
@@ -1239,11 +1300,48 @@ async fn run_runtime(
     })
     .await?;
 
-    if active_transports.is_empty() {
-        bail!("no MCP transport is active; enable one in setup or add --stdio/--http for this run");
-    }
+    Ok((transports, machine))
+}
 
-    let cancellation = CancellationToken::new();
+async fn run_runtime(
+    args: &Args,
+    launch_dir: &Path,
+    log: &LogConfig,
+    setup_color: bool,
+    shutdown: &mut Shutdown,
+    rejections: &transports::openai::RejectionLedger,
+) -> Result<RuntimeOutcome> {
+    // On the first pass this does not install a listener, preserving the OS's
+    // default Ctrl+C behavior during interactive first-run setup. Every later
+    // pass is raced from its first planning operation because the listener is
+    // sticky for the rest of the process.
+    let planned = shutdown
+        .run_until_requested(plan_runtime(args, launch_dir, log, setup_color, rejections))
+        .await;
+    let Some(planned) = planned else {
+        eprintln!("\ndotlink stopped.");
+        return Ok(RuntimeOutcome::Exit);
+    };
+    let Some(plan) = planned.map_err(recovery::config_failure)? else {
+        return Ok(RuntimeOutcome::Exit);
+    };
+
+    // Initial interactive planning is complete. From this exact point onward,
+    // signal cancellation races startup as well as the running transports.
+    shutdown.start()?;
+    let prepared = shutdown
+        .run_until_requested(prepare_runtime(args, log, plan))
+        .await;
+    let Some(prepared) = prepared else {
+        eprintln!("\ndotlink stopped.");
+        return Ok(RuntimeOutcome::Exit);
+    };
+    let (active_transports, machine) = prepared?;
+
+    let shutdown_requested = shutdown.requested()?;
+    // Linking the runtime token directly to the process listener lets OpenAI's
+    // cancellation-first selects observe the signal in the same scheduler turn.
+    let cancellation = shutdown.child_token()?;
     let _stdio_interrupt = StdioInterruptGuard::start(active_transports.stdio);
     let mut controls = RuntimeControls::start(log.clone(), active_transports.stdio);
     let controls_available = controls.is_some();
@@ -1267,15 +1365,13 @@ async fn run_runtime(
     }
 
     let event = tokio::select! {
+        biased;
+        _ = shutdown_requested => RuntimeEvent::Exit,
         result = &mut transport_task => {
             RuntimeEvent::Transport(match result {
                 Ok(result) => result,
                 Err(error) => Err(anyhow!("transport supervisor task failed: {error}")),
             })
-        }
-        signal = shutdown_signal() => {
-            signal?;
-            RuntimeEvent::Exit
         }
         control = async {
             match controls.as_mut() {
@@ -1317,6 +1413,8 @@ async fn stop_runtime_transports(
 ) -> Result<()> {
     cancellation.cancel();
     match tokio::time::timeout(std::time::Duration::from_secs(6), &mut *task).await {
+        // Stopping anyway: a transport's concurrent restart request is moot.
+        Ok(Ok(Err(error))) if Recovery::of(&error).restarts_runtime() => Ok(()),
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(anyhow!(
             "transport supervisor task failed during shutdown: {error}"

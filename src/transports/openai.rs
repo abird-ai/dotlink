@@ -28,6 +28,7 @@ use crate::{
     bounded,
     logging::{self, LogConfig},
     mcp::LocalMachine,
+    recovery::{self, Recovery},
 };
 
 /// Headroom over the poll hold for the HTTP request timeout, so an idle
@@ -103,7 +104,11 @@ pub(crate) struct TunnelTuning {
     pub activation_retry: Duration,
     /// Activation checks tolerated before the wait is treated as failed.
     pub activation_checks: u32,
-    /// Consecutive transient poll failures before the runtime restarts.
+    /// How long credential/tunnel rejections must persist before they count
+    /// as permanent; one can come from an auth outage or an edge block.
+    pub rejection_confirmation: Duration,
+    /// Transient poll failures without an accepted poll before the runtime
+    /// restarts. Rejections between them do not prove recovery.
     pub restart_after: u32,
     /// Failed response sends tolerated before the terminal response is dropped.
     pub response_attempts: u32,
@@ -169,6 +174,9 @@ impl TunnelTuning {
         if self.activation_checks == 0 {
             bail!("tunnel tuning: activation_checks must be non-zero");
         }
+        if self.rejection_confirmation.is_zero() {
+            bail!("tunnel tuning: rejection_confirmation must be non-zero");
+        }
         let activation_window = self.activation_retry.saturating_mul(self.activation_checks);
         if self.activation_grace < activation_window {
             bail!(
@@ -218,6 +226,7 @@ impl Default for TunnelTuning {
             activation_grace: activation_retry.saturating_mul(activation_checks + 1),
             activation_retry,
             activation_checks,
+            rejection_confirmation: Duration::from_secs(60),
             restart_after: 10,
             response_attempts: 6,
             backoff: Backoff {
@@ -238,6 +247,8 @@ pub struct Config {
     pub organization_id: Option<String>,
     pub new_tunnel: bool,
     pub log: LogConfig,
+    /// Process-wide; shared by every runtime the process builds.
+    pub rejections: RejectionLedger,
 }
 
 pub async fn run(
@@ -254,10 +265,13 @@ async fn run_with_tuning(
     tuning: TunnelTuning,
     cancellation: CancellationToken,
 ) -> Result<()> {
+    // Construction depends only on configuration.
     let max_request_bytes = machine.max_request_body_bytes();
-    let poll_ceiling = poll_response_ceiling(max_request_bytes)?;
+    let poll_ceiling =
+        poll_response_ceiling(max_request_bytes).map_err(recovery::config_failure)?;
     let embedded = EmbeddedMcp::new(machine, cancellation.child_token());
-    let tunnel = TunnelClient::new(config, tuning, cancellation)?;
+    let tunnel =
+        TunnelClient::new(config, tuning, cancellation).map_err(recovery::config_failure)?;
 
     match tunnel.run(embedded, poll_ceiling).await? {
         TunnelRunOutcome::Cancelled => Ok(()),
@@ -265,9 +279,11 @@ async fn run_with_tuning(
             error,
             had_success,
             threshold,
-        } => Err(anyhow::Error::new(super::RuntimeRestartRequested::new(
-            format!("OpenAI tunnel hit {threshold} consecutive transient poll failures: {error:#}"),
-            had_success,
+        } => Err(Recovery::Runtime {
+            reset_backoff: had_success,
+        }
+        .tag(anyhow!(
+            "OpenAI tunnel hit {threshold} transient poll failures without a successful poll: {error:#}"
         ))),
     }
 }
@@ -582,6 +598,26 @@ pub(crate) struct TunnelClient {
     cancellation: CancellationToken,
     concurrency: Arc<Semaphore>,
     tuning: Arc<TunnelTuning>,
+    identity: [u8; 32],
+    rejections: RejectionLedger,
+}
+
+/// What OpenAI accepts or rejects: endpoint, tunnel, key and organization.
+/// Only a digest is kept; length prefixes keep the fields apart.
+fn tunnel_identity(fields: [Option<&str>; 4]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for field in fields {
+        match field {
+            Some(value) => {
+                digest.update([1]);
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value);
+            }
+            None => digest.update([0]),
+        }
+    }
+    digest.finalize().into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -642,9 +678,94 @@ struct PolledBatch {
 }
 
 enum PollFailure {
+    /// Retry with backoff; enough without an accepted poll restart the runtime.
     Transient(anyhow::Error),
+    /// A new tunnel is not activated yet.
     NotReady(anyhow::Error),
+    /// The key or tunnel was rejected; permanent once it persists.
+    Rejected(anyhow::Error),
+    /// Stop the transport; the process may restart.
     Fatal(anyhow::Error),
+}
+
+/// Unresolved key or tunnel rejections, kept for the whole process. An
+/// in-process runtime restart proves nothing about the credential, so only an
+/// accepted poll or a different tunnel identity (endpoint, tunnel, key,
+/// organization) starts a new confirmation window. Without this, recurring
+/// 5xx restarts would reset the window and evade the operator threshold.
+#[derive(Clone, Default)]
+pub struct RejectionLedger(Arc<std::sync::Mutex<Option<Rejections>>>);
+
+/// Rejections of one tunnel identity since its last accepted poll.
+#[derive(Debug)]
+struct Rejections {
+    identity: [u8; 32],
+    since: Instant,
+    attempts: u32,
+}
+
+/// What [`RejectionLedger::record`] observed.
+#[derive(Debug, PartialEq)]
+struct Rejection {
+    attempts: u32,
+    /// The rejection state has persisted for the whole confirmation window.
+    confirmed: bool,
+}
+
+impl RejectionLedger {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<Rejections>> {
+        // Plain data with no invariant spanning a panic.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record one rejection of `identity`. Transient statuses in between do
+    /// not prove that it recovered.
+    fn record(&self, identity: [u8; 32], window: Duration) -> Rejection {
+        let mut slot = self.slot();
+        let rejections = match slot.take() {
+            Some(rejections) if rejections.identity == identity => rejections,
+            _ => Rejections {
+                identity,
+                since: Instant::now(),
+                attempts: 0,
+            },
+        };
+        let rejections = slot.insert(Rejections {
+            attempts: rejections.attempts.saturating_add(1),
+            ..rejections
+        });
+        Rejection {
+            attempts: rejections.attempts,
+            confirmed: rejections.since.elapsed() >= window,
+        }
+    }
+
+    /// An accepted poll of `identity` resolves its rejections.
+    fn accept(&self, identity: [u8; 32]) {
+        let mut slot = self.slot();
+        if slot
+            .as_ref()
+            .is_some_and(|rejections| rejections.identity == identity)
+        {
+            *slot = None;
+        }
+    }
+}
+
+/// Race one shutdown-sensitive operation with cancellation. Bias is
+/// load-bearing: a simultaneously ready HTTP result or semaphore permit must
+/// not turn an already-requested shutdown into a transport failure or new work.
+async fn cancellation_first<F>(cancellation: &CancellationToken, operation: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = operation => Some(result),
+    }
 }
 
 enum TunnelRunOutcome {
@@ -670,10 +791,18 @@ impl TunnelClient {
             organization_id,
             new_tunnel,
             log,
+            rejections,
         } = config;
         if tunnel_id.trim().is_empty() || api_key.trim().is_empty() {
             bail!("tunnel id and runtime API key are required");
         }
+        let base_url = base_url.trim_end_matches('/').to_owned();
+        let identity = tunnel_identity([
+            Some(&base_url),
+            Some(&tunnel_id),
+            Some(&api_key),
+            organization_id.as_deref(),
+        ]);
         let tuning = Arc::new(tuning.validated()?);
         let activation_grace_until = match new_tunnel {
             true => Some(
@@ -692,7 +821,7 @@ impl TunnelClient {
             .build()?;
         Ok(Self {
             http,
-            base_url: Arc::from(base_url.trim_end_matches('/').to_owned()),
+            base_url: Arc::from(base_url),
             tunnel_id: Arc::from(tunnel_id),
             api_key: Arc::from(api_key),
             organization_id: organization_id.map(Arc::from),
@@ -702,6 +831,8 @@ impl TunnelClient {
             cancellation,
             concurrency: Arc::new(Semaphore::new(tuning.max_in_flight)),
             tuning,
+            identity,
+            rejections,
         })
     }
 
@@ -721,8 +852,16 @@ impl TunnelClient {
             }
 
             let batch = tokio::select! {
+                biased;
                 _ = self.cancellation.cancelled() => break,
                 result = self.poll_once(poll_ceiling) => {
+                    // Only an accepted poll proves that an earlier rejection
+                    // recovered. 429/5xx, other failures and runtime restarts
+                    // leave both health counters intact, so alternating
+                    // statuses cannot evade every recovery path.
+                    if result.is_ok() {
+                        self.rejections.accept(self.identity);
+                    }
                     match result {
                         Ok(batch) => {
                             failures = 0;
@@ -773,9 +912,25 @@ impl TunnelClient {
                                 return Err(error.context("tunnel was not available after repeated activation checks"));
                             }
                             tokio::select! {
+                                biased;
                                 _ = self.cancellation.cancelled() => break,
                                 _ = time::sleep(self.tuning.activation_retry) => {}
                             }
+                            continue;
+                        }
+                        Err(PollFailure::Rejected(error)) => {
+                            let window = self.tuning.rejection_confirmation;
+                            let rejection = self.rejections.record(self.identity, window);
+                            if rejection.confirmed {
+                                return Err(recovery::operator(error));
+                            }
+                            if rejection.attempts == 1 {
+                                warn!(
+                                    "{error:#}; stopping if this persists for {}s",
+                                    window.as_secs()
+                                );
+                            }
+                            self.sleep_backoff(rejection.attempts).await;
                             continue;
                         }
                         Err(PollFailure::Fatal(error)) => return Err(error),
@@ -790,6 +945,7 @@ impl TunnelClient {
                 // not stop polling; a sustained backlog applies backpressure.
                 while tasks.len() >= outstanding_limit {
                     tokio::select! {
+                        biased;
                         _ = self.cancellation.cancelled() => break 'run,
                         result = tasks.join_next() => {
                             if let Some(result) = result
@@ -804,11 +960,12 @@ impl TunnelClient {
                 let mcp = mcp.clone();
                 let received_at = batch.received_at;
                 tasks.spawn(async move {
-                    let permit = tokio::select! {
-                        _ = client.cancellation.cancelled() => return,
-                        permit = client.concurrency.clone().acquire_owned() => permit,
-                    };
-                    let Ok(_permit) = permit else {
+                    let permit = cancellation_first(
+                        &client.cancellation,
+                        client.concurrency.clone().acquire_owned(),
+                    )
+                    .await;
+                    let Some(Ok(_permit)) = permit else {
                         return;
                     };
                     if let Err(error) = client.process_command(mcp, command, received_at).await {
@@ -889,11 +1046,11 @@ impl TunnelClient {
             StatusCode::NOT_FOUND if in_activation_grace => Err(PollFailure::NotReady(error)),
             StatusCode::FORBIDDEN if in_activation_grace => Err(PollFailure::NotReady(error)),
             StatusCode::NOT_FOUND => {
-                Err(PollFailure::Fatal(error.context(
+                Err(PollFailure::Rejected(error.context(
                     "the Tunnel ID was not found; run `dotlink --setup` to reconfigure it",
                 )))
             }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(PollFailure::Fatal(
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(PollFailure::Rejected(
                 error.context("check the Runtime API key and its Tunnels Read + Use permissions"),
             )),
             StatusCode::TOO_MANY_REQUESTS => Err(PollFailure::Transient(error)),
@@ -1151,6 +1308,7 @@ impl TunnelClient {
         }
         match self.post_once(command, &response, deadline).await {
             Ok(PostOutcome::Delivered) => true,
+            Ok(PostOutcome::Cancelled) => false,
             Ok(PostOutcome::Retry(error)) | Ok(PostOutcome::Fatal(error)) | Err(error) => {
                 warn!(request_id = %command.request_id_label(), "dropping intermediate tunnel notification after send failure");
                 debug!(request_id = %command.request_id_label(), %error, "intermediate tunnel notification failure detail");
@@ -1175,7 +1333,7 @@ impl TunnelClient {
                 return Ok(());
             }
             match self.post_once(command, &response, deadline).await {
-                Ok(PostOutcome::Delivered) => return Ok(()),
+                Ok(PostOutcome::Delivered | PostOutcome::Cancelled) => return Ok(()),
                 Ok(PostOutcome::Fatal(error)) => return Err(error),
                 Ok(PostOutcome::Retry(error)) | Err(error) => {
                     attempt = attempt.saturating_add(1);
@@ -1190,9 +1348,11 @@ impl TunnelClient {
                     {
                         return Ok(());
                     }
-                    tokio::select! {
-                        _ = self.cancellation.cancelled() => return Ok(()),
-                        _ = time::sleep(delay) => {}
+                    if cancellation_first(&self.cancellation, time::sleep(delay))
+                        .await
+                        .is_none()
+                    {
+                        return Ok(());
                     }
                 }
             }
@@ -1212,7 +1372,12 @@ impl TunnelClient {
             .json(response_body)
             .send();
 
-        let response = match await_before_deadline(deadline, future).await? {
+        let Some(response) =
+            cancellation_first(&self.cancellation, await_before_deadline(deadline, future)).await
+        else {
+            return Ok(PostOutcome::Cancelled);
+        };
+        let response = match response? {
             Some(result) => match result {
                 Ok(response) => response,
                 Err(error) => return Ok(PostOutcome::Retry(anyhow!(error))),
@@ -1252,15 +1417,13 @@ impl TunnelClient {
 
     async fn sleep_backoff(&self, attempt: u32) {
         let delay = self.tuning.backoff.delay(attempt);
-        tokio::select! {
-            _ = self.cancellation.cancelled() => {}
-            _ = time::sleep(delay) => {}
-        }
+        let _ = cancellation_first(&self.cancellation, time::sleep(delay)).await;
     }
 }
 
 enum PostOutcome {
     Delivered,
+    Cancelled,
     Retry(anyhow::Error),
     Fatal(anyhow::Error),
 }
@@ -1444,6 +1607,7 @@ mod tests {
             organization_id: None,
             new_tunnel: false,
             log: LogConfig::default(),
+            rejections: RejectionLedger::default(),
         }
     }
 
@@ -2036,16 +2200,13 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn repeated_transient_poll_failures_request_runtime_restart() {
+    async fn test_machine(base_dir: &std::path::Path) -> LocalMachine {
         use crate::mcp::{AccessSpec, MachineConfig};
 
-        let temp = tempfile::tempdir().unwrap();
-        let base_dir = temp.path().to_path_buf();
-        let machine = LocalMachine::new(MachineConfig {
+        LocalMachine::new(MachineConfig {
             access: AccessSpec {
-                base_dir: base_dir.clone(),
-                read_roots: vec![base_dir],
+                base_dir: base_dir.to_path_buf(),
+                read_roots: vec![base_dir.to_path_buf()],
                 write_roots: Vec::new(),
                 deny_read_roots: Vec::new(),
                 deny_write_roots: Vec::new(),
@@ -2067,43 +2228,378 @@ mod tests {
             protected_paths: Vec::new(),
         })
         .await
-        .unwrap();
+        .unwrap()
+    }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-
-        let tuning = TunnelTuning {
+    fn fast_retry_tuning() -> TunnelTuning {
+        TunnelTuning {
             backoff: Backoff {
                 base: Duration::from_millis(1),
                 cap: Duration::from_millis(2),
                 jitter: Duration::ZERO,
             },
             ..TunnelTuning::default()
+        }
+    }
+
+    /// A control plane answering poll number `n` (from 0) with `respond(n)`:
+    /// a status and how long to hold it. Returns its URL and a poll counter.
+    async fn fake_control_plane(
+        respond: impl Fn(usize) -> (StatusCode, Duration) + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let respond = Arc::new(respond);
+        let counter = polls.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (status, hold) = respond(counter.fetch_add(1, Ordering::SeqCst));
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    time::sleep(hold).await;
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (url, polls)
+    }
+
+    #[tokio::test]
+    async fn poll_statuses_distinguish_rejection_activation_and_fatal_failures() {
+        for (status, new_tunnel, expected) in [
+            (StatusCode::UNAUTHORIZED, false, "rejected"),
+            (StatusCode::FORBIDDEN, false, "rejected"),
+            (StatusCode::NOT_FOUND, false, "rejected"),
+            (StatusCode::FORBIDDEN, true, "not ready"),
+            (StatusCode::NOT_FOUND, true, "not ready"),
+            (StatusCode::BAD_REQUEST, false, "fatal"),
+            (StatusCode::CONFLICT, false, "fatal"),
+        ] {
+            let (base_url, _) = fake_control_plane(move |_| (status, Duration::ZERO)).await;
+            let client = TunnelClient::new(
+                Config {
+                    base_url,
+                    new_tunnel,
+                    ..test_config()
+                },
+                TunnelTuning::default(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            let actual = match client.poll_once(MAX_POLL_RESPONSE_BYTES).await {
+                Err(PollFailure::Rejected(_)) => "rejected",
+                Err(PollFailure::NotReady(_)) => "not ready",
+                Err(PollFailure::Fatal(error)) => {
+                    assert_eq!(Recovery::of(&error), Recovery::Process, "{status}");
+                    "fatal"
+                }
+                Err(PollFailure::Transient(_)) => "transient",
+                Ok(_) => "ok",
+            };
+            assert_eq!(actual, expected, "{status}, new tunnel: {new_tunnel}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_ready_poll_post_and_permit_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        // This helper is shared by POSTs and permit acquisition. Exercise the
+        // simultaneous-ready case directly, not merely a pending operation.
+        assert_eq!(
+            cancellation_first(&cancellation, std::future::ready(42)).await,
+            None
+        );
+        let permit_client =
+            TunnelClient::new(test_config(), TunnelTuning::default(), cancellation.clone())
+                .unwrap();
+        let permit = cancellation_first(
+            &cancellation,
+            permit_client.concurrency.clone().acquire_owned(),
+        )
+        .await;
+        assert!(permit.is_none(), "a ready permit beat requested shutdown");
+
+        let post_client =
+            TunnelClient::new(test_config(), TunnelTuning::default(), cancellation.clone())
+                .unwrap();
+        let command = TunnelCommand {
+            request_id: "request".to_owned(),
+            shard_token: "shard".to_owned(),
+            command_type: "session_termination".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: None,
+            headers: BTreeMap::new(),
+            jsonrpc: None,
         };
+        let response = TunnelResponse {
+            request_id: command.request_id.clone(),
+            channel: command.channel.clone(),
+            resp_json: None,
+            resp_headers: BTreeMap::new(),
+            resp_code: 204,
+            resp_type: "session_termination_response".to_owned(),
+        };
+        assert!(matches!(
+            post_client.post_once(&command, &response, None).await,
+            Ok(PostOutcome::Cancelled)
+        ));
+
+        let poll_client =
+            TunnelClient::new(test_config(), TunnelTuning::default(), cancellation.clone())
+                .unwrap();
+        let machine = test_machine(temp.path()).await;
+        let mcp = EmbeddedMcp::new(machine, cancellation.child_token());
+        assert!(matches!(
+            poll_client.run(mcp, MAX_POLL_RESPONSE_BYTES).await.unwrap(),
+            TunnelRunOutcome::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_rejections_need_the_operator() {
+        let temp = tempfile::tempdir().unwrap();
+        let window = Duration::from_millis(150);
+        let (base_url, polls) =
+            fake_control_plane(|_| (StatusCode::UNAUTHORIZED, Duration::ZERO)).await;
+        let started = Instant::now();
         let error = run_with_tuning(
-            machine,
+            test_machine(temp.path()).await,
             Config {
-                base_url: format!("http://{addr}"),
-                tunnel_id: "tunnel_test".into(),
-                runtime_api_key: "test-key".into(),
-                organization_id: None,
-                new_tunnel: false,
-                log: LogConfig::default(),
+                base_url,
+                ..test_config()
             },
-            tuning,
+            TunnelTuning {
+                rejection_confirmation: window,
+                ..fast_retry_tuning()
+            },
             CancellationToken::new(),
         )
         .await
         .unwrap_err();
 
-        let request = crate::transports::runtime_restart_request(&error)
-            .expect("transient failure threshold should request a restart");
-        assert!(!request.reset_backoff());
+        assert_eq!(Recovery::of(&error), Recovery::Operator);
+        assert!(format!("{error:#}").contains("Runtime API key"));
+        assert!(started.elapsed() >= window);
+        assert!(polls.load(std::sync::atomic::Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_poll_restarts_the_rejection_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let window = Duration::from_millis(100);
+        // Two rejections, one accepted poll held past the window, then
+        // rejections again. Without a reset, the first one after the
+        // accepted poll would already be confirmed.
+        let (base_url, polls) = fake_control_plane(move |poll| match poll {
+            2 => (StatusCode::NO_CONTENT, window * 2),
+            _ => (StatusCode::UNAUTHORIZED, Duration::ZERO),
+        })
+        .await;
+        let error = run_with_tuning(
+            test_machine(temp.path()).await,
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning {
+                rejection_confirmation: window,
+                ..fast_retry_tuning()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(Recovery::of(&error), Recovery::Operator);
+        assert!(polls.load(std::sync::atomic::Ordering::SeqCst) > 4);
+    }
+
+    #[test]
+    fn rejection_ledger_tracks_one_identity_until_it_is_accepted() {
+        let window = Duration::from_secs(60);
+        let ledger = RejectionLedger::default();
+        let [first, second] = [[1; 32], [2; 32]];
+        let attempts = |identity| ledger.record(identity, window).attempts;
+
+        assert_eq!(attempts(first), 1);
+        assert_eq!(attempts(first), 2);
+        // A changed endpoint, tunnel, key or organization starts over.
+        assert_eq!(attempts(second), 1);
+        ledger.accept(first);
+        assert_eq!(
+            attempts(second),
+            2,
+            "another identity's poll proves nothing"
+        );
+        ledger.accept(second);
+        assert_eq!(attempts(second), 1);
+        assert_eq!(
+            ledger.record(second, Duration::ZERO),
+            Rejection {
+                attempts: 2,
+                confirmed: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejection_window_survives_in_process_runtime_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let window = Duration::from_millis(200);
+        let (base_url, _) = fake_control_plane(|poll| {
+            let status = if poll % 2 == 0 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (status, Duration::ZERO)
+        })
+        .await;
+        let config = Config {
+            base_url,
+            ..test_config()
+        };
+        let tuning = TunnelTuning {
+            rejection_confirmation: window,
+            restart_after: 2,
+            ..fast_retry_tuning()
+        };
+        let run = || async {
+            run_with_tuning(
+                test_machine(temp.path()).await,
+                config.clone(),
+                tuning.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+        };
+
+        // Each runtime restarts on 5xx well inside the window; the rebuilt
+        // runtime inherits the unresolved rejection instead of a fresh one.
+        assert!(Recovery::of(&run().await).restarts_runtime());
+        time::sleep(window).await;
+        assert_eq!(Recovery::of(&run().await), Recovery::Operator);
+    }
+
+    #[tokio::test]
+    async fn alternating_rejections_and_transients_still_request_runtime_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let (base_url, polls) = fake_control_plane(|poll| {
+            let status = if poll % 2 == 0 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            (status, Duration::ZERO)
+        })
+        .await;
+
+        let error = run_with_tuning(
+            test_machine(temp.path()).await,
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning {
+                rejection_confirmation: Duration::from_secs(30),
+                restart_after: 3,
+                ..fast_retry_tuning()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            Recovery::of(&error),
+            Recovery::Runtime {
+                reset_backoff: false
+            }
+        );
+        assert!(polls.load(std::sync::atomic::Ordering::SeqCst) >= 6);
+    }
+
+    #[tokio::test]
+    async fn alternating_rejections_and_server_errors_still_confirm_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let window = Duration::from_millis(100);
+        let (base_url, polls) = fake_control_plane(|poll| {
+            let status = if poll % 2 == 0 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (status, Duration::ZERO)
+        })
+        .await;
+        let started = Instant::now();
+
+        let error = run_with_tuning(
+            test_machine(temp.path()).await,
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning {
+                rejection_confirmation: window,
+                restart_after: 1_000,
+                ..fast_retry_tuning()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(Recovery::of(&error), Recovery::Operator);
+        assert!(started.elapsed() >= window);
+        assert!(polls.load(std::sync::atomic::Ordering::SeqCst) > 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_transient_poll_failures_request_runtime_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = run_with_tuning(
+            test_machine(temp.path()).await,
+            Config {
+                base_url: format!("http://{addr}"),
+                ..test_config()
+            },
+            fast_retry_tuning(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            Recovery::of(&error),
+            Recovery::Runtime {
+                reset_backoff: false
+            },
+            "transient failure threshold should request a runtime restart"
+        );
         assert!(
             error
                 .to_string()
-                .contains("10 consecutive transient poll failures")
+                .contains("10 transient poll failures without a successful poll")
         );
     }
 
@@ -2282,6 +2778,26 @@ mod tests {
         ] {
             assert!(tuning.validated().is_err(), "{label} was accepted");
         }
+    }
+
+    #[test]
+    fn default_poll_query_pins_control_plane_batch_ceiling() {
+        let client = TunnelClient::new(
+            test_config(),
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let request = Client::new()
+            .get("https://example.invalid/poll")
+            .query(&client.poll_query())
+            .build()
+            .unwrap();
+        let limit = request
+            .url()
+            .query_pairs()
+            .find_map(|(key, value)| (key == "limit").then(|| value.into_owned()));
+        assert_eq!(limit.as_deref(), Some("25"));
     }
 
     #[test]

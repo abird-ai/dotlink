@@ -805,6 +805,28 @@ impl SecureFs {
         Ok((file, target))
     }
 
+    /// Pin a path just resolved as canonical, for a sandbox bind. A symlink
+    /// that appeared since fails the open instead of redirecting the bind.
+    #[cfg(target_os = "linux")]
+    pub fn pin_canonical(path: &Path) -> Result<File> {
+        let slash: OwnedFd = File::open("/")?.into();
+        let relative = path.strip_prefix("/")?;
+        let relative = if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        };
+        let fd = openat2(
+            &slash,
+            relative,
+            PATH_ONLY | libc::O_NOFOLLOW,
+            0,
+            RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        )
+        .with_context(|| format!("unsafe sandbox mount source {}", path.display()))?;
+        Ok(File::from(fd))
+    }
+
     /// Pin an explicitly configured shell-only cache source to the directory
     /// validated at startup. This is not an MCP filesystem grant.
     #[cfg(target_os = "linux")]

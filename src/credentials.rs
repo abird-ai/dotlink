@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+
+use crate::recovery::Recovery;
 
 // systemd LoadCredential passes the credential path, never its plaintext value.
 // Keep the same interface useful outside systemd as an explicit file override.
@@ -64,26 +66,39 @@ pub fn read(path: &Path, label: &'static str) -> Result<Option<CredentialSource>
     // prove that the resolved target identifies that descriptor. A symlink or
     // rename race therefore fails closed rather than protecting a different
     // file from the one whose bytes were consumed.
-    let stable_target = fs::canonicalize(path)
-        .with_context(|| format!("failed to resolve {label} {}", path.display()))?;
-    let Some(stable_file) = crate::bounded::open_regular_file(&stable_target, label)? else {
-        bail!(
-            "{label} changed while it was being read: {}",
-            path.display()
-        );
-    };
-    if !same_file_identity(&file, &stable_file)? {
-        bail!(
-            "{label} changed while it was being read: {}",
-            path.display()
-        );
-    }
+    let stable_target = revalidate_target(&file, path, label)?;
 
     Ok(Some(CredentialSource {
         secret: trimmed.to_owned(),
         lexical_target: path.to_path_buf(),
         stable_target,
     }))
+}
+
+fn revalidate_target(file: &fs::File, path: &Path, label: &'static str) -> Result<PathBuf> {
+    // A concurrent replacement (secret rotation) settles on its own. Every
+    // failure in this post-read revalidation is explicitly process-retryable,
+    // including a replacement that is no longer a regular file.
+    let changed = || {
+        Recovery::Process.tag(anyhow!(
+            "{label} changed while it was being read: {}",
+            path.display()
+        ))
+    };
+    let stable_target = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve {label} {}", path.display()))
+        .map_err(|error| Recovery::Process.tag(error))?;
+    let stable_file = crate::bounded::open_regular_file(&stable_target, label)
+        .map_err(|error| Recovery::Process.tag(error))?;
+    let Some(stable_file) = stable_file else {
+        return Err(changed());
+    };
+    let same =
+        same_file_identity(file, &stable_file).map_err(|error| Recovery::Process.tag(error))?;
+    if !same {
+        return Err(changed());
+    }
+    Ok(stable_target)
 }
 
 pub fn from_env(variable: &str) -> Result<Option<CredentialSource>> {
@@ -94,15 +109,13 @@ pub fn from_env(variable: &str) -> Result<Option<CredentialSource>> {
     if !path.is_absolute() {
         bail!("{variable} must point to an absolute credential-file path");
     }
-    read(&path, "credential file")?.map_or_else(
-        || {
-            Err(anyhow::anyhow!(
-                "credential file {} does not exist",
-                path.display()
-            ))
-        },
-        |source| Ok(Some(source)),
-    )
+    match read(&path, "credential file")? {
+        Some(source) => Ok(Some(source)),
+        // Another service may still provision an explicitly named file.
+        None => {
+            Err(Recovery::Process.tag(anyhow!("credential file {} does not exist", path.display())))
+        }
+    }
 }
 
 /// Lexical environment paths are always masked without opening them. This
@@ -114,6 +127,27 @@ pub fn protected_paths() -> Vec<PathBuf> {
         .filter_map(env::var_os)
         .map(PathBuf::from)
         .collect()
+}
+
+/// Credential variables tools must not inherit: dotlink's own and the OpenAI
+/// keys commonly exported beside them.
+const CHILD_HIDDEN_ENV: [&str; 7] = [
+    "DOTLINK_API_KEY",
+    "DOTLINK_API_KEY_FILE",
+    "CONTROL_PLANE_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_ADMIN_KEY",
+    "NGROK_AUTHTOKEN",
+    "NGROK_AUTHTOKEN_FILE",
+];
+
+/// Keep dotlink's credentials out of a child's environment. Supervisor
+/// variables never reach children: `Supervisor::take_from_env` removes them.
+pub fn hide_from_child(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    for name in CHILD_HIDDEN_ENV {
+        command.env_remove(name);
+    }
+    command
 }
 
 #[cfg(unix)]
@@ -164,6 +198,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn children_never_inherit_dotlink_credentials() {
+        let mut command = tokio::process::Command::new("true");
+        hide_from_child(&mut command);
+        let removed: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        assert_eq!(removed.len(), CHILD_HIDDEN_ENV.len());
+        for name in CHILD_HIDDEN_ENV {
+            assert!(removed.iter().any(|removed| removed == name), "{name}");
+        }
+    }
+
+    #[test]
     fn credential_file_requires_nonempty_small_regular_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("token");
@@ -179,6 +229,23 @@ mod tests {
         fs::write(&path, vec![b'x'; 16 * 1024 + 1]).unwrap();
         assert!(read(&path, "credential file").is_err());
         assert!(read(temp.path(), "credential file").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_post_read_replacement_is_process_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("token");
+        fs::write(&path, "fixture-key\n").unwrap();
+        let file = crate::bounded::open_regular_file(&path, "credential file")
+            .unwrap()
+            .unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = revalidate_target(&file, &path, "credential file").unwrap_err();
+        assert_eq!(Recovery::of(&error), Recovery::Process);
+        assert!(error.to_string().contains("regular file"));
     }
 
     #[cfg(unix)]

@@ -1,5 +1,3 @@
-use std::{error::Error, fmt};
-
 use ::http::{HeaderMap, HeaderValue};
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, prelude::BASE64_STANDARD};
@@ -8,38 +6,7 @@ use serde_json::Value;
 use tokio::{task::JoinSet, time};
 use tokio_util::sync::CancellationToken;
 
-use crate::mcp::LocalMachine;
-
-#[derive(Debug)]
-pub struct RuntimeRestartRequested {
-    reason: String,
-    reset_backoff: bool,
-}
-
-impl RuntimeRestartRequested {
-    pub fn new(reason: String, reset_backoff: bool) -> Self {
-        Self {
-            reason,
-            reset_backoff,
-        }
-    }
-
-    pub fn reset_backoff(&self) -> bool {
-        self.reset_backoff
-    }
-}
-
-impl fmt::Display for RuntimeRestartRequested {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.reason)
-    }
-}
-
-impl Error for RuntimeRestartRequested {}
-
-pub fn runtime_restart_request(error: &anyhow::Error) -> Option<&RuntimeRestartRequested> {
-    error.downcast_ref::<RuntimeRestartRequested>()
-}
+use crate::{mcp::LocalMachine, recovery::Recovery};
 
 /// Network Streamable HTTP keeps rmcp's SSE keepalives for intermediary idle
 /// timeouts. One place owns the request-body ceiling derived from the machine's
@@ -234,37 +201,36 @@ impl ActiveTransports {
             });
         }
 
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok(Ok(())) => {
-                    // A cleanly closed transport (for example stdio EOF) does not
-                    // stop other active transports.
-                }
-                Ok(Err(error)) => {
-                    if let Err(shutdown) = stop_peer_transports(&mut tasks, &cancellation).await
-                        && runtime_restart_request(&shutdown).is_none()
-                    {
-                        return Err(shutdown.context(
-                            "peer transport shutdown failed after another transport exited",
-                        ));
-                    }
-                    return Err(error);
-                }
-                Err(error) => {
-                    if let Err(shutdown) = stop_peer_transports(&mut tasks, &cancellation).await
-                        && runtime_restart_request(&shutdown).is_none()
-                    {
-                        return Err(shutdown.context(
-                            "peer transport shutdown failed after another transport panicked",
-                        ));
-                    }
-                    return Err(anyhow!("transport task panicked: {error}"));
-                }
-            }
-        }
-
-        Ok(())
+        supervise(&mut tasks, &cancellation).await
     }
+}
+
+/// Run transports until the first failure, then stop its peers.
+async fn supervise(
+    tasks: &mut JoinSet<Result<()>>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    while let Some(result) = tasks.join_next().await {
+        let error = match result {
+            // A cleanly closed transport (for example stdio EOF) does not
+            // stop other active transports.
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => error,
+            Err(error) => anyhow!("transport task panicked: {error}"),
+        };
+        // A peer's own restart request is not a cleanup failure. Any other
+        // shutdown failure wins: resources may still be live, so it must block
+        // an in-process restart.
+        if let Err(shutdown) = stop_peer_transports(tasks, cancellation).await
+            && !Recovery::of(&shutdown).restarts_runtime()
+        {
+            return Err(
+                shutdown.context("peer transport shutdown failed after another transport stopped")
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn stop_peer_transports(
@@ -281,9 +247,11 @@ async fn stop_peer_transports(
                 Ok(Err(error)) => error,
                 Err(error) => anyhow!("peer transport task panicked during shutdown: {error}"),
             };
+            // Keep the first failure, but never let a restart request mask a
+            // failure that must block in-process restart.
             if failure.as_ref().is_none_or(|existing| {
-                runtime_restart_request(existing).is_some()
-                    && runtime_restart_request(&error).is_none()
+                Recovery::of(existing).restarts_runtime()
+                    && !Recovery::of(&error).restarts_runtime()
             }) {
                 failure = Some(error);
             }
@@ -428,16 +396,16 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut tasks = JoinSet::new();
         tasks.spawn(async {
-            Err(anyhow::Error::new(RuntimeRestartRequested::new(
-                "restart".into(),
-                false,
-            )))
+            Err(Recovery::Runtime {
+                reset_backoff: false,
+            }
+            .tag(anyhow!("restart")))
         });
         tasks.spawn(async { Err(anyhow!("cleanup failed")) });
         let error = stop_peer_transports(&mut tasks, &cancellation)
             .await
             .unwrap_err();
-        assert!(runtime_restart_request(&error).is_none());
+        assert_eq!(Recovery::of(&error), Recovery::Process);
         assert_eq!(error.to_string(), "cleanup failed");
     }
 
@@ -465,13 +433,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runtime_restart_marker_survives_transport_context() {
-        let error = anyhow::Error::new(RuntimeRestartRequested::new("restart".into(), true))
-            .context("OpenAI transport failed");
-        let request =
-            runtime_restart_request(&error).expect("restart marker should survive context");
-        assert!(request.reset_backoff());
+    #[tokio::test]
+    async fn transport_failures_restart_the_process_unless_classified() {
+        let run = |failure: fn() -> Result<()>| async move {
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move { failure() });
+            supervise(&mut tasks, &CancellationToken::new())
+                .await
+                .unwrap_err()
+        };
+
+        let panicked = run(|| panic!("transport bug")).await;
+        assert_eq!(Recovery::of(&panicked), Recovery::Process);
+
+        let unclassified = run(|| Err(anyhow!("bind failed"))).await;
+        assert_eq!(Recovery::of(&unclassified), Recovery::Process);
+
+        let rejected = run(|| Err(crate::recovery::operator(anyhow!("bad key")))).await;
+        assert_eq!(Recovery::of(&rejected), Recovery::Operator);
+
+        let restart = run(|| {
+            Err(Recovery::Runtime {
+                reset_backoff: true,
+            }
+            .tag(anyhow!("tunnel unhealthy")))
+        })
+        .await;
+        assert_eq!(
+            Recovery::of(&restart),
+            Recovery::Runtime {
+                reset_backoff: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_cleanup_failure_overrides_the_primary_classification() {
+        for primary in [
+            Recovery::Runtime {
+                reset_backoff: false,
+            },
+            Recovery::Operator,
+        ] {
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move { Err(primary.tag(anyhow!("primary failure"))) });
+            tasks.spawn(std::future::pending::<Result<()>>());
+            let error = supervise(&mut tasks, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(Recovery::of(&error), Recovery::Process, "{primary:?}");
+            assert!(format!("{error:#}").contains("shutdown deadline"));
+        }
     }
 
     #[tokio::test]

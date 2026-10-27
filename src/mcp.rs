@@ -75,8 +75,11 @@ struct AccessPolicy {
     base_dir: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    /// Every name the deny rules guard; see [`guard_identities`].
     deny_read_roots: Vec<PathBuf>,
     deny_write_roots: Vec<PathBuf>,
+    /// Configured deny-read and deny-write rules, as the user counts them.
+    deny_rules: [usize; 2],
     unrestricted_fs: bool,
 }
 
@@ -146,7 +149,9 @@ const MAX_REQUEST_FRAMING_BYTES: usize = 64 * 1024;
 /// honour instead of quietly raising it.
 fn checked_limit<T: PartialOrd + std::fmt::Display>(name: &str, value: T, minimum: T) -> Result<T> {
     if value < minimum {
-        bail!("{name} must be at least {minimum}, got {value}; raise it in the profile or CLI");
+        return Err(crate::recovery::operator(anyhow!(
+            "{name} must be at least {minimum}, got {value}; raise it in the profile or CLI"
+        )));
     }
     Ok(value)
 }
@@ -321,38 +326,119 @@ async fn canonicalize_grant(base_dir: &Path, path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Deny and protected roots may name paths that do not exist yet, so the nearest
-/// existing ancestor is canonicalized and the remainder is appended. The target
-/// is folded lexically first: a `..` after a missing component would otherwise
-/// survive into the comparison and quietly fail to match the path it denies.
-async fn canonicalize_deny(base_dir: &Path, path: &Path) -> Result<PathBuf> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base_dir.join(path)
-    };
-    let target = lexical_normalize(&joined);
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
 
-    if let Ok(canonical) = fs::canonicalize(&target).await {
+/// Absent, or below a non-directory: nothing exists at the path yet.
+pub(crate) fn is_missing(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Resolve a policy path the way the kernel would reach it, without requiring
+/// it to exist. Symlinks (dangling ones included) expand in place and `..`
+/// applies to the already-resolved prefix, so `link -> pivot/../x` follows
+/// `pivot` first. Below a missing component nothing can be a link yet; there
+/// `..` folds lexically, as it would once the directory is created.
+pub(crate) fn resolve_policy_path(base_dir: &Path, path: &Path) -> Result<PathBuf> {
+    const MAX_SYMLINKS: usize = 40;
+    let joined = base_dir.join(path);
+    if let Ok(canonical) = std::fs::canonicalize(&joined) {
         return Ok(canonical);
     }
 
-    let mut ancestor = target.clone();
-    loop {
-        match fs::canonicalize(&ancestor).await {
-            Ok(canonical_ancestor) => {
-                let remainder = target
-                    .strip_prefix(&ancestor)
-                    .map_err(|_| anyhow!("failed to resolve deny path {}", target.display()))?;
-                return Ok(lexical_normalize(&canonical_ancestor.join(remainder)));
+    let parts = |path: &Path| {
+        path.components()
+            .rev()
+            .map(|part| part.as_os_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // Pending components, next one last.
+    let mut pending = parts(&joined);
+    let mut resolved = PathBuf::new();
+    let mut links = 0_usize;
+    while let Some(part) = pending.pop() {
+        match Path::new(&part).components().next() {
+            None | Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
             }
-            Err(_) => {
-                if !ancestor.pop() {
-                    bail!("could not resolve deny path {}", target.display());
+            // `push` replaces the path for a root, keeping a Windows prefix.
+            Some(Component::Prefix(_) | Component::RootDir) => resolved.push(&part),
+            Some(Component::Normal(name)) => {
+                let candidate = resolved.join(name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        links += 1;
+                        if links > MAX_SYMLINKS {
+                            bail!("too many symlinks while resolving {}", joined.display());
+                        }
+                        let link = std::fs::read_link(&candidate).with_context(|| {
+                            format!("could not read policy symlink {}", candidate.display())
+                        })?;
+                        // Relative targets continue from the link's parent.
+                        pending.extend(parts(&link));
+                    }
+                    Ok(_) => resolved = candidate,
+                    Err(error) if is_missing(&error) => resolved = candidate,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("could not inspect policy path {}", candidate.display())
+                        });
+                    }
                 }
             }
         }
     }
+
+    // Spell the existing prefix as `canonicalize` does (a verbatim prefix on
+    // Windows) so the result compares with canonical grants.
+    let mut existing = resolved.as_path();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(canonical) => {
+                let missing = resolved
+                    .strip_prefix(existing)
+                    .map_err(|_| anyhow!("failed to resolve {}", joined.display()))?;
+                return Ok(canonical.join(missing));
+            }
+            Err(error) if is_missing(&error) => {
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| anyhow!("could not resolve {}", joined.display()))?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not resolve {}", existing.display()));
+            }
+        }
+    }
+}
+
+/// Every name a deny or protected rule guards: its lexical spelling, which
+/// keeps the directory entry itself, and what that entry and the configured
+/// spelling resolve to now. Feeding the result back in re-resolves each
+/// identity, so the startup names persist alongside any later retarget.
+pub(crate) fn guard_identities(base_dir: &Path, configured: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut names = BTreeSet::new();
+    for path in configured {
+        let joined = base_dir.join(path);
+        let lexical = lexical_normalize(&joined);
+        names.insert(resolve_policy_path(base_dir, &joined)?);
+        if lexical != joined {
+            names.insert(resolve_policy_path(base_dir, &lexical)?);
+        }
+        names.insert(lexical);
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// [`guard_identities`] off the async runtime.
+async fn resolve_guards(base_dir: &Path, configured: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    crate::blocking::run(|| guard_identities(base_dir, configured))
 }
 
 impl AccessPolicy {
@@ -370,6 +456,7 @@ impl AccessPolicy {
             base_dir: spec.base_dir,
             read_roots: spec.read_roots,
             write_roots: spec.write_roots,
+            deny_rules: [spec.deny_read_roots.len(), spec.deny_write_roots.len()],
             deny_read_roots: spec.deny_read_roots,
             deny_write_roots: spec.deny_write_roots,
             unrestricted_fs: spec.unrestricted_fs,
@@ -408,6 +495,18 @@ impl AccessPolicy {
         self.deny_write_roots
             .iter()
             .any(|root| path.starts_with(root))
+    }
+
+    fn overlaps_deny_read(&self, path: &Path) -> bool {
+        self.deny_read_roots
+            .iter()
+            .any(|root| paths_overlap(path, root))
+    }
+
+    fn overlaps_deny_write(&self, path: &Path) -> bool {
+        self.deny_write_roots
+            .iter()
+            .any(|root| paths_overlap(path, root))
     }
 
     fn grant_read(&self, path: &Path) -> bool {
@@ -552,6 +651,36 @@ impl AccessPolicy {
     fn deny_write_roots(&self) -> &[PathBuf] {
         &self.deny_write_roots
     }
+
+    #[cfg(target_os = "linux")]
+    fn writable_shell_mounts(&self) -> Vec<PathBuf> {
+        self.sandbox_mounts()
+            .into_iter()
+            .filter_map(|(path, writable)| writable.then_some(path))
+            .collect()
+    }
+
+    /// Inside a writable bind, a guarded path holds only below a deny mount
+    /// point that is a direct child of the bind root: Linux refuses to rename
+    /// or unlink either mount point. Deeper, an intermediate directory could
+    /// be renamed with every nested mount and the original pathname recreated.
+    /// A symlink never becomes a mount point (the mount lands on its target),
+    /// and a missing path has none yet, so neither is a boundary.
+    #[cfg(target_os = "linux")]
+    fn has_immutable_boundary(&self, writable: &Path, guarded: &Path) -> bool {
+        guarded.starts_with(writable)
+            && self
+                .deny_read_roots
+                .iter()
+                .chain(&self.deny_write_roots)
+                .any(|boundary| {
+                    guarded.starts_with(boundary)
+                        && boundary.parent() == Some(writable)
+                        && std::fs::symlink_metadata(boundary)
+                            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+                })
+    }
+
     fn has_read_capability(&self) -> bool {
         self.unrestricted_fs && !self.denied_read(Path::new("/"))
             || self.read_roots.iter().any(|root| !self.denied_read(root))
@@ -611,24 +740,22 @@ impl AccessPolicy {
         for path in &spec.write_roots {
             write_roots.push(canonicalize_grant(&base_dir, path).await?);
         }
-        let mut deny_read_roots = Vec::with_capacity(spec.deny_read_roots.len());
-        for path in &spec.deny_read_roots {
-            deny_read_roots.push(canonicalize_deny(&base_dir, path).await?);
-        }
-        let mut deny_write_roots = Vec::with_capacity(spec.deny_write_roots.len());
-        for path in &spec.deny_write_roots {
-            deny_write_roots.push(canonicalize_deny(&base_dir, path).await?);
-        }
-
-        for roots in [
-            &mut read_roots,
-            &mut write_roots,
-            &mut deny_read_roots,
-            &mut deny_write_roots,
-        ] {
+        // A deny keeps the entry it names as well as its target: retargeting
+        // or unlinking a configured alias must not free its lexical name.
+        let deny_read_roots = resolve_guards(&base_dir, &spec.deny_read_roots).await?;
+        let deny_write_roots = resolve_guards(&base_dir, &spec.deny_write_roots).await?;
+        for roots in [&mut read_roots, &mut write_roots] {
             roots.sort();
             roots.dedup();
         }
+        let rules = |configured: &[PathBuf]| {
+            configured
+                .iter()
+                .map(|path| lexical_normalize(&base_dir.join(path)))
+                .collect::<BTreeSet<_>>()
+                .len()
+        };
+        let deny_rules = [rules(&spec.deny_read_roots), rules(&spec.deny_write_roots)];
 
         let access = Self::from_spec(AccessSpec {
             base_dir,
@@ -639,7 +766,22 @@ impl AccessPolicy {
             unrestricted_fs: spec.unrestricted_fs,
         })?;
 
-        Ok(access)
+        Ok(Self {
+            deny_rules,
+            ..access
+        })
+    }
+
+    /// The same policy with every deny alias re-resolved now. A sandbox is
+    /// assembled from pathnames, so each command masks what an alias names at
+    /// that moment as well as what it named at startup.
+    #[cfg(target_os = "linux")]
+    fn refreshed(&self) -> Result<Self> {
+        Ok(Self {
+            deny_read_roots: guard_identities(&self.base_dir, &self.deny_read_roots)?,
+            deny_write_roots: guard_identities(&self.base_dir, &self.deny_write_roots)?,
+            ..self.clone()
+        })
     }
 
     fn capabilities(&self, allow_shell: bool) -> Capabilities {
@@ -652,9 +794,136 @@ impl AccessPolicy {
     }
 }
 
+/// The guarded names one sandbox command must enforce, resolved when the
+/// command is built: deny aliases and protected paths may have been retargeted
+/// since startup, so both their startup and current identities apply.
+#[cfg(target_os = "linux")]
+struct ShellGuards {
+    access: AccessPolicy,
+    protected: Vec<PathBuf>,
+}
+
+/// A sandbox policy the shell cannot enforce as configured. Retrying with the
+/// same configuration and host layout fails again: exit `CONFIG`.
+#[cfg(target_os = "linux")]
+fn shell_policy_conflict(message: String) -> anyhow::Error {
+    crate::recovery::operator(anyhow!(message))
+}
+
+/// Masks and read-only rebinds are pathname mounts. Each guarded path needs an
+/// immutable boundary wherever a writable mount could move or replace it, and
+/// must stay off remapped caches, which expose the host object under a name
+/// that no mask covers. One rule for protected, deny-read and deny-write paths.
+#[cfg(target_os = "linux")]
+fn validate_shell_guards(
+    access: &AccessPolicy,
+    cache_mounts: &[SandboxCacheMount],
+    protected_paths: &[PathBuf],
+) -> Result<()> {
+    // (label, path, whether any visibility exposes it)
+    let guards = protected_paths
+        .iter()
+        .map(|path| ("protected path", path, true))
+        .chain(
+            access
+                .deny_read_roots
+                .iter()
+                .map(|path| ("deny-read path", path, true)),
+        )
+        .chain(
+            access
+                .deny_write_roots
+                .iter()
+                .map(|path| ("deny-write path", path, false)),
+        );
+    let writable_mounts = access.writable_shell_mounts();
+    for (label, guarded, hidden) in guards {
+        for cache in cache_mounts.iter().filter(|cache| hidden || cache.writable) {
+            if paths_overlap(guarded, &cache.source) || paths_overlap(guarded, &cache.target) {
+                return Err(shell_policy_conflict(format!(
+                    "cache mount {} -> {} overlaps {label} {}; remove that cache grant",
+                    cache.source.display(),
+                    cache.target.display(),
+                    guarded.display()
+                )));
+            }
+        }
+        for writable in &writable_mounts {
+            if !paths_overlap(guarded, writable) || access.has_immutable_boundary(writable, guarded)
+            {
+                continue;
+            }
+            let remedy = if guarded.starts_with(writable) {
+                "make that mount read-only, or deny an existing non-symlink direct child of it that contains the path"
+            } else {
+                "remove that write grant"
+            };
+            return Err(shell_policy_conflict(format!(
+                "{label} {} overlaps writable shell mount {}, where a sandboxed command could move or replace it; {remedy}",
+                guarded.display(),
+                writable.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_host_mount_policy(
+    access: &AccessPolicy,
+    host_shell: &crate::host_services::HostShell,
+    protected_paths: &[PathBuf],
+) -> Result<()> {
+    for mount in &host_shell.mounts {
+        // Check both names captured when the mount was pinned, and the
+        // sandbox target. A directory source can contain a guarded
+        // descendant; a source below a guarded root is equally disallowed.
+        // Sockets and devices act rather than hold data: a read-only bind
+        // still connects or issues ioctls, so deny-write blocks them too.
+        let blocked = [
+            mount.source.as_path(),
+            mount.resolved.as_path(),
+            mount.target.as_path(),
+        ]
+        .into_iter()
+        .any(|path| {
+            access.overlaps_deny_read(path)
+                || (mount.kind.is_operational() && access.overlaps_deny_write(path))
+                || protected_paths
+                    .iter()
+                    .any(|protected| paths_overlap(path, protected))
+        });
+        if blocked {
+            return Err(shell_policy_conflict(format!(
+                "host integration source or target is denied or protected: {} -> {}",
+                mount.source.display(),
+                mount.target.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl LocalMachine {
     pub async fn new(args: MachineConfig) -> Result<Self> {
+        let max_shell_timeout_secs = checked_limit(
+            "max_shell_timeout_secs",
+            args.max_shell_timeout_secs,
+            MIN_SHELL_TIMEOUT_SECS,
+        )?;
+        let max_output_bytes =
+            checked_limit("max_output_bytes", args.max_output_bytes, MIN_BYTE_LIMIT)?;
+        let max_read_bytes = checked_limit("max_read_bytes", args.max_read_bytes, MIN_BYTE_LIMIT)?;
+        let max_write_bytes =
+            checked_limit("max_write_bytes", args.max_write_bytes, MIN_BYTE_LIMIT)?;
+
         let access = AccessPolicy::resolve(args.access).await?;
+
+        // Keep both path identities. The lexical spelling protects the
+        // control-plane directory entry; the resolved spelling protects the
+        // target it currently names. Resolution must fail closed: a dangling
+        // final symlink still contributes the path it points at.
+        let protected_paths = resolve_guards(&access.base_dir, &args.protected_paths).await?;
 
         let mut cache_mounts = Vec::with_capacity(args.cache_mounts.len());
         let mut cache_targets = BTreeSet::new();
@@ -671,6 +940,7 @@ impl LocalMachine {
                     mount.target.display()
                 );
             }
+            let target = lexical_normalize(&mount.target);
 
             let source = match fs::canonicalize(&mount.source).await {
                 Ok(source) => source,
@@ -680,79 +950,63 @@ impl LocalMachine {
             if !fs::metadata(&source).await?.is_dir() {
                 continue;
             }
-            if access.denied_read(&source) {
+
+            // Cache sources are remapped, so a mask at the original deny or
+            // protected path cannot constrain them. Check both directions: a
+            // cache ancestor can expose a denied child, and a cache descendant
+            // can expose data below a denied ancestor. Targets receive the same
+            // treatment so a remapped cache cannot cover a sandbox policy path.
+            if access.overlaps_deny_read(&source)
+                || access.overlaps_deny_read(&target)
+                || protected_paths.iter().any(|protected| {
+                    paths_overlap(&source, protected) || paths_overlap(&target, protected)
+                })
+            {
                 continue;
             }
-            let writable = mount.writable && !access.denied_write(&source);
-            if !cache_targets.insert(mount.target.clone()) {
+            let writable = mount.writable
+                && !access.overlaps_deny_write(&source)
+                && !access.overlaps_deny_write(&target);
+            if !cache_targets.insert(target.clone()) {
                 bail!(
                     "internal error: duplicate cache sandbox target: {}",
-                    mount.target.display()
+                    target.display()
                 );
             }
 
             cache_mounts.push(SandboxCacheMount {
                 source,
-                target: mount.target,
+                target,
                 writable,
             });
         }
 
-        let mut protected_paths = Vec::with_capacity(args.protected_paths.len());
-        for path in args.protected_paths {
-            protected_paths.push(
-                canonicalize_deny(&access.base_dir, &path)
-                    .await
-                    .unwrap_or(path),
-            );
-        }
-
-        // Writable sandbox ancestors must not cause Bubblewrap to create
-        // unprotected host mount targets. Reserve only *our* XDG directories,
-        // with private permissions; other absent protected paths fail closed.
+        // Validate policy before resolving sandbox tooling so a violation fails
+        // closed even when bwrap/bash are absent from PATH (for example in a
+        // Nix build). A missing deny target is absent state, which may still
+        // appear; a policy that cannot hold is the operator's to change.
         #[cfg(target_os = "linux")]
         if args.allow_shell && args.sandbox_shell {
-            for owned_dir in [
-                crate::setup::dotlink_config_dir()?,
-                crate::oauth::state_dir()?,
-            ] {
-                let resolved = canonicalize_deny(&access.base_dir, &owned_dir).await?;
-                if access.grant_write(&resolved)
-                    && !access.denied_write(&resolved)
-                    && protected_paths
-                        .iter()
-                        .any(|protected| resolved.starts_with(protected))
-                {
-                    crate::private_state::prepare_owned_dir(&owned_dir)?;
+            for denied in access.deny_read_roots() {
+                if (access.grant_read(denied) || access.grant_write(denied)) && !denied.exists() {
+                    bail!(
+                        "sandboxed deny-read paths inside granted trees must already exist: {}",
+                        denied.display()
+                    );
                 }
             }
-        }
-
-        // Deny/protected policy is validated before resolving any sandbox or
-        // shell tooling so that a policy violation fails closed even when
-        // bwrap/bash are absent from PATH (for example inside a Nix build).
-        #[cfg(target_os = "linux")]
-        for mount in &args.host_shell.mounts {
-            // Denies/protected control-plane paths cover both the requested
-            // lexical spelling and the resolved path captured when the file
-            // descriptor was opened. Never re-resolve a mutable alias here.
-            if [mount.source.as_path(), mount.resolved.as_path()]
-                .iter()
-                .any(|path| {
-                    access.denied_read(path)
-                        || (mount.kind == crate::host_services::HostMountKind::CharacterDevice
-                            && access.denied_write(path))
-                        || protected_paths
-                            .iter()
-                            .any(|protected| *path == protected || path.starts_with(protected))
-                })
-            {
-                bail!(
-                    "host integration source is denied or protected: {}",
-                    mount.source.display()
-                );
+            for denied in access.deny_write_roots() {
+                if access.grant_read(denied) && access.grant_write(denied) && !denied.exists() {
+                    bail!(
+                        "sandboxed deny-write paths inside read+write trees must already exist: {}",
+                        denied.display()
+                    );
+                }
             }
+            validate_shell_guards(&access, &cache_mounts, &protected_paths)?;
         }
+        #[cfg(target_os = "linux")]
+        validate_host_mount_policy(&access, &args.host_shell, &protected_paths)?;
 
         let shell_program = if args.allow_shell {
             #[cfg(windows)]
@@ -773,26 +1027,6 @@ impl LocalMachine {
         } else {
             None
         };
-
-        #[cfg(target_os = "linux")]
-        if args.allow_shell && args.sandbox_shell {
-            for denied in access.deny_read_roots() {
-                if (access.grant_read(denied) || access.grant_write(denied)) && !denied.exists() {
-                    bail!(
-                        "sandboxed deny-read paths inside granted trees must already exist: {}",
-                        denied.display()
-                    );
-                }
-            }
-            for denied in access.deny_write_roots() {
-                if access.grant_read(denied) && access.grant_write(denied) && !denied.exists() {
-                    bail!(
-                        "sandboxed deny-write paths inside read+write trees must already exist: {}",
-                        denied.display()
-                    );
-                }
-            }
-        }
 
         #[cfg(target_os = "linux")]
         let bwrap_program = if args.allow_shell && args.sandbox_shell {
@@ -824,26 +1058,10 @@ impl LocalMachine {
                 allow_network: args.allow_network,
                 shell_program,
                 bwrap_program,
-                max_shell_timeout_secs: checked_limit(
-                    "max_shell_timeout_secs",
-                    args.max_shell_timeout_secs,
-                    MIN_SHELL_TIMEOUT_SECS,
-                )?,
-                max_output_bytes: checked_limit(
-                    "max_output_bytes",
-                    args.max_output_bytes,
-                    MIN_BYTE_LIMIT,
-                )?,
-                max_read_bytes: checked_limit(
-                    "max_read_bytes",
-                    args.max_read_bytes,
-                    MIN_BYTE_LIMIT,
-                )?,
-                max_write_bytes: checked_limit(
-                    "max_write_bytes",
-                    args.max_write_bytes,
-                    MIN_BYTE_LIMIT,
-                )?,
+                max_shell_timeout_secs,
+                max_output_bytes,
+                max_read_bytes,
+                max_write_bytes,
                 protected_paths,
             },
             operation_gate: Arc::new(RwLock::new(())),
@@ -852,6 +1070,17 @@ impl LocalMachine {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs,
         })
+    }
+
+    /// Re-resolve every guarded name and rerun the startup checks, so one
+    /// sandbox command enforces exactly what the host names now.
+    #[cfg(target_os = "linux")]
+    fn shell_guards(&self) -> Result<ShellGuards> {
+        let access = self.config.access.refreshed()?;
+        let protected = guard_identities(&access.base_dir, &self.config.protected_paths)?;
+        validate_shell_guards(&access, &self.config.cache_mounts, &protected)?;
+        validate_host_mount_policy(&access, &self.config.host_shell, &protected)?;
+        Ok(ShellGuards { access, protected })
     }
 
     pub fn log(&self) -> &LogConfig {
@@ -941,8 +1170,8 @@ impl LocalMachine {
             "read:{} write:{} deny-read:{} deny-write:{} caches:{}{}",
             self.config.access.read_roots.len(),
             self.config.access.write_roots.len(),
-            self.config.access.deny_read_roots.len(),
-            self.config.access.deny_write_roots.len(),
+            self.config.access.deny_rules[0],
+            self.config.access.deny_rules[1],
             self.config.cache_mounts.len(),
             if self.config.allow_shell {
                 " + shell"
@@ -972,15 +1201,19 @@ impl LocalMachine {
     }
 
     async fn resolve_existing(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
-        let path = self.config.access.resolve_existing(input, need).await?;
-        self.ensure_not_protected(&path)?;
-        Ok(path)
+        let lexical = self.config.access.lexical_target(input)?;
+        self.ensure_not_protected(&lexical)?;
+        let resolved = self.config.access.resolve_existing(input, need).await?;
+        self.ensure_not_protected(&resolved)?;
+        Ok(resolved)
     }
 
     async fn resolve_for_create(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
-        let path = self.config.access.resolve_for_create(input, need).await?;
-        self.ensure_not_protected(&path)?;
-        Ok(path)
+        let lexical = self.config.access.lexical_target(input)?;
+        self.ensure_not_protected(&lexical)?;
+        let resolved = self.config.access.resolve_for_create(input, need).await?;
+        self.ensure_not_protected(&resolved)?;
+        Ok(resolved)
     }
 
     #[cfg(any(test, windows))]
@@ -1609,6 +1842,124 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn protected_symlink_keeps_both_names_and_cannot_be_replaced_after_unlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let target = root.join("runtime.key");
+        let alias = root.join("credential-link");
+        std::fs::write(&target, b"secret").unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root.clone()],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            // Exercise normalization as well as the lexical/resolved pair.
+            protected_paths: vec![root.join("unused/../credential-link")],
+        })
+        .await
+        .unwrap();
+
+        assert!(machine.config.protected_paths.contains(&alias));
+        assert!(machine.config.protected_paths.contains(&target));
+        assert!(
+            machine
+                .resolve_for_create("credential-link", AccessNeed::Write)
+                .await
+                .is_err()
+        );
+
+        // If the alias disappears after startup, an authorized native write
+        // still cannot install a replacement at its lexical name.
+        std::fs::remove_file(&alias).unwrap();
+        let result: Result<()> = async {
+            let path = machine
+                .resolve_for_create("credential-link", AccessNeed::Write)
+                .await?;
+            machine.write_file_atomic(&path, b"replacement").await
+        }
+        .await;
+        assert!(result.is_err());
+        assert!(!alias.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_protected_symlink_retains_its_missing_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let alias = root.join("credential-link");
+        let target = root.join("future").join("runtime.key");
+        symlink("future/runtime.key", &alias).unwrap();
+
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: vec![alias.clone()],
+        })
+        .await
+        .unwrap();
+
+        assert!(machine.config.protected_paths.contains(&alias));
+        assert!(
+            machine.config.protected_paths.contains(&target),
+            "a dangling final symlink must not fall back to protecting only its lexical name"
+        );
+
+        std::fs::create_dir(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"secret").unwrap();
+        assert!(
+            machine
+                .resolve_existing("future/runtime.key", AccessNeed::Read)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn protected_write_target_cannot_be_reached_through_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -1892,6 +2243,11 @@ mod tests {
                 && error.to_string().contains("got 32"),
             "{error}"
         );
+        // Restarting with the same profile cannot help.
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
 
         // An accepted value is used exactly as configured.
         let machine = LocalMachine::new(machine_config(2048)).await.unwrap();
@@ -1957,5 +2313,207 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("denied by policy"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_paths_resolve_each_symlink_before_its_parent_component() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        symlink("a/b", root.join("pivot")).unwrap();
+        // Dangling: the kernel follows `pivot` first, so `..` leaves `a/b`
+        // for `a`. Folding `pivot/..` lexically would guard `root/x` instead.
+        symlink("pivot/../x", root.join("link")).unwrap();
+        assert_eq!(
+            resolve_policy_path(&root, Path::new("link")).unwrap(),
+            root.join("a/x")
+        );
+        // Below a missing component `..` folds as it will once created, and
+        // a symlink reached again after it is still followed.
+        assert_eq!(
+            resolve_policy_path(&root, Path::new("missing/../pivot/new")).unwrap(),
+            root.join("a/b/new")
+        );
+
+        symlink("loop", root.join("loop")).unwrap();
+        assert!(resolve_policy_path(&root, Path::new("loop/x")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deny_alias_keeps_its_name_and_startup_target_after_a_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let secret = root.join("secret");
+        let other = root.join("other");
+        let alias = root.join("alias");
+        for directory in [&secret, &other] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("file"), b"data").unwrap();
+        }
+        symlink(&secret, &alias).unwrap();
+
+        let policy = AccessPolicy::resolve(AccessSpec {
+            base_dir: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![root.clone()],
+            deny_read_roots: vec![alias.clone()],
+            deny_write_roots: vec![alias.clone()],
+            unrestricted_fs: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(policy.deny_read_roots, [alias.clone(), secret.clone()]);
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        for input in ["alias/file", "secret/file"] {
+            assert!(
+                policy
+                    .resolve_existing(input, AccessNeed::Read)
+                    .await
+                    .is_err(),
+                "{input} escaped the deny"
+            );
+            assert!(
+                policy
+                    .resolve_for_create(input, AccessNeed::Write)
+                    .await
+                    .is_err(),
+                "{input} escaped the deny"
+            );
+        }
+        std::fs::remove_file(&alias).unwrap();
+        assert!(
+            policy
+                .resolve_for_create("alias", AccessNeed::Write)
+                .await
+                .is_err(),
+            "an unlinked alias freed its name"
+        );
+
+        // The sandbox also masks what the alias names when a command starts.
+        #[cfg(target_os = "linux")]
+        {
+            symlink(&other, &alias).unwrap();
+            let current = policy.refreshed().unwrap();
+            assert!(current.denied_read(&other.join("file")));
+            assert!(current.denied_read(&secret.join("file")));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sandboxed_config(root: &Path, deny_read: Vec<PathBuf>) -> MachineConfig {
+        MachineConfig {
+            access: AccessSpec {
+                base_dir: root.to_path_buf(),
+                read_roots: vec![root.to_path_buf()],
+                write_roots: vec![root.to_path_buf()],
+                deny_read_roots: deny_read,
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: true,
+            sandbox_shell: true,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            protected_paths: Vec::new(),
+        }
+    }
+
+    /// A deny mask deep inside a writable bind moves with a renamed
+    /// intermediate directory, and the denied pathname can then be recreated.
+    /// Startup refuses it before any tool runs, as an operator error.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandboxed_denies_need_an_immutable_boundary_in_writable_mounts() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let nested = project.join(".env");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(&nested, b"secret").unwrap();
+        let alias = root.join("alias");
+        symlink(&project, &alias).unwrap();
+
+        for (deny, reason) in [
+            (nested.clone(), "two levels below the writable root"),
+            (alias, "a symlink cannot become a mount point"),
+        ] {
+            let error = match LocalMachine::new(sandboxed_config(&root, vec![deny])).await {
+                Ok(_) => panic!("{reason}: sandbox policy was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("overlaps writable shell mount"),
+                "{reason}: {error}"
+            );
+            assert_eq!(
+                crate::recovery::Recovery::of(&error),
+                crate::recovery::Recovery::Operator,
+                "{reason}"
+            );
+        }
+
+        // A direct child is its own boundary, and contains deeper denies.
+        let access = AccessPolicy::resolve(sandboxed_config(&root, vec![project, nested]).access)
+            .await
+            .unwrap();
+        validate_shell_guards(&access, &[], &[]).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn deny_write_blocks_operational_host_mounts() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let agent = root.join("agent.sock");
+        let _listener = UnixListener::bind(&agent).unwrap();
+        let host_shell = crate::host_services::HostShell {
+            mounts: vec![
+                crate::host_services::HostMount::new(
+                    agent.clone(),
+                    PathBuf::from("/tmp/ssh-agent.sock"),
+                    crate::host_services::HostMountKind::Socket,
+                )
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let access = AccessPolicy::resolve(AccessSpec {
+            base_dir: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: Vec::new(),
+            deny_read_roots: Vec::new(),
+            deny_write_roots: vec![agent],
+            unrestricted_fs: false,
+        })
+        .await
+        .unwrap();
+
+        // A read-only bind of a socket still connects; deny-write must hold.
+        let error = validate_host_mount_policy(&access, &host_shell, &[]).unwrap_err();
+        assert!(error.to_string().contains("denied or protected"), "{error}");
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
     }
 }

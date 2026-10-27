@@ -133,8 +133,7 @@ pub async fn run(
     let Some(session) = startup_or_cancelled(&cancellation, session_builder.connect()).await else {
         return Ok(());
     };
-    let mut session = session
-        .context("failed to connect to ngrok; set NGROK_AUTHTOKEN or NGROK_AUTHTOKEN_FILE")?;
+    let mut session = session.map_err(ngrok_connect_error)?;
 
     let mut endpoint = session.http_endpoint();
     endpoint.binding(Binding::Public);
@@ -273,6 +272,21 @@ pub async fn run(
     };
     drop(tunnel);
     merge_primary_and_cleanup(primary, cleanup)
+}
+
+/// Only ngrok's answer to authentication points at the token, not a network
+/// failure on the way. It stays restartable: ngrok also rejects transient
+/// conditions such as a lingering prior session.
+fn ngrok_connect_error(error: ngrok::session::ConnectError) -> anyhow::Error {
+    use ngrok::session::{ConnectError, RpcError};
+
+    let context = match error {
+        ConnectError::Auth(RpcError::Response(_)) => {
+            "ngrok rejected the session; check NGROK_AUTHTOKEN or NGROK_AUTHTOKEN_FILE"
+        }
+        _ => "failed to connect to ngrok",
+    };
+    anyhow::Error::new(error).context(context)
 }
 
 pub(super) const HTTP_SHUTDOWN_BUDGET_SECS: u64 = 5;
@@ -1824,6 +1838,29 @@ mod tests {
             .unwrap();
         assert!(cancellation.is_cancelled());
         assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn only_an_ngrok_authentication_answer_blames_the_token() {
+        use ngrok::session::{ConnectError, RpcError};
+
+        let token_hint = "check NGROK_AUTHTOKEN";
+        let rejected = ngrok_connect_error(ConnectError::Auth(RpcError::Response(
+            "authentication failed\nERR_NGROK_107".into(),
+        )));
+        assert!(rejected.to_string().contains(token_hint));
+
+        for unreachable in [
+            ConnectError::Auth(RpcError::Send(io::Error::other("connection reset"))),
+            ConnectError::Tcp(io::Error::other("network unreachable")),
+        ] {
+            let error = ngrok_connect_error(unreachable);
+            assert_eq!(error.to_string(), "failed to connect to ngrok");
+        }
+        assert_eq!(
+            crate::recovery::Recovery::of(&rejected),
+            crate::recovery::Recovery::Process
+        );
     }
 
     #[tokio::test]

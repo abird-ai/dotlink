@@ -11,6 +11,7 @@
 }: let
   inherit (lib) mkOption types;
   cfg = config.services.dotlink;
+  systemdVersion = lib.getVersion config.systemd.package;
 
   commonOptions = {
     enableDefault,
@@ -331,6 +332,7 @@
       ["ngrok-authtoken:${instance.credentials.ngrokAuthTokenFile}"];
     serviceEnv =
       instance.environment
+      // {DOTLINK_SUPERVISOR = "systemd";}
       // lib.optionalAttrs (instance.sshAgentSocket != null) {
         DOTLINK_SSH_AGENT_SOCKET = instance.sshAgentSocket;
       }
@@ -348,6 +350,9 @@
     wantedBy = ["multi-user.target"];
     wants = ["network-online.target"];
     after = ["network-online.target"];
+    # Dotlink retries recoverable transport failures in-process; systemd
+    # restarts the process with exponential backoff instead of a start fuse.
+    startLimitIntervalSec = 0;
     path =
       instance.extraPackages
       ++ lib.optionals (instance.hostAccess.nixDaemon || instance.hostAccess.nixConfig) [pkgs.nix]
@@ -361,9 +366,18 @@
         SetLoginEnvironment = true;
         WorkingDirectory = instance.workingDirectory;
         ExecStart = "${lib.getExe instance.package} ${lib.concatStringsSep " " args}";
-        Restart = "on-failure";
-        RestartSec = "5s";
+        # Exit 2 (usage) and 78 (CONFIG) need the operator. Restart=always
+        # also covers clean exits/signals; systemd stop/restart jobs suppress it.
+        # Delays start at 2s and double to 10min. RESTART_RESET=1 needs NotifyAccess.
+        Restart = "always";
+        RestartPreventExitStatus = "2 CONFIG";
+        RestartSec = "2s";
+        RestartSteps = 8;
+        RestartMaxDelaySec = "10min";
+        NotifyAccess = "main";
         TimeoutStopSec = "15s";
+        # Stop and restart reach every descendant, sandboxed or not.
+        KillMode = "control-group";
         KillSignal = "SIGTERM";
         StandardInput = "null";
         StandardOutput = "journal";
@@ -401,8 +415,21 @@ in {
     };
 
   config = lib.mkIf cfg.enable {
+    warnings =
+      lib.optional (
+        !lib.versionOlder systemdVersion "255"
+        && lib.versionOlder systemdVersion "258"
+      )
+      "services.dotlink: systemd ${systemdVersion} ignores RESTART_RESET=1, so healthy runs never reset restart backoff; delays stay at up to 10 minutes until an explicit restart. Use systemd 258 or newer.";
+
     assertions =
-      (lib.mapAttrsToList (name: instance: {
+      [
+        {
+          assertion = !lib.versionOlder systemdVersion "255";
+          message = "services.dotlink requires systemd 255 or newer (RestartSteps/RestartMaxDelaySec require 254; SetLoginEnvironment requires 255), but systemd ${systemdVersion} is configured.";
+        }
+      ]
+      ++ (lib.mapAttrsToList (name: instance: {
           assertion =
             instance.workingDirectory
             != null

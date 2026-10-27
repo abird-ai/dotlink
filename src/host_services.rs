@@ -53,6 +53,14 @@ pub enum HostMountKind {
     CharacterDevice,
 }
 
+impl HostMountKind {
+    /// Sockets and devices grant operations, not data: a read-only bind still
+    /// connects or issues ioctls, so deny-write must block them as well.
+    pub fn is_operational(self) -> bool {
+        matches!(self, Self::Socket | Self::CharacterDevice)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HostShell {
     pub mounts: Vec<HostMount>,

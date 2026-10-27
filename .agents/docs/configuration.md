@@ -29,7 +29,15 @@ Private control-plane files use symmetric read/write ceilings: profiles up to
 up to 16 KiB. Writes are serialized and checked before their atomic commit, so
 dotlink never persists a file it cannot reload. Unix readers open nonblocking
 and reject FIFOs/devices before reading; oversized, malformed or special files
-fail clearly without unbounded buffering or startup hangs.
+fail clearly without unbounded buffering or startup hangs. Protected paths and
+deny rules retain both the normalized lexical path and resolved target,
+including a missing target behind a dangling symlink. Sandboxed shell startup
+rejects (exit 78) a protected or denied path inside a writable bind unless it
+lies below an existing, non-symlink deny that is a direct child of the bind:
+for `allow_rw: ["~/src"]`, deny `~/src/app` rather than `~/src/app/.env`, or
+narrow the grant to `~/src/app`. Cache and host remapping cannot bypass
+protected or denied roots; cache deny-write overlap downgrades the complete
+cache to read-only.
 
 Profiles are JSONC: comments and trailing commas are allowed. OpenAI Runtime keys are stored separately and never serialized into the profile. The optional `runtime_key_revision` and `owner_password_revision` fields are opaque selectors: setup stages immutable credential generations before atomically selecting them with the JSONC rename. A crash before selection keeps the previous key and owner password live; legacy profiles without selectors keep using `runtime[.<profile>].key` and the original OAuth owner hash. After a durable credential rotation, obsolete generations are pruned, retaining the active and immediately preceding secrets; unrelated profile edits do not retire credentials potentially in use by running processes. Failed cleanup warns but never turns an already-committed edit into an error. Legacy profiles continue to load unchanged. A missing, empty, oversized, special or unreadable selected Runtime key fails closed when OpenAI executes, but profile inspection/mutation remains usable and can atomically replace it. Interrupted profile deletion is retryable even when only orphaned generated keys remain. OAuth owner-password hashes, approved DCR clients, and hashed refresh grants are stored in the private OAuth state file rather than JSONC. On Unix dotlink-owned config/state directories are mode `0700` and private files are `0600`.
 

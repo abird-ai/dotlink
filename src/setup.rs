@@ -620,18 +620,49 @@ pub(crate) fn inspection_permissions(profile: Option<&str>) -> Result<Permission
     }
 }
 
-fn load_profile_for_edit(profile: Option<&str>) -> Result<Option<AppConfig>> {
-    let Some(mut config) = read_profile_config_migrated(profile)? else {
-        return Ok(None);
-    };
+struct ProfileEditSnapshot {
+    editable: Option<AppConfig>,
+    baseline: Option<AppConfig>,
+}
+
+impl ProfileEditSnapshot {
+    /// Pair the editor input and non-secret CAS baseline from one profile read.
+    fn from_profile_read(
+        persisted: Option<AppConfig>,
+        selected_runtime_key: Option<String>,
+    ) -> Self {
+        let mut editable = persisted.clone();
+        if let Some(config) = editable.as_mut() {
+            config.runtime_api_key = selected_runtime_key.unwrap_or_default();
+        }
+        Self {
+            editable,
+            baseline: persisted,
+        }
+    }
+
+    fn ensure_unchanged(&self, current: &Option<AppConfig>) -> Result<()> {
+        if serde_json::to_value(current)? != serde_json::to_value(&self.baseline)? {
+            bail!("profile changed during setup; rerun setup to avoid overwriting another edit");
+        }
+        Ok(())
+    }
+}
+
+fn load_profile_for_edit(profile: Option<&str>) -> Result<ProfileEditSnapshot> {
+    let persisted = read_profile_config_migrated(profile)?;
     // Management remains usable when the selected Runtime key is missing,
     // malformed, oversized or unreadable. The editor can replace it; actual
     // execution uses the strict mode below and never weakens this failure.
-    config.runtime_api_key =
-        read_selected_runtime_key(&config, profile, RuntimeKeyReadMode::Management)?
-            .map(|source| source.secret().to_owned())
-            .unwrap_or_default();
-    Ok(Some(config))
+    let selected_runtime_key = match persisted.as_ref() {
+        Some(config) => read_selected_runtime_key(config, profile, RuntimeKeyReadMode::Management)?
+            .map(|source| source.secret().to_owned()),
+        None => None,
+    };
+    Ok(ProfileEditSnapshot::from_profile_read(
+        persisted,
+        selected_runtime_key,
+    ))
 }
 
 pub async fn load_or_setup(
@@ -693,8 +724,8 @@ pub async fn load_or_setup(
         );
     }
 
-    let existing = load_profile_for_edit(profile)?;
-    interactive_setup(profile, color, existing).await
+    let edit = load_profile_for_edit(profile)?;
+    interactive_setup(profile, color, edit).await
 }
 
 fn secret_env_connection(
@@ -778,7 +809,7 @@ fn apply_env_overrides(
 
 async fn command_path(program: &str, args: &[&str]) -> Option<PathBuf> {
     let mut command = Command::new(program);
-    command
+    crate::credentials::hide_from_child(&mut command)
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -1156,7 +1187,7 @@ fn setup_style(color: bool, code: &str, text: impl AsRef<str>) -> String {
 async fn interactive_setup(
     profile: Option<&str>,
     color: bool,
-    existing: Option<AppConfig>,
+    mut edit: ProfileEditSnapshot,
 ) -> Result<Option<SetupResult>> {
     println!();
     println!("{}", setup_style(color, "1;36", "abird dotlink setup"));
@@ -1186,10 +1217,13 @@ async fn interactive_setup(
         println!();
     }
 
-    // Remember only the persisted, nonsecret profile snapshot. A long
-    // interactive setup must not overwrite a concurrent profile manager edit.
-    let persisted_before = read_profile_config(profile)?;
-    let mut config = existing.unwrap_or_else(default_app_config);
+    // This validation used to happen during a second profile read here. Keep
+    // it without reopening the stale-editor/fresh-baseline race: the editable
+    // config and non-secret CAS baseline both came from edit's one read.
+    if let Some(persisted) = edit.baseline.as_ref() {
+        validate_config_structure(persisted)?;
+    }
+    let mut config = edit.editable.take().unwrap_or_else(default_app_config);
     let previous = config.clone();
     let current_transports = config.transports.clone();
 
@@ -1659,9 +1693,7 @@ async fn interactive_setup(
     // other profile writers cannot overwrite or select half-staged state.
     let _profile_lock = profile_lock(profile)?;
     let persisted_now = read_profile_config(profile)?;
-    if serde_json::to_value(&persisted_now)? != serde_json::to_value(&persisted_before)? {
-        bail!("profile changed during setup; rerun setup to avoid overwriting another edit");
-    }
+    edit.ensure_unchanged(&persisted_now)?;
     if let Some(change) = owner_password_change.as_ref() {
         change.apply()?;
         // The referenced OAuth generation must survive a crash before the
@@ -2504,8 +2536,9 @@ fn profile_target(name: &str) -> Result<Option<&str>> {
 
 fn require_profile(name: &str) -> Result<(Option<&str>, AppConfig)> {
     let target = profile_target(name)?;
-    let config =
-        load_profile_for_edit(target)?.ok_or_else(|| anyhow!("profile {name:?} does not exist"))?;
+    let config = load_profile_for_edit(target)?
+        .editable
+        .ok_or_else(|| anyhow!("profile {name:?} does not exist"))?;
     Ok((target, config))
 }
 
@@ -2594,19 +2627,23 @@ pub async fn create_profile(name: &str, color: bool) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!("profile creation is interactive; run it in a terminal");
     }
-    Ok(interactive_setup(target, color, None).await?.is_some())
+    let edit = load_profile_for_edit(target)?;
+    if edit.editable.is_some() {
+        bail!("profile {name:?} already exists");
+    }
+    Ok(interactive_setup(target, color, edit).await?.is_some())
 }
 
 pub async fn edit_profile(name: &str, color: bool) -> Result<bool> {
     let target = profile_target(name)?;
-    let existing =
-        load_profile_for_edit(target)?.ok_or_else(|| anyhow!("profile {name:?} does not exist"))?;
+    let edit = load_profile_for_edit(target)?;
+    if edit.editable.is_none() {
+        bail!("profile {name:?} does not exist");
+    }
     if !io::stdin().is_terminal() {
         bail!("profile editing is interactive; run it in a terminal");
     }
-    Ok(interactive_setup(target, color, Some(existing))
-        .await?
-        .is_some())
+    Ok(interactive_setup(target, color, edit).await?.is_some())
 }
 
 fn delete_profile_artifacts(name: &str, config: &Path, key: &Path) -> Result<()> {
@@ -3283,6 +3320,68 @@ mod tests {
             max_read_bytes: 1024,
             max_write_bytes: 1024,
         }
+    }
+
+    #[test]
+    fn profile_edit_snapshot_rejects_former_stale_editor_fresh_baseline_race() {
+        let mut stale = example_config();
+        stale.runtime_api_key.clear();
+        stale.organization_id = Some("org-before".to_owned());
+
+        let snapshot = ProfileEditSnapshot::from_profile_read(
+            Some(stale.clone()),
+            Some("management-read-key".to_owned()),
+        );
+        let editable = snapshot.editable.as_ref().unwrap();
+        assert_eq!(editable.organization_id.as_deref(), Some("org-before"));
+        assert_eq!(editable.runtime_api_key, "management-read-key");
+        assert!(
+            snapshot
+                .baseline
+                .as_ref()
+                .unwrap()
+                .runtime_api_key
+                .is_empty()
+        );
+        snapshot.ensure_unchanged(&Some(stale.clone())).unwrap();
+
+        // The old two-read flow could pair this stale editor with `concurrent`
+        // as its fresh baseline and then accept it at commit time.
+        let mut concurrent = stale;
+        concurrent.organization_id = Some("org-concurrent".to_owned());
+        let error = snapshot.ensure_unchanged(&Some(concurrent)).unwrap_err();
+        assert!(error.to_string().contains("profile changed during setup"));
+    }
+
+    #[test]
+    fn absent_profile_edit_snapshot_rejects_concurrent_creation() {
+        let snapshot = ProfileEditSnapshot::from_profile_read(None, None);
+        snapshot.ensure_unchanged(&None).unwrap();
+
+        let error = snapshot
+            .ensure_unchanged(&Some(example_config()))
+            .unwrap_err();
+        assert!(error.to_string().contains("profile changed during setup"));
+    }
+
+    #[test]
+    fn profile_edit_snapshot_rejects_concurrent_credential_rotations() {
+        let mut initial = example_config();
+        initial.runtime_api_key.clear();
+        initial.runtime_key_revision = Some("a".repeat(32));
+        initial.owner_password_revision = Some("b".repeat(32));
+        let snapshot = ProfileEditSnapshot::from_profile_read(
+            Some(initial.clone()),
+            Some("selected-key".to_owned()),
+        );
+
+        let mut runtime_rotated = initial.clone();
+        runtime_rotated.runtime_key_revision = Some("c".repeat(32));
+        assert!(snapshot.ensure_unchanged(&Some(runtime_rotated)).is_err());
+
+        let mut owner_rotated = initial;
+        owner_rotated.owner_password_revision = Some("d".repeat(32));
+        assert!(snapshot.ensure_unchanged(&Some(owner_rotated)).is_err());
     }
 
     #[test]
