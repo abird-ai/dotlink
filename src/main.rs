@@ -904,12 +904,21 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
-    eprintln!("Error: {error:?}");
     let recovery = Recovery::of(&error);
-    if recovery == Recovery::Operator
-        && let Some(hint) = supervisor.operator_hint()
-    {
-        eprintln!("{hint}");
+    if recovery == Recovery::Unconfigured {
+        // Setup is pending, not broken: report it as a notice and leave the
+        // failure hint to the classes that need an operator to fix something.
+        eprintln!("{error:?}");
+        if let Some(hint) = supervisor.unconfigured_hint() {
+            eprintln!("{hint}");
+        }
+    } else {
+        eprintln!("Error: {error:?}");
+        if recovery == Recovery::Operator
+            && let Some(hint) = supervisor.operator_hint()
+        {
+            eprintln!("{hint}");
+        }
     }
     recovery.exit_code()
 }

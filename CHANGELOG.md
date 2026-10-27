@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Unconfigured services stop cleanly. A service with no saved profile, no explicit
+  configuration and non-interactive stdin now exits `NOTCONFIGURED` (6) instead of
+  `CONFIG` (78), prints a notice rather than an error, and carries a supervisor hint
+  that the stop is clean. The NixOS unit declares `SuccessExitStatus=NOTCONFIGURED`
+  and `RestartPreventExitStatus=2 CONFIG NOTCONFIGURED`, so a host that has not run
+  `dotlink --setup` yet leaves the unit inactive instead of failing activation and
+  rolling back a fleet deploy. Invalid profiles, policies and credentials still exit
+  `CONFIG` and still fail loudly.
+
 ## [0.11.0] - 2026-10-27
 
 ### Changed

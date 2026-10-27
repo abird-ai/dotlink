@@ -47,6 +47,13 @@ impl Supervisor {
         )
     }
 
+    /// Setup is pending; the unit stops cleanly rather than failing.
+    pub fn unconfigured_hint(&self) -> Option<&'static str> {
+        self.systemd.then_some(
+            "systemd stops this unit cleanly, not as a failure; run 'dotlink --setup' as the service user, then restart it.",
+        )
+    }
+
     /// After ten minutes of uptime, let systemd's crash backoff start over.
     pub fn schedule_restart_reset(&self) {
         if self.systemd {

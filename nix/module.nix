@@ -366,11 +366,15 @@
         SetLoginEnvironment = true;
         WorkingDirectory = instance.workingDirectory;
         ExecStart = "${lib.getExe instance.package} ${lib.concatStringsSep " " args}";
-        # Exit 2 (usage) and 78 (CONFIG) need the operator. Restart=always
-        # also covers clean exits/signals; systemd stop/restart jobs suppress it.
-        # Delays start at 2s and double to 10min. RESTART_RESET=1 needs NotifyAccess.
+        # Exit 2 (usage) and 78 (CONFIG) need the operator. Exit 6
+        # (NOTCONFIGURED) means first-run setup has not run yet: it is a clean
+        # stop, so an unprovisioned host never fails its own switch.
+        # Restart=always also covers clean exits/signals; systemd stop/restart
+        # jobs suppress it. Delays start at 2s and double to 10min.
+        # RESTART_RESET=1 needs NotifyAccess.
         Restart = "always";
-        RestartPreventExitStatus = "2 CONFIG";
+        RestartPreventExitStatus = "2 CONFIG NOTCONFIGURED";
+        SuccessExitStatus = "NOTCONFIGURED";
         RestartSec = "2s";
         RestartSteps = 8;
         RestartMaxDelaySec = "10min";

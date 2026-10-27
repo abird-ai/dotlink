@@ -719,9 +719,11 @@ pub async fn load_or_setup(
         let profile_hint = profile
             .map(|name| format!(" --profile {name}"))
             .unwrap_or_default();
-        bail!(
-            "dotlink needs first-run setup, but stdin is not interactive. Run 'dotlink --setup{profile_hint}' in a terminal first"
-        );
+        // Setup is pending, not broken: a supervisor must stop cleanly here
+        // instead of failing the service and the switch that started it.
+        return Err(crate::recovery::unconfigured(anyhow!(
+            "dotlink is not configured yet: no profile is saved and stdin is not interactive. Run 'dotlink --setup{profile_hint}' in a terminal first"
+        )));
     }
 
     let edit = load_profile_for_edit(profile)?;

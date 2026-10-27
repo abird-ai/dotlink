@@ -4,7 +4,9 @@
 //! message. Unclassified errors default to [`Recovery::Process`], so a missing
 //! or lost tag fails safe: a supervisor retries with backoff instead of leaving
 //! the service down. Reserve [`Recovery::Operator`] for failures that retrying
-//! unchanged provably cannot fix.
+//! unchanged provably cannot fix. [`Recovery::Unconfigured`] is not a failure:
+//! it reports that first-run setup has not run yet, so a supervisor stops
+//! instead of failing.
 //!
 //! A tag wraps the error: the tagged head stays visible in messages but not to
 //! `chain()` downcasts, and a captured backtrace starts at the tag. Tag a
@@ -15,6 +17,9 @@ use std::{error::Error as StdError, fmt, io, process::ExitCode};
 /// sysexits `EX_CONFIG`; systemd names it `CONFIG`.
 pub const EXIT_OPERATOR: u8 = 78;
 
+/// systemd's `NOTCONFIGURED`: first-run setup is still pending.
+pub const EXIT_NOTCONFIGURED: u8 = 6;
+
 /// Next step after a runtime failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Recovery {
@@ -24,6 +29,9 @@ pub enum Recovery {
     Process,
     /// Exit `CONFIG`: configuration, credentials or the binary must change.
     Operator,
+    /// Exit `NOTCONFIGURED`: no profile exists yet, so setup is pending. Nothing
+    /// is broken; a supervisor treats it as a clean stop, not a failure.
+    Unconfigured,
 }
 
 impl Recovery {
@@ -50,6 +58,7 @@ impl Recovery {
     pub fn exit_code(self) -> ExitCode {
         match self {
             Self::Operator => ExitCode::from(EXIT_OPERATOR),
+            Self::Unconfigured => ExitCode::from(EXIT_NOTCONFIGURED),
             Self::Runtime { .. } | Self::Process => ExitCode::FAILURE,
         }
     }
@@ -58,6 +67,11 @@ impl Recovery {
 /// `Recovery::Operator.tag(error)`, shaped for `map_err`.
 pub fn operator(error: impl Into<anyhow::Error>) -> anyhow::Error {
     Recovery::Operator.tag(error)
+}
+
+/// `Recovery::Unconfigured.tag(error)`, shaped for `map_err`.
+pub fn unconfigured(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    Recovery::Unconfigured.tag(error)
 }
 
 /// A failure to resolve configuration from local state needs the operator,
@@ -166,11 +180,18 @@ mod tests {
 
         let classified = config_failure(Recovery::Process.tag(anyhow!("secret changed")));
         assert_eq!(Recovery::of(&classified), Recovery::Process);
+
+        let pending = config_failure(unconfigured(anyhow!("no profile yet")));
+        assert_eq!(Recovery::of(&pending), Recovery::Unconfigured);
     }
 
     #[test]
     fn only_operator_failures_exit_config() {
         assert_eq!(Recovery::Operator.exit_code(), ExitCode::from(78));
+        assert_eq!(
+            Recovery::Unconfigured.exit_code(),
+            ExitCode::from(EXIT_NOTCONFIGURED)
+        );
         assert_eq!(Recovery::Process.exit_code(), ExitCode::FAILURE);
         assert_eq!(
             Recovery::Runtime {
@@ -186,5 +207,6 @@ mod tests {
             .restarts_runtime()
         );
         assert!(!Recovery::Process.restarts_runtime());
+        assert!(!Recovery::Unconfigured.restarts_runtime());
     }
 }

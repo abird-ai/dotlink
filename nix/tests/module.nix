@@ -151,7 +151,8 @@
   hasSupervisionPolicy = service:
     (service.startLimitIntervalSec == 0)
     && service.serviceConfig.Restart == "always"
-    && service.serviceConfig.RestartPreventExitStatus == "2 CONFIG"
+    && service.serviceConfig.RestartPreventExitStatus == "2 CONFIG NOTCONFIGURED"
+    && service.serviceConfig.SuccessExitStatus == "NOTCONFIGURED"
     && service.serviceConfig.RestartSec == "2s"
     && service.serviceConfig.RestartSteps == 8
     && service.serviceConfig.RestartMaxDelaySec == "10min"

@@ -787,7 +787,7 @@ services.dotlink.credentials.runtimeApiKeyFile =
   config.sops.secrets.dotlink-runtime.path;
 ~~~
 
-Omitting this option retains the user's saved Runtime key. `credentials.ngrokAuthTokenFile` works similarly. There are also `instances.<name>` for independent named services, `extraPackages` for shell tools, and `logging.verbosity = "lifecycle" | "tools" | "requests"` (default: lifecycle). The service disables stdio MCP, gracefully handles SIGTERM, and logs to journald. Exits 2 and 78 stay stopped until fixed and explicitly restarted; any other termination, including exit 0 or a clean signal outside a systemd stop/restart job, restarts with exponential backoff up to 10 minutes. Explicit `systemctl stop` remains stopped. The module requires systemd 255 or newer and warns on 255–257 because backoff reset notifications require 258:
+Omitting this option retains the user's saved Runtime key. `credentials.ngrokAuthTokenFile` works similarly. There are also `instances.<name>` for independent named services, `extraPackages` for shell tools, and `logging.verbosity = "lifecycle" | "tools" | "requests"` (default: lifecycle). The service disables stdio MCP, gracefully handles SIGTERM, and logs to journald. Exits 2 and 78 stay stopped until fixed and explicitly restarted; exit 6 (`NOTCONFIGURED`, setup still pending) also stays stopped but counts as a clean stop, so an unprovisioned host never fails its own activation; any other termination, including exit 0 or a clean signal outside a systemd stop/restart job, restarts with exponential backoff up to 10 minutes. Explicit `systemctl stop` remains stopped. The module requires systemd 255 or newer and warns on 255–257 because backoff reset notifications require 258:
 
 ~~~bash
 systemctl status dotlink

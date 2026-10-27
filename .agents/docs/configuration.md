@@ -49,6 +49,8 @@ Running `dotlink --serialize` (or `-s`) executes all MCP calls sequentially with
 
 ## Setup flow
 
+Setup is interactive. A process with no saved profile, no `settings`/`configFile` and no explicit connection environment exits `NOTCONFIGURED` (systemd's code 6) with a notice naming `dotlink --setup`; nothing is misconfigured, so supervisors stop it cleanly instead of treating it as a failure. Invalid or unreachable configuration still exits `CONFIG` (78).
+
 Transport selection accepts `1`/openai, `2`/stdio, `3`/http, comma-separated combinations, or `all`. `0`, `none`, `cancel`, `q`, and `quit` cancel setup successfully without saving.
 
 When HTTP is selected, setup can persist:
