@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `bedit` retains its documented 64 MiB source/result ceiling with a streamed, descriptor-pinned update: source and output SHA-256 verification, original-offset range splicing and atomic staging use fixed-size IO buffers rather than two full file copies. Both Unix and Windows staging use the same write-producer API, preserve file permissions, and remove failed temporaries. Identical edits preserve the original mtime.
 - `patch` borrows unchanged source lines instead of allocating one owned string per line. Scratch line-index bytes are charged independently of the resulting file's write limit; projected line-index and output growth are checked before each hunk allocates replacements. Dense-line files no longer fail merely because a small write ceiling was confused with the temporary-memory budget.
 
+## [0.13.1] - 2026-10-28
+
 ### Changed
 
 - Multi-file text `edit` now permits 512 operations and 64 distinct files per call, both from two shared constants. Its wire decoder, advertised `maxItems`/description, planner, and TOOL-log preview use the same bounds; invalid oversized batches stop during decoding and cannot trigger quadratic log work.
