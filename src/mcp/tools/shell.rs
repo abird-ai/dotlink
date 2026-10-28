@@ -11,11 +11,14 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::{
     ErrorData as McpError,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ProgressNotificationParam, ProgressToken, Tool},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, CreateTaskResult,
+        ProgressNotificationParam, ProgressToken, Tool,
+    },
     schemars,
     service::{Peer, RequestContext, RoleServer},
     tool, tool_router,
@@ -30,39 +33,46 @@ use tokio::{
 };
 use tokio_util::task::AbortOnDropHandle;
 
-use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
-use crate::mcp::AccessNeed;
+use super::{LocalMachine, dot, resolve_capped, tool_error};
 #[cfg(target_os = "linux")]
-use crate::mcp::AccessPolicy;
+use crate::mcp::{
+    AccessPolicy, ShellGuards, guard_identities, validate_host_mount_policy, validate_shell_guards,
+};
+use crate::{
+    jobs::{JobCompletion, JobHandle, JobResultContext, JobStatus, JobWait, StreamSummary},
+    mcp::RuntimeConfig,
+};
 #[cfg(target_os = "linux")]
 use std::{collections::BTreeSet, path::Component};
 
-/// The client picks `timeout_secs`; the profile ceiling only bounds it and is
-/// the fallback when the caller omits it.
+/// The client picks the command execution timeout; the profile ceiling bounds
+/// it and is the fallback when omitted. Transport response windows never
+/// rewrite this execution lifetime.
 fn resolve_shell_timeout(requested: Option<u64>, ceiling: u64) -> u64 {
     resolve_capped(requested, ceiling)
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ShellArgs {
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShellArgs {
     /// Command string to execute.
-    command: String,
+    pub(crate) command: String,
 
     /// Working directory. Relative paths resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]
-    dir: String,
+    pub(crate) dir: String,
 
     /// Optional stdin text passed to the process.
     #[serde(default)]
-    stdin: Option<String>,
+    pub(crate) stdin: Option<String>,
 
-    /// Timeout in seconds. Defaults to the client's response window when the transport provides one, else the profile ceiling (max_shell_timeout_secs); clamped to that ceiling.
+    /// Command execution timeout in seconds. Defaults to the profile max_shell_timeout_secs ceiling and is capped there. Transport response windows only control how long the caller waits before the same durable execution is handed off.
     #[serde(default)]
-    timeout_secs: Option<u64>,
+    pub(crate) timeout_secs: Option<u64>,
 
     /// Output byte limit per stream. Defaults to the profile ceiling (max_output_bytes); clamped to it.
     #[serde(default)]
-    max_output_bytes: Option<usize>,
+    pub(crate) max_output_bytes: Option<usize>,
 }
 
 /// Shell progress is a bare heartbeat: the caller cannot know how much of an
@@ -130,12 +140,14 @@ async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
-        "Timeout in seconds. Defaults to the client's response window when the transport provides one, else {max_secs}; capped at {max_secs}."
+        "Execution timeout in seconds. Defaults to {max_secs} and is capped there. Transport response windows do not shorten execution: a command that is still running when the caller's synchronous window closes continues as the same durable job/task."
     )
 }
 
 fn shell_output_description(max_bytes: usize) -> String {
-    format!("Output byte limit per stream. Defaults to {max_bytes} and is capped there.")
+    format!(
+        "Ordinary shell-result byte limit per stream. Defaults to {max_bytes} and is capped there. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same job/task handle and its retained output is paged with job_output."
+    )
 }
 
 /// Tool schemas are static, the policy ceilings are not. Replace the limit
@@ -154,37 +166,95 @@ pub(crate) fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usiz
     ] {
         if let Some(Value::Object(property)) = properties.get_mut(key) {
             property.insert("description".to_owned(), Value::String(description));
+            property.insert(
+                "maximum".to_owned(),
+                Value::from(if key == "timeout_secs" {
+                    max_secs
+                } else {
+                    max_bytes as u64
+                }),
+            );
         }
     }
     tool.input_schema = Arc::new(schema);
     tool
 }
 
-async fn drain_capped<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+/// Drain a long-running job stream directly into its private spool file. The
+/// stored prefix is bounded independently of response paging, while the pipe is
+/// always fully drained so a noisy child can never deadlock on a full pipe.
+async fn spool_job_output<R>(
+    mut reader: R,
+    path: PathBuf,
+    job: JobHandle,
+) -> std::io::Result<StreamSummary>
 where
     R: AsyncRead + Unpin,
 {
-    let mut kept = Vec::with_capacity(limit.min(64 * 1024));
-    let mut buffer = [0_u8; 8192];
+    let cap = crate::jobs::spool_limit();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total = 0_u64;
+    let mut stored = 0_u64;
     let mut truncated = false;
-
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-
-        let remaining = limit.saturating_sub(kept.len());
-        if remaining > 0 {
-            let copy_len = remaining.min(read);
-            kept.extend_from_slice(&buffer[..copy_len]);
+        total = total.saturating_add(read as u64);
+        let remaining = cap.saturating_sub(stored);
+        let wanted = remaining.min(read as u64);
+        let reserved = job.reserve_spool(wanted);
+        let keep = usize::try_from(reserved).unwrap_or(read);
+        if keep > 0 {
+            let mut written = 0_usize;
+            while written < keep {
+                match file.write(&buffer[written..keep]).await {
+                    Ok(0) => {
+                        job.release_spool(reserved.saturating_sub(written as u64));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "job spool write made no progress",
+                        ));
+                    }
+                    Ok(count) => written += count,
+                    Err(error) => {
+                        // Successful prefix writes remain charged; release only
+                        // the bytes that never reached the spool file.
+                        job.release_spool(reserved.saturating_sub(written as u64));
+                        return Err(error);
+                    }
+                }
+            }
+            // Flush each received chunk: a failed tunnel request may lose its
+            // response, but never bytes already accepted from the child.
+            file.flush().await?;
+            stored = stored.saturating_add(written as u64);
         }
-        if read > remaining {
+        if reserved < read as u64 {
             truncated = true;
         }
     }
+    file.flush().await?;
+    Ok(StreamSummary {
+        total_bytes: total,
+        stored_bytes: stored,
+        truncated,
+    })
+}
 
-    Ok((kept, truncated))
+fn stream_summary_from_file(path: &Path, truncated: bool) -> StreamSummary {
+    let stored = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+    StreamSummary {
+        total_bytes: stored,
+        stored_bytes: stored,
+        truncated,
+    }
 }
 
 pub(crate) fn resolve_executable(name: &str) -> Option<PathBuf> {
@@ -344,306 +414,66 @@ impl RuntimeLayout {
     }
 }
 
-impl LocalMachine {
-    async fn execute_shell(
+#[derive(Clone, Debug)]
+struct ShellRuntime {
+    config: RuntimeConfig,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    secure_fs: Arc<crate::secure_fs::SecureFs>,
+}
+
+impl ShellRuntime {
+    async fn prepare_shell_command(
         &self,
-        args: ShellArgs,
+        args: &ShellArgs,
         powershell: bool,
-        heartbeat: Option<ProgressHeartbeat>,
-    ) -> Result<CallToolResult, McpError> {
-        if args.command.trim().is_empty() {
-            return Err(McpError::invalid_params("command must not be empty", None));
-        }
+    ) -> Result<(Command, PathBuf)> {
         if let Some(stdin_text) = args.stdin.as_ref()
             && stdin_text.len() > self.config.max_write_bytes
         {
-            return Ok(tool_error(format!(
+            anyhow::bail!(
                 "stdin is {} bytes, above the {} byte limit",
                 stdin_text.len(),
                 self.config.max_write_bytes
-            )));
+            );
         }
-
-        let working_dir = match self.resolve_existing(&args.dir, AccessNeed::Read).await {
-            Ok(path) => path,
-            Err(error) => return Ok(tool_error(error)),
-        };
-        if !fs::metadata(&working_dir)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            return Ok(tool_error("dir is not a directory"));
+        let working_dir = resolve_existing_runtime(&self.config, &args.dir).await?;
+        if !fs::metadata(&working_dir).await?.is_dir() {
+            anyhow::bail!("dir is not a directory");
         }
-
-        let timeout_secs =
-            resolve_shell_timeout(args.timeout_secs, self.config.max_shell_timeout_secs);
-        let shell_program = match &self.config.shell_program {
-            Some(path) => path,
-            None => return Ok(tool_error("shell execution is disabled")),
-        };
+        let shell_program = self
+            .config
+            .shell_program
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("shell execution is disabled"))?;
 
         #[cfg(target_os = "linux")]
-        let mut command = if self.config.sandbox_shell && !powershell {
-            match self.bubblewrap_command(shell_program, &working_dir, &args.command) {
-                Ok(command) => command,
-                Err(error) => return Ok(tool_error(error)),
-            }
+        let command = if self.config.sandbox_shell && !powershell {
+            self.bubblewrap_command(shell_program, &working_dir, &args.command)?
         } else {
             direct_shell_command(shell_program, powershell, &working_dir, &args.command)
         };
         #[cfg(not(target_os = "linux"))]
-        let mut command =
-            direct_shell_command(shell_program, powershell, &working_dir, &args.command);
+        let command = direct_shell_command(shell_program, powershell, &working_dir, &args.command);
+        Ok((command, working_dir))
+    }
 
-        crate::shell_process::configure(&mut command);
-        crate::credentials::hide_from_child(&mut command)
-            .stdin(if args.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => return Ok(tool_error(error)),
-        };
-        let mut process_tree = match crate::shell_process::Guard::attach(&child) {
-            Ok(group) => group,
-            Err(error) => {
-                Self::terminate_child(&mut child).await;
-                return Ok(tool_error(format!(
-                    "could not contain command tree: {error}"
-                )));
-            }
-        };
-
-        // A configured ceiling can exceed what the clock can represent; fail
-        // the call instead of panicking on the addition.
-        let Some(deadline) = Instant::now().checked_add(Duration::from_secs(timeout_secs)) else {
-            return Ok(tool_error(format!(
-                "timeout_secs {timeout_secs} is too large to schedule"
-            )));
-        };
-        let output_limit = self.output_limit(args.max_output_bytes);
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                Self::terminate_child(&mut child).await;
-                return Ok(tool_error("failed to capture child stdout"));
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                Self::terminate_child(&mut child).await;
-                return Ok(tool_error("failed to capture child stderr"));
-            }
-        };
-        // Start draining before stdin: a child that writes before reading its
-        // stdin must never be able to fill the stdout pipe and deadlock the
-        // writer.
-        // Spawning pipe workers is safe only when their handles are owned by
-        // the request: dropping a cancelled tool call must abort all readers.
-        let stdout_task = AbortOnDropHandle::new(tokio::spawn(drain_capped(stdout, output_limit)));
-        let stderr_task = AbortOnDropHandle::new(tokio::spawn(drain_capped(stderr, output_limit)));
-
-        let (mut stdin_task, mut stdin_rx) = match args.stdin {
-            Some(stdin_text) => match child.stdin.take() {
-                Some(mut stdin) => {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let task = AbortOnDropHandle::new(tokio::spawn(async move {
-                        let result = stdin.write_all(stdin_text.as_bytes()).await;
-                        let _ = tx.send(result);
-                    }));
-                    (Some(task), Some(rx))
-                }
-                None => {
-                    Self::terminate_child(&mut child).await;
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    return Ok(tool_error("failed to capture child stdin"));
-                }
-            },
-            None => (None, None),
-        };
-
-        enum WaitOutcome {
-            Child(std::result::Result<std::process::ExitStatus, std::io::Error>),
-            Timeout,
-            StdinFailure(String),
-        }
-        let outcome = {
-            let wait = timeout_at(deadline, child.wait());
-            tokio::pin!(wait);
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut wait => break match result {
-                        Ok(result) => WaitOutcome::Child(result),
-                        Err(_) => WaitOutcome::Timeout,
-                    },
-                    result = async {
-                        match stdin_rx.as_mut() {
-                            Some(rx) => rx.await,
-                            None => std::future::pending().await,
-                        }
-                    }, if stdin_rx.is_some() => {
-                        match result {
-                            Ok(Ok(())) => {
-                                stdin_rx = None;
-                                stdin_task.take();
-                            }
-                            Ok(Err(error)) => {
-                                break WaitOutcome::StdinFailure(format!(
-                                    "failed writing stdin: {error}"
-                                ));
-                            }
-                            Err(_) => {
-                                break WaitOutcome::StdinFailure(
-                                    "stdin writer task failed".to_owned(),
-                                );
-                            }
-                        }
-                    }
-                    () = async {
-                        heartbeat_tick(heartbeat.as_ref()).await;
-                        if let Some(heartbeat) = heartbeat.as_ref() {
-                            heartbeat.report(deadline).await;
-                        }
-                    }, if heartbeat.is_some() => {}
-                }
-            }
-        };
-
-        let status = match outcome {
-            WaitOutcome::StdinFailure(message) => {
-                Self::terminate_child(&mut child).await;
-                if let Some(task) = stdin_task.take() {
-                    task.abort();
-                }
-                stdout_task.abort();
-                stderr_task.abort();
-                return Ok(tool_error(message));
-            }
-            WaitOutcome::Timeout => {
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
-                if let Some(task) = stdin_task.take() {
-                    task.abort();
-                }
-                None
-            }
-            WaitOutcome::Child(result) => match result {
-                Ok(status) => {
-                    // The child is done. A still-running stdin task has no
-                    // reader; abort it rather than letting a descendant-held
-                    // pipe delay the result.
-                    if let Some(task) = stdin_task.take() {
-                        task.abort();
-                    }
-                    Some(status)
-                }
-                Err(error) => {
-                    Self::terminate_child(&mut child).await;
-                    if let Some(task) = stdin_task.take() {
-                        task.abort();
-                    }
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    return Ok(tool_error(error));
-                }
-            },
-        };
-        let timed_out = status.is_none();
-
-        // A killed child closes its pipes; descendants may still hold them, so a
-        // timed-out call gets a short grace to salvage partial output.
-        let collect_deadline = match timed_out {
-            false => deadline,
-            true => Instant::now() + TIMEOUT_OUTPUT_GRACE,
-        };
-        let mut stdout_task = stdout_task;
-        let mut stderr_task = stderr_task;
-        let collected = timeout_at(collect_deadline, async {
-            let stdout = (&mut stdout_task).await;
-            let stderr = (&mut stderr_task).await;
-            (stdout, stderr)
+    #[cfg(target_os = "linux")]
+    fn shell_guards(&self) -> Result<ShellGuards> {
+        let access = self.config.access.refreshed()?;
+        let protected = guard_identities(&access.base_dir, &self.config.protected_paths)?;
+        let runtime =
+            RuntimeLayout::for_shell(self.config.allow_network, self.config.host_shell.ssh_agent)?;
+        validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
+        validate_host_mount_policy(&access, &self.config.host_shell, &protected)?;
+        Ok(ShellGuards {
+            access,
+            protected,
+            runtime,
         })
-        .await;
-        let collected = match collected {
-            Ok(results) => Some(results),
-            Err(_) => {
-                stdout_task.abort();
-                stderr_task.abort();
-                None
-            }
-        };
+    }
 
-        let (stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated) = match collected {
-            Some((stdout_result, stderr_result)) => {
-                let (stdout_bytes, stdout_truncated) = match stdout_result {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => {
-                        return Ok(tool_error(format!("failed reading stdout: {error}")));
-                    }
-                    Err(error) => {
-                        return Ok(tool_error(format!("stdout reader task failed: {error}")));
-                    }
-                };
-                let (stderr_bytes, stderr_truncated) = match stderr_result {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => {
-                        return Ok(tool_error(format!("failed reading stderr: {error}")));
-                    }
-                    Err(error) => {
-                        return Ok(tool_error(format!("stderr reader task failed: {error}")));
-                    }
-                };
-                (
-                    stdout_bytes,
-                    stdout_truncated,
-                    stderr_bytes,
-                    stderr_truncated,
-                )
-            }
-            None if timed_out => (Vec::new(), false, Vec::new(), false),
-            None => {
-                return Ok(tool_error(format!(
-                    "collecting command output timed out after {timeout_secs} seconds"
-                )));
-            }
-        };
-
-        let mut payload = serde_json::json!({
-            "exit_code": status.as_ref().and_then(|status| status.code()),
-            "success": status.as_ref().is_some_and(|status| status.success()),
-            "timed_out": timed_out,
-            "dir": self.config.access.relative_display(&working_dir),
-            "sandboxed": self.config.sandbox_shell,
-            "network": self.config.allow_network,
-            "stdout": String::from_utf8_lossy(&stdout_bytes),
-            "stderr": String::from_utf8_lossy(&stderr_bytes),
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-        });
-        if timed_out {
-            // Report a real MCP error so the model knows why it has no result,
-            // and keep whatever output arrived before the deadline.
-            payload["error"] = Value::String(format!(
-                "command timed out after {timeout_secs} seconds and was terminated; retry with a larger timeout_secs or run it in the background"
-            ));
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                payload.to_string(),
-            )]));
-        }
-        // A normal exit is allowed to start independent background work.
-        // Error/cancellation paths retain the guard and kill the tree.
-        process_tree.disarm();
-        Ok(ok_text(payload.to_string()))
+    fn output_limit(&self, requested: Option<usize>) -> usize {
+        resolve_capped(requested, self.config.max_output_bytes)
     }
 
     #[cfg(target_os = "linux")]
@@ -850,10 +680,592 @@ impl LocalMachine {
         }
         Ok(command)
     }
+}
 
-    /// Output ceiling for one stream: the caller picks, the profile bounds.
-    fn output_limit(&self, requested: Option<usize>) -> usize {
-        resolve_capped(requested, self.config.max_output_bytes)
+async fn resolve_existing_runtime(config: &RuntimeConfig, raw: &str) -> Result<PathBuf> {
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        config.access.base_dir.join(raw)
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .await
+        .with_context(|| format!("path does not exist: {}", candidate.display()))?;
+    if !config.access.grant_read(&canonical) || config.access.denied_read(&canonical) {
+        anyhow::bail!("read access is not allowed: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
+impl LocalMachine {
+    fn shell_runtime(&self) -> ShellRuntime {
+        ShellRuntime {
+            config: self.config.clone(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            secure_fs: self.secure_fs.clone(),
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn bubblewrap_command(
+        &self,
+        shell: &Path,
+        working_dir: &Path,
+        script: &str,
+    ) -> Result<Command> {
+        self.shell_runtime()
+            .bubblewrap_command(shell, working_dir, script)
+    }
+
+    async fn run_shell_to_completion(
+        &self,
+        args: ShellArgs,
+        powershell: bool,
+        heartbeat: Option<ProgressHeartbeat>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = match self.start_shell_job(args, powershell, None) {
+            Ok(started) => started,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        let wait = self.jobs.wait_until(&started.id, None);
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut wait => {
+                    result.map_err(crate::jobs::JobError::into_mcp)?;
+                    break;
+                }
+                () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
+                    if let Some(heartbeat) = heartbeat.as_ref() {
+                        heartbeat
+                            .report(Instant::now() + Duration::from_secs(self.config.max_shell_timeout_secs))
+                            .await;
+                    }
+                }
+            }
+        }
+        let result = self
+            .jobs
+            .tool_result(&started.id, None)
+            .map_err(crate::jobs::JobError::into_mcp)?
+            .ok_or_else(|| {
+                McpError::internal_error("local shell result unexpectedly unavailable", None)
+            })?;
+        self.jobs
+            .mark_synchronous_result(&started.id)
+            .map_err(crate::jobs::JobError::into_mcp)?;
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    async fn execute_shell(
+        &self,
+        args: ShellArgs,
+        powershell: bool,
+        heartbeat: Option<ProgressHeartbeat>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_shell_to_completion(args, powershell, heartbeat)
+            .await
+    }
+
+    fn handoff_shell_job(
+        &self,
+        id: &str,
+        native_tasks: bool,
+        result_budget: Option<usize>,
+    ) -> Result<CallToolResponse, McpError> {
+        if native_tasks
+            && let Some(task) = self
+                .jobs
+                .expose_native_task(id, self.task_result_budget(result_budget))
+                .map_err(crate::jobs::JobError::into_mcp)?
+        {
+            return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+        }
+        let receipt = self
+            .jobs
+            .expose_compatibility(id)
+            .map_err(crate::jobs::JobError::into_mcp)?;
+        Ok(CallToolResponse::Complete(receipt))
+    }
+
+    pub(crate) async fn handle_shell_call(
+        &self,
+        request: &CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Option<CallToolResponse>, McpError> {
+        self.handle_shell_call_with(
+            request,
+            self.request_sync_budget_millis(context),
+            context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks()),
+            self.request_job_key(context),
+            self.request_result_budget(context),
+            ProgressHeartbeat::for_request(context),
+        )
+        .await
+    }
+
+    async fn handle_shell_call_with(
+        &self,
+        request: &CallToolRequestParams,
+        sync_budget_millis: Option<u64>,
+        native_tasks: bool,
+        request_key: Option<String>,
+        result_budget: Option<usize>,
+        heartbeat: Option<ProgressHeartbeat>,
+    ) -> Result<Option<CallToolResponse>, McpError> {
+        let name = request.name.as_ref();
+        let explicit_background = name == "job_start";
+        if !explicit_background && !crate::mcp::is_shell_tool(name) {
+            return Ok(None);
+        }
+        if !self.has_tool_for_policy(name) {
+            return Ok(None);
+        }
+        let arguments = request.arguments.clone().unwrap_or_default();
+        let args = if explicit_background {
+            super::jobs::decode_job_start(arguments)
+        } else {
+            serde_json::from_value::<ShellArgs>(Value::Object(arguments))
+        }
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let powershell = if explicit_background {
+            cfg!(windows)
+        } else {
+            name == "powershell"
+        };
+
+        if explicit_background {
+            let started = self
+                .start_shell_job(args, powershell, request_key)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            let receipt = self
+                .jobs
+                .expose_compatibility(&started.id)
+                .map_err(crate::jobs::JobError::into_mcp)?;
+            return Ok(Some(CallToolResponse::Complete(receipt)));
+        }
+
+        // Every ordinary shell call starts exactly one durable execution. The
+        // transport decides only how long to wait for that handle. A fast
+        // command therefore remains a normal synchronous tools/call even when
+        // its requested timeout is long; a slow command keeps running after the
+        // synchronous response window closes.
+        let started = self
+            .start_shell_job(args, powershell, request_key)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        if !started.is_new {
+            let (exposed, native) = self
+                .jobs
+                .is_exposed(&started.id)
+                .map_err(crate::jobs::JobError::into_mcp)?;
+            if exposed {
+                let _ = native;
+                return self
+                    .handoff_shell_job(&started.id, native_tasks, result_budget)
+                    .map(Some);
+            }
+        }
+
+        let deadline = sync_budget_millis
+            .and_then(|millis| Instant::now().checked_add(Duration::from_millis(millis)));
+        let wait = self.jobs.wait_until(&started.id, deadline);
+        tokio::pin!(wait);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                result = &mut wait => break result.map_err(crate::jobs::JobError::into_mcp)?,
+                () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
+                    if let Some(heartbeat) = heartbeat.as_ref() {
+                        let report_deadline = deadline.unwrap_or_else(|| {
+                            Instant::now() + Duration::from_secs(self.config.max_shell_timeout_secs)
+                        });
+                        heartbeat.report(report_deadline).await;
+                    }
+                }
+            }
+        };
+        match outcome {
+            JobWait::Terminal => {
+                if let Some(result) = self
+                    .jobs
+                    .tool_result(&started.id, result_budget)
+                    .map_err(crate::jobs::JobError::into_mcp)?
+                {
+                    self.jobs
+                        .mark_synchronous_result(&started.id)
+                        .map_err(crate::jobs::JobError::into_mcp)?;
+                    return Ok(Some(CallToolResponse::Complete(result)));
+                }
+                // Execution finished, but the ordinary result cannot fit this
+                // transport response. Expose the same terminal execution for
+                // compact status + paged stdout/stderr rather than failing after
+                // side effects have already happened.
+                self.handoff_shell_job(&started.id, native_tasks, result_budget)
+                    .map(Some)
+            }
+            JobWait::Pending => self
+                .handoff_shell_job(&started.id, native_tasks, result_budget)
+                .map(Some),
+        }
+    }
+
+    pub(crate) fn start_shell_job(
+        &self,
+        args: ShellArgs,
+        powershell: bool,
+        request_key: Option<String>,
+    ) -> Result<crate::jobs::JobStart> {
+        if args.command.trim().is_empty() {
+            anyhow::bail!("command must not be empty");
+        }
+        let timeout_secs =
+            resolve_shell_timeout(args.timeout_secs, self.config.max_shell_timeout_secs);
+        let runtime = self.shell_runtime();
+        let operation_gate = (self.serialize || cfg!(windows)).then(|| self.operation_gate.clone());
+        let output_limit = runtime.output_limit(args.max_output_bytes);
+        let runner_args = args.clone();
+        crate::blocking::run(|| {
+            self.jobs.spawn(
+                timeout_secs,
+                output_limit,
+                request_key,
+                move |job| async move {
+                    // Queueing is not execution time. Acquire the topology/ordering
+                    // gate first, then resolve paths and pin mounts under that gate.
+                    let operation_guard = match operation_gate {
+                        Some(gate) => {
+                            tokio::select! {
+                                biased;
+                                _ = job.cancel.cancelled() => {
+                                    return JobCompletion::cancelled(
+                                        StreamSummary::default(),
+                                        StreamSummary::default(),
+                                    );
+                                }
+                                guard = gate.write_owned() => Some(guard),
+                            }
+                        }
+                        None => None,
+                    };
+                    if job.cancel.is_cancelled() {
+                        return JobCompletion::cancelled(
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        );
+                    }
+
+                    let (mut command, working_dir) = match runtime
+                        .prepare_shell_command(&runner_args, powershell)
+                        .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            let message = error.to_string();
+                            return JobCompletion::failed(message);
+                        }
+                    };
+                    if job.cancel.is_cancelled() {
+                        return JobCompletion::cancelled(
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        );
+                    }
+                    crate::shell_process::configure(&mut command);
+                    crate::credentials::hide_from_child(&mut command)
+                        .stdin(if runner_args.stdin.is_some() {
+                            Stdio::piped()
+                        } else {
+                            Stdio::null()
+                        })
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true);
+                    if !job.mark_running() {
+                        return JobCompletion::cancelled(
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        );
+                    }
+                    let Some(deadline) =
+                        Instant::now().checked_add(Duration::from_secs(timeout_secs))
+                    else {
+                        let message =
+                            format!("timeout_secs {timeout_secs} is too large to schedule");
+                        return JobCompletion::failed(message);
+                    };
+                    let result_context = JobResultContext {
+                        dir: runtime.config.access.relative_display(&working_dir),
+                        sandboxed: runtime.config.sandbox_shell,
+                        network: runtime.config.allow_network,
+                        timeout_secs,
+                    };
+                    let completion = LocalMachine::run_shell_job(
+                        command,
+                        runner_args.stdin,
+                        deadline,
+                        job,
+                        result_context,
+                    )
+                    .await;
+                    drop(operation_guard);
+                    completion
+                },
+            )
+        })
+    }
+
+    async fn run_shell_job(
+        mut command: Command,
+        stdin_text: Option<String>,
+        deadline: Instant,
+        job: JobHandle,
+        result_context: JobResultContext,
+    ) -> JobCompletion {
+        if Instant::now() >= deadline {
+            return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
+                .with_context(result_context);
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return JobCompletion::failed(error.to_string()).with_context(result_context);
+            }
+        };
+        let mut process_tree = match crate::shell_process::Guard::attach(&child) {
+            Ok(group) => group,
+            Err(error) => {
+                Self::terminate_child(&mut child).await;
+                return JobCompletion::failed(format!("could not contain command tree: {error}"))
+                    .with_context(result_context);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                process_tree.terminate();
+                Self::terminate_child(&mut child).await;
+                return JobCompletion::failed("failed to capture child stdout")
+                    .with_context(result_context);
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                process_tree.terminate();
+                Self::terminate_child(&mut child).await;
+                return JobCompletion::failed("failed to capture child stderr")
+                    .with_context(result_context);
+            }
+        };
+        let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
+            stdout,
+            job.stdout_path.clone(),
+            job.clone(),
+        )));
+        let mut stderr_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
+            stderr,
+            job.stderr_path.clone(),
+            job.clone(),
+        )));
+
+        let (mut stdin_task, mut stdin_rx) = match stdin_text {
+            Some(stdin_text) => match child.stdin.take() {
+                Some(mut stdin) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let task = AbortOnDropHandle::new(tokio::spawn(async move {
+                        let result = stdin.write_all(stdin_text.as_bytes()).await;
+                        let _ = tx.send(result);
+                    }));
+                    (Some(task), Some(rx))
+                }
+                None => {
+                    process_tree.terminate();
+                    Self::terminate_child(&mut child).await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return JobCompletion::failed("failed to capture child stdin")
+                        .with_context(result_context);
+                }
+            },
+            None => (None, None),
+        };
+
+        enum WaitOutcome {
+            Child(std::result::Result<std::process::ExitStatus, std::io::Error>),
+            Timeout,
+            Cancelled,
+            StdinFailure(String),
+        }
+        let outcome = {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = job.cancel.cancelled() => break WaitOutcome::Cancelled,
+                    _ = sleep_until(deadline) => break WaitOutcome::Timeout,
+                    result = &mut wait => break WaitOutcome::Child(result),
+                    result = async {
+                        match stdin_rx.as_mut() {
+                            Some(rx) => rx.await,
+                            None => std::future::pending().await,
+                        }
+                    }, if stdin_rx.is_some() => {
+                        match result {
+                            Ok(Ok(())) => {
+                                stdin_rx = None;
+                                stdin_task.take();
+                            }
+                            Ok(Err(error)) => break WaitOutcome::StdinFailure(format!("failed writing stdin: {error}")),
+                            Err(_) => break WaitOutcome::StdinFailure("stdin writer task failed".to_owned()),
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut exit_status = None;
+        let mut terminal = JobStatus::Completed;
+        let mut terminal_error = None;
+        match outcome {
+            WaitOutcome::Child(Ok(status)) => exit_status = Some(status),
+            WaitOutcome::Child(Err(error)) => {
+                terminal = JobStatus::Failed;
+                terminal_error = Some(error.to_string());
+                process_tree.terminate();
+                Self::terminate_child(&mut child).await;
+            }
+            WaitOutcome::Timeout => {
+                terminal = JobStatus::TimedOut;
+                process_tree.terminate();
+                Self::terminate_child(&mut child).await;
+            }
+            WaitOutcome::Cancelled => {
+                terminal = JobStatus::Cancelled;
+                process_tree.terminate();
+                Self::terminate_child(&mut child).await;
+            }
+            WaitOutcome::StdinFailure(message) => {
+                terminal = JobStatus::Failed;
+                terminal_error = Some(message);
+                process_tree.terminate();
+                Self::terminate_child(&mut child).await;
+            }
+        }
+        if let Some(task) = stdin_task.take() {
+            task.abort();
+        }
+
+        let collect_deadline = if terminal == JobStatus::Completed {
+            deadline
+        } else {
+            Instant::now() + TIMEOUT_OUTPUT_GRACE
+        };
+        let collected = timeout_at(collect_deadline, async {
+            let stdout = (&mut stdout_task).await;
+            let stderr = (&mut stderr_task).await;
+            (stdout, stderr)
+        })
+        .await;
+        let (stdout, stderr) = match collected {
+            Ok((stdout_result, stderr_result)) => {
+                let stdout = match stdout_result {
+                    Ok(Ok(summary)) => summary,
+                    Ok(Err(error)) => {
+                        process_tree.terminate();
+                        return JobCompletion::internal_failed(
+                            format!("failed spooling stdout: {error}"),
+                            stream_summary_from_file(&job.stdout_path, true),
+                            stream_summary_from_file(&job.stderr_path, true),
+                        )
+                        .with_context(result_context);
+                    }
+                    Err(error) => {
+                        process_tree.terminate();
+                        return JobCompletion::internal_failed(
+                            format!("stdout spool task failed: {error}"),
+                            stream_summary_from_file(&job.stdout_path, true),
+                            stream_summary_from_file(&job.stderr_path, true),
+                        )
+                        .with_context(result_context);
+                    }
+                };
+                let stderr = match stderr_result {
+                    Ok(Ok(summary)) => summary,
+                    Ok(Err(error)) => {
+                        process_tree.terminate();
+                        return JobCompletion::internal_failed(
+                            format!("failed spooling stderr: {error}"),
+                            stream_summary_from_file(&job.stdout_path, true),
+                            stream_summary_from_file(&job.stderr_path, true),
+                        )
+                        .with_context(result_context);
+                    }
+                    Err(error) => {
+                        process_tree.terminate();
+                        return JobCompletion::internal_failed(
+                            format!("stderr spool task failed: {error}"),
+                            stream_summary_from_file(&job.stdout_path, true),
+                            stream_summary_from_file(&job.stderr_path, true),
+                        )
+                        .with_context(result_context);
+                    }
+                };
+                (stdout, stderr)
+            }
+            Err(_) if terminal == JobStatus::Completed => {
+                stdout_task.abort();
+                stderr_task.abort();
+                process_tree.terminate();
+                return JobCompletion::internal_failed(
+                    format!(
+                        "collecting command output timed out after {} seconds",
+                        result_context.timeout_secs
+                    ),
+                    stream_summary_from_file(&job.stdout_path, true),
+                    stream_summary_from_file(&job.stderr_path, true),
+                )
+                .with_context(result_context);
+            }
+            Err(_) => {
+                stdout_task.abort();
+                stderr_task.abort();
+                (
+                    stream_summary_from_file(&job.stdout_path, true),
+                    stream_summary_from_file(&job.stderr_path, true),
+                )
+            }
+        };
+
+        match terminal {
+            JobStatus::Completed => {
+                let status = exit_status.expect("completed job has an exit status");
+                // A normal exit may intentionally launch independent background
+                // work. Keep containment armed until all inherited output has
+                // been collected successfully, matching synchronous shell.
+                process_tree.disarm();
+                JobCompletion::completed(status.code(), status.success(), stdout, stderr)
+                    .with_context(result_context)
+            }
+            JobStatus::TimedOut => {
+                JobCompletion::timed_out(stdout, stderr).with_context(result_context)
+            }
+            JobStatus::Cancelled => {
+                JobCompletion::cancelled(stdout, stderr).with_context(result_context)
+            }
+            JobStatus::Failed => JobCompletion::failed_with_output(
+                terminal_error.unwrap_or_else(|| "shell job failed".to_owned()),
+                stdout,
+                stderr,
+            )
+            .with_context(result_context),
+            JobStatus::Working => unreachable!(),
+        }
     }
 
     async fn terminate_child(child: &mut tokio::process::Child) {
@@ -982,7 +1394,7 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.execute_shell(args, false, ProgressHeartbeat::for_request(&context))
+        self.run_shell_to_completion(args, false, ProgressHeartbeat::for_request(&context))
             .await
     }
 
@@ -1001,7 +1413,7 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.execute_shell(args, true, ProgressHeartbeat::for_request(&context))
+        self.run_shell_to_completion(args, true, ProgressHeartbeat::for_request(&context))
             .await
     }
 }
@@ -1013,7 +1425,8 @@ mod tests {
 
     use crate::logging::LogConfig;
     use crate::mcp::{
-        AccessPolicy, AccessSpec, LocalMachine, MachineConfig, RuntimeConfig, SandboxCacheMount,
+        AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, RuntimeConfig,
+        SandboxCacheMount, TransportContextToken,
     };
 
     #[cfg(unix)]
@@ -1051,14 +1464,211 @@ mod tests {
                 max_output_bytes: max_bytes,
                 max_read_bytes: max_bytes,
                 max_write_bytes: max_bytes,
+
+                task_result_budget: None,
                 protected_paths: Vec::new(),
             },
+
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
             operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
             router: std::sync::OnceLock::new(),
             serialize: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_jobs_survive_machine_rebuild_but_die_with_the_process_session() {
+        let Some(_bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let jobs = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let config = || crate::mcp::MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root.clone()],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: true,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 16 * 1024,
+            max_read_bytes: 16 * 1024,
+            max_write_bytes: 16 * 1024,
+
+            task_result_budget: None,
+            job_retention_secs: 60,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        };
+
+        let first = LocalMachine::new_with_jobs(config(), jobs.clone())
+            .await
+            .unwrap();
+        let gate = first.operation_gate.clone();
+        let id = first
+            .start_shell_job(
+                ShellArgs {
+                    command: "sleep 0.08; printf survived".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: None,
+                },
+                false,
+                None,
+            )
+            .unwrap()
+            .id;
+        drop(first);
+
+        let second = LocalMachine::new_with_jobs(config(), jobs.clone())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&gate, &second.operation_gate));
+        for _ in 0..100 {
+            let status: Value = serde_json::from_str(&second.jobs.status(&id).unwrap()).unwrap();
+            if status["status"] != "working" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let output = second
+            .jobs
+            .output_page(&id, crate::jobs::JobStream::Stdout, 0, 4096, 4096, false)
+            .unwrap();
+        assert!(output.contains("survived"), "{output}");
+        drop(second);
+
+        // The final process-session owner is authoritative for cleanup. A job
+        // cannot escape by retaining the LocalMachine/JobManager in its task.
+        let marker = root.join("must-not-appear");
+        let third = LocalMachine::new_with_jobs(config(), jobs.clone())
+            .await
+            .unwrap();
+        third
+            .start_shell_job(
+                ShellArgs {
+                    command: format!("sleep 0.25; printf leaked > '{}'", marker.display()),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: None,
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        drop(third);
+        drop(jobs);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !marker.exists(),
+            "session drop must kill the contained process tree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serialized_jobs_return_ids_while_queued_without_spending_execution_timeout() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut machine = direct_shell_machine(root.clone(), bash, 16 * 1024);
+        machine.serialize = true;
+        let first_started = root.join("first-started");
+        let late_dir = root.join("late-dir");
+        let second_ran = root.join("second-ran");
+
+        let first = machine
+            .start_shell_job(
+                ShellArgs {
+                    command: format!("touch '{}'; sleep 0.35", first_started.display()),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(2),
+                    max_output_bytes: None,
+                },
+                false,
+                None,
+            )
+            .unwrap()
+            .id;
+        for _ in 0..100 {
+            if first_started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            first_started.exists(),
+            "first job never acquired the serialize gate"
+        );
+
+        let started = Instant::now();
+        let second = machine
+            .start_shell_job(
+                ShellArgs {
+                    command: format!("touch '{}'", second_ran.display()),
+                    dir: "late-dir".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(1),
+                    max_output_bytes: None,
+                },
+                false,
+                None,
+            )
+            .unwrap()
+            .id;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "queued job creation waited on the serialize gate"
+        );
+        let queued: Value = serde_json::from_str(&machine.jobs.status(&second).unwrap()).unwrap();
+        assert_eq!(queued["phase"], "queued", "{queued}");
+        assert!(
+            !late_dir.exists(),
+            "test precondition: queued working directory must not exist yet"
+        );
+        std::fs::create_dir(&late_dir).unwrap();
+
+        for _ in 0..200 {
+            let status: Value =
+                serde_json::from_str(&machine.jobs.status(&second).unwrap()).unwrap();
+            if status["status"] != "working" {
+                assert_eq!(status["status"], "completed", "{status}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            second_ran.exists(),
+            "queued job must resolve its working directory only after acquiring the gate"
+        );
+
+        machine.jobs.cancel(&first).unwrap();
+        machine.jobs.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -1156,6 +1766,589 @@ mod tests {
         // Zero is clamped up; a degenerate ceiling still yields a positive deadline.
         assert_eq!(resolve_shell_timeout(Some(0), 3_600), 1);
         assert_eq!(resolve_shell_timeout(None, 0), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_waits_synchronously_then_hands_off_the_same_durable_job() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let request = |command: &str, timeout: Option<u64>| {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("command".to_owned(), Value::String(command.to_owned()));
+            if let Some(timeout) = timeout {
+                arguments.insert("timeout_secs".to_owned(), Value::from(timeout));
+            }
+            CallToolRequestParams::new("bash").with_arguments(arguments)
+        };
+
+        // A generous execution timeout never forces an early handoff. If the
+        // command actually finishes inside the transport window it is the
+        // ordinary synchronous bash result.
+        let fast = machine
+            .handle_shell_call_with(
+                &request("printf fast", Some(3)),
+                Some(500),
+                false,
+                Some("fast-request".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("shell is handled by the durable layer");
+        let CallToolResponse::Complete(fast) = fast else {
+            panic!("fast command should stay synchronous")
+        };
+        let fast_text = serde_json::to_value(fast).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(fast_text.contains("fast"), "{fast_text}");
+        assert!(!fast_text.contains("job_id"), "{fast_text}");
+
+        // Omitted execution timeout still uses the profile ceiling; only the
+        // response wait is short. The command continues and compatibility
+        // clients get its stable job id.
+        let slow_request = request("sleep 0.12; printf compat", None);
+        let first = machine
+            .handle_shell_call_with(
+                &slow_request,
+                Some(10),
+                false,
+                Some("compat-request".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let compat_id = match first {
+            CallToolResponse::Complete(result) => {
+                let value = serde_json::to_value(result).unwrap();
+                let text = value["content"][0]["text"].as_str().unwrap();
+                serde_json::from_str::<Value>(text).unwrap()["job_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            }
+            other => panic!("expected compatibility job receipt, got {other:?}"),
+        };
+        // Redelivery of the same tunnel request must never launch a duplicate.
+        let replay = machine
+            .handle_shell_call_with(
+                &slow_request,
+                Some(10),
+                false,
+                Some("compat-request".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let replay_id = match replay {
+            CallToolResponse::Complete(result) => {
+                let value = serde_json::to_value(result).unwrap();
+                let text = value["content"][0]["text"].as_str().unwrap();
+                serde_json::from_str::<Value>(text).unwrap()["job_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            }
+            other => panic!("expected replayed compatibility receipt, got {other:?}"),
+        };
+        assert_eq!(replay_id, compat_id);
+
+        // Tasks-capable clients expose the same durable execution through MCP
+        // Tasks when it outlives the synchronous response window.
+        let native = machine
+            .handle_shell_call_with(
+                &request("sleep 0.12; printf native", Some(3)),
+                Some(10),
+                true,
+                Some("native-request".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let native_id = match native {
+            CallToolResponse::Task(task) => task.task.task_id,
+            other => panic!("expected native task, got {other:?}"),
+        };
+
+        for _ in 0..100 {
+            let status: Value =
+                serde_json::from_str(&machine.jobs.status(&compat_id).unwrap()).unwrap();
+            if status["status"] != "working" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let compat_status: Value =
+            serde_json::from_str(&machine.jobs.status(&compat_id).unwrap()).unwrap();
+        assert_ne!(compat_status["status"], "working");
+        for _ in 0..100 {
+            if machine
+                .jobs
+                .detailed_task(&native_id)
+                .unwrap()
+                .status()
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            machine
+                .jobs
+                .detailed_task(&native_id)
+                .unwrap()
+                .status()
+                .is_terminal()
+        );
+        assert!(
+            machine
+                .jobs
+                .output_page(
+                    &compat_id,
+                    crate::jobs::JobStream::Stdout,
+                    0,
+                    4096,
+                    4096,
+                    false,
+                )
+                .unwrap()
+                .contains("compat")
+        );
+        assert!(
+            machine
+                .jobs
+                .output_page(
+                    &native_id,
+                    crate::jobs::JobStream::Stdout,
+                    0,
+                    4096,
+                    4096,
+                    false,
+                )
+                .unwrap()
+                .contains("native")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_execution_shell_failure_keeps_plain_tool_error_contract() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let result = machine
+            .execute_shell(
+                ShellArgs {
+                    command: "printf never-runs".to_owned(),
+                    dir: "missing-directory".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: None,
+                },
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        assert!(text.contains("path does not exist"), "{text}");
+        assert!(
+            !text.starts_with('{'),
+            "pre-execution errors should stay direct: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_shell_result_that_cannot_fit_hands_off_the_same_job() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let request = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "printf '%4096s' x",
+                "dir": ".",
+                "timeout_secs": 3,
+                "max_output_bytes": 8192
+            }))
+            .unwrap(),
+        );
+        let response = machine
+            .handle_shell_call_with(
+                &request,
+                Some(2_000),
+                false,
+                Some("oversized-complete".to_owned()),
+                Some(512),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let CallToolResponse::Complete(receipt) = response else {
+            panic!("compatibility client should receive a compact job receipt")
+        };
+        let receipt_text = receipt.content[0].as_text().unwrap().text.as_str();
+        let receipt: Value = serde_json::from_str(receipt_text).unwrap();
+        assert_eq!(receipt["status"], "completed", "{receipt}");
+        assert_eq!(receipt["async"], true, "{receipt}");
+        let job_id = receipt["job_id"].as_str().unwrap();
+        let page: Value = serde_json::from_str(
+            &machine
+                .jobs
+                .output_page(job_id, crate::jobs::JobStream::Stdout, 0, 8192, 8192, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["stored_bytes"], 4096);
+        assert_eq!(page["data"].as_str().unwrap().len(), 4096);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_oversized_shell_result_falls_back_to_compatibility_job() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 64 * 1024);
+        let request = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "python3 - <<'PY'\nprint('x' * 8192, end='')\nPY",
+                "timeout_secs": 3,
+                "max_output_bytes": 16384
+            }))
+            .unwrap(),
+        );
+        let response = machine
+            .handle_shell_call_with(
+                &request,
+                Some(5_000),
+                true,
+                Some("oversized-complete".to_owned()),
+                Some(1024),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("shell interception");
+        let CallToolResponse::Complete(receipt) = response else {
+            panic!("oversized completed result must use compatibility receipt")
+        };
+        let value = serde_json::to_value(receipt).unwrap();
+        assert_ne!(value["isError"], true);
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let receipt: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(receipt["async"], true, "{receipt}");
+        let job_id = receipt["job_id"].as_str().unwrap();
+        let status: Value = serde_json::from_str(&machine.jobs.status(job_id).unwrap()).unwrap();
+        assert_eq!(status["status"], "completed");
+        let output: Value = serde_json::from_str(
+            &machine
+                .jobs
+                .output_page(
+                    job_id,
+                    crate::jobs::JobStream::Stdout,
+                    0,
+                    16_384,
+                    16_384,
+                    false,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["stored_bytes"], 8192);
+        assert_eq!(output["data"].as_str().unwrap().len(), 8192);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn promoted_native_task_returns_the_exact_original_shell_result() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let expected = machine
+            .execute_shell(
+                ShellArgs {
+                    command: "printf abcdefgh".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: Some(4),
+                },
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let request = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "sleep 0.05; printf abcdefgh",
+                "dir": ".",
+                "timeout_secs": 3,
+                "max_output_bytes": 4
+            }))
+            .unwrap(),
+        );
+        let task_id = match machine
+            .handle_shell_call_with(
+                &request,
+                Some(1),
+                true,
+                Some("native-exact".to_owned()),
+                Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            CallToolResponse::Task(task) => task.task.task_id,
+            other => panic!("expected native task, got {other:?}"),
+        };
+        let completed = loop {
+            let detailed = machine.jobs.detailed_task(&task_id).unwrap();
+            if detailed.status().is_terminal() {
+                break detailed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let rmcp::model::TaskPayload::Completed { result } = completed.payload else {
+            panic!("native task did not complete with a tool result")
+        };
+        let task_result: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&task_result).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "SEP-2663 tasks/get must inline the original tools/call result"
+        );
+
+        // Full durable output remains pageable beyond the ordinary result's
+        // per-stream limit, and acknowledgement cannot delete the source needed
+        // to reproduce the native Task result until task retention expires.
+        let stdout_page: Value = serde_json::from_str(
+            &machine
+                .jobs
+                .output_page(
+                    &task_id,
+                    crate::jobs::JobStream::Stdout,
+                    0,
+                    4096,
+                    4096,
+                    false,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stdout_page["data"], "abcdefgh");
+        let stdout_end = stdout_page["next_offset"].as_u64().unwrap();
+        let acknowledged: Value = serde_json::from_str(
+            &machine
+                .jobs
+                .acknowledge_output(&task_id, crate::jobs::JobStream::Stdout, stdout_end)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(acknowledged["stdout"]["released"], true);
+        let compacted: Value =
+            serde_json::from_str(&machine.jobs.status(&task_id).unwrap()).unwrap();
+        assert_eq!(
+            compacted["stdout"]["stored_bytes"], 4,
+            "job_get must report the retained native-task prefix, not historical spool bytes"
+        );
+        let replay = machine.jobs.detailed_task(&task_id).unwrap();
+        let rmcp::model::TaskPayload::Completed { result } = replay.payload else {
+            panic!("acknowledgement changed native task status")
+        };
+        let replayed: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_task_falls_back_to_compat_when_exact_result_cannot_be_guaranteed_to_fit() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 2 * 1024 * 1024);
+        let request = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "sleep 0.05; printf done",
+                "timeout_secs": 3,
+                "max_output_bytes": 1024 * 1024
+            }))
+            .unwrap(),
+        );
+        let response = machine
+            .handle_shell_call_with(
+                &request,
+                Some(1),
+                true,
+                Some("native-unsafe".to_owned()),
+                Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let CallToolResponse::Complete(receipt) = response else {
+            panic!("unsafe native task result ceiling must use compatibility handoff")
+        };
+        let text = receipt.content[0].as_text().unwrap().text.as_str();
+        let receipt: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(receipt["async"], true);
+        assert!(receipt["job_id"].as_str().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn machine_wide_task_budget_protects_cross_transport_tasks() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut machine = direct_shell_machine(root, bash, 2 * 1024 * 1024);
+        // Model a runtime shared with a bounded transport such as OpenAI. The
+        // local caller itself supplies no result budget, but any native Task it
+        // creates must still be fetchable through every active transport.
+        machine.config.task_result_budget = Some(1024);
+        let request = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "sleep 0.05; printf done",
+                "timeout_secs": 3,
+                "max_output_bytes": 4096
+            }))
+            .unwrap(),
+        );
+        let response = machine
+            .handle_shell_call_with(&request, Some(1), true, None, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(response, CallToolResponse::Complete(_)),
+            "machine-wide bounded transport must prevent an unsafe native Task"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_shell_preflight_rejects_arguments_the_tool_schema_rejects() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let shell = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "true",
+                "unknown": true
+            }))
+            .unwrap(),
+        );
+        let error = machine
+            .handle_shell_call_with(&shell, Some(1_000), false, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("unknown field"), "{error:?}");
+
+        let job_start = CallToolRequestParams::new("job_start").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "true",
+                "max_output_bytes": 4096
+            }))
+            .unwrap(),
+        );
+        let error = machine
+            .handle_shell_call_with(&job_start, Some(1_000), true, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("unknown field"), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_job_keeps_containment_until_inherited_pipes_finish() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("descendant-must-not-run");
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let id = machine
+            .start_shell_job(
+                ShellArgs {
+                    command: format!("(sleep 2; touch '{}') & printf done", marker.display()),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(1),
+                    max_output_bytes: Some(4096),
+                },
+                false,
+                None,
+            )
+            .unwrap()
+            .id;
+
+        let status = loop {
+            let status: Value = serde_json::from_str(&machine.jobs.status(&id).unwrap()).unwrap();
+            if status["status"] != "working" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(status["status"], "failed", "{status}");
+        assert!(
+            status["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("collecting command output timed out")),
+            "{status}"
+        );
+        assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
+        let partial = machine
+            .jobs
+            .output_page(&id, crate::jobs::JobStream::Stdout, 0, 4096, 4096, false)
+            .unwrap();
+        assert!(partial.contains("done"), "{partial}");
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(
+            !marker.exists(),
+            "descendant holding inherited pipes must remain contained through output collection"
+        );
+        machine.jobs.shutdown().await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -1358,9 +2551,17 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
                 protected_paths: Vec::new(),
             },
+
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
             operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
             router: std::sync::OnceLock::new(),
             serialize: false,
             secure_fs: Arc::new(
@@ -1698,6 +2899,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -1762,6 +2968,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: vec![protected],
         })
         .await
@@ -1806,6 +3017,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -1868,9 +3084,17 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
                 protected_paths: Vec::new(),
             },
+
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
             operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
             router: std::sync::OnceLock::new(),
             serialize: false,
             #[cfg(target_os = "linux")]
@@ -1935,9 +3159,17 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
                 protected_paths: Vec::new(),
             },
+
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
             operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
             router: std::sync::OnceLock::new(),
             serialize: false,
             #[cfg(target_os = "linux")]
@@ -2044,9 +3276,17 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
                 protected_paths: Vec::new(),
             },
+
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
             operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
             router: std::sync::OnceLock::new(),
             serialize: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2114,9 +3354,17 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
                 protected_paths: Vec::new(),
             },
+
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
             operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
             router: std::sync::OnceLock::new(),
             serialize: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2217,6 +3465,11 @@ mod tests {
             max_output_bytes: 16 * 1024,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -2292,6 +3545,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -2379,6 +3637,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -2477,6 +3740,11 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
+                job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
                 protected_paths: Vec::new(),
             })
             .await
@@ -2559,6 +3827,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await;
@@ -2620,6 +3893,11 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
+                job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
                 protected_paths: vec![protected],
             })
             .await;
@@ -2736,6 +4014,11 @@ mod tests {
             max_output_bytes: 16 * 1024,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -2789,6 +4072,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -2848,6 +4136,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await;
@@ -2930,6 +4223,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -3021,6 +4319,11 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
+                job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
                 protected_paths: Vec::new(),
             })
             .await
@@ -3107,6 +4410,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -3187,9 +4495,17 @@ mod tests {
                 max_output_bytes: 16 * 1024,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
+
+                task_result_budget: None,
                 protected_paths: Vec::new(),
             },
+
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
             operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
             router: std::sync::OnceLock::new(),
             serialize: false,
             #[cfg(target_os = "linux")]

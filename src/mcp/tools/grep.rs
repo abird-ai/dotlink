@@ -7,14 +7,18 @@ use std::{
 
 use anyhow::{Context, Result};
 use rmcp::{
-    handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
+    handler::server::wrapper::Parameters,
+    model::CallToolResult,
+    schemars,
+    service::{RequestContext, RoleServer},
+    tool, tool_router,
 };
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{
     GlobFilter, LocalMachine, WalkFilter, dot, marker_bytes, marker_files, marker_hits, ok_text,
-    retain_best, tool_error, trim_to_ceiling,
+    retain_best, tool_error, trim_to_result_budget,
 };
 use crate::mcp::AccessNeed;
 
@@ -128,26 +132,51 @@ pub(crate) struct GrepArgs {
 /// memory, not just what is returned.
 #[derive(Default)]
 struct OutputBudget {
-    limit: usize,
-    used: usize,
+    raw_limit: usize,
+    raw_used: usize,
+    wire_limit: Option<usize>,
+    wire_used: usize,
 }
 
 impl OutputBudget {
-    fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+    fn new(raw_limit: usize, wire_limit: Option<usize>) -> Self {
+        Self {
+            raw_limit,
+            raw_used: 0,
+            wire_limit,
+            wire_used: 0,
+        }
     }
 
-    /// Bytes still available in this call's output budget.
     fn remaining(&self) -> usize {
-        self.limit.saturating_sub(self.used)
+        self.raw_limit.saturating_sub(self.raw_used)
     }
 
-    /// Reserve `bytes` if the payload still fits.
     fn take(&mut self, bytes: usize) -> bool {
-        if self.used + bytes > self.limit {
+        if self.raw_used.saturating_add(bytes) > self.raw_limit {
             return false;
         }
-        self.used += bytes;
+        self.raw_used += bytes;
+        true
+    }
+
+    fn can_take_text(&self, text: &str) -> bool {
+        self.raw_used.saturating_add(text.len()) <= self.raw_limit
+            && self.wire_limit.is_none_or(|limit| {
+                self.wire_used
+                    .saturating_add(crate::mcp::serialized_text_content_len(text))
+                    <= limit
+            })
+    }
+
+    fn take_text(&mut self, text: &str) -> bool {
+        if !self.can_take_text(text) {
+            return false;
+        }
+        self.raw_used += text.len();
+        self.wire_used = self
+            .wire_used
+            .saturating_add(crate::mcp::serialized_text_content_len(text));
         true
     }
 }
@@ -240,16 +269,42 @@ impl LocalMachine {
         }
     }
 
+    #[cfg(test)]
     async fn grep_impl(&self, args: GrepArgs) -> Result<String> {
-        self.grep_impl_with_budget(args, MAX_GREP_SCAN_BYTES, MAX_GREP_SCAN_FILES)
-            .await
+        self.grep_impl_with_result_budget(args, None).await
     }
 
+    async fn grep_impl_with_result_budget(
+        &self,
+        args: GrepArgs,
+        result_budget: Option<usize>,
+    ) -> Result<String> {
+        self.grep_impl_with_limits(
+            args,
+            MAX_GREP_SCAN_BYTES,
+            MAX_GREP_SCAN_FILES,
+            result_budget,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn grep_impl_with_budget(
         &self,
         args: GrepArgs,
         max_scanned_bytes: usize,
         max_scanned_files: usize,
+    ) -> Result<String> {
+        self.grep_impl_with_limits(args, max_scanned_bytes, max_scanned_files, None)
+            .await
+    }
+
+    async fn grep_impl_with_limits(
+        &self,
+        args: GrepArgs,
+        max_scanned_bytes: usize,
+        max_scanned_files: usize,
+        result_budget: Option<usize>,
     ) -> Result<String> {
         if args.pattern.is_empty() {
             anyhow::bail!("pattern must not be empty");
@@ -291,7 +346,8 @@ impl LocalMachine {
         // A bounded heap retains the lexically first candidate paths over the
         // complete walk, not an arbitrary enumeration-order prefix. Only paths
         // are retained; files are opened individually after the walk.
-        let mut candidates = BinaryHeap::<PathBuf>::new();
+        let candidate_limit = MAX_GREP_FILES.min(max_scanned_files);
+        let mut candidates = BinaryHeap::<PathBuf>::with_capacity(candidate_limit);
         let mut candidates_capped = false;
         let progress = self
             .walk_entries_bounded(
@@ -312,7 +368,7 @@ impl LocalMachine {
                     {
                         return true;
                     }
-                    candidates_capped |= retain_best(&mut candidates, entry.path, MAX_GREP_FILES);
+                    candidates_capped |= retain_best(&mut candidates, entry.path, candidate_limit);
                     true
                 },
             )
@@ -338,7 +394,14 @@ impl LocalMachine {
             }
             GrepOutputMode::Files | GrepOutputMode::Count => 0,
         };
-        let mut budget = OutputBudget::new(ceiling.saturating_sub(reserve));
+        let wire_limit = result_budget.map(|budget| {
+            budget
+                .saturating_sub(crate::mcp::serialized_text_tool_result_fixed_len())
+                // All allowed text bytes expand by at most 2x when encoded as a
+                // JSON string; reserve suffix markers before admitting hits.
+                .saturating_sub(reserve.saturating_mul(2))
+        });
+        let mut budget = OutputBudget::new(ceiling.saturating_sub(reserve), wire_limit);
         // Stop scanning at the first refusal in every mode. A later file must
         // not be emitted after a skipped one, or paging would repeat or lose
         // records depending on where the caller resumes.
@@ -377,7 +440,7 @@ impl LocalMachine {
             };
             let text =
                 super::text_bytes(&text).expect("search input already classified as UTF-8 text");
-            let display = self.config.access.relative_display(path);
+            let display = self.config.access.relative_text_display(path);
 
             match args.output_mode {
                 GrepOutputMode::Content => {
@@ -400,16 +463,17 @@ impl LocalMachine {
                         break;
                     }
                     let take_max = selection.selected.len();
-                    // Preserve the largest prefix that fits. A page can have
-                    // overlapping context windows; clipping only whole hits
-                    // keeps pagination stable even near the byte ceiling.
+                    // Capture the bounded neighborhood of all selected hits
+                    // once. Each trial prefix then walks only these borrowed
+                    // lines, not the 480k lines preceding a deep page.
+                    let context = capture_hit_context(text, &selection.selected, before, after);
                     let mut take = take_max;
                     let rendered = loop {
                         if take == 0 {
                             break None;
                         }
-                        let candidate = render_hit_page(
-                            text,
+                        let candidate = render_hit_context(
+                            &context,
                             &selection.selected[..take],
                             selection.previous,
                             selection.selected.get(take).copied().or(selection.next),
@@ -420,7 +484,8 @@ impl LocalMachine {
                                 display: &display,
                             },
                         );
-                        if candidate.len() <= budget.remaining() {
+                        if candidate.len() <= budget.remaining() && budget.can_take_text(&candidate)
+                        {
                             break Some((take, candidate));
                         }
                         take -= 1;
@@ -429,7 +494,7 @@ impl LocalMachine {
                         stop = Some(StopReason::ByteBudget);
                         break;
                     };
-                    let _ = budget.take(group.len());
+                    let _ = budget.take_text(&group);
                     content.push_str(&group);
                     paging.emit_many(take);
                     let more_in_file = take < selection.selected.len() || selection.next.is_some();
@@ -470,7 +535,13 @@ impl LocalMachine {
                 }
             }
         }
-        let work_incomplete = stop == Some(StopReason::WorkBudget);
+        let discovery_stop = candidates_capped.then_some(if candidate_limit == max_scanned_files {
+            StopReason::WorkBudget
+        } else {
+            StopReason::CandidateCap
+        });
+        let work_incomplete = stop == Some(StopReason::WorkBudget)
+            || (stop.is_none() && discovery_stop == Some(StopReason::WorkBudget));
         let mut incomplete_reasons = Vec::new();
         if work_incomplete {
             incomplete_reasons.push("content_budget");
@@ -485,8 +556,8 @@ impl LocalMachine {
         let incomplete_reason = incomplete_reasons.first().copied();
         if progress.incomplete && !work_incomplete {
             stop = Some(StopReason::ScanBudget);
-        } else if stop.is_none() && candidates_capped {
-            stop = Some(StopReason::CandidateCap);
+        } else if stop.is_none() {
+            stop = discovery_stop;
         }
 
         match args.output_mode {
@@ -498,7 +569,7 @@ impl LocalMachine {
                 // so appending it here cannot cut into an accepted line.
                 let marker = match stop {
                     Some(StopReason::ByteBudget) => Some(marker_bytes(ceiling)),
-                    Some(StopReason::CandidateCap) => Some(marker_files(MAX_GREP_FILES)),
+                    Some(StopReason::CandidateCap) => Some(marker_files(candidate_limit)),
                     Some(StopReason::ScanBudget) => {
                         Some("… discovery scan incomplete; narrow path or glob".to_owned())
                     }
@@ -547,7 +618,8 @@ impl LocalMachine {
                     })
                     .to_string()
                 };
-                let (files, truncated) = trim_to_ceiling(files, ceiling, stop.is_some(), render);
+                let (files, truncated) =
+                    trim_to_result_budget(files, ceiling, result_budget, stop.is_some(), render);
                 Ok(serde_json::json!({
                     "files": files, "truncated": truncated,
                     "scan_incomplete": scan_incomplete,
@@ -572,7 +644,8 @@ impl LocalMachine {
                     })
                     .to_string()
                 };
-                let (counts, truncated) = trim_to_ceiling(counts, ceiling, stop.is_some(), render);
+                let (counts, truncated) =
+                    trim_to_result_budget(counts, ceiling, result_budget, stop.is_some(), render);
                 Ok(render(&counts, truncated))
             }
         }
@@ -621,11 +694,49 @@ fn select_hit_page(text: &str, regex: &regex::Regex, offset: usize, limit: usize
     selection
 }
 
-/// Render one page with the original context and paging semantics. The input
-/// is traversed without collecting its lines; only at most 50 selected hits
-/// and their merged context ranges are retained.
-fn render_hit_page(
-    text: &str,
+/// Borrow only the neighborhoods that might appear on this page, at most
+/// `MAX_GREP_PER_FILE * (2 * MAX_GREP_CONTEXT + 1)` lines. One pass through
+/// the input suffices regardless of how many hit prefixes are tested against
+/// the output byte ceiling.
+fn capture_hit_context<'a>(
+    text: &'a str,
+    selected: &[usize],
+    before: usize,
+    after: usize,
+) -> Vec<(usize, &'a str)> {
+    let mut windows: Vec<(usize, usize)> = Vec::with_capacity(selected.len());
+    for &hit in selected {
+        let start = hit.saturating_sub(before);
+        let end = hit.saturating_add(after);
+        match windows.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => windows.push((start, end)),
+        }
+    }
+    let mut context = Vec::with_capacity(
+        selected
+            .len()
+            .saturating_mul(before.saturating_add(after).saturating_add(1)),
+    );
+    let mut window = 0_usize;
+    for (number, line) in text.lines().enumerate() {
+        while windows.get(window).is_some_and(|range| number > range.1) {
+            window += 1;
+        }
+        let Some(&(start, _)) = windows.get(window) else {
+            break;
+        };
+        if number >= start {
+            context.push((number, line));
+        }
+    }
+    context
+}
+
+/// Render selected hit windows from a compact borrowed context cache. Only
+/// selected lines and their bounded context are traversed for each prefix.
+fn render_hit_context(
+    context: &[(usize, &str)],
     selected: &[usize],
     previous_match: Option<usize>,
     next_match: Option<usize>,
@@ -657,7 +768,7 @@ fn render_hit_page(
     }
 
     let mut output = String::new();
-    let mut lines = text.lines().enumerate().peekable();
+    let mut lines = context.iter().peekable();
     for (index, (start, end)) in ranges.into_iter().enumerate() {
         if index > 0 && (before > 0 || after > 0) {
             output.push_str("--\n");
@@ -666,7 +777,7 @@ fn render_hit_page(
             lines.next();
         }
         while lines.peek().is_some_and(|(line, _)| *line <= end) {
-            let (number, line) = lines.next().expect("peeked a line");
+            let &(number, line) = lines.next().expect("peeked a line");
             match numbered {
                 true => output.push_str(&format!("{display}:{}: {line}\n", number + 1)),
                 false => output.push_str(&format!("{display}: {line}\n")),
@@ -674,6 +785,18 @@ fn render_hit_page(
         }
     }
     output
+}
+
+#[cfg(test)]
+fn render_hit_page(
+    text: &str,
+    selected: &[usize],
+    previous_match: Option<usize>,
+    next_match: Option<usize>,
+    render: HitRender<'_>,
+) -> String {
+    let context = capture_hit_context(text, selected, render.before, render.after);
+    render_hit_context(&context, selected, previous_match, next_match, render)
 }
 
 /// Page position across one call: hits (content) or files (files/count).
@@ -720,8 +843,15 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn grep(&self, Parameters(args): Parameters<GrepArgs>) -> CallToolResult {
-        match self.grep_impl(args).await {
+    async fn grep(
+        &self,
+        Parameters(args): Parameters<GrepArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        match self
+            .grep_impl_with_result_budget(args, self.request_result_budget(&context))
+            .await
+        {
             Ok(text) => ok_text(text),
             Err(error) => tool_error(error),
         }
@@ -756,6 +886,100 @@ mod tests {
             },
         );
         assert_eq!(result, "file.txt:199991: hit\nfile.txt:199992: hit\n");
+    }
+
+    #[test]
+    fn cached_context_matches_complete_line_rendering_for_random_pages() {
+        let regex = regex::Regex::new("hit").unwrap();
+        let mut seed = 19_u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for case in 0..600 {
+            let len = (next() % 300) as usize;
+            let mut text = String::new();
+            for _ in 0..len {
+                let hit = next().is_multiple_of(6);
+                text.push_str(if hit { "hit" } else { "other" });
+                text.push('\n');
+            }
+            if case % 3 == 0 {
+                text.push_str("last");
+            }
+            let matches = text
+                .lines()
+                .enumerate()
+                .filter_map(|(i, line)| regex.is_match(line).then_some(i))
+                .collect::<Vec<_>>();
+            let offset = (next() % 35) as usize;
+            let limit = (next() % 50 + 1) as usize;
+            let selected = matches
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .copied()
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            let previous = offset.checked_sub(1).and_then(|i| matches.get(i)).copied();
+            let next_match = matches.get(offset + selected.len()).copied();
+            let before = (next() % 9) as usize;
+            let after = (next() % 9) as usize;
+            let numbered = next().is_multiple_of(2);
+            let cache = capture_hit_context(&text, &selected, before, after);
+            assert!(cache.len() <= selected.len() * (before + after + 1));
+            for take in 1..=selected.len() {
+                let boundary = selected.get(take).copied().or(next_match);
+                let config = HitRender {
+                    before,
+                    after,
+                    numbered,
+                    display: "path/test.txt",
+                };
+                let got = render_hit_context(&cache, &selected[..take], previous, boundary, config);
+                let mut ranges = Vec::<(usize, usize)>::new();
+                for &hit in &selected[..take] {
+                    let start = hit
+                        .saturating_sub(before)
+                        .max(previous.map_or(0, |line| line + 1));
+                    let end = hit
+                        .saturating_add(after)
+                        .min(boundary.map_or(usize::MAX, |line| line.saturating_sub(1)));
+                    if start > end {
+                        continue;
+                    }
+                    if let Some(last) = ranges.last_mut()
+                        && start <= last.1.saturating_add(1)
+                    {
+                        last.1 = last.1.max(end);
+                        continue;
+                    }
+                    ranges.push((start, end));
+                }
+                let source_lines = text.lines().collect::<Vec<_>>();
+                let mut expected = String::new();
+                for (group, (start, end)) in ranges.iter().enumerate() {
+                    if group > 0 && (before > 0 || after > 0) {
+                        expected.push_str("--\n");
+                    }
+                    for (line, &contents) in source_lines
+                        .iter()
+                        .enumerate()
+                        .take(end.saturating_add(1))
+                        .skip(*start)
+                    {
+                        if numbered {
+                            expected.push_str(&format!("path/test.txt:{}: {contents}\n", line + 1));
+                        } else {
+                            expected.push_str(&format!("path/test.txt: {contents}\n"));
+                        }
+                    }
+                }
+                assert_eq!(got, expected, "case={case} take={take}");
+            }
+        }
     }
 
     #[test]
@@ -1475,7 +1699,7 @@ mod walk_tests {
         let machine = test_machine(root.clone());
 
         let listed = machine
-            .ls(Parameters(ListArgs {
+            .ls_for_test(Parameters(ListArgs {
                 path: "locked".to_owned(),
                 ..ListArgs::default()
             }))
@@ -1745,6 +1969,62 @@ mod walk_tests {
         let content = machine.grep_impl(grep_args("hit")).await.unwrap();
         assert!(content.contains("truncated at 1024 bytes"), "{content}");
         assert!(!content.contains("truncated at 1 hits"), "{content}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_content_escapes_ambiguous_and_invalid_utf8_path_labels() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("line\nbreak:part.txt"), "hit\n").unwrap();
+        let invalid = OsString::from_vec(b"bad\xff.txt".to_vec());
+        std::fs::write(root.join(invalid), "hit\n").unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine(root);
+        let content = machine.grep_impl(grep_args("hit")).await.unwrap();
+
+        assert!(
+            content.contains("\"line\\nbreak:part.txt\":1: hit"),
+            "{content:?}"
+        );
+        assert!(!content.contains("line\nbreak:part.txt:1:"), "{content:?}");
+        assert!(content.contains("b\"bad\\xFF.txt\":1: hit"), "{content:?}");
+    }
+
+    #[tokio::test]
+    async fn grep_modes_fit_the_serialized_mcp_result_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let quoted = format!("hit {}\n", "\"\\".repeat(700));
+        for index in 0..20 {
+            std::fs::write(
+                root.join(format!("{index:02}-{}", "\"".repeat(20))),
+                &quoted,
+            )
+            .unwrap();
+        }
+        let machine = crate::mcp::tools::test_support::test_machine_with(root, |config| {
+            config.max_output_bytes = 64 * 1024;
+        });
+        let budget = 4096;
+        for mode in [
+            GrepOutputMode::Content,
+            GrepOutputMode::Files,
+            GrepOutputMode::Count,
+        ] {
+            let mut args = grep_args("hit");
+            args.output_mode = mode;
+            let text = machine
+                .grep_impl_with_result_budget(args, Some(budget))
+                .await
+                .unwrap();
+            assert!(
+                crate::mcp::serialized_text_tool_result_len(&text) <= budget,
+                "mode={mode:?} size={}",
+                crate::mcp::serialized_text_tool_result_len(&text)
+            );
+        }
     }
 
     #[tokio::test]

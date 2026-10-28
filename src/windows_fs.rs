@@ -21,8 +21,8 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-        OPEN_EXISTING,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, OPEN_EXISTING,
     },
 };
 
@@ -51,16 +51,20 @@ fn raw_open(path: &Path, access: u32, share: u32, flags: u32) -> io::Result<Owne
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
-fn checked_attributes(handle: &OwnedHandle, directory: bool) -> Result<()> {
+fn handle_information(handle: &OwnedHandle) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     use std::os::windows::io::AsRawHandle as _;
     let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
     // SAFETY: valid live handle and writable fixed-size output.
     let result = unsafe { GetFileInformationByHandle(handle.as_raw_handle(), info.as_mut_ptr()) };
     if result == 0 {
-        return Err(io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: API returned success, so all output fields are initialized.
-    let attributes = unsafe { info.assume_init() }.dwFileAttributes;
+    Ok(unsafe { info.assume_init() })
+}
+
+fn checked_attributes(handle: &OwnedHandle, directory: bool) -> Result<()> {
+    let attributes = handle_information(handle)?.dwFileAttributes;
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         bail!("Windows reparse point is not permitted for native filesystem access");
     }
@@ -69,6 +73,21 @@ fn checked_attributes(handle: &OwnedHandle, directory: bool) -> Result<()> {
         bail!("Windows filesystem object type changed during authorization");
     }
     Ok(())
+}
+
+/// Stable Windows object identity for recovery/authority comparisons. The path
+/// is opened with metadata-only access and full sharing, so this observes the
+/// object without perturbing ordinary filesystem concurrency.
+pub(crate) fn path_identity(path: &Path) -> io::Result<(u32, u64)> {
+    let handle = raw_open(
+        path,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    )?;
+    let info = handle_information(&handle)?;
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((info.dwVolumeSerialNumber, index))
 }
 
 /// An ancestor and the requested directory are kept open with no delete
@@ -159,6 +178,21 @@ pub(crate) fn open_file(path: &Path, write: bool) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_identity_changes_when_one_name_is_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live.txt");
+        let replacement = temp.path().join("replacement.txt");
+        let old = temp.path().join("old.txt");
+        std::fs::write(&live, b"old").unwrap();
+        std::fs::write(&replacement, b"new").unwrap();
+        let before = path_identity(&live).unwrap();
+        std::fs::rename(&live, &old).unwrap();
+        std::fs::rename(&replacement, &live).unwrap();
+        let after = path_identity(&live).unwrap();
+        assert_ne!(before, after);
+    }
 
     #[test]
     fn reparse_escape_is_refused() {

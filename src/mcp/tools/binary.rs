@@ -3,9 +3,12 @@
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
+    RoleServer,
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock, ResourceContents, Tool},
-    schemars, tool, tool_router,
+    schemars,
+    service::RequestContext,
+    tool, tool_router,
 };
 use serde::Deserialize;
 use std::io::Seek as _;
@@ -35,6 +38,44 @@ enum BreadFormat {
     Mcp,
     Base64,
     Hex,
+}
+
+fn binary_raw_response_ceiling(
+    format: BreadFormat,
+    profile_max: usize,
+    result_budget: Option<usize>,
+) -> usize {
+    let Some(result_budget) = result_budget else {
+        return profile_max.max(1);
+    };
+    let payload =
+        result_budget.saturating_sub(crate::limits::OPENAI_TUNNEL_BINARY_RESPONSE_RESERVE_BYTES);
+    let encoded_safe = match format {
+        BreadFormat::Mcp | BreadFormat::Base64 => (payload / 4).saturating_mul(3),
+        BreadFormat::Hex => payload / 2,
+    };
+    profile_max.min(encoded_safe).max(1)
+}
+
+fn requested_binary_read_limit(
+    format: BreadFormat,
+    requested: Option<usize>,
+    profile_max: usize,
+    result_budget: Option<usize>,
+) -> Result<usize> {
+    let ceiling = binary_raw_response_ceiling(format, profile_max, result_budget);
+    match requested {
+        Some(0) => anyhow::bail!("limit must be at least 1 byte"),
+        Some(value) if value > profile_max => anyhow::bail!(
+            "requested binary read limit {value} exceeds the profile read ceiling {profile_max}"
+        ),
+        Some(value) if value > ceiling => anyhow::bail!(
+            "requested binary read limit {value} cannot fit this encoding inside the {} byte MCP tool-result budget; use limit<={ceiling} and continue from the returned offset",
+            result_budget.unwrap_or(usize::MAX),
+        ),
+        Some(value) => Ok(value),
+        None => Ok(ceiling),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
@@ -115,6 +156,38 @@ pub(crate) fn with_bedit_limits(tool: &mut Tool) {
     super::mutation::set_array_max_items(tool, "edits", MAX_BEDIT_RANGES);
 }
 
+pub(crate) fn with_read_limit(tool: &mut Tool, max_bytes: usize) {
+    if tool.name.as_ref() != "bread" {
+        return;
+    }
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(property) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("limit"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        property.insert(
+            "description".to_owned(),
+            serde_json::Value::String(format!(
+                "Maximum raw bytes for this call, capped at the {max_bytes}-byte profile read ceiling. On OpenAI, omitted limits automatically fit the selected encoding inside the MCP response budget (base64/MCP up to {} raw bytes, hex up to {}); use offset for additional chunks.",
+                binary_raw_response_ceiling(
+                    BreadFormat::Base64,
+                    max_bytes,
+                    Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+                ),
+                binary_raw_response_ceiling(
+                    BreadFormat::Hex,
+                    max_bytes,
+                    Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+                ),
+            )),
+        );
+        property.insert("maximum".to_owned(), serde_json::Value::from(max_bytes));
+    }
+    tool.input_schema = std::sync::Arc::new(schema);
+}
+
 fn bounded_bedit_ranges<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Vec<BeditRange>, D::Error> {
@@ -177,7 +250,11 @@ struct RangePlan {
 }
 
 impl LocalMachine {
-    async fn bread_impl(&self, args: BreadArgs) -> Result<CallToolResult> {
+    async fn bread_impl_with_result_budget(
+        &self,
+        args: BreadArgs,
+        result_budget: Option<usize>,
+    ) -> Result<CallToolResult> {
         let path = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         let mut file = self.open_read_file(&path).await?;
         let total_size = file.metadata().await?.len();
@@ -187,14 +264,18 @@ impl LocalMachine {
                 if args.offset.unwrap_or(0) != 0 {
                     anyhow::bail!("format=mcp requires offset=0");
                 }
-                let limit = args.limit.unwrap_or(self.config.max_read_bytes);
-                if total_size > limit.min(self.config.max_read_bytes) as u64 {
+                let limit = requested_binary_read_limit(
+                    BreadFormat::Mcp,
+                    args.limit,
+                    self.config.max_read_bytes,
+                    result_budget,
+                )?;
+                if total_size > limit as u64 {
                     anyhow::bail!(
-                        "format=mcp requires the complete file within the read limit; use base64 or hex for chunked reads"
+                        "format=mcp requires the complete file within the {limit} byte encoded-response-safe limit; use base64 or hex for chunked reads"
                     );
                 }
-                let bytes =
-                    Self::read_bounded(&mut file, limit.min(self.config.max_read_bytes)).await?;
+                let bytes = Self::read_bounded(&mut file, limit).await?;
                 let encoded = BASE64.encode(bytes);
                 let mime = mime_guess::from_path(&path)
                     .first_or_octet_stream()
@@ -217,10 +298,12 @@ impl LocalMachine {
                 if offset > total_size {
                     anyhow::bail!("offset is beyond end of file");
                 }
-                let limit = args
-                    .limit
-                    .unwrap_or(self.config.max_read_bytes)
-                    .clamp(1, self.config.max_read_bytes);
+                let limit = requested_binary_read_limit(
+                    args.format,
+                    args.limit,
+                    self.config.max_read_bytes,
+                    result_budget,
+                )?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
                 let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
                 file.take(limit as u64).read_to_end(&mut bytes).await?;
@@ -444,8 +527,15 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn bread(&self, Parameters(args): Parameters<BreadArgs>) -> CallToolResult {
-        match self.bread_impl(args).await {
+    async fn bread(
+        &self,
+        Parameters(args): Parameters<BreadArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        match self
+            .bread_impl_with_result_budget(args, self.request_result_budget(&context))
+            .await
+        {
             Ok(result) => result,
             Err(error) => tool_error(error),
         }
@@ -489,6 +579,60 @@ impl LocalMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bread_format_limits_fit_encoded_responses_and_are_exposed_to_the_model() {
+        let profile = crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES;
+        let base64 = binary_raw_response_ceiling(
+            BreadFormat::Base64,
+            profile,
+            Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+        );
+        let hex = binary_raw_response_ceiling(
+            BreadFormat::Hex,
+            profile,
+            Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+        );
+        assert!(base64 < profile && base64 > 6 * 1024 * 1024, "{base64}");
+        assert!(hex < base64 && hex > 4 * 1024 * 1024, "{hex}");
+        assert_eq!(
+            binary_raw_response_ceiling(BreadFormat::Base64, profile, None),
+            profile
+        );
+        assert_eq!(
+            requested_binary_read_limit(BreadFormat::Base64, Some(profile), profile, None).unwrap(),
+            profile
+        );
+        assert_eq!(
+            requested_binary_read_limit(
+                BreadFormat::Base64,
+                None,
+                profile,
+                Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES)
+            )
+            .unwrap(),
+            base64
+        );
+        assert!(
+            requested_binary_read_limit(
+                BreadFormat::Base64,
+                Some(profile),
+                profile,
+                Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot fit this encoding")
+        );
+
+        let mut tool = LocalMachine::all_tools().get("bread").cloned().unwrap();
+        with_read_limit(&mut tool, profile);
+        let limit = &tool.input_schema["properties"]["limit"];
+        assert_eq!(limit["maximum"], profile);
+        let description = limit["description"].as_str().unwrap();
+        assert!(description.contains(&base64.to_string()), "{description}");
+        assert!(description.contains(&hex.to_string()), "{description}");
+    }
 
     #[test]
     fn bedit_schema_advertises_the_same_range_ceiling_as_its_decoder() {

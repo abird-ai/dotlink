@@ -15,11 +15,18 @@ and the launch directory is the only implicit readable directory. `--no-default-
 
 ## Service and file-backed credentials
 
-The NixOS module runs dotlink as the explicitly selected Unix user (non-root strongly recommended), retains that user's ordinary XDG credential discovery by default, and requires an explicit working directory so the dynamic `.` read grant never silently expands to a surprise directory. Optional systemd `LoadCredential` runtime/ngrok key files are not embedded in generated Nix settings, systemd arguments, or the journal. Their paths are protected from MCP file access, and credential variables are removed from every child process; systemd notification variables never leave dotlink. The systemd-255-or-newer unit restarts all process terminations except statuses 2 and 78 and the non-failure `NOTCONFIGURED` (6), which leaves an unconfigured unit inactive, but systemd stop/restart jobs remain authoritative and suppress automatic restart. The selected Unix user's own filesystem permissions remain a separate boundary; an intentionally unrestricted, unsandboxed shell running as the same user must not be considered isolated from that user's private credentials. Opted-in TOOL logging intentionally stores full shell command text and paths in journald, including any inline secrets; restrict journal readers and retention accordingly. See `.agents/docs/nixos-service.md`.
+The NixOS module runs dotlink as the explicitly selected Unix user (non-root strongly recommended), retains that user's ordinary XDG credential discovery by default, and requires an explicit working directory so the dynamic `.` read grant never silently expands to a surprise directory. Optional systemd `LoadCredential` runtime/ngrok key files are not embedded in generated Nix settings, systemd arguments, or the journal. Their paths are protected from MCP file access, and credential variables are removed from every child process; systemd notification variables never leave dotlink. The systemd-255-or-newer unit restarts all process terminations except statuses 2 and 78 and the non-failure `NOTCONFIGURED` (6), which leaves an unconfigured unit inactive, but systemd stop/restart jobs remain authoritative and suppress automatic restart. The selected Unix user's own filesystem permissions remain a separate boundary; an intentionally unrestricted, unsandboxed shell running as the same user must not be considered isolated from that user's private credentials. Opted-in TOOL logging stores complete path labels and up to 256 rendered characters of shell commands by default. Full commands require interactive TOOL mode plus `V`; secrets within logged excerpts can enter the journal, so restrict readers and retention. See `.agents/docs/nixos-service.md`.
 
 ## Profiles and permission precedence
 
 Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v10 is the current profile format. Known compatible older schemas are migrated forward in memory (v9 → v10 is additive); newer schemas and older schemas without an explicit migration path are rejected rather than guessed. A migrated profile is written as the current schema the next time it is edited or saved.
+
+Saved profiles express defaults, not mandatory grants. A grant-free profile is
+valid; runtime admission checks minimum effective capabilities after composing
+profile defaults, one-run CLI grants, and denies. `--no-default-allow` with no
+other effective grant still fails, as does enabling a shell without a readable
+directory. Structural profile dependencies (such as network requiring shell)
+remain enforced on saved configuration.
 
 Runtime allow rules are additive. Denies always take precedence over profile defaults, ordinary allows, and developer-cache grants.
 
@@ -95,7 +102,7 @@ directory renamed inside the grant after the walk can change which inode a
 candidate path names; it cannot leave the grant. Symlink entries are listed by
 `ls` and never traversed or searched by `grep`. Glob, regex and `.gitignore`
 matching are pure matchers over already-authorized paths and bounded buffers.
-Search bounds are explicit: 1 MiB per file, 65536 candidate files, 50 matches
+Search bounds are explicit: 1 MiB per file, at most 4096 retained/scanned candidate files per production request, 50 matches
 per file per `content` page, 200 hits or files, 1024-character patterns, regex
 size/DFA limits of 1 MiB, 8 context lines per side, 64 KiB / 1024 lines per
 `.gitignore` file with invalid patterns failing closed, and a rendered-output
@@ -113,11 +120,14 @@ limits collected results; the shared walker visits at most 100,000 directory
 entries per request. On a partial walk, `scan_incomplete` distinguishes sorted
 results from a globally exhaustive search; narrow path/glob before paging.
 
-Native filesystem mutators (`write`, `bwrite`, `edit`, `patch`, `bedit`) take a
-bounded per-path mutation lock before reading a snapshot and hold it through
-commit, so two dotlink calls cannot both verify the same bytes and then
-overwrite one another. Multi-file edits acquire their shard locks in sorted
-order.
+Native filesystem mutators (`write`, `bwrite`, `edit`, `patch`, `bedit`) first
+take sorted exact-path mutexes for pathname/topology ordering. On Unix they
+also derive a stable target identity from the nearest existing ancestor's
+`(dev, ino)` plus the remaining relative target path, so lexical or bind-mount
+aliases of the same directory entry converge on one in-process mutex before a
+snapshot is read. Both lock classes are held through commit; unrelated files
+remain concurrent without hash-shard collisions. Weak-reference registries
+reclaim unused mutexes; no lockfiles are created.
 
 Cross-process coordination uses hierarchical advisory `flock`. Each existing
 ancestor directory receives a shared intention lock; the deepest existing
@@ -128,10 +138,13 @@ cannot bypass a creator by discovering a newly created directory. A directory
 that exists but cannot be opened fails closed, never substituting a different
 lock identity. A rename does not change the directory inode. No workspace
 lockfile, XDG state, or `/run/lock` capability is required. Locks are ordered
-root-to-leaf, wait at most 30 seconds and release automatically on exit. The
-256 in-process shards retain concurrency between independent files. Writers in
-different directories remain concurrent across processes unless they need to
-change a common ancestor. Windows retains its conservative in-process gate.
+root-to-leaf; the same 30-second deadline spans in-process path mutexes and
+OS-level locks, and failed partial acquisitions release their held guards. The
+Exact pathname mutexes retain topology ordering while the Unix stable-target
+mutex closes alias bypasses; both use weak registries so idle identities are
+reclaimable. Writers in different directories remain concurrent across
+processes unless they need to change a common ancestor. Windows retains its
+conservative in-process gate and native case-normalized named mutexes.
 
 The locks are advisory, and network filesystems or independent mount
 namespaces require additional coordination. A shell command or another program
@@ -495,30 +508,35 @@ Proxy environment settings are disabled for the metadata HTTP client, so DNS
 pinning cannot silently be bypassed by a proxy resolving the target itself.
 Only public resolved addresses are allowed, and redirects are disabled.
 
-OpenAI tunnel polls use a streaming ceiling of at least 64 MiB, raised to
-fit the configured maximum single JSON request plus command-wrapper headroom.
-The explicit safety maximum is 256 MiB; oversized write configurations fail at
-tunnel startup and can use local HTTP/stdio instead. Poll command count remains
-bounded independently. The shared byte-ceiling primitive applies before
-deserialization rather than after buffering a response.
+OpenAI Secure MCP Tunnel polls use the hosted 10 MiB serialized-envelope ceiling directly. Raw/tool transfers are capped at 8 MiB, complete embedded MCP requests/responses at 9 MiB, and the final 1 MiB is reserved for tunnel framing. Encoding expansion is handled before binary reads: `bread` derives a format-safe raw window for MCP/base64/hex rather than relying on a later body-limit failure. Local HTTP/stdio retain their profile-derived bounds. Poll command count remains bounded independently. The shared byte-ceiling primitive applies before deserialization rather than after buffering a response.
 
 ## Logging privacy
 
-At `-v` (or NixOS `logging.verbosity = "tools"`), TOOL logs intentionally
-record the **complete `bash`/`powershell` command**, as a quoted single-line
-representation with newlines and control characters escaped. This is an
-explicit operator audit feature, not an accidental payload leak; Dotlink does
-not truncate or substitute `command_bytes`. **Commands can contain inline
-passwords, access tokens and other secrets, which will be stored in journald.**
-Enable TOOL logging only with suitable journal permissions and retention. It
-is quiet by default. Logs order `p` (path), `d` (working directory), then
-complete `c` (shell command), followed by `max_t`/`max_b` and other fields.
+At `-v` (or NixOS `logging.verbosity = "tools"`), TOOL logs record
+**up to 256 rendered characters** of `bash`/`powershell` command values,
+including their quotes and escaped control characters. A truncated value ends
+with `…` inside its closing quote; bytes beyond the excerpt are not logged.
+`p=`, `d=`, and `edit`'s `paths=[...]` list retain all complete path names
+(up to the tool's 64 distinct files per valid request). Only the command
+excerpt is capped; while interactive terminal controls are active, **`V`
+(Shift+V)** toggles the full escaped command **only while TOOL logging is
+active**. In quiet/REQ-only mode the key is ignored and its hint is hidden;
+full mode resets when TOOL logging turns off, on shutdown, or on restart.
+Stdio and noninteractive services cannot enable it. Interactive
+ANSI colors distinguish argument keys, values and status; ordinary redirected
+argument summaries stay plain. The command excerpt is deliberately visible:
+**passwords, access tokens and other secrets in the prefix—or anywhere in an
+interactive full command—can still be stored in logs.** Restrict journal
+permissions and retention.
+TOOL logs are quiet by default and order `p` (path), `d` (working directory),
+then `c` (shell command), followed by `max_t`/`max_b` and other fields.
 Existing symlink targets are resolved for the audit label when possible:
 paths whose targets are within launch cwd display as `./...`, and outside
 paths as absolute. Failed resolutions retain a lexical display and never
 change native authorization.
 The compact `b="N"` field summarizes the aggregate bytes of other payloads;
-`edit` uses a capped `paths=[...]` display for its file targets.
+`edit` shows every distinct file path in valid requests, with overflow
+markers for invalid requests above the tool's file/operation limits.
 
 Mutating tools share one output-before-commit contract. `edit` and `patch`
 use the same staged update/create engine and bounded receipt builder, including
@@ -542,6 +560,39 @@ cloning a complete large JSON request unless unknown-tool rewriting is needed.
 `bedit` no-ops are proven by comparing the requested ranges and rehashing the
 current authorized file before returning without staging; ordinary binary
 updates preserve the existing staged-update and commit-time verification.
+
+Patch additions use a shared borrowed hunk-action iterator for all update
+planning and writing paths. Added lines map positionally to their removed source lines' delimiters,
+then use the last removed style for excess additions; pure insertions inherit
+their insertion site's delimiter, never arbitrary preceding context.
+The same action stream provides exact pre-write byte accounting. Add-file
+parsing and output share one borrowed decoder, so accepted bare CRLF blanks
+are not silently converted to LF, and strict write limits match output sizes.
+Patch matching excludes a synthetic empty line after a file's final newline,
+while preserving real blank lines and exact LF/CRLF byte semantics. A patch's
+header determines whether the CR preceding its newline is syntactic; LF-format
+patch hunk content can contain literal CR bytes, and these are not discarded
+by normalization. Unterminated CRLF-style files gain the missing CRLF bridge
+when an EOF append creates a new successor line. A literal trailing CR in
+original or newly added content gets a distinct delimiter CR, preventing
+content loss when a following LF is emitted; its size is included in preflight. CRs
+belonging to removed CRLF separators cannot become stray data at an
+unterminated EOF; byte limits account for that normalization before writing.
+Matching indices use pointers into the borrowed parser, with their temporary
+failure-table bytes checked against the existing scratch budget. EOF markers
+filter context candidates before ambiguity counting and trimmed fallback;
+addition-only update hunks require an explicit EOF anchor, never an arbitrary
+insertion position. Pure context hunks do not allocate replacement indices.
+Final mutating hunks write directly to their output buffer, and earlier hunks
+shift the index in place with only the consumed source span retained. These
+paths keep the existing 64 MiB plan and per-file write ceilings rather than
+raising them for dense patches.
+
+Hunk context searches use the shared streaming sequence matcher with linear
+comparison work and bounded ambiguity previews, preventing tiny repetitive
+patch requests from monopolizing CPU with quadratic candidate×prefix scans.
+Exact matches still outrank whitespace-trimmed matches, and overlapping
+matches still report ambiguity instead of silently editing one occurrence.
 
 `edit`, `patch`, and `bedit` use the shared 64 MiB retained-buffer
 planning budget alongside their per-file and operation ceilings. `edit` counts
@@ -584,14 +635,14 @@ runtime keys separately from an explicitly logged shell command.
 - tunnel concurrency is bounded; SSE events are decoded incrementally and forwarded through a bounded notification queue while the tool is still running;
 - shell stdout/stderr are drained continuously with bounded retained output;
 - shell stdin is written concurrently with process execution after the output drains start, so a child that writes before reading its input cannot deadlock both pipes;
-- `max_output_bytes`, `max_read_bytes` and `max_write_bytes` are hard ceilings: a value below the supported minimum is rejected at configuration time, never silently widened at startup;
+- `max_output_bytes`, `max_read_bytes` and `max_write_bytes` are hard profile ceilings: new profiles default to 1 MiB; values below the supported minimum or above the 8 MiB transfer ceiling are rejected at configuration time, never silently widened; `read.max_read_bytes` and `job_output.max_output_bytes` let a caller choose a smaller per-call page under the profile ceiling;
 - the shared traversal boundary records unreadable descendant directories and metadata errors (including races with deletions), exposes `traversal_error` to `ls` and `grep`, and distinguishes intentionally filtered entries; grep also marks individually unreadable discovered files. JSON keeps compatibility `incomplete_reason` and adds `incomplete_reasons` so simultaneous causes remain visible;
-- UTF-8 text tools share binary-control rejection, and grep skips non-text candidates; byte-oriented files use bread/bwrite/bedit; grep caps a request at 32 MiB content I/O and 4096 candidate files, reporting incomplete search coverage; optional gitignore work is separately capped at 4 MiB and 256 non-absent file reads, charging bytes returned before failed reads and rejecting any per-file overflow of 64 KiB or 1024 lines instead of silently discarding rules; unreadable or policy-denied ignore files mark discovery incomplete (`ignore_rules`) without reading denied bytes;
+- UTF-8 text tools share binary-control rejection, and grep skips non-text candidates; byte-oriented files use bread/bwrite/bedit; grep caps a request at 32 MiB content I/O and 4096 candidate files, retaining only those scanable candidates; content-mode path labels escape newline/delimiter/control characters and invalid-UTF-8 Unix bytes so filenames cannot forge result records, reporting incomplete search coverage; optional gitignore work is separately capped at 4 MiB and 256 non-absent file reads, charging bytes returned before failed reads and rejecting any per-file overflow of 64 KiB or 1024 lines instead of silently discarding rules; unreadable or policy-denied ignore files mark discovery incomplete (`ignore_rules`) without reading denied bytes;
 - text/binary reads and writes are bounded; `read` streams a line window instead of preloading the whole file, builds the page in one output buffer, and its reply — truncation marker included — fits `max_read_bytes`; a source-level limiter ensures buffered prefetch cannot exceed the separate 32 MiB skipped-line I/O budget, while preserving already-prefetched selected-window bytes; a preceding line larger than the output ceiling still works within that budget;
-- the streamable-HTTP request-body ceiling is derived from the profile and shared edit bounds, not from the transport's default: six times `max_write_bytes` for worst-case JSON escaping, plus 64 KiB framing and per-edit pathname headroom derived from the 512-operation ceiling. Local HTTP and embedded OpenAI use the same limit;
-- local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes`: ordinary text gets sixfold JSON-escape headroom, while shell reserves sevenfold nested-JSON headroom for each independently capped stdout/stderr stream, plus framing; unlike a fixed 16 MiB tunnel cap, larger configured limits can be returned consistently via HTTP, stdio, and the embedded tunnel;
+- local streamable-HTTP request bodies use a profile-derived ceiling: six times `max_write_bytes` for worst-case JSON escaping, plus 64 KiB framing and per-edit pathname headroom derived from the 512-operation ceiling. The embedded OpenAI MCP endpoint caps the complete local MCP request at 9 MiB, leaving 1 MiB inside the hosted 10 MiB envelope;
+- local MCP response bodies remain bounded during streaming; the OpenAI adapter caps the complete embedded MCP response at 9 MiB and the outer tunnel envelope at 10 MiB, while raw/tool ceilings stay at 8 MiB. `ActiveTransports` derives the shared bounded-transport constraints. A redacted capability-authenticated private request context carries OpenAI budgets/replay identity; the adapter removes all preexisting `io.abird.dotlink/*` fields before inserting trusted values. `read`, `grep`, `ls`, `bread`, shell and `job_output` prefit their normal result shapes, and the shared `call_tool` boundary enforces a final serialized-size postcondition on every tool result/protocol error, including errors; local HTTP/stdio keep their profile-derived framing limits;
 - shell progress heartbeats are best-effort with a 100 ms delivery budget clipped to the command's absolute deadline, never an unbounded wait or delayed timeout inside the child-process supervision loop;
-- shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants), chosen per call by the client, bounded by the tunnel client's own `response_timeout` window when present, and clamped to the profile `max_shell_timeout_secs` ceiling; a timeout still returns a bounded, non-secret error result with any partial output;
+- every shell call is admitted as one durable execution. `timeout_secs` bounds command execution only (defaulting to the profile ceiling); OpenAI's 120 s request lifetime and 5 s delivery reserve bound only how long the response waits. If the job finishes in-window the ordinary shell result is returned; otherwise the same execution is exposed as an MCP Task or compatibility job. Tunnel request ids are deduplicated so redelivery cannot repeat the side effect. Before terminal delivery is confirmed, terminal metadata plus the existing stdout/stderr spools remain the exact replay source; failed, expired, or ambiguous delivery keeps them, and only confirmed successful delivery retires the request key and compacts hidden replay state. Native MCP Tasks are exposed only when their exact eventual `CallToolResult` is guaranteed to fit the task response budget; `tasks/get` reconstructs that exact result from the same retained stdout/stderr spools. Otherwise dotlink uses the compatibility job surface. No duplicate full result artifact is stored. Under serialization/Windows, path/mount preparation occurs only after the operation gate is acquired and execution timing starts afterward. Jobs retain at most 64 MiB per stdout/stderr stream and share a configurable aggregate spool quota (512 MiB default). `job_output` is pure/replayable, `job_ack` explicitly advances cleanup, reader leases prevent deletion during reads, and `job_list` recovers exposed ids after lost receipts. Fully acknowledged compatibility streams are deleted; native Tasks retain only the bounded ordinary-result prefix required for exact `tasks/get` replay until task TTL. Automatic recovery retains jobs only after `PreparedMachine` resolves/pins/validates one immutable authority snapshot and that exact snapshot matches the existing session. Unix/macOS grants are fingerprinted from their pinned root descriptors; Windows paths include native volume/file index. The same prepared object is consumed by machine construction, so fingerprint and runtime cannot diverge through a second canonicalization. Preparation failure is fail-closed and revokes the old session; policy/object retarget, reload or exit likewise cancels and awaits it. Fully acknowledged compatibility metadata is reclaimable under capacity pressure, and transient spool cleanup failures remain pending/retryable rather than being marked released;
 - user shell mounts must not expose protected/read-denied objects (even through read-only binds), nor writable write-denied objects: external host renames invalidate pathname masks over the lifetime of a command. The shell policy fails closed with an actionable narrow-grant error; separate runtime/cache/host mounts have their own checks;
 - shell cancellation and timeout abort request-owned pipe tasks and terminate the associated Unix process group or Windows Job Object; Windows creates the process suspended until it joins the Job Object. Unsandboxed Unix descendants that call `setsid` can escape process-group cleanup by design; Bubblewrap's PID namespace provides the stronger default boundary. Successful commands can deliberately start background work;
 - HTTP and transport lifecycles share cancellation; outer middleware drops every accepted MCP/OAuth route future (including body extraction) during shutdown, force-close-aware accepted IO wakes detached Axum connection tasks at the drain bound, and the ngrok HTTP supervisor owns the local listener and direct tunnel server tasks, explicitly closes the public tunnel and parent session with bounded RPCs concurrent with connection draining, treats a drain timeout as cleanup failure because synchronous handler work cannot be preempted, gives cleanup failures precedence over restart requests, and aborts tasks on unexpected termination;

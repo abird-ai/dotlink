@@ -4,13 +4,18 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 
 use anyhow::Result;
 use rmcp::{
-    handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
+    handler::server::wrapper::Parameters,
+    model::CallToolResult,
+    schemars,
+    service::{RequestContext, RoleServer},
+    tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use super::{
-    GlobFilter, LocalMachine, WalkFilter, dot, ok_text, retain_best, tool_error, trim_to_ceiling,
+    GlobFilter, LocalMachine, WalkFilter, dot, ok_text, retain_best, tool_error,
+    trim_to_result_budget,
 };
 use crate::mcp::AccessNeed;
 
@@ -154,7 +159,16 @@ fn list_depth(requested: Option<usize>, pattern: Option<&str>) -> usize {
 }
 
 impl LocalMachine {
+    #[cfg(test)]
     async fn list_impl(&self, args: ListArgs) -> Result<(Vec<FsEntry>, bool, super::WalkProgress)> {
+        self.list_impl_with_result_budget(args, None).await
+    }
+
+    async fn list_impl_with_result_budget(
+        &self,
+        args: ListArgs,
+        result_budget: Option<usize>,
+    ) -> Result<(Vec<FsEntry>, bool, super::WalkProgress)> {
         let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         if !fs::metadata(&root).await?.is_dir() {
             anyhow::bail!("not a directory: {}", args.path);
@@ -221,13 +235,36 @@ impl LocalMachine {
             })
             .to_string()
         };
-        let (output, truncated) = trim_to_ceiling(
+        let (output, truncated) = trim_to_result_budget(
             output,
             self.config.max_output_bytes,
+            result_budget,
             truncated || progress.scan_incomplete(),
             render,
         );
         Ok((output, truncated, progress))
+    }
+}
+
+#[cfg(test)]
+impl LocalMachine {
+    pub(super) async fn ls_for_test(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+    ) -> CallToolResult {
+        match self.list_impl(args).await {
+            Ok((entries, truncated, progress)) => ok_text(
+                serde_json::json!({
+                    "entries": entries,
+                    "truncated": truncated,
+                    "scan_incomplete": progress.scan_incomplete(),
+                    "incomplete_reason": progress.incomplete_reason(),
+                    "incomplete_reasons": progress.incomplete_reasons(),
+                })
+                .to_string(),
+            ),
+            Err(error) => tool_error(error),
+        }
     }
 }
 
@@ -243,8 +280,15 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    pub(super) async fn ls(&self, Parameters(args): Parameters<ListArgs>) -> CallToolResult {
-        match self.list_impl(args).await {
+    pub(super) async fn ls(
+        &self,
+        Parameters(args): Parameters<ListArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        match self
+            .list_impl_with_result_budget(args, self.request_result_budget(&context))
+            .await
+        {
             Ok((entries, truncated, progress)) => {
                 let payload = serde_json::json!({
                     "entries": entries,
@@ -276,7 +320,7 @@ mod tests {
         std::fs::write(root.join("README.md"), "x").unwrap();
         let machine = test_machine(root);
 
-        let reply = machine.ls(Parameters(ListArgs::default())).await;
+        let reply = machine.ls_for_test(Parameters(ListArgs::default())).await;
         let reply = serde_json::to_value(reply).unwrap();
         let payload: serde_json::Value =
             serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -518,6 +562,33 @@ mod tests {
         let rendered = serde_json::json!({"entries": entries, "truncated": truncated}).to_string();
         assert!(truncated, "{rendered}");
         assert!(rendered.len() <= 1024, "{} bytes", rendered.len());
+    }
+
+    #[tokio::test]
+    async fn ls_pages_fit_the_serialized_mcp_result_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for index in 0..80 {
+            std::fs::write(root.join(format!("{index:03}-{}", "\"\\".repeat(24))), "x").unwrap();
+        }
+        let machine = crate::mcp::tools::test_support::test_machine_with(root, |config| {
+            config.max_output_bytes = 64 * 1024;
+        });
+        let budget = 4096;
+        let (entries, truncated, progress) = machine
+            .list_impl_with_result_budget(ListArgs::default(), Some(budget))
+            .await
+            .unwrap();
+        let text = serde_json::json!({
+            "entries": entries,
+            "truncated": truncated,
+            "scan_incomplete": progress.scan_incomplete(),
+            "incomplete_reason": progress.incomplete_reason(),
+            "incomplete_reasons": progress.incomplete_reasons(),
+        })
+        .to_string();
+        assert!(truncated);
+        assert!(crate::mcp::serialized_text_tool_result_len(&text) <= budget);
     }
 
     #[test]

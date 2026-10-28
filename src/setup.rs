@@ -23,8 +23,8 @@ use crate::{
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_MAX_SHELL_TIMEOUT_SECS: u64 = 3_600;
-const DEFAULT_MAX_OUTPUT_BYTES: usize = 1_048_576;
-const DEFAULT_MAX_FILE_BYTES: usize = 4_194_304;
+const DEFAULT_MAX_OUTPUT_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
+const DEFAULT_MAX_FILE_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransportConfig {
@@ -404,6 +404,10 @@ pub struct AppConfig {
     pub max_read_bytes: usize,
     #[serde(default = "default_file_bytes")]
     pub max_write_bytes: usize,
+    #[serde(default = "default_job_retention_secs")]
+    pub job_retention_secs: u64,
+    #[serde(default = "default_job_spool_bytes")]
+    pub job_spool_bytes: u64,
 }
 
 pub struct SetupResult {
@@ -509,6 +513,14 @@ fn default_file_bytes() -> usize {
     DEFAULT_MAX_FILE_BYTES
 }
 
+fn default_job_retention_secs() -> u64 {
+    crate::limits::DEFAULT_JOB_RETENTION_SECS
+}
+
+fn default_job_spool_bytes() -> u64 {
+    crate::limits::DEFAULT_JOB_SPOOL_BYTES
+}
+
 fn default_app_config() -> AppConfig {
     AppConfig {
         version: config_version(),
@@ -526,6 +538,9 @@ fn default_app_config() -> AppConfig {
         max_output_bytes: default_output_bytes(),
         max_read_bytes: default_file_bytes(),
         max_write_bytes: default_file_bytes(),
+
+        job_retention_secs: default_job_retention_secs(),
+        job_spool_bytes: default_job_spool_bytes(),
     }
 }
 
@@ -3079,17 +3094,9 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
     {
         bail!("permissions.allow_gpu cannot contain duplicate GPU vendors");
     }
-    let has_read = config.permissions.default_allow
-        || !config.permissions.allow_read.is_empty()
-        || !config.permissions.allow_rw.is_empty();
-    let has_write =
-        !config.permissions.allow_write.is_empty() || !config.permissions.allow_rw.is_empty();
-    if config.permissions.allow_shell && !has_read {
-        bail!("permissions.allow_shell requires at least one readable path");
-    }
-    if !has_read && !has_write && !config.permissions.allow_shell {
-        bail!("profile has no local capability; enable default read access or add an allow rule");
-    }
+    // A saved profile describes defaults, not the complete execution policy.
+    // One-run --allow-* grants and --deny-* rules are composed later; only the
+    // effective policy can decide whether any usable capability remains.
     if config.transports.http_ephemeral_url && !config.transports.http {
         bail!("transports.http_ephemeral_url requires transports.http");
     }
@@ -3178,6 +3185,33 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
                 crate::mcp::MIN_BYTE_LIMIT
             );
         }
+        if value > crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES {
+            bail!(
+                "{name} must not exceed {} bytes, the configured transfer ceiling below the OpenAI tunnel's {} byte serialized-message limit",
+                crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES,
+                crate::limits::OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES,
+            );
+        }
+    }
+    if !(crate::limits::MIN_JOB_RETENTION_SECS..=crate::limits::MAX_JOB_RETENTION_SECS)
+        .contains(&config.job_retention_secs)
+    {
+        bail!(
+            "job_retention_secs must be between {} and {} seconds, got {}",
+            crate::limits::MIN_JOB_RETENTION_SECS,
+            crate::limits::MAX_JOB_RETENTION_SECS,
+            config.job_retention_secs,
+        );
+    }
+    if !(crate::limits::MIN_JOB_SPOOL_BYTES..=crate::limits::MAX_JOB_SPOOL_BYTES)
+        .contains(&config.job_spool_bytes)
+    {
+        bail!(
+            "job_spool_bytes must be between {} and {} bytes, got {}",
+            crate::limits::MIN_JOB_SPOOL_BYTES,
+            crate::limits::MAX_JOB_SPOOL_BYTES,
+            config.job_spool_bytes,
+        );
     }
 
     Ok(())
@@ -3338,6 +3372,9 @@ mod tests {
             max_output_bytes: 1024,
             max_read_bytes: 1024,
             max_write_bytes: 1024,
+
+            job_retention_secs: default_job_retention_secs(),
+            job_spool_bytes: default_job_spool_bytes(),
         }
     }
 
@@ -3411,6 +3448,33 @@ mod tests {
             ..example_config()
         };
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn durable_job_spool_quota_defaults_and_validates() {
+        assert_eq!(
+            default_job_spool_bytes(),
+            crate::limits::DEFAULT_JOB_SPOOL_BYTES
+        );
+        let mut config = example_config();
+        config.job_spool_bytes = crate::limits::MIN_JOB_SPOOL_BYTES;
+        validate_config(&config).unwrap();
+        config.job_spool_bytes = crate::limits::MAX_JOB_SPOOL_BYTES;
+        validate_config(&config).unwrap();
+        config.job_spool_bytes = crate::limits::MIN_JOB_SPOOL_BYTES - 1;
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("job_spool_bytes")
+        );
+        config.job_spool_bytes = crate::limits::MAX_JOB_SPOOL_BYTES + 1;
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("job_spool_bytes")
+        );
     }
 
     #[test]
@@ -3979,6 +4043,26 @@ mod tests {
         assert!(migrated.transports.stdio);
         assert!(migrated.transports.ngrok_domain.is_none());
         assert!(!migrated.oauth.enabled);
+        assert_eq!(
+            migrated.max_output_bytes,
+            crate::limits::DEFAULT_TRANSFER_BYTES
+        );
+        assert_eq!(
+            migrated.max_read_bytes,
+            crate::limits::DEFAULT_TRANSFER_BYTES
+        );
+        assert_eq!(
+            migrated.max_write_bytes,
+            crate::limits::DEFAULT_TRANSFER_BYTES
+        );
+        assert_eq!(
+            migrated.job_retention_secs,
+            crate::limits::DEFAULT_JOB_RETENTION_SECS
+        );
+        assert_eq!(
+            migrated.job_spool_bytes,
+            crate::limits::DEFAULT_JOB_SPOOL_BYTES
+        );
         validate_config_structure(&migrated).unwrap();
     }
 
@@ -4228,7 +4312,7 @@ mod tests {
     }
 
     #[test]
-    fn config_validation_rejects_unusable_local_capabilities() {
+    fn empty_saved_permissions_are_valid_defaults_not_an_effective_policy() {
         let mut config = example_config();
         config.transports.openai = false;
         config.tunnel_id = None;
@@ -4238,13 +4322,19 @@ mod tests {
         config.permissions.allow_write.clear();
         config.permissions.allow_rw.clear();
         config.permissions.allow_shell = false;
-        assert!(validate_config(&config).is_err());
+        validate_config(&config).unwrap();
 
+        // A saved shell preference can be made usable by a one-run filesystem
+        // grant, so don't reject it before CLI composition either.
         config.permissions.allow_shell = true;
-        assert!(validate_config(&config).is_err());
-
+        validate_config(&config).unwrap();
         config.permissions.allow_read.push(PathBuf::from("."));
         validate_config(&config).unwrap();
+
+        // Actual structural dependencies stay mandatory for every profile.
+        config.permissions.allow_shell = false;
+        config.permissions.allow_network = true;
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]

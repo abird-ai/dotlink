@@ -4,12 +4,19 @@ use std::io;
 
 use anyhow::Result;
 use rmcp::{
-    handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
+    RoleServer,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, Tool},
+    schemars,
+    service::RequestContext,
+    tool, tool_router,
 };
 use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
-use super::{LocalMachine, marker_lines, mutation::compact_text_receipt, ok_text, tool_error};
+use super::{
+    LocalMachine, marker_lines, mutation::compact_text_receipt, ok_text, resolve_capped, tool_error,
+};
 use crate::mcp::AccessNeed;
 
 const DEFAULT_READ_LINES: usize = 4 * 1024;
@@ -34,6 +41,11 @@ pub(super) struct ReadArgs {
     /// Set false to return the file text exactly, byte for byte.
     #[serde(default)]
     numbered: Option<bool>,
+
+    /// Maximum returned bytes for this call. Defaults to the profile read ceiling
+    /// and is capped there. A capped result ends with a truncation marker.
+    #[serde(default)]
+    max_read_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -151,33 +163,57 @@ where
 
 /// Drop the last whole line of a buffer that holds only lines. Each line ends
 /// with its terminator, except possibly the file's last one.
-fn drop_last_line(buffer: &mut Vec<u8>) -> bool {
-    let Some(last) = buffer.last().copied() else {
-        return false;
-    };
-    let end = if last == b'\n' {
-        buffer.len() - 1
-    } else {
-        buffer.len()
-    };
-    let start = buffer[..end]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    buffer.truncate(start);
-    true
+pub(crate) fn with_read_limit(tool: &mut Tool, max_bytes: usize) {
+    if tool.name.as_ref() != "read" {
+        return;
+    }
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(property) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("max_read_bytes"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        property.insert(
+            "description".to_owned(),
+            serde_json::Value::String(format!(
+                "Maximum raw returned bytes for this call. Defaults to {max_bytes} and is capped at {max_bytes}. When the transport supplies a serialized-result budget, the final page also fits that budget, so escape-heavy text may end earlier at a whole-line boundary."
+            )),
+        );
+        property.insert("maximum".to_owned(), serde_json::Value::from(max_bytes));
+    }
+    tool.input_schema = std::sync::Arc::new(schema);
 }
 
 impl LocalMachine {
+    #[cfg(test)]
     async fn read_impl(&self, args: ReadArgs) -> Result<String> {
-        self.read_impl_with_scan_budget(args, MAX_READ_SCAN_BYTES)
+        self.read_impl_with_result_budget(args, None).await
+    }
+
+    async fn read_impl_with_result_budget(
+        &self,
+        args: ReadArgs,
+        result_budget: Option<usize>,
+    ) -> Result<String> {
+        self.read_impl_with_limits(args, MAX_READ_SCAN_BYTES, result_budget)
             .await
     }
 
+    #[cfg(test)]
     async fn read_impl_with_scan_budget(
         &self,
         args: ReadArgs,
         scan_budget: usize,
+    ) -> Result<String> {
+        self.read_impl_with_limits(args, scan_budget, None).await
+    }
+
+    async fn read_impl_with_limits(
+        &self,
+        args: ReadArgs,
+        scan_budget: usize,
+        result_budget: Option<usize>,
     ) -> Result<String> {
         let path = self.resolve_existing(&args.path, AccessNeed::Read).await?;
         let file = self.open_read_file(&path).await?;
@@ -186,7 +222,7 @@ impl LocalMachine {
         // A zero window would render a nonsense marker ("truncated at line 0").
         let limit = args.limit.unwrap_or(DEFAULT_READ_LINES).max(1);
         let numbered = args.numbered.unwrap_or(true);
-        let byte_limit = self.config.max_read_bytes;
+        let byte_limit = resolve_capped(args.max_read_bytes, self.config.max_read_bytes);
         let (mut reader, mut line_number) = reader_at_line(file, offset, scan_budget).await?;
         // A trailing newline terminates the preceding line; it does not create
         // another line. Only an actually empty file is readable at offset 1.
@@ -200,6 +236,7 @@ impl LocalMachine {
         // One output buffer with whole lines only, so making room for the
         // truncation marker can drop a line but never cut one in half.
         let mut out: Vec<u8> = Vec::new();
+        let mut line_ends = Vec::with_capacity(limit.min(DEFAULT_READ_LINES));
         let mut line = Vec::new();
         let mut emitted = 0_usize;
         let mut capped = false;
@@ -236,6 +273,7 @@ impl LocalMachine {
             }
             line_number += 1;
             emitted += 1;
+            line_ends.push(out.len());
         }
         if !capped && emitted == limit {
             // Peek only the next buffer, never the next whole line: a huge
@@ -256,10 +294,10 @@ impl LocalMachine {
         if capped {
             let mut marker = marker_lines(offset + emitted - 1);
             while out.len() + 1 + marker.len() > byte_limit {
-                if !drop_last_line(&mut out) {
-                    anyhow::bail!("read window exceeds the {byte_limit} byte read limit");
-                }
+                line_ends.pop();
                 emitted -= 1;
+                let end = line_ends.last().copied().unwrap_or(0);
+                out.truncate(end);
                 if emitted == 0 {
                     anyhow::bail!(
                         "line {offset} and its truncation marker do not fit the {byte_limit} byte read limit; raise max_read_bytes"
@@ -267,6 +305,70 @@ impl LocalMachine {
                 }
                 marker = marker_lines(offset + emitted - 1);
             }
+        }
+
+        // Raw bytes and serialized MCP bytes are different budgets: JSON
+        // escaping can expand quotes/newlines substantially. Keep the 8 MiB raw
+        // profile ceiling, but fit the actual text result below the shared MCP
+        // result budget by dropping whole trailing lines only when necessary.
+        let result_budget = result_budget.unwrap_or(usize::MAX);
+        let current =
+            std::str::from_utf8(&out).map_err(|_| anyhow::anyhow!("binary file; use bread"))?;
+        let plain = if !capped && numbered && current.ends_with('\n') {
+            &current[..current.len() - 1]
+        } else {
+            current
+        };
+        let current_size = if capped {
+            let marker = marker_lines(offset + emitted - 1);
+            let separator = if current.is_empty() || current.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            crate::mcp::serialized_text_tool_result_parts_len(&[current, separator, &marker])
+        } else {
+            crate::mcp::serialized_text_tool_result_len(plain)
+        };
+        if current_size > result_budget {
+            capped = true;
+            if emitted == 0 {
+                anyhow::bail!("read result cannot fit the MCP response budget");
+            }
+            let mut low = 1_usize;
+            let mut high = emitted;
+            let mut best = 0_usize;
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let end = line_ends[mid - 1];
+                let prefix = std::str::from_utf8(&out[..end])
+                    .map_err(|_| anyhow::anyhow!("binary file; use bread"))?;
+                let marker = marker_lines(offset + mid - 1);
+                let separator = if prefix.is_empty() || prefix.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                let size = crate::mcp::serialized_text_tool_result_parts_len(&[
+                    prefix, separator, &marker,
+                ]);
+                if size <= result_budget {
+                    best = mid;
+                    low = mid + 1;
+                } else if mid == 1 {
+                    break;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            if best == 0 {
+                anyhow::bail!(
+                    "line {offset} and its truncation marker do not fit the MCP response budget; use bread for this content"
+                );
+            }
+            emitted = best;
+            out.truncate(line_ends[best - 1]);
+            line_ends.truncate(best);
         }
 
         let mut text =
@@ -319,8 +421,15 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn read(&self, Parameters(args): Parameters<ReadArgs>) -> CallToolResult {
-        match self.read_impl(args).await {
+    async fn read(
+        &self,
+        Parameters(args): Parameters<ReadArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        match self
+            .read_impl_with_result_budget(args, self.request_result_budget(&context))
+            .await
+        {
             Ok(text) => ok_text(text),
             Err(error) => tool_error(error),
         }
@@ -346,6 +455,29 @@ impl LocalMachine {
 
 #[cfg(test)]
 mod tests {
+    impl LocalMachine {
+        async fn read_for_test(&self, Parameters(args): Parameters<ReadArgs>) -> CallToolResult {
+            match self.read_impl(args).await {
+                Ok(text) => ok_text(text),
+                Err(error) => tool_error(error),
+            }
+        }
+    }
+
+    #[test]
+    fn read_schema_exposes_the_profile_byte_ceiling() {
+        let mut tool = LocalMachine::all_tools().get("read").cloned().unwrap();
+        with_read_limit(&mut tool, 8 * 1024 * 1024);
+        let property = &tool.input_schema["properties"]["max_read_bytes"];
+        assert_eq!(property["maximum"], 8 * 1024 * 1024);
+        assert!(
+            property["description"]
+                .as_str()
+                .unwrap()
+                .contains("8388608")
+        );
+    }
+
     use super::*;
     use crate::mcp::tools::test_support::{test_machine, test_machine_with};
 
@@ -360,6 +492,8 @@ mod tests {
             offset: Some(3),
             limit: Some(1),
             numbered: Some(false),
+
+            max_read_bytes: None,
         };
         let error = machine
             .read_impl_with_scan_budget(args(), 10)
@@ -472,6 +606,8 @@ mod tests {
                 offset: None,
                 limit: Some(1),
                 numbered: None,
+
+                max_read_bytes: None,
             })
             .await;
         assert!(
@@ -490,11 +626,13 @@ mod tests {
         let machine = test_machine(root.clone());
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -504,11 +642,13 @@ mod tests {
         );
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: Some(2),
                 limit: Some(1),
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -518,11 +658,13 @@ mod tests {
         );
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: Some(2),
                 limit: None,
                 numbered: Some(false),
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -535,11 +677,13 @@ mod tests {
         // CRLF and a missing trailing newline survive the round trip.
         std::fs::write(root.join("crlf.txt"), "a\r\nb\r\n").unwrap();
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "crlf.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: Some(false),
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -549,11 +693,13 @@ mod tests {
         );
         // Numbered rendering strips the terminator so lines join cleanly.
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "crlf.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -564,11 +710,13 @@ mod tests {
 
         // Reading past the end of the file is an error, not an empty answer.
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: Some(50),
                 limit: None,
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -588,11 +736,13 @@ mod tests {
             .join("\n");
         std::fs::write(machine.config.access.base_dir.join("big.txt"), &big).unwrap();
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "big.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: Some(false),
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -613,11 +763,13 @@ mod tests {
             config.max_read_bytes = 1024
         });
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "wide.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: Some(false),
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -646,11 +798,13 @@ mod tests {
         // A window selected by `offset` must not depend on the size of what
         // precedes it.
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: Some(2),
                 limit: Some(1),
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -673,11 +827,13 @@ mod tests {
         ] {
             std::fs::write(root.join(source), content).unwrap();
             let result = machine
-                .read(Parameters(ReadArgs {
+                .read_for_test(Parameters(ReadArgs {
                     path: source.to_owned(),
                     offset: Some(lines + 1),
                     limit: Some(1),
                     numbered: Some(false),
+
+                    max_read_bytes: None,
                 }))
                 .await;
             let result = serde_json::to_value(result).unwrap();
@@ -691,11 +847,13 @@ mod tests {
         }
         std::fs::write(root.join("empty.txt"), "").unwrap();
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "empty.txt".to_owned(),
                 offset: Some(1),
                 limit: Some(1),
                 numbered: Some(false),
+
+                max_read_bytes: None,
             }))
             .await;
         assert_eq!(
@@ -713,11 +871,13 @@ mod tests {
         let machine = test_machine_with(root, |config| config.max_read_bytes = 4096);
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "many.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -743,11 +903,13 @@ mod tests {
         let machine = test_machine_with(root, |config| config.max_read_bytes = 1024);
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -760,11 +922,13 @@ mod tests {
 
         // Without the numbering prefix the same line fits.
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: None,
                 limit: None,
                 numbered: Some(false),
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -780,32 +944,67 @@ mod tests {
         let machine = test_machine(root);
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.bin".to_owned(),
                 offset: Some(2),
                 limit: None,
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
         assert_eq!(serialized["content"][0]["text"].as_str().unwrap(), "2\tok");
     }
 
-    #[test]
-    fn dropping_the_last_line_never_cuts_a_line() {
-        let mut buffer = b"1\ta\n22\tb\n".to_vec();
-        assert!(drop_last_line(&mut buffer));
-        assert_eq!(buffer, b"1\ta\n");
-        assert!(drop_last_line(&mut buffer));
-        assert_eq!(buffer, b"");
-        assert!(!drop_last_line(&mut buffer), "empty buffers have no line");
+    #[tokio::test]
+    async fn escape_heavy_read_pages_fit_the_serialized_mcp_result_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let line = format!("{}\n", "\"".repeat(2040));
+        let content = line.repeat(4096);
+        assert!(content.len() < crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES);
+        std::fs::write(root.join("quotes.txt"), &content).unwrap();
+        let machine = test_machine_with(root, |config| {
+            config.max_read_bytes = crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES;
+        });
+        let text = machine
+            .read_impl_with_result_budget(
+                ReadArgs {
+                    path: "quotes.txt".to_owned(),
+                    offset: None,
+                    limit: Some(4096),
+                    numbered: Some(false),
+                    max_read_bytes: Some(crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES),
+                },
+                Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+            )
+            .await
+            .unwrap();
+        assert!(
+            text.len() < content.len(),
+            "escape-heavy page should be shortened"
+        );
+        assert!(text.contains("… truncated at line"), "{text:?}");
+        assert!(
+            crate::mcp::serialized_text_tool_result_len(&text)
+                <= crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES
+        );
 
-        // An unterminated last line is dropped from its own start.
-        let mut buffer = b"1\ta\n2\tb".to_vec();
-        assert!(drop_last_line(&mut buffer));
-        assert_eq!(buffer, b"1\ta\n");
-        assert!(drop_last_line(&mut buffer));
-        assert_eq!(buffer, b"");
+        let local = machine
+            .read_impl(ReadArgs {
+                path: "quotes.txt".to_owned(),
+                offset: None,
+                limit: Some(4096),
+                numbered: Some(false),
+                max_read_bytes: Some(crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            local, content,
+            "local transport must retain the full raw profile ceiling"
+        );
     }
 
     #[tokio::test]
@@ -821,11 +1020,13 @@ mod tests {
         });
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "large.txt".to_owned(),
                 offset: None,
                 limit: Some(1),
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();
@@ -843,11 +1044,13 @@ mod tests {
         let machine = test_machine(root);
 
         let result = machine
-            .read(Parameters(ReadArgs {
+            .read_for_test(Parameters(ReadArgs {
                 path: "a.txt".to_owned(),
                 offset: None,
                 limit: Some(0),
                 numbered: None,
+
+                max_read_bytes: None,
             }))
             .await;
         let serialized = serde_json::to_value(&result).unwrap();

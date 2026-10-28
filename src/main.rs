@@ -7,6 +7,8 @@ mod credentials;
 mod hardware;
 #[cfg(target_os = "linux")]
 mod host_services;
+mod jobs;
+mod limits;
 mod logging;
 mod mcp;
 mod mutation;
@@ -53,7 +55,7 @@ use crate::{
     backoff::Backoff,
     controls::{RuntimeControl, RuntimeControls, StdioInterruptGuard},
     logging::{ColorMode, LogConfig},
-    mcp::{AccessSpec, LocalMachine, MachineConfig, SandboxCacheMount},
+    mcp::{AccessSpec, LocalMachine, MachineConfig, PreparedMachine, SandboxCacheMount},
     recovery::Recovery,
     setup::{
         CacheKind, CacheMode, GpuVendor, PermissionConfig, ProfileBool, ProfileRuleKind,
@@ -957,6 +959,9 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
     // rejection must survive an in-process restart.
     let mut shutdown = Shutdown::default();
     let rejections = transports::openai::RejectionLedger::default();
+    // Long-running jobs belong to the dotlink process session, not one OpenAI
+    // transport runtime. Automatic tunnel recovery therefore preserves them.
+    let mut jobs: Option<jobs::JobManager> = None;
     let mut runtime_restarts = 0_u32;
     loop {
         match run_runtime(
@@ -966,16 +971,25 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
             setup_color,
             &mut shutdown,
             &rejections,
+            &mut jobs,
         )
         .await
         {
-            Ok(RuntimeOutcome::Exit) => return Ok(()),
+            Ok(RuntimeOutcome::Exit) => {
+                shutdown_job_session(&mut jobs).await?;
+                return Ok(());
+            }
             Ok(RuntimeOutcome::Restart) => {
                 runtime_restarts = 0;
+                // Ctrl+R is a policy reload, not transport recovery. Drop the
+                // old session so revoked shell/filesystem authority also stops
+                // work that was launched under it.
+                shutdown_job_session(&mut jobs).await?;
                 log.notice("runtime", "restarting");
             }
             Err(error) => {
                 let Recovery::Runtime { reset_backoff } = Recovery::of(&error) else {
+                    shutdown_job_session(&mut jobs).await?;
                     return Err(error);
                 };
 
@@ -998,6 +1012,7 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
                 tokio::select! {
                     biased;
                     _ = shutdown_requested => {
+                        shutdown_job_session(&mut jobs).await?;
                         eprintln!("\ndotlink stopped.");
                         return Ok(());
                     }
@@ -1006,6 +1021,13 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
             }
         }
     }
+}
+
+async fn shutdown_job_session(jobs: &mut Option<jobs::JobManager>) -> Result<()> {
+    if let Some(manager) = jobs.take() {
+        manager.shutdown().await?;
+    }
+    Ok(())
 }
 
 async fn run_command(command: &Command, color: bool) -> Result<()> {
@@ -1139,6 +1161,90 @@ struct RuntimePlan {
     transports: ActiveTransports,
 }
 
+fn transport_authority_value(
+    setup: &SetupResult,
+    transports: &ActiveTransports,
+) -> serde_json::Value {
+    let openai = transports.openai.as_ref().map(|config| {
+        serde_json::json!({
+            "base_url": config.base_url,
+            "tunnel_id": config.tunnel_id,
+            "organization_id": config.organization_id,
+            "runtime_key": hex::encode(crate::mcp::sha256(config.runtime_api_key.as_bytes())),
+        })
+    });
+    let http = transports.http.as_ref().map(|config| {
+        serde_json::json!({
+            "bind": config.bind.to_string(),
+            "ngrok": config.ngrok,
+            "ngrok_domain": config.ngrok_domain,
+            "http_ephemeral_url": config.http_ephemeral_url,
+            "ngrok_ephemeral_url": config.ngrok_ephemeral_url,
+            "local_oauth": config.local_oauth,
+            "ngrok_oauth": config.ngrok_oauth,
+            "oauth_public_url": config.oauth_public_url.as_ref().map(ToString::to_string),
+            "ngrok_no_auth": config.ngrok_no_auth,
+            "ngrok_token": config.ngrok_authtoken.as_ref().map(|token| {
+                hex::encode(crate::mcp::sha256(token.as_bytes()))
+            }),
+        })
+    });
+    let constraints = transports.constraints();
+    serde_json::json!({
+        "openai": openai,
+        "stdio": transports.stdio,
+        "http": http,
+        "constraints": {
+            "task_result_budget": constraints.task_result_budget,
+        },
+        "owner_password_revision": setup.config.owner_password_revision,
+    })
+}
+
+fn job_authority_intent_fingerprint(
+    args: &Args,
+    setup: &SetupResult,
+    policy: &Policy,
+    transports: &ActiveTransports,
+) -> Result<[u8; 32]> {
+    let mut authority = serde_json::json!({
+        "base_dir": policy.base_dir,
+        "read_roots": policy.read_roots,
+        "write_roots": policy.write_roots,
+        "deny_read_roots": policy.deny_read_roots,
+        "deny_write_roots": policy.deny_write_roots,
+        "unrestricted_fs": policy.unrestricted_fs,
+        "allow_shell": policy.allow_shell,
+        "sandbox_shell": policy.sandbox_shell,
+        "allow_network": policy.allow_network,
+        "max_shell_timeout_secs": setup.config.max_shell_timeout_secs,
+        "saved_caches": setup.config.caches,
+        "cli_caches": args.cache_flags.requested(),
+        "protected_paths": setup.protected_paths,
+        "active_transports": transport_authority_value(setup, transports),
+    });
+    #[cfg(target_os = "linux")]
+    {
+        authority["host_access"] = serde_json::json!({
+            "nix_daemon": policy.host_access.nix_daemon,
+            "nix_config": policy.host_access.nix_config,
+            "ssh_agent": policy.host_access.ssh_agent,
+            "git_config": policy.host_access.git_config,
+            "kvm": policy.allow_kvm,
+            "gpu": policy.allow_gpu,
+        });
+    }
+    Ok(crate::mcp::sha256(&serde_json::to_vec(&authority)?))
+}
+
+fn job_authority_fingerprint(intent: [u8; 32], prepared: &PreparedMachine) -> Result<[u8; 32]> {
+    let authority = serde_json::json!({
+        "intent": hex::encode(intent),
+        "machine": prepared.authority_value(),
+    });
+    Ok(crate::mcp::sha256(&serde_json::to_vec(&authority)?))
+}
+
 /// Resolve configuration from local state, without host devices or the network
 /// (first-run interactive setup aside). `None` means that setup was cancelled.
 async fn plan_runtime(
@@ -1245,6 +1351,8 @@ async fn prepare_runtime(
     args: &Args,
     log: &LogConfig,
     plan: RuntimePlan,
+    intent: [u8; 32],
+    jobs: &mut Option<jobs::JobManager>,
 ) -> Result<(ActiveTransports, LocalMachine)> {
     let RuntimePlan {
         setup,
@@ -1253,8 +1361,9 @@ async fn prepare_runtime(
     } = plan;
 
     // Startup depends on the host (devices, caches and filesystem state), so
-    // its failures restart by default. A policy the sandbox provably cannot
-    // enforce (`LocalMachine::new`) is tagged `Operator` where it is found.
+    // its failures restart by default. Resolve/pin machine authority once into a
+    // PreparedMachine; the fingerprint and final LocalMachine consume that exact
+    // snapshot instead of independently traversing the same pathnames.
     let mut cache_mounts = Vec::new();
     let mut shell_env = BTreeMap::new();
     #[cfg(target_os = "linux")]
@@ -1283,7 +1392,9 @@ async fn prepare_runtime(
         }
     }
 
-    let machine = LocalMachine::new(MachineConfig {
+    let retention = std::time::Duration::from_secs(setup.config.job_retention_secs);
+    let spool_limit = setup.config.job_spool_bytes;
+    let machine_config = MachineConfig {
         access: AccessSpec {
             base_dir: policy.base_dir.clone(),
             read_roots: policy.read_roots.clone(),
@@ -1305,10 +1416,60 @@ async fn prepare_runtime(
         max_output_bytes: setup.config.max_output_bytes,
         max_read_bytes: setup.config.max_read_bytes,
         max_write_bytes: setup.config.max_write_bytes,
+        task_result_budget: transports.constraints().task_result_budget,
+        job_retention_secs: setup.config.job_retention_secs,
+        job_spool_bytes: setup.config.job_spool_bytes,
         protected_paths: setup.protected_paths.clone(),
-    })
-    .await?;
+    };
 
+    let (job_manager, prepared) = if let Some(existing) = jobs.as_ref() {
+        let prepared = match LocalMachine::prepare_with_job_root(
+            machine_config.clone(),
+            existing.protected_path(),
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Reuse is allowed only after the replacement authority is
+                // successfully prepared and proven identical. A preparation
+                // failure leaves equality unknown, so revoke the old session
+                // before propagating the startup error.
+                shutdown_job_session(jobs).await?;
+                return Err(error);
+            }
+        };
+        let authority = job_authority_fingerprint(intent, &prepared)?;
+        if existing.bind_policy(authority) {
+            (existing.clone(), prepared)
+        } else {
+            shutdown_job_session(jobs).await?;
+            let created = jobs::JobManager::with_spool_limit(retention, spool_limit)?;
+            let bound_intent = created.bind_intent(intent);
+            debug_assert!(bound_intent);
+            let prepared =
+                LocalMachine::prepare_with_job_root(machine_config, created.protected_path())
+                    .await?;
+            let authority = job_authority_fingerprint(intent, &prepared)?;
+            let bound_policy = created.bind_policy(authority);
+            debug_assert!(bound_policy);
+            *jobs = Some(created.clone());
+            (created, prepared)
+        }
+    } else {
+        let created = jobs::JobManager::with_spool_limit(retention, spool_limit)?;
+        let bound_intent = created.bind_intent(intent);
+        debug_assert!(bound_intent);
+        let prepared =
+            LocalMachine::prepare_with_job_root(machine_config, created.protected_path()).await?;
+        let authority = job_authority_fingerprint(intent, &prepared)?;
+        let bound_policy = created.bind_policy(authority);
+        debug_assert!(bound_policy);
+        *jobs = Some(created.clone());
+        (created, prepared)
+    };
+
+    let machine = LocalMachine::from_prepared(prepared, job_manager)?;
     Ok((transports, machine))
 }
 
@@ -1319,6 +1480,7 @@ async fn run_runtime(
     setup_color: bool,
     shutdown: &mut Shutdown,
     rejections: &transports::openai::RejectionLedger,
+    jobs: &mut Option<jobs::JobManager>,
 ) -> Result<RuntimeOutcome> {
     // On the first pass this does not install a listener, preserving the OS's
     // default Ctrl+C behavior during interactive first-run setup. Every later
@@ -1334,12 +1496,21 @@ async fn run_runtime(
     let Some(plan) = planned.map_err(recovery::config_failure)? else {
         return Ok(RuntimeOutcome::Exit);
     };
-
+    let intent =
+        job_authority_intent_fingerprint(args, &plan.setup, &plan.policy, &plan.transports)?;
+    if jobs
+        .as_ref()
+        .is_some_and(|existing| !existing.bind_intent(intent))
+    {
+        // Config/CLI authority changed. Revoke the old session before any
+        // potentially failing startup/discovery work for the replacement.
+        shutdown_job_session(jobs).await?;
+    }
     // Initial interactive planning is complete. From this exact point onward,
     // signal cancellation races startup as well as the running transports.
     shutdown.start()?;
     let prepared = shutdown
-        .run_until_requested(prepare_runtime(args, log, plan))
+        .run_until_requested(prepare_runtime(args, log, plan, intent, jobs))
         .await;
     let Some(prepared) = prepared else {
         eprintln!("\ndotlink stopped.");
@@ -1613,10 +1784,7 @@ fn print_banner(
     eprintln!();
     eprintln!(
         "{}",
-        log.style(
-            "1;36",
-            format!("abird dotlink {}", env!("CARGO_PKG_VERSION"))
-        )
+        log.style("1;36", format!("dotlink v{}", env!("CARGO_PKG_VERSION")))
     );
     eprintln!(
         "{}",
@@ -1693,17 +1861,14 @@ fn print_banner(
     if transports.stdio {
         eprintln!("stdio MCP server active; stdout is reserved for MCP.");
     }
-    if controls_available {
-        eprintln!(
-            "{}",
-            log.style(
-                "2",
-                "Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity"
-            )
-        );
+    let keys = if controls_available && log.activity_enabled() {
+        "Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity · V: full commands"
+    } else if controls_available {
+        "Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity"
     } else {
-        eprintln!("{}", log.style("2", "Keys        Ctrl-C: exit"));
-    }
+        "Keys        Ctrl-C: exit"
+    };
+    eprintln!("{}", log.style("2", keys));
     eprintln!();
 }
 
@@ -1731,6 +1896,187 @@ mod tests {
 
     fn loopback_http_bind() -> Option<SocketAddr> {
         Some("127.0.0.1:3000".parse().unwrap())
+    }
+
+    #[test]
+    fn shell_timeout_ceiling_participates_in_job_authority_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let mut config: crate::setup::AppConfig =
+            serde_json::from_value(serde_json::json!({"version": 10})).unwrap();
+        config.transports.openai = false;
+        config.transports.stdio = true;
+        config.permissions.default_allow = true;
+        config.max_shell_timeout_secs = 60;
+        let setup = SetupResult {
+            config,
+            new_tunnel: false,
+            protected_paths: Vec::new(),
+        };
+        let policy = Policy::from_args(&args, root, &setup.config.permissions).unwrap();
+        let transports = ActiveTransports {
+            openai: None,
+            stdio: true,
+            http: None,
+        };
+        let before = job_authority_intent_fingerprint(&args, &setup, &policy, &transports).unwrap();
+
+        let mut changed = setup;
+        changed.config.max_shell_timeout_secs = 61;
+        let after =
+            job_authority_intent_fingerprint(&args, &changed, &policy, &transports).unwrap();
+        assert_ne!(
+            before, after,
+            "execution-lifetime policy changes must revoke the old job session"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prepared_authority_is_stable_and_reprepare_observes_guard_retarget() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        let deny_alias = root.join("deny-link");
+        let protected_alias = root.join("protected-link");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        symlink(&first, &deny_alias).unwrap();
+        symlink(&first, &protected_alias).unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let config = MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root.clone()],
+                deny_read_roots: vec![deny_alias.clone()],
+                deny_write_roots: vec![deny_alias.clone()],
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            host_shell: host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 60,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: 60,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: vec![protected_alias.clone()],
+        };
+        let prepared_before =
+            LocalMachine::prepare_with_job_root(config.clone(), manager.protected_path())
+                .await
+                .unwrap();
+        let before = job_authority_fingerprint([7; 32], &prepared_before).unwrap();
+
+        std::fs::remove_file(&deny_alias).unwrap();
+        std::fs::remove_file(&protected_alias).unwrap();
+        symlink(&second, &deny_alias).unwrap();
+        symlink(&second, &protected_alias).unwrap();
+
+        assert_eq!(
+            before,
+            job_authority_fingerprint([7; 32], &prepared_before).unwrap(),
+            "one prepared snapshot must not re-resolve host names during fingerprinting"
+        );
+        let prepared_after = LocalMachine::prepare_with_job_root(config, manager.protected_path())
+            .await
+            .unwrap();
+        let after = job_authority_fingerprint([7; 32], &prepared_after).unwrap();
+        assert_ne!(before, after, "re-preparing must observe guard retargeting");
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prepared_grant_fingerprint_uses_the_pinned_root_capability() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("first-grant");
+        let second = root.join("second-grant");
+        let grant = root.join("grant-link");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        symlink(&first, &grant).unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let config = MachineConfig {
+            access: AccessSpec {
+                base_dir: root,
+                read_roots: vec![grant.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            host_shell: host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 60,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: 60,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        };
+        let prepared =
+            LocalMachine::prepare_with_job_root(config.clone(), manager.protected_path())
+                .await
+                .unwrap();
+        let before = job_authority_fingerprint([9; 32], &prepared).unwrap();
+
+        std::fs::remove_file(&grant).unwrap();
+        symlink(&second, &grant).unwrap();
+        assert_eq!(
+            before,
+            job_authority_fingerprint([9; 32], &prepared).unwrap(),
+            "the prepared snapshot must use its already-pinned root capability"
+        );
+
+        let reparsed = LocalMachine::prepare_with_job_root(config, manager.protected_path())
+            .await
+            .unwrap();
+        let after = job_authority_fingerprint([9; 32], &reparsed).unwrap();
+        assert_ne!(
+            before, after,
+            "a new preparation must observe the new grant target"
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_path_identity_tracks_the_object_behind_one_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live");
+        let replacement = temp.path().join("replacement");
+        let old = temp.path().join("old");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let before = crate::mcp::authority_path_identity(&live);
+        std::fs::rename(&live, &old).unwrap();
+        std::fs::rename(&replacement, &live).unwrap();
+        let after = crate::mcp::authority_path_identity(&live);
+        assert_eq!(before["path"], after["path"]);
+        assert_ne!(before["ino"], after["ino"]);
     }
 
     #[test]
@@ -1877,6 +2223,58 @@ mod tests {
         let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap();
         assert_eq!(policy.base_dir, PathBuf::from("/workspace"));
         assert_eq!(policy.read_roots, [PathBuf::from("/ref")]);
+    }
+
+    #[test]
+    fn empty_profile_grants_are_composed_with_cli_before_capability_checks() {
+        let mut defaults = no_defaults();
+        defaults.default_allow = false;
+        defaults.allow_read.clear();
+        defaults.allow_write.clear();
+        defaults.allow_rw.clear();
+        let base = PathBuf::from("/workspace");
+        let plain = Args::try_parse_from(["dotlink", "--no-default-allow"]).unwrap();
+        assert!(
+            Policy::from_args(&plain, base.clone(), &defaults)
+                .unwrap_err()
+                .to_string()
+                .contains("no effective local capability")
+        );
+
+        let read = Args::try_parse_from(["dotlink", "--no-default-allow", "--allow-read=/project"])
+            .unwrap();
+        let policy = Policy::from_args(&read, base.clone(), &defaults).unwrap();
+        assert_eq!(policy.read_roots, [PathBuf::from("/project")]);
+
+        let rw = Args::try_parse_from(["dotlink", "--no-default-allow", "--allow-rw=/"]).unwrap();
+        let policy = Policy::from_args(&rw, base.clone(), &defaults).unwrap();
+        assert_eq!(policy.read_roots, [PathBuf::from("/")]);
+        assert_eq!(policy.write_roots, [PathBuf::from("/")]);
+
+        defaults.allow_shell = true;
+        let error = Policy::from_args(&plain, base.clone(), &defaults).unwrap_err();
+        assert!(error.to_string().contains("shell access requires"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            Policy::from_args(&read, base.clone(), &defaults)
+                .unwrap()
+                .allow_shell
+        );
+
+        defaults.allow_shell = false;
+        let denied = Args::try_parse_from([
+            "dotlink",
+            "--no-default-allow",
+            "--allow-read=/project",
+            "--deny-read=/project",
+        ])
+        .unwrap();
+        assert!(
+            Policy::from_args(&denied, base, &defaults)
+                .unwrap_err()
+                .to_string()
+                .contains("no effective local capability")
+        );
     }
 
     #[test]

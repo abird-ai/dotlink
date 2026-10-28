@@ -39,10 +39,56 @@ impl ColorMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutcomeTone {
+    Success,
+    Neutral,
+    Error,
+}
+
+/// Typed completion outcome shared by TOOL and REQ logs. Callers provide the
+/// semantic class rather than relying on label parsing; HTTP status classes are
+/// classified centrally so every transport renders them consistently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogOutcome<'a> {
+    Success(&'a str),
+    Neutral(&'a str),
+    Error(&'a str),
+    Http(u16),
+}
+
+impl<'a> LogOutcome<'a> {
+    pub(crate) const fn success(label: &'a str) -> Self {
+        Self::Success(label)
+    }
+
+    pub(crate) const fn neutral(label: &'a str) -> Self {
+        Self::Neutral(label)
+    }
+
+    pub(crate) const fn error(label: &'a str) -> Self {
+        Self::Error(label)
+    }
+
+    pub(crate) const fn http(status: u16) -> Self {
+        Self::Http(status)
+    }
+
+    fn tone(self) -> OutcomeTone {
+        match self {
+            Self::Success(_) | Self::Http(200..=299) => OutcomeTone::Success,
+            Self::Error(_) | Self::Http(400..=599) => OutcomeTone::Error,
+            Self::Neutral(_) | Self::Http(_) => OutcomeTone::Neutral,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LogState {
     verbosity: AtomicU8,
     quiet_activity: AtomicBool,
+    interactive: AtomicBool,
+    full_commands: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +110,8 @@ impl LogConfig {
             state: Arc::new(LogState {
                 verbosity: AtomicU8::new(verbose.min(2)),
                 quiet_activity: AtomicBool::new(quiet_activity),
+                interactive: AtomicBool::new(false),
+                full_commands: AtomicBool::new(false),
             }),
             color,
         }
@@ -94,6 +142,51 @@ impl LogConfig {
         }
     }
 
+    /// RuntimeControls alone enables this after acquiring interactive stdin.
+    /// Disabling it resets full command logging for services and restarts.
+    pub(crate) fn set_interactive(&self, active: bool) {
+        if !active {
+            self.state.full_commands.store(false, Ordering::Relaxed);
+        }
+        self.state.interactive.store(active, Ordering::Relaxed);
+    }
+
+    pub(crate) fn toggle_full_commands(&self) -> Option<bool> {
+        if !self.state.interactive.load(Ordering::Relaxed) || !self.activity_enabled() {
+            return None;
+        }
+        Some(!self.state.full_commands.fetch_xor(true, Ordering::Relaxed))
+    }
+
+    fn full_commands_enabled(&self) -> bool {
+        self.activity_enabled()
+            && self.state.interactive.load(Ordering::Relaxed)
+            && self.state.full_commands.load(Ordering::Relaxed)
+    }
+
+    fn highlight_fields(&self) -> bool {
+        self.color && self.state.interactive.load(Ordering::Relaxed)
+    }
+
+    /// Shared TOOL summary for stdio, HTTP and OpenAI. Only interactive
+    /// terminal controls can choose an uncapped command excerpt.
+    pub(crate) fn summarize_arguments<'a>(
+        &self,
+        tool: &str,
+        arguments: &Map<String, Value>,
+        keys: impl IntoIterator<Item = &'a str>,
+        cwd: Option<&Path>,
+    ) -> String {
+        summarize_arguments_with_options(
+            tool,
+            arguments,
+            keys,
+            cwd,
+            self.full_commands_enabled(),
+            self.highlight_fields(),
+        )
+    }
+
     pub fn cycle_verbosity(&self) -> &'static str {
         self.state.quiet_activity.store(false, Ordering::Relaxed);
         let mut current = self.state.verbosity.load(Ordering::Relaxed).min(2);
@@ -105,7 +198,14 @@ impl LogConfig {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return self.verbosity_label(),
+                Ok(_) => {
+                    if next == 0 {
+                        // Don't silently resume full command logging when TOOL
+                        // verbosity is re-enabled later.
+                        self.state.full_commands.store(false, Ordering::Relaxed);
+                    }
+                    return self.verbosity_label();
+                }
                 Err(actual) => current = actual.min(2),
             }
         }
@@ -126,36 +226,42 @@ impl LogConfig {
             return None;
         }
         let detail = detail.as_ref();
-        let message = if detail.is_empty() {
-            "→".to_owned()
+        let arrow = if self.highlight_fields() {
+            "\x1b[2m→\x1b[0m"
         } else {
-            format!("→ {detail}")
+            "→"
+        };
+        let message = if detail.is_empty() {
+            arrow.to_owned()
+        } else {
+            format!("{arrow} {detail}")
         };
         self.line("TOOL", tool, &message, "36");
         Some(Instant::now())
     }
 
-    pub fn activity_done(&self, tool: &str, started: Option<Instant>, outcome: impl AsRef<str>) {
+    pub fn activity_done(&self, tool: &str, started: Option<Instant>, outcome: LogOutcome<'_>) {
         let Some(started) = started else {
             return;
         };
-        self.line(
-            "TOOL",
-            tool,
-            &format!(
-                "← {}  {}ms",
-                outcome.as_ref(),
-                started.elapsed().as_millis()
-            ),
-            "36",
+        let message = format_log_outcome(
+            outcome,
+            started.elapsed().as_millis(),
+            self.highlight_fields(),
         );
+        self.line("TOOL", tool, &message, "36");
     }
 
     pub fn request(&self, transport: &str, method: &str) -> Option<Instant> {
         if !self.developer_enabled() {
             return None;
         }
-        self.line("REQ", transport, &format!("→ {method}"), "35");
+        let message = if self.highlight_fields() {
+            format!("\x1b[2m→\x1b[0m \x1b[35m{method}\x1b[0m")
+        } else {
+            format!("→ {method}")
+        };
+        self.line("REQ", transport, &message, "35");
         Some(Instant::now())
     }
 
@@ -164,18 +270,24 @@ impl LogConfig {
         transport: &str,
         method: &str,
         started: Option<Instant>,
-        outcome: impl AsRef<str>,
+        outcome: LogOutcome<'_>,
     ) {
         let Some(started) = started else {
             return;
         };
-        let elapsed = format!("  {}ms", started.elapsed().as_millis());
-        self.line(
-            "REQ",
-            transport,
-            &format!("← {method}  {}{elapsed}", outcome.as_ref()),
-            "35",
+        let colored = self.highlight_fields();
+        let elapsed = started.elapsed().as_millis();
+        let arrow = if colored { "\x1b[2m←\x1b[0m" } else { "←" };
+        let method = if colored {
+            format!("\x1b[35m{method}\x1b[0m")
+        } else {
+            method.to_owned()
+        };
+        let message = format!(
+            "{arrow} {method}  {}",
+            outcome_label(outcome, elapsed, colored)
         );
+        self.line("REQ", transport, &message, "35");
     }
 
     pub fn style(&self, code: &str, text: impl AsRef<str>) -> String {
@@ -197,6 +309,32 @@ impl LogConfig {
             eprintln!("[{timestamp}] {level:<4} {scope:<10} {message}");
         }
     }
+}
+
+/// Shared TOOL/REQ completion formatting. Outcome class is structured at the
+/// call site (or derived from an HTTP code) rather than guessed from display
+/// text, so transports and tools cannot silently drift in status coloring.
+fn outcome_label(outcome: LogOutcome<'_>, elapsed_ms: u128, colored: bool) -> String {
+    let label = match outcome {
+        LogOutcome::Success(label) | LogOutcome::Neutral(label) | LogOutcome::Error(label) => {
+            label.to_owned()
+        }
+        LogOutcome::Http(status) => status.to_string(),
+    };
+    if !colored {
+        return format!("{label}  {elapsed_ms}ms");
+    }
+    let tone = match outcome.tone() {
+        OutcomeTone::Success => "92",
+        OutcomeTone::Neutral => "93",
+        OutcomeTone::Error => "91",
+    };
+    format!("\x1b[1;{tone}m{label}\x1b[0m  \x1b[2m{elapsed_ms}ms\x1b[0m")
+}
+
+fn format_log_outcome(outcome: LogOutcome<'_>, elapsed_ms: u128, colored: bool) -> String {
+    let arrow = if colored { "\x1b[2m←\x1b[0m" } else { "←" };
+    format!("{arrow} {}", outcome_label(outcome, elapsed_ms, colored))
 }
 
 const LOG_SCOPE_CHARS: usize = 48;
@@ -223,13 +361,48 @@ fn sanitize_log_scope(scope: &str) -> String {
     sanitized
 }
 
-/// Widest scalar argument rendered literally in a tool-call summary.
+/// Default maximum visible command value (including quotes and escaping).
+/// Paths are always logged in full; only interactive `V` removes this cap.
+const LOG_ARGUMENT_CHARS: usize = 256;
+/// Unrelated scalar strings longer than this are still summarized as bytes.
 const SUMMARY_VALUE_CHARS: usize = 120;
 
+/// Quote and escape a log value without formatting an unbounded string.
+/// Accounting for escaped characters prevents a long script of newlines or
+/// control bytes from exceeding the visible limit or spanning journal lines.
+fn quoted_log_argument(value: &str, limit: usize) -> String {
+    debug_assert!(limit >= 3);
+    let mut result = String::with_capacity(limit + 16);
+    let mut chars = value.chars().peekable();
+    let mut rendered = 1_usize; // opening quote
+    result.push('"');
+    while let Some(character) = chars.next() {
+        // Rust's str Debug leaves single quotes alone, unlike char Debug.
+        let escaped = character.escape_debug();
+        let count = if character == '\'' {
+            1
+        } else {
+            escaped.clone().count()
+        };
+        let reserve = 1 + usize::from(chars.peek().is_some()); // quote + ellipsis
+        if rendered + count + reserve > limit {
+            result.push('…');
+            break;
+        }
+        if character == '\'' {
+            result.push(character);
+        } else {
+            result.extend(escaped);
+        }
+        rendered += count;
+    }
+    result.push('"');
+    result
+}
+
 /// Payloads other than executable commands remain byte counts. TOOL logging
-/// is deliberately opt-in (`-v` / `logging.verbosity = "tools"`): users who
-/// enable it explicitly want the complete shell command recorded in journald.
-/// Never truncate the shell command or silently substitute its byte length.
+/// is opt-in (`-v` / `logging.verbosity = "tools"`); executable commands are
+/// short, escaped excerpts rather than unbounded journal entries.
 const PAYLOAD_ARGUMENTS: &[&str] = &[
     "content", "stdin", "data", "old_text", "new_text", "patch", "pattern",
 ];
@@ -264,71 +437,93 @@ fn display_path(input: &str, cwd: Option<&Path>) -> String {
     }
 }
 
-/// Enumerate only work that `edit` can accept. The tool will reject a call
-/// with more than MAX_EDIT_OPS operations or MAX_EDIT_FILES distinct files, so
-/// logging must not perform unbounded quadratic work before that rejection.
-/// Preserve encounter order and a compact, constant-width journal preview.
+/// Enumerate only work that `edit` can accept. Show every distinct path in
+/// a valid call (up to MAX_EDIT_FILES) without truncating its spelling. When
+/// the request itself exceeds the tool ceilings, report an overflow instead
+/// of scanning unbounded or doing quadratic work before tool validation.
 fn edit_paths(arguments: &Map<String, Value>, cwd: Option<&Path>) -> Option<String> {
     use crate::mcp::{MAX_EDIT_FILES, MAX_EDIT_OPS};
-    const PREVIEW_PATHS: usize = 16;
 
     let edits = arguments.get("edits")?.as_array()?;
     let fallback = arguments.get("path").and_then(Value::as_str);
     let mut seen = HashSet::with_capacity(MAX_EDIT_FILES);
-    let mut shown = Vec::with_capacity(PREVIEW_PATHS);
+    let mut paths = Vec::with_capacity(MAX_EDIT_FILES);
     let mut exceeded_files = false;
     for edit in edits.iter().take(MAX_EDIT_OPS) {
         let Some(path) = edit.get("path").and_then(Value::as_str).or(fallback) else {
             continue;
         };
-        if seen.contains(path) {
+        if !seen.insert(path) {
             continue;
         }
-        if seen.len() == MAX_EDIT_FILES {
+        if seen.len() > MAX_EDIT_FILES {
             exceeded_files = true;
             break;
         }
-        seen.insert(path);
-        if shown.len() < PREVIEW_PATHS {
-            shown.push(path);
-        }
+        paths.push(format!("{:?}", display_path(path, cwd)));
     }
-    if seen.is_empty() && !exceeded_files {
+    if paths.is_empty() && !exceeded_files {
         return None;
     }
-    let displayed = shown
-        .iter()
-        .map(|path| format!("{:?}", display_path(path, cwd)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let omitted = seen.len().saturating_sub(shown.len());
-    let suffix = if omitted > 0 {
-        format!(", … +{omitted} files")
-    } else {
-        String::new()
-    };
+    let mut preview = format!("paths=[{}]", paths.join(", "));
+    if exceeded_files {
+        preview.push_str(&format!(" files_above_limit={MAX_EDIT_FILES}"));
+    }
     let unscanned = edits.len().saturating_sub(MAX_EDIT_OPS);
-    let overflow = if exceeded_files {
-        format!(" files_above_limit={MAX_EDIT_FILES}")
-    } else {
-        String::new()
+    if unscanned > 0 {
+        preview.push_str(&format!(" unscanned_edits={unscanned}"));
+    }
+    Some(preview)
+}
+
+/// A color-safe field is assembled *before* the summary is joined: quoted
+/// user values can contain text such as ` p=` without becoming new fields.
+#[derive(Clone, Copy)]
+enum FieldTone {
+    Path,
+    Directory,
+    Command,
+    Numeric,
+    Boolean,
+    Text,
+}
+
+fn log_field(key: &str, value: impl AsRef<str>, tone: FieldTone, colored: bool) -> String {
+    let value = value.as_ref();
+    if !colored {
+        return format!("{key}={value}");
+    }
+    let (key_color, value_color) = match tone {
+        FieldTone::Path => ("1;36", "96"),
+        FieldTone::Directory => ("1;34", "94"),
+        FieldTone::Command => ("1;33", "93"),
+        FieldTone::Numeric => ("1;35", "95"),
+        FieldTone::Boolean => ("1;36", if value == "true" { "92" } else { "90" }),
+        FieldTone::Text => ("1;36", "37"),
     };
-    let overflow = if unscanned > 0 {
-        format!("{overflow} unscanned_edits={unscanned}")
-    } else {
-        overflow
-    };
-    Some(format!("paths=[{displayed}{suffix}]{overflow}"))
+    format!("\x1b[{key_color}m{key}\x1b[2m=\x1b[{value_color}m{value}\x1b[0m")
 }
 
 /// Stable, operator-friendly argument order. The JSON schema currently stores
 /// properties in a sorted map, which otherwise puts offset/limit before path.
 /// Reuse this order for local HTTP, stdio, and OpenAI diagnostic summaries.
+#[cfg(test)]
 pub fn summarize_arguments<'a>(
     tool: &str,
     arguments: &Map<String, Value>,
     keys: impl IntoIterator<Item = &'a str>,
     cwd: Option<&Path>,
+) -> String {
+    summarize_arguments_with_options(tool, arguments, keys, cwd, false, false)
+}
+
+fn summarize_arguments_with_options<'a>(
+    tool: &str,
+    arguments: &Map<String, Value>,
+    keys: impl IntoIterator<Item = &'a str>,
+    cwd: Option<&Path>,
+    full_commands: bool,
+    colored: bool,
 ) -> String {
     let keys = keys.into_iter().collect::<Vec<_>>();
     let is_edit = tool == "edit";
@@ -344,7 +539,10 @@ pub fn summarize_arguments<'a>(
     );
     let mut parts = Vec::new();
     if is_edit && let Some(paths) = edit_paths(arguments, cwd) {
-        parts.push(paths);
+        // `edit_paths` constructs this trusted, complete valid-file list.
+        // Never reinterpret quoted user path values as new log fields.
+        let (key, value) = paths.split_once('=').expect("edit paths summary has a key");
+        parts.push(log_field(key, value, FieldTone::Path, colored));
     }
     let mut payload_bytes = 0_usize;
     for key in ordered {
@@ -355,45 +553,82 @@ pub fn summarize_arguments<'a>(
             continue;
         };
         match value {
-            // Commands are deliberately complete, one-line escaped, never
-            // truncated or replaced with their byte count.
-            Value::String(value) if key == "command" => parts.push(format!("c={value:?}")),
+            // Keep executable commands visible but capped, with one-line
+            // escaping. File contents and other bulk payloads stay byte counts.
+            Value::String(value) if key == "command" => {
+                let quoted = if full_commands {
+                    format!("{value:?}")
+                } else {
+                    quoted_log_argument(value, LOG_ARGUMENT_CHARS)
+                };
+                parts.push(log_field("c", quoted, FieldTone::Command, colored));
+            }
             Value::String(value) if key == "path" => {
-                parts.push(format!("p={:?}", display_path(value, cwd)));
+                parts.push(log_field(
+                    "p",
+                    format!("{:?}", display_path(value, cwd)),
+                    FieldTone::Path,
+                    colored,
+                ));
             }
             Value::String(value) if key == "dir" => {
-                parts.push(format!("d={:?}", display_path(value, cwd)));
+                parts.push(log_field(
+                    "d",
+                    format!("{:?}", display_path(value, cwd)),
+                    FieldTone::Directory,
+                    colored,
+                ));
             }
             Value::String(value) if PAYLOAD_ARGUMENTS.contains(&key) => {
                 payload_bytes = payload_bytes.saturating_add(value.len());
             }
-            Value::String(value) if value.chars().count() > SUMMARY_VALUE_CHARS => {
+            Value::String(value) if value.chars().nth(SUMMARY_VALUE_CHARS).is_some() => {
                 payload_bytes = payload_bytes.saturating_add(value.len());
             }
             Value::String(value) => {
-                parts.push(format!(
-                    "{key}={:?}",
-                    truncate(
-                        &value.split_whitespace().collect::<Vec<_>>().join(" "),
-                        SUMMARY_VALUE_CHARS
-                    )
+                let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+                parts.push(log_field(
+                    key,
+                    quoted_log_argument(&normalized, LOG_ARGUMENT_CHARS),
+                    FieldTone::Text,
+                    colored,
                 ));
             }
-            Value::Bool(value) => parts.push(format!("{key}={value}")),
+            Value::Bool(value) => parts.push(log_field(
+                key,
+                value.to_string(),
+                FieldTone::Boolean,
+                colored,
+            )),
             Value::Number(value) => {
                 let short = match key {
                     "timeout_secs" => "max_t",
                     "max_output_bytes" | "max_read_bytes" | "max_write_bytes" => "max_b",
                     _ => key,
                 };
-                parts.push(format!("{short}={value}"));
+                parts.push(log_field(
+                    short,
+                    value.to_string(),
+                    FieldTone::Numeric,
+                    colored,
+                ));
             }
-            Value::Array(items) => parts.push(format!("{key}={}", items.len())),
+            Value::Array(items) => parts.push(log_field(
+                key,
+                items.len().to_string(),
+                FieldTone::Numeric,
+                colored,
+            )),
             Value::Null | Value::Object(_) => {}
         }
     }
     if payload_bytes > 0 {
-        parts.push(format!("b={:?}", payload_bytes.to_string()));
+        parts.push(log_field(
+            "b",
+            format!("{:?}", payload_bytes.to_string()),
+            FieldTone::Numeric,
+            colored,
+        ));
     }
     parts.join(" ")
 }
@@ -515,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_log_prefers_path_and_keeps_full_escaped_shell_command() {
+    fn tool_log_prefers_path_and_bounds_escaped_shell_command() {
         let long_script = format!("printf 'hello'\n{}\u{1b}[31m", "x".repeat(1024));
         let arguments = serde_json::json!({
             "limit": 30, "offset": 10, "path": "/project/first.rs",
@@ -531,7 +766,19 @@ mod tests {
             summary.starts_with("p=\"/project/first.rs\" c=\"printf"),
             "{summary}"
         );
-        assert!(summary.contains(&"x".repeat(1024)));
+        let command = summary
+            .split(" c=")
+            .nth(1)
+            .unwrap()
+            .split(" limit=")
+            .next()
+            .unwrap()
+            .split(" offset=")
+            .next()
+            .unwrap();
+        assert_eq!(command.chars().count(), LOG_ARGUMENT_CHARS);
+        assert!(command.ends_with("…\""), "{command}");
+        assert!(!summary.contains(&"x".repeat(1024)));
         assert!(summary.contains("\\n"));
         assert!(!summary.contains('\n'));
         assert!(!summary.contains('\u{1b}'));
@@ -550,6 +797,260 @@ mod tests {
             logged.starts_with("d=\"/project\" c=\"echo hello\" max_t=30"),
             "{logged}"
         );
+    }
+
+    #[test]
+    fn quoted_log_arguments_have_a_hard_visible_ceiling_and_keep_escapes_whole() {
+        let repeated = "\\\\\"\n\u{1b}".repeat(90);
+        let samples = [
+            "simple text",
+            "it's quoted \" hello \" \\ done",
+            "\n\r\t\0\u{1b}\u{200b}\u{2028}é🙂",
+            repeated.as_str(),
+        ];
+        for value in samples {
+            if format!("{value:?}").chars().count() <= LOG_ARGUMENT_CHARS {
+                assert_eq!(
+                    quoted_log_argument(value, LOG_ARGUMENT_CHARS),
+                    format!("{value:?}")
+                );
+            }
+            let encoded = quoted_log_argument(value, LOG_ARGUMENT_CHARS);
+            assert!(encoded.chars().count() <= LOG_ARGUMENT_CHARS, "{encoded}");
+            assert!(
+                encoded.starts_with('"') && encoded.ends_with('"'),
+                "{encoded}"
+            );
+            assert!(
+                !encoded.contains('\n') && !encoded.contains('\r') && !encoded.contains('\u{1b}')
+            );
+        }
+        let exactly = "x".repeat(LOG_ARGUMENT_CHARS - 2);
+        assert_eq!(
+            quoted_log_argument(&exactly, LOG_ARGUMENT_CHARS),
+            format!("\"{exactly}\"")
+        );
+        let longer = "x".repeat(LOG_ARGUMENT_CHARS + 1024);
+        let encoded = quoted_log_argument(&longer, LOG_ARGUMENT_CHARS);
+        assert_eq!(encoded.chars().count(), LOG_ARGUMENT_CHARS);
+        assert!(encoded.ends_with("…\""));
+        assert!(!encoded.contains(&"x".repeat(LOG_ARGUMENT_CHARS)));
+
+        let escaped = quoted_log_argument(&"\n".repeat(1024), LOG_ARGUMENT_CHARS);
+        assert!(escaped.chars().count() <= LOG_ARGUMENT_CHARS);
+        assert!(escaped.ends_with("\\n…\""), "{escaped}");
+        assert_eq!(escaped.matches("\\n").count(), (LOG_ARGUMENT_CHARS - 4) / 2);
+        let emoji = quoted_log_argument(&"🙂".repeat(500), LOG_ARGUMENT_CHARS);
+        assert_eq!(emoji.chars().count(), LOG_ARGUMENT_CHARS);
+        assert!(emoji.ends_with("🙂…\""));
+    }
+
+    #[test]
+    fn quoted_arguments_preserve_rust_escaping_under_random_unicode() {
+        let alphabet = [
+            'a', ' ', '\n', '\r', '\t', '\0', '\u{1b}', '\u{202e}', '\u{200b}', '\u{0301}',
+            '\u{2028}', '\u{2066}', '\u{2069}', '\'', '"', '\\', '🙂', 'é', '漢', 'λ', '=', ';',
+            '#', '\u{7f}', '\u{85}',
+        ];
+        let mut state = 1337_u32;
+        for n in 0..900_usize {
+            let size = (n * 31) % 400;
+            let input: String = (0..size)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    alphabet[(state as usize) % alphabet.len()]
+                })
+                .collect();
+            let encoded = quoted_log_argument(&input, LOG_ARGUMENT_CHARS);
+            let complete = format!("{input:?}");
+            if complete.chars().count() <= LOG_ARGUMENT_CHARS {
+                assert_eq!(encoded, complete, "sample={n}");
+            } else {
+                assert!(encoded.ends_with("…\""), "sample={n} {encoded}");
+                assert!(encoded.chars().count() <= LOG_ARGUMENT_CHARS);
+            }
+            assert!(!encoded.contains(['\n', '\r', '\u{1b}', '\u{202e}']));
+        }
+    }
+
+    #[test]
+    fn tool_log_caps_commands_but_keeps_complete_paths() {
+        let path = "é".repeat(1024);
+        let dir = "a\nb".repeat(500);
+        let args = serde_json::json!({
+            "path": path,
+            "dir": dir,
+            "command": "printf hi; ".repeat(150),
+            "timeout_secs": 30,
+        });
+        let summary = summarize_arguments(
+            "bash",
+            args.as_object().unwrap(),
+            ["path", "dir", "command", "timeout_secs"],
+            None,
+        );
+        let actual_path = summary
+            .split("p=")
+            .nth(1)
+            .unwrap()
+            .split(" d=")
+            .next()
+            .unwrap();
+        let actual_dir = summary
+            .split(" d=")
+            .nth(1)
+            .unwrap()
+            .split(" c=")
+            .next()
+            .unwrap();
+        let actual_command = summary
+            .split(" c=")
+            .nth(1)
+            .unwrap()
+            .split(" max_t=")
+            .next()
+            .unwrap();
+        assert_eq!(actual_path, format!("{:?}", path));
+        assert_eq!(actual_dir, format!("{:?}", dir));
+        assert!(actual_path.chars().count() > LOG_ARGUMENT_CHARS);
+        assert!(actual_dir.chars().count() > LOG_ARGUMENT_CHARS);
+        assert!(!actual_path.contains('…') && !actual_dir.contains('…'));
+        assert!(actual_command.chars().count() <= LOG_ARGUMENT_CHARS);
+        assert!(actual_command.ends_with("…\""), "{actual_command}");
+        assert!(!summary.contains('\n') && summary.contains(" max_t=30"));
+
+        // All 64 valid distinct file names are logged in full, not just a
+        // preview subset, even when each path is long.
+        let paths = (0..crate::mcp::MAX_EDIT_FILES)
+            .map(|i| format!("src/{i}/{}", "x".repeat(130)))
+            .collect::<Vec<_>>();
+        let edits = serde_json::json!({"edits": paths.iter()
+            .map(|path| serde_json::json!({"path":path}))
+            .collect::<Vec<_>>()});
+        let summary = summarize_arguments("edit", edits.as_object().unwrap(), ["edits"], None);
+        let preview = summary.split(" edits=").next().unwrap();
+        assert!(preview.starts_with("paths=[") && preview.ends_with(']'));
+        for path in &paths {
+            assert!(preview.contains(&format!("{path:?}")), "missing {path}");
+        }
+        assert!(!preview.contains("…") && !preview.contains("files_above_limit"));
+        assert!(summary.ends_with(&format!("edits={}", paths.len())));
+    }
+
+    #[test]
+    fn interactive_command_toggle_requires_terminal_controls_and_resets() {
+        let log = LogConfig::new(1, false, ColorMode::Never);
+        let command = format!("echo start\n{}", "x".repeat(2000));
+        let args = serde_json::json!({"command":command});
+        let summarize =
+            || log.summarize_arguments("bash", args.as_object().unwrap(), ["command"], None);
+        assert_eq!(log.toggle_full_commands(), None);
+        assert!(summarize().ends_with("…\""));
+
+        log.set_interactive(true);
+        assert_eq!(log.toggle_full_commands(), Some(true));
+        let full = summarize();
+        assert_eq!(full, format!("c={:?}", command));
+        assert!(full.contains(&"x".repeat(2000)));
+        assert!(!full.contains('\n'));
+        assert_eq!(log.toggle_full_commands(), Some(false));
+        assert!(summarize().ends_with("…\""));
+        assert_eq!(log.toggle_full_commands(), Some(true));
+        log.set_interactive(false);
+        assert_eq!(log.toggle_full_commands(), None);
+        assert!(summarize().ends_with("…\""));
+        log.set_interactive(true);
+        assert!(summarize().ends_with("…\""), "full command mode must reset");
+        log.set_interactive(false);
+    }
+
+    #[test]
+    fn full_commands_require_tool_logging_even_with_active_interactive_controls() {
+        let log = LogConfig::new(0, false, ColorMode::Never);
+        let args = serde_json::json!({"command": "x".repeat(900)});
+        let summarize =
+            || log.summarize_arguments("bash", args.as_object().unwrap(), ["command"], None);
+        log.set_interactive(true);
+        assert_eq!(log.toggle_full_commands(), None);
+        assert!(summarize().ends_with("…\""));
+        assert_eq!(log.cycle_verbosity(), "TOOL");
+        assert_eq!(log.toggle_full_commands(), Some(true));
+        assert!(summarize().contains(&"x".repeat(900)));
+        assert_eq!(log.cycle_verbosity(), "TOOL + REQ");
+        assert!(summarize().contains(&"x".repeat(900)));
+        assert_eq!(log.cycle_verbosity(), "quiet");
+        assert_eq!(log.toggle_full_commands(), None);
+        assert!(summarize().ends_with("…\""));
+        assert_eq!(log.cycle_verbosity(), "TOOL");
+        assert!(summarize().ends_with("…\""));
+        log.set_interactive(false);
+
+        let req_only = LogConfig::new(2, true, ColorMode::Never);
+        req_only.set_interactive(true);
+        assert_eq!(req_only.verbosity_label(), "REQ");
+        assert_eq!(req_only.toggle_full_commands(), None);
+        req_only.set_interactive(false);
+    }
+
+    #[test]
+    fn interactive_arg_colors_distinguish_keys_values_and_outcomes() {
+        let log = LogConfig::new(1, false, ColorMode::Always);
+        let data = serde_json::json!({
+            "path":"src/p=anything\n\u{1b}[31m.rs",
+            "dir":".",
+            "command":"echo 'd=malicious'",
+            "limit":5,
+            "literal":true,
+            "stdin":"PRIVATE_CONTENT",
+        });
+        let keys = ["path", "dir", "command", "limit", "literal", "stdin"];
+        let plain = log.summarize_arguments("bash", data.as_object().unwrap(), keys, None);
+        assert!(!plain.contains('\u{1b}'));
+        log.set_interactive(true);
+        let colored = log.summarize_arguments("bash", data.as_object().unwrap(), keys, None);
+        assert!(colored.contains("\x1b[1;36mp\x1b[2m=\x1b[96m"));
+        assert!(colored.contains("\x1b[1;34md\x1b[2m=\x1b[94m"));
+        assert!(colored.contains("\x1b[1;33mc\x1b[2m=\x1b[93m"));
+        assert!(colored.contains("\x1b[1;35mlimit\x1b[2m=\x1b[95m"));
+        assert!(colored.contains("\x1b[1;36mliteral\x1b[2m=\x1b[92mtrue"));
+        assert!(!colored.contains("PRIVATE_CONTENT"));
+        assert!(!colored.contains('\n'));
+        assert!(colored.contains("\\n\\u{1b}"));
+        assert_eq!(strip_ansi_for_test(&colored), plain);
+        assert_eq!(
+            format_log_outcome(LogOutcome::error("error"), 4, false),
+            "← error  4ms"
+        );
+        assert!(format_log_outcome(LogOutcome::success("ok"), 4, true).contains("\x1b[1;92mok"));
+        assert!(
+            format_log_outcome(LogOutcome::error("error"), 4, true).contains("\x1b[1;91merror")
+        );
+        assert!(outcome_label(LogOutcome::http(204), 4, true).contains("\x1b[1;92m204"));
+        assert!(outcome_label(LogOutcome::http(302), 4, true).contains("\x1b[1;93m302"));
+        assert!(outcome_label(LogOutcome::http(404), 4, true).contains("\x1b[1;91m404"));
+        assert!(outcome_label(LogOutcome::http(503), 4, true).contains("\x1b[1;91m503"));
+        log.set_interactive(false);
+        assert_eq!(
+            log.summarize_arguments("bash", data.as_object().unwrap(), keys, None),
+            plain
+        );
+    }
+
+    fn strip_ansi_for_test(text: &str) -> String {
+        let mut output = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' && chars.next_if_eq(&'[').is_some() {
+                for code in chars.by_ref() {
+                    if code == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        output
     }
 
     #[test]
@@ -665,7 +1166,10 @@ mod tests {
         );
         assert!(!summary.contains("file-128.txt"), "{summary}");
         assert!(!summary.contains("secret"));
-        assert!(summary.len() < 1000, "{summary}");
+        assert!(
+            summary.len() < 2000,
+            "unexpected unbounded number of edit paths"
+        );
     }
 
     #[test]

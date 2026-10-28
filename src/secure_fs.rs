@@ -551,6 +551,14 @@ struct Root {
     resolve: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootIdentity {
+    pub(crate) path: PathBuf,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) rdev: u64,
+}
+
 /// Immutable root capabilities. The same Root directory FDs are shared by
 /// independent requests; none of the tools mutate a process-wide cwd.
 #[derive(Debug)]
@@ -623,6 +631,27 @@ impl SecureFs {
             .context("secure filesystem access requires Linux openat2 (5.6+)")?;
         }
         Ok(Self { read, write })
+    }
+
+    pub(crate) fn authority_roots(&self) -> Result<(Vec<RootIdentity>, Vec<RootIdentity>)> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let identities = |roots: &[Root]| -> Result<Vec<RootIdentity>> {
+            let mut values = Vec::with_capacity(roots.len());
+            for root in roots {
+                let file = File::from(root.fd.try_clone()?);
+                let metadata = file.metadata()?;
+                values.push(RootIdentity {
+                    path: root.path.clone(),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                    rdev: metadata.rdev(),
+                });
+            }
+            values.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(values)
+        };
+        Ok((identities(&self.read)?, identities(&self.write)?))
     }
 
     fn root<'a, 'b>(&'a self, target: &'b Path, write: bool) -> Result<(&'a Root, &'b Path)> {

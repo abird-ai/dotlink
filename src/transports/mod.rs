@@ -170,6 +170,14 @@ const TRANSPORT_SHUTDOWN_TIMEOUT: std::time::Duration =
 #[cfg(test)]
 const TRANSPORT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransportConstraints {
+    /// Smallest serialized native-Task result budget across every active
+    /// transport sharing one LocalMachine. None means all active transports can
+    /// carry the profile-derived exact task result.
+    pub(crate) task_result_budget: Option<usize>,
+}
+
 pub struct ActiveTransports {
     pub openai: Option<openai::Config>,
     pub stdio: bool,
@@ -177,6 +185,14 @@ pub struct ActiveTransports {
 }
 
 impl ActiveTransports {
+    pub(crate) fn constraints(&self) -> TransportConstraints {
+        let mut task_result_budget = None;
+        if self.openai.is_some() {
+            task_result_budget = Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES);
+        }
+        TransportConstraints { task_result_budget }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.openai.is_none() && !self.stdio && self.http.is_none()
     }
@@ -571,5 +587,38 @@ mod tests {
         assert!(error.to_string().contains("shutdown deadline"));
         assert!(cancellation.is_cancelled());
         assert!(tasks.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod constraint_tests {
+    use super::*;
+
+    #[test]
+    fn active_transport_constraints_derive_task_budget() {
+        let local = ActiveTransports {
+            openai: None,
+            stdio: true,
+            http: None,
+        };
+        assert_eq!(local.constraints().task_result_budget, None);
+
+        let bounded = ActiveTransports {
+            openai: Some(openai::Config {
+                base_url: "https://example.invalid".to_owned(),
+                tunnel_id: "tunnel_test".to_owned(),
+                runtime_api_key: "test-key".to_owned(),
+                organization_id: None,
+                new_tunnel: false,
+                log: crate::logging::LogConfig::default(),
+                rejections: openai::RejectionLedger::default(),
+            }),
+            stdio: true,
+            http: None,
+        };
+        assert_eq!(
+            bounded.constraints().task_result_budget,
+            Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES)
+        );
     }
 }

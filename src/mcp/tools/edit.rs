@@ -172,9 +172,8 @@ impl LocalMachine {
         }
 
         // Hold every target for the whole plan -> verify -> stage -> commit
-        // sequence. Locks are sharded by resolved path and acquired in sorted
-        // shard order, so multi-file edits cannot deadlock and unrelated files
-        // stay concurrent.
+        // sequence. Exact resolved-path locks are acquired in sorted order, so
+        // multi-file edits cannot deadlock and unrelated files stay concurrent.
         let _mutation = self
             .lock_mutations(resolved_paths.iter().map(|path| path.as_path()))
             .await?;

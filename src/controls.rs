@@ -220,6 +220,7 @@ impl StdioInterruptGuard {
 }
 
 pub struct RuntimeControls {
+    log: LogConfig,
     receiver: mpsc::UnboundedReceiver<RuntimeControl>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -236,6 +237,8 @@ impl RuntimeControls {
         terminal.enable_runtime_mode().ok()?;
 
         let (sender, receiver) = mpsc::unbounded_channel();
+        log.set_interactive(true);
+        let reader_log = log.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = stop.clone();
         let thread = std::thread::spawn(move || {
@@ -243,7 +246,7 @@ impl RuntimeControls {
                 match event::poll(Duration::from_millis(100)) {
                     Ok(true) => match event::read() {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                            if let Some(control) = handle_key(key, &log) {
+                            if let Some(control) = handle_key(key, &reader_log) {
                                 let _ = sender.send(control);
                             }
                         }
@@ -257,6 +260,7 @@ impl RuntimeControls {
         });
 
         Some(Self {
+            log,
             receiver,
             stop,
             thread: Some(thread),
@@ -277,6 +281,7 @@ impl RuntimeControls {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.log.set_interactive(false);
     }
 }
 
@@ -302,8 +307,25 @@ fn handle_key(key: KeyEvent, log: &LogConfig) -> Option<RuntimeControl> {
     }
 
     if matches!(key.code, KeyCode::Char('v' | 'V')) {
-        let state = log.cycle_verbosity();
-        log.notice("verbosity", state);
+        if key.code == KeyCode::Char('V') || key.modifiers.contains(KeyModifiers::SHIFT) {
+            if let Some(full) = log.toggle_full_commands() {
+                log.notice(
+                    "verbosity",
+                    if full {
+                        "commands: full (interactive only)"
+                    } else {
+                        "commands: 256 chars"
+                    },
+                );
+            }
+        } else {
+            let state = log.cycle_verbosity();
+            if log.activity_enabled() {
+                log.notice("verbosity", format!("{state} · V: full commands"));
+            } else {
+                log.notice("verbosity", state);
+            }
+        }
     }
     None
 }
@@ -322,6 +344,81 @@ mod tests {
         assert_eq!(handle_key(ctrl_r, &log), Some(RuntimeControl::Restart));
         assert_eq!(handle_key(ctrl_c, &log), Some(RuntimeControl::Exit));
         assert_eq!(handle_key(other, &log), None);
+    }
+
+    #[test]
+    fn uppercase_v_is_an_interactive_only_full_command_modifier() {
+        let log = LogConfig::new(1, false, ColorMode::Never);
+        let args = serde_json::json!({"command": "echo start\n".to_owned() + &"x".repeat(1024)});
+        let summary =
+            || log.summarize_arguments("bash", args.as_object().unwrap(), ["command"], None);
+        let v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        let shift_v = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT);
+        let shift_lowercase_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SHIFT);
+
+        // A noninteractive call must never enable unbounded commands.
+        assert_eq!(handle_key(shift_v, &log), None);
+        assert!(summary().ends_with("…\""));
+        log.set_interactive(true);
+        assert_eq!(log.verbosity_label(), "TOOL");
+        assert_eq!(handle_key(shift_v, &log), None);
+        assert_eq!(log.verbosity_label(), "TOOL");
+        assert!(summary().len() > 1024);
+        assert!(summary().contains(&"x".repeat(1024)));
+        assert_eq!(handle_key(shift_lowercase_v, &log), None);
+        assert!(summary().ends_with("…\""));
+        assert_eq!(handle_key(v, &log), None);
+        assert_eq!(log.verbosity_label(), "TOOL + REQ");
+        assert!(summary().ends_with("…\""));
+        assert_eq!(handle_key(shift_v, &log), None);
+        assert!(summary().len() > 1024);
+        log.set_interactive(false);
+        assert!(summary().ends_with("…\""));
+        assert_eq!(log.toggle_full_commands(), None);
+    }
+
+    #[test]
+    fn shift_v_is_hidden_when_tool_logging_is_off_and_resets_with_verbosity() {
+        let log = LogConfig::new(0, false, ColorMode::Never);
+        let shift_v = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT);
+        let v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        let args = serde_json::json!({"command":"x".repeat(1000)});
+        let summary =
+            || log.summarize_arguments("bash", args.as_object().unwrap(), ["command"], None);
+        log.set_interactive(true);
+        assert_eq!(handle_key(shift_v, &log), None);
+        assert_eq!(log.toggle_full_commands(), None);
+        assert!(summary().ends_with("…\""));
+
+        // Enabling TOOL logging exposes the modifier without requiring restart.
+        assert_eq!(handle_key(v, &log), None);
+        assert_eq!(log.verbosity_label(), "TOOL");
+        assert_eq!(handle_key(shift_v, &log), None);
+        assert!(summary().contains(&"x".repeat(1000)));
+        assert_eq!(handle_key(v, &log), None);
+        assert_eq!(log.verbosity_label(), "TOOL + REQ");
+        assert!(summary().contains(&"x".repeat(1000)));
+
+        // Leaving TOOL logging clears full mode. A disabled V cannot enable
+        // it, and re-enabling TOOL starts with the capped command again.
+        assert_eq!(handle_key(v, &log), None);
+        assert_eq!(log.verbosity_label(), "quiet");
+        assert_eq!(handle_key(shift_v, &log), None);
+        assert_eq!(log.toggle_full_commands(), None);
+        assert!(summary().ends_with("…\""));
+        assert_eq!(handle_key(v, &log), None);
+        assert_eq!(log.verbosity_label(), "TOOL");
+        assert!(summary().ends_with("…\""));
+        log.set_interactive(false);
+
+        // REQ-only is also TOOL-disabled, even if it has -vv internally.
+        let req_only = LogConfig::new(2, true, ColorMode::Never);
+        req_only.set_interactive(true);
+        assert!(req_only.developer_enabled());
+        assert!(!req_only.activity_enabled());
+        assert_eq!(handle_key(shift_v, &req_only), None);
+        assert_eq!(req_only.toggle_full_commands(), None);
+        req_only.set_interactive(false);
     }
 
     #[test]

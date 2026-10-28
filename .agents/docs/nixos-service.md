@@ -28,6 +28,7 @@ dotlink loads that user's usual files:
 - `$XDG_CONFIG_HOME/abird/dotlink/config.jsonc` or `~/.config/abird/dotlink/config.jsonc`
 - `$XDG_CONFIG_HOME/abird/dotlink/runtime.key` or `~/.config/abird/dotlink/runtime.key`
 - OAuth state under `$XDG_STATE_HOME/abird/dotlink/` (or `~/.local/state/abird/dotlink/`)
+- Durable shell-job spools under the same protected state tree. Each profile defaults to a 512 MiB aggregate retained-job quota (`job_spool_bytes`) and one-hour terminal retention (`job_retention_secs`); declarative `settings` can override both using the normal profile schema.
 
 Select a saved named profile with `services.dotlink.profile = "work";`.
 The named profile uses `config.work.jsonc`, `runtime.work.key`, and its
@@ -69,6 +70,9 @@ services.dotlink = {
       allow_shell = true;
       allow_network = false;
     };
+    # Optional durable-job tuning from the normal profile schema:
+    job_retention_secs = 3600;
+    job_spool_bytes = 536870912;
   };
 
   extraPackages = with pkgs; [ git ripgrep fd ];
@@ -355,17 +359,20 @@ override the setting. See the README for the non-Linux fallback.
 
 These map to normal CLI output, `-v`, and `-vv`. `RUST_LOG` is separately
 configurable using `environment.RUST_LOG`. Logs may include filesystem paths,
-tunnel IDs, public MCP URLs and bounded request metadata; commands, grep
-patterns and bulk payloads are represented only by size. rmcp tracing remains
-suppressed regardless of `RUST_LOG` because upstream debug events render full
-MCP payloads. Journald retention/access remains under the host's policy. Avoid
-request logging on shared systems unless needed. `logging.verbosity = "tools"`
-intentionally records each complete shell command as `c="..."` in journald,
-with newlines escaped onto one record. Logged paths are relative to Dotlink's
-launch directory (`./...`) when inside it; external paths remain absolute.
-`p`/`d` precede `c`, and `max_t`/`max_b` show tool ceilings. Inline credentials
-in shell commands are recorded too;
-limit journal access and retention if you enable this audit mode.
+tunnel IDs, public MCP URLs and bounded request metadata. Bulk payloads such as
+file contents, patches, stdin and grep patterns are represented only by size.
+With `logging.verbosity = "tools"`, shell commands are recorded as an escaped
+single-line `c="..."` excerpt capped at **256 visible characters** (including
+quotes/escaping). Interactive CLI runs can press `V` to toggle uncapped command
+logging, but systemd services have no interactive controls, so the 256-character
+cap always applies there. The cap is not secret redaction: credentials or other
+sensitive text near the beginning of a command can still appear in journald.
+Logged paths are complete; paths inside Dotlink's launch directory are rendered
+relative as `./...`, while external paths remain absolute. `p`/`d` precede `c`,
+and `max_t`/`max_b` show tool ceilings. rmcp tracing remains suppressed
+regardless of `RUST_LOG` because upstream debug events render full MCP payloads.
+Journald retention/access remains under the host's policy; limit journal access
+and retention when enabling tool/request audit logging.
 
 systemd hardening must preserve dotlink's Bubblewrap namespaces, user-owned
 project directories, and writable developer caches. The module intentionally

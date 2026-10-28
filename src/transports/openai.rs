@@ -14,6 +14,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinSet,
@@ -26,7 +27,7 @@ use uuid::Uuid;
 use crate::{
     backoff::Backoff,
     bounded,
-    logging::{self, LogConfig},
+    logging::{self, LogConfig, LogOutcome},
     mcp::LocalMachine,
     recovery::{self, Recovery},
 };
@@ -39,26 +40,22 @@ const CONTROL_PLANE_MAX_POLL_LIMIT: usize = 25;
 const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
 const SERVER_INFO: &str =
     r#"{"version":2,"channels":[{"name":"main","stateless":true,"proc_affinity":true}]}"#;
-// A poll may contain multiple commands; limit the whole external envelope
-// before serde deserializes it. Large transfers can use later polls.
-const MAX_POLL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-/// A deliberate process-memory bound: even an oversized configured write must
-/// not make one remote envelope consume arbitrary memory.
-const MAX_SAFE_POLL_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
-/// Tunnel command wrappers (request id, shard token, headers, JSONRPC framing).
-const TUNNEL_COMMAND_OVERHEAD_BYTES: usize = 1024 * 1024;
+// The hosted tunnel imposes one serialized-message ceiling on poll commands
+// and terminal responses. Keep this exact service limit visible in code instead
+// of hiding a larger process-local allowance behind configuration math.
+const MAX_POLL_RESPONSE_BYTES: usize = crate::limits::OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES;
 
-fn poll_response_ceiling(max_request_bytes: usize) -> Result<usize> {
-    let needed = max_request_bytes
-        .checked_add(TUNNEL_COMMAND_OVERHEAD_BYTES)
-        .ok_or_else(|| anyhow!("OpenAI tunnel request ceiling overflows the address space"))?;
-    if needed > MAX_SAFE_POLL_RESPONSE_BYTES {
-        bail!(
-            "OpenAI tunnel cannot carry a configured single request of {max_request_bytes} bytes              inside the {} MiB safe poll envelope; lower max_write_bytes or use local HTTP/stdio",
-            MAX_SAFE_POLL_RESPONSE_BYTES / (1024 * 1024),
-        );
-    }
-    Ok(MAX_POLL_RESPONSE_BYTES.max(needed))
+fn poll_response_ceiling() -> usize {
+    MAX_POLL_RESPONSE_BYTES
+}
+
+fn durable_request_key(tunnel_id: &str, request_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update((tunnel_id.len() as u64).to_be_bytes());
+    digest.update(tunnel_id.as_bytes());
+    digest.update((request_id.len() as u64).to_be_bytes());
+    digest.update(request_id.as_bytes());
+    hex::encode(digest.finalize())
 }
 
 const REQUEST_HEADER_ALLOWLIST: &[&str] = &[
@@ -234,7 +231,7 @@ impl Default for TunnelTuning {
                 cap: Duration::from_secs(5),
                 jitter: Duration::from_millis(250),
             },
-            delivery_reserve: Duration::from_secs(5),
+            delivery_reserve: crate::limits::OPENAI_TUNNEL_DELIVERY_RESERVE,
         }
     }
 }
@@ -266,9 +263,7 @@ async fn run_with_tuning(
     cancellation: CancellationToken,
 ) -> Result<()> {
     // Construction depends only on configuration.
-    let max_request_bytes = machine.max_request_body_bytes();
-    let poll_ceiling =
-        poll_response_ceiling(max_request_bytes).map_err(recovery::config_failure)?;
+    let poll_ceiling = poll_response_ceiling();
     let embedded = EmbeddedMcp::new(machine, cancellation.child_token());
     let tunnel =
         TunnelClient::new(config, tuning, cancellation).map_err(recovery::config_failure)?;
@@ -305,9 +300,14 @@ struct LocalResponse {
 
 impl EmbeddedMcp {
     pub(crate) fn new(machine: LocalMachine, cancellation: CancellationToken) -> Self {
-        let max_request_bytes = machine.max_request_body_bytes();
-        let max_response_bytes = machine.max_response_body_bytes();
-        let config = super::embedded_streamable_config(&machine, cancellation);
+        let max_request_bytes = machine
+            .max_request_body_bytes()
+            .min(crate::limits::OPENAI_TUNNEL_MCP_MESSAGE_BYTES);
+        let max_response_bytes = machine
+            .max_response_body_bytes()
+            .min(crate::limits::OPENAI_TUNNEL_MCP_MESSAGE_BYTES);
+        let config = super::embedded_streamable_config(&machine, cancellation)
+            .with_max_request_body_bytes(max_request_bytes);
         let service_machine = machine.clone();
         let service = StreamableHttpService::new(
             move || Ok(service_machine.clone()),
@@ -1129,8 +1129,8 @@ impl TunnelClient {
         let request_id_label = command.request_id_label().to_owned();
         let channel_label = command.channel_label().to_owned();
         let command_type_label = command.command_type_label().to_owned();
-        let deadline = parse_response_timeout(command.response_timeout.as_ref())
-            .and_then(|duration| received_at.checked_add(duration));
+        let response_window = effective_response_window(command.response_timeout.as_ref());
+        let deadline = received_at.checked_add(response_window);
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             warn!(
                 request_id = %request_id_label,
@@ -1145,26 +1145,35 @@ impl TunnelClient {
             return Ok(());
         }
 
-        // Keep the delivery reserve for the terminal response. Shell timeouts
-        // are shortened explicitly; every other dispatch is bounded by the
-        // same effective deadline.
+        // Keep the delivery reserve for the terminal response. Shell caller
+        // intent is never shortened: the remaining window is metadata used by
+        // the shell layer to choose synchronous execution versus a durable job.
+        // Every dispatch is still bounded so the terminal response can be sent.
         let dispatch_deadline = deadline.map(|deadline| {
             deadline
                 .checked_sub(self.tuning.delivery_reserve)
                 .unwrap_or_else(Instant::now)
         });
+        let durable_request_key = durable_request_key(&self.tunnel_id, &command.request_id);
         if let Some(remaining) =
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
             && let Some(jsonrpc) = command.jsonrpc.as_mut()
-            && let Some(secs) =
-                apply_response_window(jsonrpc, remaining, self.tuning.delivery_reserve)
         {
-            debug!(
-                request_id = %request_id_label,
-                window_secs = remaining.as_secs_f32(),
-                timeout_secs = secs,
-                "bounded shell timeout to the client response window"
+            let sync_secs = annotate_response_context(
+                jsonrpc,
+                remaining,
+                self.tuning.delivery_reserve,
+                &durable_request_key,
+                mcp.machine.transport_context_token(),
             );
+            if let Some(secs) = sync_secs {
+                debug!(
+                    request_id = %request_id_label,
+                    window_secs = remaining.as_secs_f32(),
+                    sync_budget_secs = secs,
+                    "annotated shell call with durable request identity and synchronous budget"
+                );
+            }
         }
 
         match command.command_type.as_str() {
@@ -1199,7 +1208,7 @@ impl TunnelClient {
                                     resp_code: 502,
                                     resp_type: "jsonrpc_response".to_owned(),
                                 };
-                                self.post_terminal(&command, response, deadline).await?;
+                                let _ = self.post_terminal(&command, response, deadline).await?;
                             } else {
                                 let response = TunnelResponse {
                                     request_id: command.request_id.clone(),
@@ -1209,7 +1218,7 @@ impl TunnelClient {
                                     resp_code: 502,
                                     resp_type: "notify_ack".to_owned(),
                                 };
-                                self.post_terminal(&command, response, deadline).await?;
+                                let _ = self.post_terminal(&command, response, deadline).await?;
                             }
                             return Ok(());
                         }
@@ -1225,8 +1234,12 @@ impl TunnelClient {
                     Err(error) => return Err(error),
                 };
 
-                self.log
-                    .request_done("openai", &request_label, started, local.status.to_string());
+                self.log.request_done(
+                    "openai",
+                    &request_label,
+                    started,
+                    LogOutcome::http(local.status),
+                );
 
                 if !has_request_id {
                     let response = TunnelResponse {
@@ -1237,7 +1250,7 @@ impl TunnelClient {
                         resp_code: local.status,
                         resp_type: "notify_ack".to_owned(),
                     };
-                    self.post_terminal(&command, response, deadline).await?;
+                    let _ = self.post_terminal(&command, response, deadline).await?;
                     return Ok(());
                 }
 
@@ -1265,9 +1278,9 @@ impl TunnelClient {
                     }
                 }
 
-                let (resp_json, resp_code) = match terminal {
-                    Some(message) => (message, local.status),
-                    None => (synthesized_jsonrpc_error(jsonrpc, "protocol"), 502),
+                let (resp_json, resp_code, real_terminal) = match terminal {
+                    Some(message) => (message, local.status, true),
+                    None => (synthesized_jsonrpc_error(jsonrpc, "protocol"), 502, false),
                 };
                 let response = TunnelResponse {
                     request_id: command.request_id.clone(),
@@ -1277,7 +1290,10 @@ impl TunnelClient {
                     resp_code,
                     resp_type: "jsonrpc_response".to_owned(),
                 };
-                self.post_terminal(&command, response, deadline).await?;
+                if self.post_terminal(&command, response, deadline).await? && real_terminal {
+                    mcp.machine
+                        .acknowledge_job_request_delivery(&durable_request_key);
+                }
             }
             "session_termination" => {
                 // dotlink advertises a stateless main channel, so there is no local
@@ -1291,7 +1307,7 @@ impl TunnelClient {
                     resp_code: 204,
                     resp_type: "session_termination_response".to_owned(),
                 };
-                self.post_terminal(&command, response, deadline).await?;
+                let _ = self.post_terminal(&command, response, deadline).await?;
             }
             _ => {
                 warn!(request_id = %request_id_label, command_type = %command_type_label, "ignoring unknown tunnel command type");
@@ -1312,7 +1328,7 @@ impl TunnelClient {
         }
         match self.post_once(command, &response, deadline).await {
             Ok(PostOutcome::Delivered) => true,
-            Ok(PostOutcome::Cancelled) => false,
+            Ok(PostOutcome::Undeliverable | PostOutcome::Cancelled) => false,
             Ok(PostOutcome::Retry(error)) | Ok(PostOutcome::Fatal(error)) | Err(error) => {
                 warn!(request_id = %command.request_id_label(), "dropping intermediate tunnel notification after send failure");
                 debug!(request_id = %command.request_id_label(), %error, "intermediate tunnel notification failure detail");
@@ -1326,7 +1342,7 @@ impl TunnelClient {
         command: &TunnelCommand,
         response: TunnelResponse,
         deadline: Option<Instant>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut attempt = 0_u32;
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1334,10 +1350,11 @@ impl TunnelClient {
                     request_id = %command.request_id_label(),
                     "client response window expired before the response could be posted"
                 );
-                return Ok(());
+                return Ok(false);
             }
             match self.post_once(command, &response, deadline).await {
-                Ok(PostOutcome::Delivered | PostOutcome::Cancelled) => return Ok(()),
+                Ok(PostOutcome::Delivered) => return Ok(true),
+                Ok(PostOutcome::Undeliverable | PostOutcome::Cancelled) => return Ok(false),
                 Ok(PostOutcome::Fatal(error)) => return Err(error),
                 Ok(PostOutcome::Retry(error)) | Err(error) => {
                     attempt = attempt.saturating_add(1);
@@ -1350,13 +1367,13 @@ impl TunnelClient {
                             .checked_add(delay)
                             .is_none_or(|next| next >= deadline)
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                     if cancellation_first(&self.cancellation, time::sleep(delay))
                         .await
                         .is_none()
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
             }
@@ -1386,13 +1403,17 @@ impl TunnelClient {
                 Ok(response) => response,
                 Err(error) => return Ok(PostOutcome::Retry(anyhow!(error))),
             },
-            None => return Ok(PostOutcome::Delivered),
+            None => return Ok(PostOutcome::Undeliverable),
         };
         let status = response.status();
-        if status.is_success() || status == StatusCode::NOT_FOUND {
-            // A response POST may return 404 after the request has already been
-            // fulfilled or expired. The protocol treats that command as terminal.
+        if status.is_success() {
             return Ok(PostOutcome::Delivered);
+        }
+        if status == StatusCode::NOT_FOUND {
+            // The control plane uses 404 for both already-fulfilled and expired
+            // requests. That is terminal for this POST attempt, but it is not a
+            // positive delivery acknowledgement; retain request-key replay state.
+            return Ok(PostOutcome::Undeliverable);
         }
         let error = control_plane_status_error("response", status);
         if retryable_response_status(status) {
@@ -1427,6 +1448,7 @@ impl TunnelClient {
 
 enum PostOutcome {
     Delivered,
+    Undeliverable,
     Cancelled,
     Retry(anyhow::Error),
     Fatal(anyhow::Error),
@@ -1449,6 +1471,12 @@ where
             }
         }
     }
+}
+
+fn effective_response_window(value: Option<&Value>) -> Duration {
+    parse_response_timeout(value)
+        .unwrap_or(crate::limits::OPENAI_TUNNEL_REQUEST_DEADLINE)
+        .min(crate::limits::OPENAI_TUNNEL_REQUEST_DEADLINE)
 }
 
 fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
@@ -1487,32 +1515,56 @@ fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
 const OUTSTANDING_BATCHES: usize = 3;
 
 fn shell_timeout_within(window: Duration, reserve: Duration) -> u64 {
-    window.saturating_sub(reserve).as_secs().max(1)
+    window.saturating_sub(reserve).as_secs()
 }
 
-/// Thread the client-owned response window into a shell `tools/call`.
-///
-/// The caller's `timeout_secs` is client-controlled and preserved when it fits;
-/// otherwise it is shortened so dotlink can return a real tool result instead of
-/// being dropped at the window boundary. The policy ceiling still applies later.
-fn apply_response_window(jsonrpc: &mut Value, window: Duration, reserve: Duration) -> Option<u64> {
+/// Tell the local MCP server how long this response may wait and which durable
+/// request it represents. Execution deadlines are never rewritten: every shell
+/// call starts one durable execution and waits only until this response window;
+/// a still-running command is then exposed through that same stable job/task id.
+fn annotate_response_context(
+    jsonrpc: &mut Value,
+    window: Duration,
+    reserve: Duration,
+    request_key: &str,
+    transport_context_token: &str,
+) -> Option<u64> {
     if jsonrpc.get("method").and_then(Value::as_str) != Some("tools/call") {
         return None;
     }
     let name = jsonrpc.pointer("/params/name").and_then(Value::as_str)?;
-    // The capability table is the only list of shell tools; a renamed or added
-    // shell variant is bounded by the delivery reserve without a second edit.
-    if !crate::mcp::is_shell_tool(name) {
+    let shell = crate::mcp::is_shell_tool(name);
+    let durable_shell = shell || name == "job_start";
+    let params = jsonrpc.get_mut("params")?.as_object_mut()?;
+    let meta = params
+        .entry("_meta")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()?;
+    meta.retain(|key, _| !key.starts_with(crate::mcp::TRANSPORT_META_PREFIX));
+    meta.insert(
+        crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY.to_owned(),
+        Value::String(transport_context_token.to_owned()),
+    );
+    meta.insert(
+        crate::mcp::RESULT_BUDGET_META_KEY.to_owned(),
+        Value::from(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES as u64),
+    );
+    if durable_shell {
+        meta.insert(
+            crate::mcp::REQUEST_KEY_META_KEY.to_owned(),
+            Value::String(request_key.to_owned()),
+        );
+    }
+    if !shell {
         return None;
     }
-    let object = jsonrpc.pointer_mut("/params/arguments")?.as_object_mut()?;
-    let budget = shell_timeout_within(window, reserve);
-    let applied = match object.get("timeout_secs") {
-        Some(value) => value.as_u64()?.min(budget),
-        None => budget,
-    };
-    object.insert("timeout_secs".to_owned(), Value::from(applied));
-    Some(applied)
+    let budget = window.saturating_sub(reserve);
+    let millis = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
+    meta.insert(
+        crate::mcp::SYNC_BUDGET_META_KEY.to_owned(),
+        Value::from(millis),
+    );
+    Some(shell_timeout_within(window, reserve))
 }
 
 fn verbose_request_label(jsonrpc: &Value) -> String {
@@ -1620,6 +1672,77 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_supplied_reserved_dotlink_meta_is_ignored_without_runtime_token() {
+        use crate::mcp::{AccessSpec, MachineConfig};
+        let Some(_shell) = crate::mcp::resolve_executable(crate::mcp::shell_tool_name()) else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let shell = crate::mcp::shell_tool_name();
+        let call = |id: i64, output: &str| {
+            json!({
+                "jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params": {
+                    "name": shell,
+                    "arguments": {"command": format!("printf {output}")},
+                    "_meta": {
+                        crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY: "attacker",
+                        crate::mcp::REQUEST_KEY_META_KEY: "same-key",
+                        crate::mcp::SYNC_BUDGET_META_KEY: 1,
+                        crate::mcp::RESULT_BUDGET_META_KEY: 64
+                    }
+                }
+            })
+        };
+        for (id, expected) in [(1, "first"), (2, "second")] {
+            let response = mcp
+                .dispatch(&BTreeMap::new(), &call(id, expected))
+                .await
+                .unwrap();
+            let message = response
+                .messages
+                .iter()
+                .find(|message| message.get("id") == Some(&json!(id)))
+                .unwrap();
+            let text = message["result"]["content"][0]["text"].as_str().unwrap();
+            let result: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(result["stdout"], expected, "{message}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn descriptor_rooted_native_tools_round_trip_through_mcp() {
@@ -1656,6 +1779,11 @@ mod tests {
             max_output_bytes: 1024,
             max_read_bytes: 1024,
             max_write_bytes: 1024,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: vec![protected],
         })
         .await
@@ -1898,6 +2026,11 @@ mod tests {
                     max_output_bytes: 1024,
                     max_read_bytes: 1024,
                     max_write_bytes: 1024,
+
+                    task_result_budget: None,
+                    job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+                    job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
                     protected_paths: Vec::new(),
                 })
                 .await
@@ -1953,12 +2086,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedded_binary_read_respects_configured_read_ceiling_not_fixed_16mib() {
+    async fn embedded_binary_read_uses_the_hosted_envelope_above_the_raw_tool_ceiling() {
         use crate::mcp::{AccessSpec, MachineConfig};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let size = 13 * 1024 * 1024;
-        std::fs::write(root.join("large.bin"), vec![b'z'; size]).unwrap();
+        let fits_after_base64 = 6 * 1024 * 1024;
+        let exceeds_after_base64 = 8 * 1024 * 1024;
+        std::fs::write(root.join("fits.bin"), vec![b'z'; fits_after_base64]).unwrap();
+        std::fs::write(root.join("too-large.bin"), vec![b'z'; exceeds_after_base64]).unwrap();
         let machine = LocalMachine::new(MachineConfig {
             access: AccessSpec {
                 base_dir: root.clone(),
@@ -1979,21 +2114,33 @@ mod tests {
             allow_network: false,
             max_shell_timeout_secs: 10,
             max_output_bytes: 1024 * 1024,
-            max_read_bytes: 20 * 1024 * 1024,
+            max_read_bytes: crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES,
             max_write_bytes: 1024 * 1024,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
         .unwrap();
         let embedded = EmbeddedMcp::new(machine, CancellationToken::new());
-        assert!(embedded.max_response_bytes > 16 * 1024 * 1024);
+        let transport_token = embedded.machine.transport_context_token().to_owned();
+        assert_eq!(
+            embedded.max_response_bytes,
+            crate::limits::OPENAI_TUNNEL_MCP_MESSAGE_BYTES
+        );
+
         let response = embedded
             .dispatch(
                 &BTreeMap::new(),
                 &json!({
                     "jsonrpc": "2.0", "id": 42, "method": "tools/call",
-                    "params": {"name": "bread", "arguments": {
-                        "path": "large.bin", "format": "base64"}}
+                    "params": {"_meta": {
+                        crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY: transport_token,
+                        crate::mcp::RESULT_BUDGET_META_KEY: crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES
+                    }, "name": "bread", "arguments": {
+                        "path": "fits.bin", "format": "base64", "limit": fits_after_base64}}
                 }),
             )
             .await
@@ -2003,10 +2150,35 @@ mod tests {
             .messages
             .iter()
             .find(|value| value.get("id") == Some(&json!(42)))
-            .expect("large binary MCP response");
+            .expect("binary MCP response");
         assert_ne!(result["result"]["isError"], true);
-        let receipt = result["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(receipt.len() > 16 * 1024 * 1024);
+
+        let response = embedded
+            .dispatch(
+                &BTreeMap::new(),
+                &json!({
+                    "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+                    "params": {"_meta": {
+                        crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY: transport_token,
+                        crate::mcp::RESULT_BUDGET_META_KEY: crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES
+                    }, "name": "bread", "arguments": {
+                        "path": "too-large.bin", "format": "base64", "limit": exceeds_after_base64}}
+                }),
+            )
+            .await
+            .unwrap();
+        let result = response
+            .messages
+            .iter()
+            .find(|value| value.get("id") == Some(&json!(43)))
+            .expect("oversized binary tool response");
+        assert_eq!(result["result"]["isError"], true);
+        let text = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("cannot fit this encoding"), "{text}");
+        assert!(
+            text.contains(&crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES.to_string()),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -2174,18 +2346,52 @@ mod tests {
     }
 
     #[test]
-    fn poll_ceiling_covers_a_configured_single_request_and_fails_closed_for_oversize() {
+    fn durable_request_keys_are_fixed_width_and_unambiguous() {
+        let a = durable_request_key("a", "b:c");
+        let b = durable_request_key("a:b", "c");
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 64);
+        assert_eq!(a, durable_request_key("a", "b:c"));
+    }
+
+    #[test]
+    fn poll_ceiling_is_the_hosted_serialized_message_limit() {
         assert_eq!(
-            poll_response_ceiling(1_000_000).unwrap(),
-            MAX_POLL_RESPONSE_BYTES
+            poll_response_ceiling(),
+            crate::limits::OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES
         );
-        // 12 MiB of control characters can expand to 72 MiB of JSON: the
-        // previous fixed 64 MiB ceiling rejected a valid tool request.
-        let large_request = 12 * 1024 * 1024 * 6 + 64 * 1024;
-        let raised = poll_response_ceiling(large_request).unwrap();
-        assert!(raised > MAX_POLL_RESPONSE_BYTES);
-        assert!(raised >= large_request + TUNNEL_COMMAND_OVERHEAD_BYTES);
-        assert!(poll_response_ceiling(MAX_SAFE_POLL_RESPONSE_BYTES).is_err());
+    }
+
+    #[test]
+    fn eight_mib_ascii_write_fits_embedded_and_hosted_envelopes() {
+        let content = "a".repeat(crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES);
+        let jsonrpc = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{"name":"write","arguments":{"path":"large.txt","content":content}}
+        });
+        let inner = serde_json::to_vec(&jsonrpc).unwrap().len();
+        assert!(
+            inner <= crate::limits::OPENAI_TUNNEL_MCP_MESSAGE_BYTES,
+            "8 MiB raw write serialized to {inner} bytes"
+        );
+        let envelope = json!({
+            "commands":[{
+                "request_id":"request",
+                "shard_token":"shard",
+                "command_type":"jsonrpc",
+                "channel":"main",
+                "response_timeout":"120s",
+                "headers":{},
+                "jsonrpc":jsonrpc
+            }]
+        });
+        let outer = serde_json::to_vec(&envelope).unwrap().len();
+        assert!(
+            outer <= crate::limits::OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES,
+            "8 MiB raw write tunnel envelope serialized to {outer} bytes"
+        );
     }
 
     #[test]
@@ -2234,6 +2440,11 @@ mod tests {
             max_output_bytes: 1024,
             max_read_bytes: 1024,
             max_write_bytes: 1024,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -2318,6 +2529,61 @@ mod tests {
             };
             assert_eq!(actual, expected, "{status}, new tunnel: {new_tunnel}");
         }
+    }
+
+    #[tokio::test]
+    async fn expired_or_ambiguous_response_posts_are_not_delivery_acknowledgements() {
+        let command = TunnelCommand {
+            request_id: "request".to_owned(),
+            shard_token: "shard".to_owned(),
+            command_type: "jsonrpc".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: None,
+            headers: BTreeMap::new(),
+            jsonrpc: Some(json!({"jsonrpc":"2.0","id":1,"method":"tools/call"})),
+        };
+        let response = TunnelResponse {
+            request_id: command.request_id.clone(),
+            channel: command.channel.clone(),
+            resp_json: Some(json!({"jsonrpc":"2.0","id":1,"result":{}})),
+            resp_headers: BTreeMap::new(),
+            resp_code: 200,
+            resp_type: "jsonrpc_response".to_owned(),
+        };
+
+        let (base_url, _) =
+            fake_control_plane(|_| (StatusCode::OK, Duration::from_millis(80))).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let outcome = client
+            .post_once(
+                &command,
+                &response,
+                Some(Instant::now() + Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PostOutcome::Undeliverable));
+
+        let (base_url, _) = fake_control_plane(|_| (StatusCode::NOT_FOUND, Duration::ZERO)).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let outcome = client.post_once(&command, &response, None).await.unwrap();
+        assert!(matches!(outcome, PostOutcome::Undeliverable));
     }
 
     #[tokio::test]
@@ -2614,6 +2880,123 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serialized_background_job_control_remains_pollable_and_cancellable() {
+        use crate::mcp::{AccessSpec, MachineConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: true,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 10,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: 60,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let headers = BTreeMap::new();
+        let call = |id: i64, name: &str, arguments: Value| {
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            })
+        };
+        let terminal = |response: &LocalResponse, id: i64| {
+            response
+                .messages
+                .iter()
+                .find(|value| value.get("id") == Some(&json!(id)))
+                .cloned()
+                .expect("terminal JSON-RPC response")
+        };
+
+        let started = Instant::now();
+        let created = mcp
+            .dispatch(
+                &headers,
+                &call(
+                    1,
+                    "job_start",
+                    json!({"command":"printf started; sleep 5", "timeout_secs":8}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let created = terminal(&created, 1);
+        let receipt: Value =
+            serde_json::from_str(created["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let job_id = receipt["job_id"].as_str().unwrap().to_owned();
+
+        // The running job owns the serialize gate. Control tools must bypass
+        // that gate or they would be unusable until the job had already ended.
+        let polled_at = Instant::now();
+        let polled = mcp
+            .dispatch(&headers, &call(2, "job_get", json!({"job_id":job_id})))
+            .await
+            .unwrap();
+        assert!(polled_at.elapsed() < Duration::from_secs(1));
+        let polled = terminal(&polled, 2);
+        let status: Value =
+            serde_json::from_str(polled["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(status["status"], "working");
+
+        let cancelled_at = Instant::now();
+        let cancelled = mcp
+            .dispatch(&headers, &call(3, "job_cancel", json!({"job_id":job_id})))
+            .await
+            .unwrap();
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert_ne!(terminal(&cancelled, 3)["result"]["isError"], true);
+
+        let mut final_status = None;
+        for attempt in 0..100_i64 {
+            let polled = mcp
+                .dispatch(
+                    &headers,
+                    &call(10 + attempt, "job_get", json!({"job_id":job_id})),
+                )
+                .await
+                .unwrap();
+            let polled = terminal(&polled, 10 + attempt);
+            let value: Value =
+                serde_json::from_str(polled["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            if value["status"] != "working" {
+                final_status = value["status"].as_str().map(str::to_owned);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(final_status.as_deref(), Some("cancelled"));
+    }
+
     #[test]
     fn response_timeout_parser_accepts_contract_values() {
         assert_eq!(
@@ -2643,6 +3026,26 @@ mod tests {
         ] {
             assert_eq!(parse_response_timeout(Some(&value)), None);
         }
+    }
+
+    #[test]
+    fn response_window_always_has_the_known_hosted_deadline_fallback() {
+        assert_eq!(
+            effective_response_window(None),
+            crate::limits::OPENAI_TUNNEL_REQUEST_DEADLINE
+        );
+        assert_eq!(
+            effective_response_window(Some(&json!("not-a-duration"))),
+            crate::limits::OPENAI_TUNNEL_REQUEST_DEADLINE
+        );
+        assert_eq!(
+            effective_response_window(Some(&json!("30s"))),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            effective_response_window(Some(&json!("10m"))),
+            crate::limits::OPENAI_TUNNEL_REQUEST_DEADLINE
+        );
     }
 
     #[test]
@@ -2867,57 +3270,137 @@ mod tests {
     }
 
     #[test]
-    fn client_window_bounds_shell_timeouts_only() {
+    fn client_window_is_metadata_and_never_rewrites_shell_timeout() {
         let window = Duration::from_secs(120);
         let reserve = TunnelTuning::default().delivery_reserve;
-        assert_eq!(reserve, Duration::from_secs(5));
+        assert_eq!(reserve, crate::limits::OPENAI_TUNNEL_DELIVERY_RESERVE);
         assert_eq!(shell_timeout_within(window, reserve), 115);
-        assert_eq!(shell_timeout_within(Duration::from_secs(3), reserve), 1);
+        assert_eq!(shell_timeout_within(Duration::from_secs(3), reserve), 0);
+        let mut subsecond = json!({
+            "jsonrpc":"2.0","id":9,"method":"tools/call",
+            "params":{"name":crate::mcp::shell_tool_name(),"arguments":{"command":"true","timeout_secs":1}}
+        });
+        assert_eq!(
+            annotate_response_context(
+                &mut subsecond,
+                reserve + Duration::from_millis(999),
+                reserve,
+                "request",
+                "token",
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            subsecond.pointer("/params/_meta/io.abird.dotlink~1syncBudgetMs"),
+            Some(&json!(999))
+        );
 
         let shell_name = crate::mcp::shell_tool_name();
         let shell = |arguments: Value| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":shell_name,"arguments":arguments}});
+        let sync_meta = |call: &Value| {
+            call.pointer("/params/_meta/io.abird.dotlink~1syncBudgetMs")
+                .and_then(Value::as_u64)
+        };
+        let request_meta = |call: &Value| {
+            call.pointer("/params/_meta/io.abird.dotlink~1requestKey")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
 
-        // Omitted -> derived from the client window.
+        // Omitted execution timeout stays omitted: the durable runner uses the
+        // profile ceiling. The transport budget controls only how long this
+        // request waits before returning the same durable job/task handle.
         let mut call = shell(json!({"command":"cargo build --release"}));
-        assert_eq!(apply_response_window(&mut call, window, reserve), Some(115));
+        call["params"]["_meta"] = json!({
+            "io.abird.dotlink/futureField": "attacker",
+            "io.abird.dotlink/syncBudgetMs": 999999999_u64,
+            "unrelated-client-meta": "preserve-me"
+        });
         assert_eq!(
-            call.pointer("/params/arguments/timeout_secs"),
-            Some(&json!(115))
+            annotate_response_context(&mut call, window, reserve, "request", "token"),
+            Some(115)
+        );
+        assert_eq!(call.pointer("/params/arguments/timeout_secs"), None);
+        assert_eq!(sync_meta(&call), Some(115_000));
+        assert_eq!(request_meta(&call), Some("request".to_owned()));
+        let meta = call["params"]["_meta"].as_object().unwrap();
+        assert!(!meta.contains_key("io.abird.dotlink/futureField"));
+        assert_eq!(
+            meta.get("unrelated-client-meta"),
+            Some(&json!("preserve-me"))
+        );
+        assert_eq!(
+            call.pointer("/params/_meta/io.abird.dotlink~1transportContextToken")
+                .and_then(Value::as_str),
+            Some("token")
+        );
+        assert_eq!(
+            call.pointer("/params/_meta/io.abird.dotlink~1resultBudgetBytes")
+                .and_then(Value::as_u64),
+            Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES as u64)
         );
 
-        // Caller value is preserved when it fits.
-        let mut call = shell(json!({"command":"true","timeout_secs":30}));
-        assert_eq!(apply_response_window(&mut call, window, reserve), Some(30));
-        assert_eq!(
-            call.pointer("/params/arguments/timeout_secs"),
-            Some(&json!(30))
-        );
+        // Explicit caller values are never rewritten, regardless of whether
+        // they fit this request. The shell layer decides sync vs durable job.
+        for value in [30_u64, 600] {
+            let mut call = shell(json!({"command":"true","timeout_secs":value}));
+            assert_eq!(
+                annotate_response_context(&mut call, window, reserve, "request", "token"),
+                Some(115)
+            );
+            assert_eq!(
+                call.pointer("/params/arguments/timeout_secs"),
+                Some(&json!(value))
+            );
+            assert_eq!(sync_meta(&call), Some(115_000));
+        }
 
-        // Caller value is shortened to keep the response deliverable.
-        let mut call = shell(json!({"command":"true","timeout_secs":600}));
-        assert_eq!(apply_response_window(&mut call, window, reserve), Some(115));
-        assert_eq!(
-            call.pointer("/params/arguments/timeout_secs"),
-            Some(&json!(115))
-        );
-
-        // Wrong types are left to schema validation instead of being rewritten.
+        // Invalid argument types are also left untouched for schema validation;
+        // metadata annotation must not become a second argument parser.
         let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
-        assert_eq!(apply_response_window(&mut call, window, reserve), None);
+        assert_eq!(
+            annotate_response_context(&mut call, window, reserve, "request", "token"),
+            Some(115)
+        );
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!("600"))
         );
+        assert_eq!(sync_meta(&call), Some(115_000));
+        assert_eq!(request_meta(&call), Some("request".to_owned()));
 
-        // Non-shell tools and non-call methods are untouched.
+        // Explicit background jobs carry request identity but no synchronous
+        // wait budget because they return immediately by definition.
+        let mut job_start = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"job_start","arguments":{"command":"true"}}});
+        assert_eq!(
+            annotate_response_context(&mut job_start, window, reserve, "job-request", "token"),
+            None
+        );
+        assert_eq!(request_meta(&job_start), Some("job-request".to_owned()));
+        assert_eq!(sync_meta(&job_start), None);
+
+        // Every tools/call gets the serialized result budget, while only
+        // durable shell calls get request identity / synchronous-window metadata.
         let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"a"}}});
-        let original = call.clone();
-        assert_eq!(apply_response_window(&mut call, window, reserve), None);
-        assert_eq!(call, original);
+        assert_eq!(
+            annotate_response_context(&mut call, window, reserve, "request", "token"),
+            None
+        );
+        assert_eq!(sync_meta(&call), None);
+        assert_eq!(request_meta(&call), None);
+        assert_eq!(
+            call.pointer("/params/_meta/io.abird.dotlink~1resultBudgetBytes")
+                .and_then(Value::as_u64),
+            Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES as u64)
+        );
 
+        // Non-call methods remain untouched.
         let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
         let original = call.clone();
-        assert_eq!(apply_response_window(&mut call, window, reserve), None);
+        assert_eq!(
+            annotate_response_context(&mut call, window, reserve, "request", "token"),
+            None
+        );
         assert_eq!(call, original);
     }
 
@@ -2952,6 +3435,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -3048,6 +3536,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -3058,17 +3551,30 @@ mod tests {
             "params": {"name": "bash", "arguments": {"command": "sleep 30"}}
         });
         let reserve = TunnelTuning::default().delivery_reserve;
+        let transport_token = mcp.machine.transport_context_token().to_owned();
         assert_eq!(
-            apply_response_window(&mut call, Duration::from_millis(2_000), reserve),
-            Some(1)
+            annotate_response_context(
+                &mut call,
+                Duration::from_millis(2_000),
+                reserve,
+                "request",
+                &transport_token
+            ),
+            Some(0)
         );
 
         let started = Instant::now();
         let result = mcp.dispatch(&BTreeMap::new(), &call).await.unwrap();
         assert_eq!(result.status, 200);
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let body = result.messages.first().unwrap().to_string();
-        assert!(body.contains("timed out after 1 seconds"), "{body}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let message = result.messages.first().unwrap();
+        let receipt_text = message["result"]["content"][0]["text"]
+            .as_str()
+            .expect("durable shell receipt text");
+        let receipt: Value = serde_json::from_str(receipt_text).unwrap();
+        assert_eq!(receipt["async"], true, "{receipt}");
+        assert_eq!(receipt["timeout_secs"], 600, "{receipt}");
+        assert!(receipt["job_id"].as_str().is_some(), "{receipt}");
     }
 
     #[test]

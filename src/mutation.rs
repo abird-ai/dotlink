@@ -1,14 +1,16 @@
 //! Mutation coordination across MCP calls and independent dotlink processes.
 //!
-//! The target inode changes on atomic replacement. Lock its containing
-//! directory instead: a stable OS object with no workspace lockfiles, no XDG
-//! dependency, and no assumption about another process's mount namespace.
+//! Inside one process, exact path mutexes plus stable Unix directory-entry
+//! identities prevent conflicting aliases without serializing unrelated files.
+//! Across Unix processes, target inodes change on atomic replacement, so lock
+//! their stable parent directories instead: no workspace lockfiles or XDG
+//! dependency.
 
 use std::{
-    collections::{BTreeSet, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
-    path::Path,
-    sync::{Arc, OnceLock},
+    collections::{BTreeSet, HashMap},
+    hash::Hash,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -18,34 +20,60 @@ use anyhow::bail;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[cfg(unix)]
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::PathBuf,
-    sync::Weak,
-};
+use std::collections::BTreeMap;
 
-const LOCK_SHARDS: usize = 256;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const LOCK_RETRY: Duration = Duration::from_millis(2);
-#[cfg(unix)]
 const REGISTRY_PRUNE_AT: usize = 512;
-static SHARDS: OnceLock<Box<[Arc<Mutex<()>>]>> = OnceLock::new();
 
-fn shards() -> &'static [Arc<Mutex<()>>] {
-    SHARDS.get_or_init(|| (0..LOCK_SHARDS).map(|_| Arc::new(Mutex::new(()))).collect())
+/// Weak keyed mutexes avoid unrelated hash-shard collisions while allowing
+/// idle entries to disappear. The same registry primitive backs lexical path
+/// coordination and Unix stable directory-entry identities.
+struct LocalLockRegistry<K> {
+    entries: StdMutex<HashMap<K, Weak<Mutex<()>>>>,
 }
 
-fn shard(path: &Path) -> usize {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    (hasher.finish() as usize) % LOCK_SHARDS
+impl<K> Default for LocalLockRegistry<K> {
+    fn default() -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K> LocalLockRegistry<K>
+where
+    K: Clone + Eq + Hash,
+{
+    fn get(&self, key: &K) -> Arc<Mutex<()>> {
+        let mut entries = self.entries.lock().expect("mutation local-lock registry");
+        if let Some(lock) = entries.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        if entries.len() >= REGISTRY_PRUNE_AT {
+            entries.retain(|_, weak| weak.strong_count() > 0);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        entries.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
+static PATH_LOCKS: OnceLock<LocalLockRegistry<PathBuf>> = OnceLock::new();
+
+fn path_lock(path: &Path) -> Arc<Mutex<()>> {
+    PATH_LOCKS
+        .get_or_init(Default::default)
+        .get(&path.to_path_buf())
 }
 
 /// Held from snapshot read through the last commit, with deterministic
 /// acquisition and automatic release on cancellation, error, or process exit.
 pub(crate) struct MutationGuard {
-    _shards: Vec<OwnedMutexGuard<()>>,
+    _paths: Vec<OwnedMutexGuard<()>>,
+    #[cfg(unix)]
+    _targets: Vec<OwnedMutexGuard<()>>,
     #[cfg(unix)]
     _directories: Vec<Arc<DirectoryLock>>,
     #[cfg(windows)]
@@ -65,6 +93,87 @@ enum LockMode {
 }
 
 #[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct PlannedDirectory {
+    path: PathBuf,
+    mode: LockMode,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct UnixTargetKey {
+    ancestor_dev: u64,
+    ancestor_ino: u64,
+    relative: PathBuf,
+}
+
+#[cfg(unix)]
+static UNIX_TARGET_LOCKS: OnceLock<LocalLockRegistry<UnixTargetKey>> = OnceLock::new();
+
+#[cfg(unix)]
+fn unix_target_key(target: &Path) -> Result<UnixTargetKey> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let parent = target.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot identify root for file mutation: {}",
+            target.display()
+        )
+    })?;
+    if !parent.is_absolute() {
+        bail!("mutation paths must be absolute: {}", target.display());
+    }
+    let mut current = PathBuf::new();
+    let mut nearest = None;
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => nearest = Some((current.clone(), metadata)),
+            Ok(_) => bail!("unsafe mutation parent directory: {}", current.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => bail!(
+                "cannot inspect mutation parent {}: {error}",
+                current.display()
+            ),
+        }
+    }
+    let (ancestor, metadata) =
+        nearest.ok_or_else(|| anyhow::anyhow!("no existing directory for {}", target.display()))?;
+    let relative = target.strip_prefix(&ancestor).map_err(|_| {
+        anyhow::anyhow!(
+            "mutation target {} is not below its existing ancestor {}",
+            target.display(),
+            ancestor.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        bail!(
+            "mutation target must name a file below {}",
+            ancestor.display()
+        );
+    }
+    Ok(UnixTargetKey {
+        ancestor_dev: metadata.dev(),
+        ancestor_ino: metadata.ino(),
+        relative: relative.to_path_buf(),
+    })
+}
+
+#[cfg(unix)]
+fn unix_target_plan(paths: &[&Path]) -> Result<std::collections::BTreeMap<UnixTargetKey, PathBuf>> {
+    let mut targets = std::collections::BTreeMap::new();
+    for path in paths {
+        targets
+            .entry(unix_target_key(path)?)
+            .or_insert_with(|| path.to_path_buf());
+    }
+    Ok(targets)
+}
+
+#[cfg(unix)]
 struct DirectoryLock {
     _file: std::fs::File,
 }
@@ -73,7 +182,12 @@ struct DirectoryLock {
 /// that would let two writers choose different locks for one target.
 #[cfg(unix)]
 impl DirectoryLock {
-    async fn acquire(path: &Path, mode: LockMode, deadline: Instant) -> Result<Arc<Self>> {
+    async fn acquire(
+        path: &Path,
+        expected: DirectoryIdentity,
+        mode: LockMode,
+        deadline: Instant,
+    ) -> Result<Arc<Self>> {
         use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
 
         let file = std::fs::File::open(path).map_err(|error| {
@@ -83,7 +197,16 @@ impl DirectoryLock {
         if !metadata.is_dir() {
             bail!("mutation directory is not a directory: {}", path.display());
         }
-        let identity = (metadata.dev(), metadata.ino(), mode);
+        let found = (metadata.dev(), metadata.ino());
+        if found != expected {
+            bail!(
+                "mutation directory changed while locking {} (expected {:?}, found {:?})",
+                path.display(),
+                expected,
+                found,
+            );
+        }
+        let identity = (expected.0, expected.1, mode);
         let registry = DIRECTORIES.get_or_init(Default::default);
         let operation = match mode {
             LockMode::Intent => libc::LOCK_SH,
@@ -136,7 +259,9 @@ impl DirectoryLock {
 /// Locking an unreadable ancestor fails closed rather than substituting a
 /// different directory. This preserves automatic parent creation safely.
 #[cfg(unix)]
-fn lock_plan(paths: &[&Path]) -> Result<BTreeMap<PathBuf, LockMode>> {
+fn lock_plan(paths: &[&Path]) -> Result<BTreeMap<DirectoryIdentity, PlannedDirectory>> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let mut plan = BTreeMap::new();
     for target in paths {
         let parent = target.parent().ok_or_else(|| {
@@ -151,10 +276,12 @@ fn lock_plan(paths: &[&Path]) -> Result<BTreeMap<PathBuf, LockMode>> {
             current.push(component.as_os_str());
             match std::fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.is_dir() => {
-                    // Missing execute/read permission cannot be bypassed by
-                    // falling back to a readable ancestor.
-                    nearest = Some(current.clone());
-                    plan.entry(current.clone()).or_insert(LockMode::Intent);
+                    let identity = (metadata.dev(), metadata.ino());
+                    nearest = Some(identity);
+                    plan.entry(identity).or_insert_with(|| PlannedDirectory {
+                        path: current.clone(),
+                        mode: LockMode::Intent,
+                    });
                 }
                 Ok(_) => bail!("unsafe mutation parent directory: {}", current.display()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
@@ -166,9 +293,22 @@ fn lock_plan(paths: &[&Path]) -> Result<BTreeMap<PathBuf, LockMode>> {
         }
         let nearest = nearest
             .ok_or_else(|| anyhow::anyhow!("no existing directory for {}", target.display()))?;
-        plan.insert(nearest, LockMode::Exclusive);
+        plan.get_mut(&nearest)
+            .expect("nearest existing directory was inserted")
+            .mode = LockMode::Exclusive;
     }
     Ok(plan)
+}
+
+#[cfg(all(test, unix))]
+fn planned_mode(
+    plan: &BTreeMap<DirectoryIdentity, PlannedDirectory>,
+    path: &Path,
+) -> Option<LockMode> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(path).ok()?;
+    plan.get(&(metadata.dev(), metadata.ino()))
+        .map(|entry| entry.mode)
 }
 
 /// Windows kernel mutexes work across processes and logon sessions, are
@@ -322,38 +462,76 @@ impl WindowsMutationLock {
 }
 
 pub(crate) async fn lock<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<MutationGuard> {
+    let deadline = Instant::now()
+        .checked_add(LOCK_TIMEOUT)
+        .expect("30-second lock deadline fits monotonic clock");
+    lock_until(paths, deadline).await
+}
+
+/// One deadline covers every in-process lock and each OS-level lock, rather
+/// than granting another full timeout after waiting behind a local mutation.
+async fn lock_until<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    deadline: Instant,
+) -> Result<MutationGuard> {
     let paths = paths.into_iter().collect::<Vec<_>>();
-    let indices = paths
-        .iter()
-        .map(|path| shard(path))
-        .collect::<BTreeSet<_>>();
-    let mut guards = Vec::with_capacity(indices.len());
-    for index in indices {
-        guards.push(shards()[index].clone().lock_owned().await);
+    let targets = paths.iter().copied().collect::<BTreeSet<_>>();
+    let mut guards = Vec::with_capacity(targets.len());
+    for target in targets {
+        let guard = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            path_lock(target).lock_owned(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "another mutation is holding {}; retry when it finishes",
+                target.display()
+            )
+        })?;
+        guards.push(guard);
+    }
+
+    #[cfg(unix)]
+    let mut unix_targets = Vec::new();
+    #[cfg(unix)]
+    for (identity, path) in unix_target_plan(&paths)? {
+        let guard = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            UNIX_TARGET_LOCKS
+                .get_or_init(Default::default)
+                .get(&identity)
+                .lock_owned(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "another mutation is holding {}; retry when it finishes",
+                path.display()
+            )
+        })?;
+        unix_targets.push(guard);
     }
 
     #[cfg(unix)]
     let mut directories = Vec::new();
     #[cfg(unix)]
-    {
-        let deadline = Instant::now()
-            .checked_add(LOCK_TIMEOUT)
-            .expect("30-second lock deadline fits monotonic clock");
-        for (path, mode) in lock_plan(&paths)? {
-            directories.push(DirectoryLock::acquire(&path, mode, deadline).await?);
-        }
+    for (identity, planned) in lock_plan(&paths)? {
+        directories
+            .push(DirectoryLock::acquire(&planned.path, identity, planned.mode, deadline).await?);
     }
+
     #[cfg(windows)]
     let mut windows = Vec::new();
     #[cfg(windows)]
-    {
-        let deadline = Instant::now() + LOCK_TIMEOUT;
-        for (identity, path) in windows_lock_plan(&paths)? {
-            windows.push(WindowsMutationLock::acquire(&path, identity, deadline).await?);
-        }
+    for (identity, path) in windows_lock_plan(&paths)? {
+        windows.push(WindowsMutationLock::acquire(&path, identity, deadline).await?);
     }
+
     Ok(MutationGuard {
-        _shards: guards,
+        _paths: guards,
+        #[cfg(unix)]
+        _targets: unix_targets,
         #[cfg(unix)]
         _directories: directories,
         #[cfg(windows)]
@@ -391,6 +569,119 @@ mod tests {
         assert_eq!(plan.len(), 2);
     }
 
+    #[tokio::test]
+    async fn in_process_mutation_wait_respects_the_shared_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap().join("held.txt");
+        let guard = lock([path.as_path()]).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let now = Instant::now();
+        let error = lock_until([path.as_path()], deadline)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("another mutation is holding"), "{error}");
+        assert!(now.elapsed() < Duration::from_secs(2));
+        drop(guard);
+        // A failed multi-path acquisition releases previously acquired keys.
+        let a = root.path().join("a.txt");
+        let b = root.path().join("b.txt");
+        let held_b = lock([b.as_path()]).await.unwrap();
+        assert!(
+            lock_until(
+                [a.as_path(), b.as_path()],
+                Instant::now() + Duration::from_millis(40)
+            )
+            .await
+            .is_err()
+        );
+        let a_guard = lock_until([a.as_path()], Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        drop(a_guard);
+        drop(held_b);
+        let both = lock_until(
+            [a.as_path(), b.as_path()],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        drop(both);
+    }
+
+    #[test]
+    fn path_lock_registry_keeps_only_weak_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("transient.txt");
+        let lock = path_lock(&path);
+        let weak = Arc::downgrade(&lock);
+        assert!(Arc::ptr_eq(&lock, &path_lock(&path)));
+        drop(lock);
+        assert!(weak.upgrade().is_none(), "idle locks must be reclaimable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_process_aliases_of_one_directory_entry_share_the_target_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let direct = root.join("file.txt");
+        let alias = root.join("sub").join("..").join("file.txt");
+        assert_ne!(direct, alias);
+        assert_eq!(
+            unix_target_key(&direct).unwrap(),
+            unix_target_key(&alias).unwrap()
+        );
+
+        let held = lock([direct.as_path()]).await.unwrap();
+        let error = lock_until(
+            [alias.as_path()],
+            Instant::now() + Duration::from_millis(40),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("another mutation is holding"), "{error}");
+        drop(held);
+        lock_until([alias.as_path()], Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn old_hash_shard_collisions_do_not_block_distinct_mutation_paths() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        use tokio::sync::oneshot;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let a = root.join("a.txt");
+        let old_shard = |path: &Path| {
+            let mut hasher = DefaultHasher::new();
+            path.hash(&mut hasher);
+            hasher.finish() % 256
+        };
+        let b = (0..10_000)
+            .map(|n| root.join(format!("different-{n}.txt")))
+            .find(|path| path != &a && old_shard(path) == old_shard(&a))
+            .expect("10,000 candidates contain a colliding shard");
+        let held = lock([a.as_path()]).await.unwrap();
+        let (send, recv) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let _different = lock([b.as_path()]).await.unwrap();
+            let _ = send.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(3), recv)
+            .await
+            .expect("different files must never share an in-process path lock")
+            .unwrap();
+        worker.await.unwrap();
+        drop(held);
+    }
+
     #[cfg(unix)]
     #[test]
     fn parent_creation_is_locked_at_the_nearest_existing_ancestor() {
@@ -398,14 +689,14 @@ mod tests {
         let parent = root.path().canonicalize().unwrap();
         let target = parent.join("new/child/data.txt");
         let plan = lock_plan(&[target.as_path()]).unwrap();
-        assert_eq!(plan.get(&parent), Some(&LockMode::Exclusive));
-        assert!(!plan.contains_key(&parent.join("new")));
+        assert_eq!(planned_mode(&plan, &parent), Some(LockMode::Exclusive));
+        assert!(planned_mode(&plan, &parent.join("new")).is_none());
         std::fs::create_dir_all(parent.join("new/child")).unwrap();
         let plan = lock_plan(&[target.as_path()]).unwrap();
-        assert_eq!(plan.get(&parent), Some(&LockMode::Intent));
+        assert_eq!(planned_mode(&plan, &parent), Some(LockMode::Intent));
         assert_eq!(
-            plan.get(&parent.join("new/child")),
-            Some(&LockMode::Exclusive)
+            planned_mode(&plan, &parent.join("new/child")),
+            Some(LockMode::Exclusive)
         );
     }
 
@@ -428,13 +719,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn one_process_reuses_the_held_directory_descriptor() {
+    async fn directory_lock_rejects_an_inode_changed_since_planning() {
+        use std::os::unix::fs::MetadataExt as _;
         let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let metadata = std::fs::metadata(&a).unwrap();
+        let expected = (metadata.dev(), metadata.ino());
+        let error = DirectoryLock::acquire(
+            &b,
+            expected,
+            LockMode::Exclusive,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("changed while locking"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_process_reuses_the_held_directory_descriptor() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(root.path()).unwrap();
+        let identity = (metadata.dev(), metadata.ino());
         let deadline = Instant::now() + LOCK_TIMEOUT;
-        let a = DirectoryLock::acquire(root.path(), LockMode::Exclusive, deadline)
+        let a = DirectoryLock::acquire(root.path(), identity, LockMode::Exclusive, deadline)
             .await
             .unwrap();
-        let b = DirectoryLock::acquire(root.path(), LockMode::Exclusive, deadline)
+        let b = DirectoryLock::acquire(root.path(), identity, LockMode::Exclusive, deadline)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&a, &b));

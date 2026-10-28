@@ -85,7 +85,7 @@ Default runs are quiet. Add `-v` to see tool activity:
 ~~~text
 $ dotlink -v -p aw
 
-abird dotlink 0.13.0
+dotlink v0.14.0
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
@@ -96,7 +96,7 @@ abird dotlink 0.13.0
 • Logging    TOOL
 
 OpenAI Secure MCP Tunnel connecting…
-Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity
+Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity · V: full commands
 
 ✓ Connected — ready
 
@@ -104,7 +104,7 @@ Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity
 [10:59:19.194] TOOL read       ← ok  9ms
 ~~~
 
-`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` without restarting. Each change emits a compact `LOG verbosity …` line. `Ctrl+R` fully reloads the profile/policy/transports; `Ctrl+C` exits. Runtime key controls are disabled when stdio MCP is active so protocol stdin is never intercepted. TOOL logging intentionally records full shell commands (including embedded arguments and secrets) as quoted, escaped one-line text. File contents, binary payloads, explicit Runtime keys, and raw request bodies are not intentionally logged.
+`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` and **`V` (Shift+V)** to toggle full versus 256-character `c=` command logging, **only while TOOL logging is enabled**. In quiet/REQ-only mode, the `V` hint is hidden and the key is ignored. Leaving TOOL logging or restarting resets full mode; noninteractive and stdio runs always cap commands. `Ctrl+R` reloads profile/policy/transports; `Ctrl+C` exits. Runtime controls are disabled during stdio MCP so protocol stdin is never intercepted. TOOL commands are quoted and escaped onto one line, with `…` inside the closing quote when truncated. File contents, binary payloads, explicit Runtime keys, and raw request bodies are not intentionally logged.
 
 ## Connect dotlink to ChatGPT
 
@@ -147,7 +147,7 @@ The tools ChatGPT discovers follow dotlink's local permissions:
 read-only      ls, grep, read, bread
 write          + write, bwrite
 read + write   + edit, patch, bedit
-shell          + bash (Unix) / powershell (Windows)
+shell          + bash/powershell + job_start, job_list, job_get, job_output, job_ack, job_cancel
 ~~~
 
 Never paste a Runtime or Admin API key into ChatGPT. ChatGPT only needs the `tunnel_...` ID.
@@ -309,7 +309,7 @@ public HTTP ingress      OFF
 unsandboxed host mode    OFF
 ~~~
 
-Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--allow-shell`, and `--allow-network`. Denies always win. `--allow-rw=/` grants filesystem RW only; full unsandboxed host authority requires `--allow-all --no-sandbox`.
+Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--allow-shell`, and `--allow-network`. A saved profile may have no filesystem grants: one-run CLI permissions are merged before checking whether a usable capability remains. No effective grant still fails closed, and the shell still requires a readable directory. Denies always win. `--allow-rw=/` grants filesystem RW only; full unsandboxed host authority requires `--allow-all --no-sandbox`.
 
 ### Filesystem policy
 
@@ -335,7 +335,13 @@ Targets are canonicalized before checks; create targets canonicalize their neare
 | `bwrite` | write | Create or replace a binary file |
 | `bedit` | read+write | Apply byte ranges against original-file offsets |
 
-| `bash` / `powershell` | shell | Run a command inside the sandbox |
+| `bash` / `powershell` | shell | Start one durable execution, return its ordinary result if it finishes in the response window, otherwise return the same job/task handle while it keeps running |
+| `job_start` | shell | Explicitly start a durable background shell job and return immediately |
+| `job_list` | shell | Recover recent exposed job ids/status after a lost response |
+| `job_get` | shell | Poll job/task status and output byte counts |
+| `job_output` | shell | Pure, replayable page read of durable stdout/stderr by raw byte offset |
+| `job_ack` | shell | Idempotently acknowledge safely received stdout/stderr bytes so terminal spools may be released or, for native Tasks, compacted to the exact-result prefix |
+| `job_cancel` | shell | Cancel a running durable job and its contained process tree |
 
 One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
 `{a,b}` stay within one path segment and `**` recurses without a level cap.
@@ -353,21 +359,24 @@ or 1024 lines. Narrow `path` or `glob`/`pattern` for large trees. `read` errors
 rather than emitting a misleading line-zero marker if the first complete line
 plus marker cannot fit. Skipping to a distant line offset is separately limited
 to exactly 32 MiB of source I/O per call, including buffered prefetch. Otherwise,
-`read` ends a capped result with a single marker. `ls` and `grep`
+`read` ends a capped result with a single marker. On bounded transports, every tool result and protocol error has a final serialized-size postcondition; pageable success paths still preflight their exact shape, while unexpectedly large error text is shortened with an explicit marker instead of becoming a transport failure. `read`, `grep`, and `ls` also fit the **serialized MCP tool result**, so quote/backslash-heavy content may page earlier than the raw profile ceiling while local transports retain the full raw window. `ls` and `grep`
 retain the best sorted candidates within the scanned entries in bounded memory.
 Both bound their JSON replies at `max_output_bytes`, keeping the longest prefix
 that fits. `ls` derives its default depth from the pattern (one level per segment,
 unbounded for `**`) so a deep pattern never silently returns nothing, and
-`grep` pages only ever contain whole matching lines. File contents are
+`grep` pages only ever contain whole matching lines. In content mode ordinary UTF-8 filenames keep the familiar `path:line:` label; names containing delimiter/control characters are quoted, and invalid-UTF-8 Unix names use explicit byte escapes so one filename cannot manufacture extra result lines or collapse onto another. Discovery retains only the lexically best candidates the per-call 4096-file scan budget can actually inspect. File contents are
 UTF-8-validated without copying; each content page keeps only a bounded
-selection of matching line indices and streams context from the same buffer,
-not a vector of every line or hit. `grep count` reports
+selection of matching line indices and captures their bounded context once
+from the same buffer. Shorter result pages reuse those borrowed lines rather
+than rescanning deep files, with no vector of every line or hit. `grep count` reports
 `page_total` for the returned page. `read` streams a line window, so
 `max_read_bytes` bounds the returned window, its marker and one line rather than
 rejecting a large file outright; the page is assembled in one buffer, and lines
 skipped to reach `offset` are scanned rather than buffered, so a long first line
 never blocks a later window; a single returned line larger than the ceiling is
-an error naming it, since cutting it silently would hide content.
+an error naming it, since cutting it silently would hide content. `read.max_read_bytes` is a per-call page budget exposed in the tool schema, defaulting to the profile `max_read_bytes` ceiling and clamped to it. New profiles default `max_read_bytes`, `max_write_bytes`, and `max_output_bytes` to 1 MiB; configured raw/tool transfer ceilings may be raised to 8 MiB. The OpenAI adapter allows a complete embedded MCP message up to 9 MiB and reserves the final 1 MiB below the hosted 10 MiB tunnel-envelope limit for tunnel framing. `bread` derives encoding-safe raw windows automatically (base64/MCP about 3/4 of the MCP payload room, hex about 1/2); an explicit binary window that cannot fit returns an actionable smaller limit before encoding.
+
+OpenAI Secure MCP Tunnel requests have a fixed 120-second hosted lifetime. dotlink reserves 5 seconds for terminal delivery, but that window limits only how long the request waits — it never shortens command execution. Every `bash`/`powershell` call starts exactly one durable execution. If it finishes in the remaining response window and the complete ordinary result fits the transport result budget, dotlink returns that result; otherwise the same execution is exposed through either a native MCP Task or the compatibility job id—even if execution already finished. Active transports derive one shared constraint set; OpenAI's private sync/result/replay metadata is authenticated with a redacted per-runtime opaque capability, and the adapter clears dotlink's reserved `_meta` namespace before installing trusted values, so client-supplied metadata cannot spoof transport deadlines, budgets, deduplication keys, or future private fields. Native MCP Tasks are created only when their exact eventual `CallToolResult` is safe for the tightest active transport sharing the runtime; `tasks/get` reconstructs it from the same retained stdout/stderr spools, otherwise dotlink uses the compatibility job surface. `job_output` remains available for the full retained streams. `job_start` is the explicit return-immediately form. OpenAI request ids are scoped to the tunnel and deduplicated, so a redelivered shell call cannot launch the side effect twice; request-key + spool replay state is retained across failed/expired/ambiguous delivery and compacted only after OpenAI positively accepts the terminal response, and `job_list` recovers exposed ids if a creation receipt was lost. Output streams directly to private files below dotlink's protected XDG state tree. Each stdout/stderr stream retains at most 64 MiB while excess output is drained and marked truncated, and the whole live/retained session has a configurable aggregate `job_spool_bytes` quota (512 MiB by default). `job_output` is a pure replayable read; only explicit `job_ack` advances cleanup watermarks. After both streams are acknowledged, compatibility-job spools disappear immediately and their metadata may be reclaimed under capacity pressure; native MCP Tasks compact each stream to only the ordinary-result prefix needed to reproduce exact `tasks/get` results, then remove that prefix when task retention expires. Transient deletion/truncation failures remain pending and are retried rather than falsely marking output released. Unacknowledged terminal state expires after `job_retention_secs` (1 hour by default). Automatic transport recovery reuses jobs only after a single prepared runtime snapshot proves the effective filesystem/shell/network/cache/host authority is unchanged. Grants are fingerprinted from the same pinned native capabilities the replacement machine consumes; guards/caches/host resources are resolved once into that frozen snapshot, Windows path identities include volume/file index, and construction performs no second authority resolution. If preparation cannot prove equality, or any policy/object identity changes, the old session is cancelled before recovery continues. `Ctrl+R` and normal exit likewise cancel and await the old session before removing its spool directory.
 
 Text tools (`grep`, `read`, `write`, `edit`, `patch`) accept UTF-8
 without binary control bytes. Use `bread`, `bwrite`, or `bedit` for
@@ -377,14 +386,28 @@ Every write is atomic: the new bytes go beside the target and are installed only
 at commit, so a failed or interrupted write leaves the old file intact and a
 reader never sees a half-written one. The native filesystem mutators (`write`,
 `bwrite`, `edit`, `patch`, `bedit`) coordinate from snapshot read through
-commit with directory locks on Unix: shared ancestor intent locks and an
-exclusive lock on the deepest existing parent. Missing parent creation is also
+commit with exact pathname locks plus stable Unix directory-entry identity locks
+within a process, then inode-coalesced directory `flock`s across processes:
+shared ancestor intent locks and one exclusive lock on the deepest existing parent. Missing parent creation is also
 covered; unreadable directories fail closed. Independent subdirectories remain
 concurrent, with no lock service or workspace lockfiles. Shell commands are
 outside that coordination because their write paths are arbitrary. Existing-file writes keep their permission
 bits; create-only writes are absent until commit. `read` with `numbered: false`
 returns the text byte for byte, so a read → write round trip preserves line
-endings, and `patch` uses the target file's line ending for added lines.
+endings. `patch` preserves the target file's line-ending style for added lines
+when an existing delimiter establishes that style, including when an
+unterminated last line gains a CRLF separator. In mixed-ending files,
+successive replacement lines retain their corresponding removed lines' LF/CRLF
+separators, not unrelated context. When adding more lines than were removed,
+extra lines reuse the last removed line's style; pure insertions follow their
+insertion position. Bare blank
+lines and explicit `+` blanks in `*** Add File` both retain the patch's CRLF
+separator. Literal terminal CR bytes remain content when an append adds a
+new LF: a separate delimiter CR is inserted so the original is not consumed
+as CRLF syntax. Added lines containing a literal final CR receive the same
+protection. CRLF-formatted patch syntax is identified by its header. `*** End of File` limits
+context matching to EOF and can anchor a context-free append to an existing
+file; context-free insertions without that marker are deliberately rejected.
 Multi-file calls preflight every file and replace each atomically, but the
 commit sequence is not a transaction.
 
@@ -496,7 +519,9 @@ fit the profile output ceiling using `truncated` and omitted counts, checked
 before any commits; `write`/`bwrite` likewise avoid overly long path messages.
 Patch file names and update-hunk lines are borrowed from the request; add-file
 sections retain one contiguous source range rather than even a per-line slice
-vector. CRLF target adjustments are represented as borrowed lines plus a flag;
+vector. `patch` hunk matching uses a shared linear-time sequence scan rather than
+trying every candidate against the entire context block, while preserving
+exact-first and whitespace-tolerant fallback. Source-line matching excludes the nonexistent empty line after a terminal `\n`, but keeps real blank lines and the exact trailing-newline state. Context-only hunks avoid duplicate replacement vectors. CRLF target adjustments are represented as borrowed lines plus a flag;
 no `String` allocation is needed for each added line. This avoids millions of tiny allocations for large patches. Existing-file
 snapshots are rechecked with a fixed scratch buffer; common text replacements
 edit in place. Identical binary ranges avoid staging a temporary while still
@@ -533,8 +558,9 @@ Example with `-v`:
 [01:06:47.411] TOOL read       ← ok  1ms
 ~~~
 
-Shell commands are logged in full when TOOL verbosity is enabled, using a compact
-single-line, escaped format:
+Shell commands are logged as capped 256-character quoted excerpts by default
+when TOOL verbosity is enabled, using a compact single-line, escaped format.
+Truncated `c=` values end with `…` inside the closing quote:
 
 ~~~text
 [01:06:48.410] TOOL bash       → d="./src" c="echo hello\nls -la" max_b=30000 max_t=60
@@ -544,8 +570,10 @@ single-line, escaped format:
 `p` and `d` show `./...` for resolved paths inside Dotlink's launch directory
 and absolute `/...` paths outside it. The labels follow existing symlinks on a
 best-effort basis, so a symlink pointing outside normally logs its outside
-target; actual permission checks remain independent. For writes, `b="N"` reports payload bytes;
-`edit` uses a bounded, deduplicated `paths=[...]` preview. These are audit
+target; actual permission checks remain independent. `p=`, `d=`, and `paths=[...]`
+show complete path names. A valid `edit` call shows all its distinct files (up
+to 64); invalid oversized calls report their limits without scanning unbounded
+operations. For writes, `b="N"` reports payload bytes; These are audit
 labels only: permissions use the original paths. Enable TOOL logs deliberately,
 since shell commands may include inline credentials.
 
@@ -556,9 +584,9 @@ With `-vv`, transport diagnostics are added:
 [01:06:47.427] REQ  stdio      → tools/call
 ~~~
 
-TOOL logs prioritize `p` (path), `d` (working directory), then complete `c` (shell command). By design, `-v` logs the **complete** shell command as `c="..."`, with newlines/control characters escaped onto one journal line—not `command_bytes` and not a truncated excerpt. **Inline passwords or tokens inside commands will be stored in journald** when TOOL logging is enabled. Keep that setting intentional and restrict journal access/retention accordingly. File contents, patches, search patterns, binary data and stdin remain byte counts; the default is quiet.
+TOOL logs prioritize `p` (path), `d` (working directory), then `c` (shell command). At `-v`, `c=` is limited by default to **256 rendered characters**, counting quotes and escape sequences; truncated commands end with `…` immediately before the closing quote. Only interactive `V` **while TOOL logging is active** removes the command limit; otherwise its hint is hidden and the key does nothing. `p=`, `d=`, and `paths=[...]` always show complete path names. Interactive logs color keys, values, and success/error outcomes separately (unless `--color=never`); noninteractive logs have plain argument fields. **Inline passwords or tokens within the visible command prefix—or full commands enabled by `V`—can still be stored in journald.** Restrict journal access and retention accordingly. File contents, patches, search patterns, binary data and stdin remain byte counts; the default is quiet.
 
-Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
+Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling, `V` for full commands only when TOOL logging is enabled, and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
 
 ## CLI summary
 

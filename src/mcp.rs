@@ -21,8 +21,10 @@ use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::tool::ToolCallContext,
     model::{
-        CacheScope, CallToolRequestParams, CallToolResponse, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ResultType, Tool,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        ContentBlock, GetTaskParams, GetTaskResult, Implementation, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ResultType, ServerCapabilities, ServerConfig,
+        Tool, UpdateTaskParams,
     },
     service::{RequestContext, RoleServer},
     tool_handler,
@@ -30,8 +32,9 @@ use rmcp::{
 
 use serde_json::Value;
 use tokio::{fs, io::AsyncReadExt, sync::RwLock};
+use uuid::Uuid;
 
-use crate::logging::LogConfig;
+use crate::logging::{LogConfig, LogOutcome};
 
 pub(crate) use tools::shell::{resolve_executable, with_profile_limits};
 
@@ -61,6 +64,12 @@ pub struct MachineConfig {
     pub max_output_bytes: usize,
     pub max_read_bytes: usize,
     pub max_write_bytes: usize,
+    /// Smallest serialized native-Task result budget across all active
+    /// transports sharing this runtime. None means every active transport is
+    /// effectively unbounded for task results.
+    pub task_result_budget: Option<usize>,
+    pub job_retention_secs: u64,
+    pub job_spool_bytes: u64,
     pub protected_paths: Vec<PathBuf>,
 }
 
@@ -101,18 +110,61 @@ struct RuntimeConfig {
     max_output_bytes: usize,
     max_read_bytes: usize,
     max_write_bytes: usize,
+    task_result_budget: Option<usize>,
     protected_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TransportContextToken(Arc<str>);
+
+impl TransportContextToken {
+    fn random() -> Self {
+        Self(Arc::from(Uuid::new_v4().to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl From<&str> for TransportContextToken {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl std::fmt::Debug for TransportContextToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TransportContextToken([redacted])")
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct LocalMachine {
     config: RuntimeConfig,
+    jobs: crate::jobs::JobManager,
     operation_gate: Arc<RwLock<()>>,
     serialize: bool,
+    /// Capability token authenticating transport-injected request constraints.
+    /// It never leaves the process except inside the private in-process OpenAI
+    /// dispatch envelope and makes client-supplied lookalike `_meta` inert.
+    transport_context_token: TransportContextToken,
     /// The advertised surface, built once. Visibility depends only on the
     /// immutable access policy, so every request can share one router instead
     /// of merging the per-family routers again.
     router: OnceLock<Arc<ToolRouter<Self>>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    secure_fs: Arc<crate::secure_fs::SecureFs>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedMachine {
+    config: RuntimeConfig,
+    authority: serde_json::Value,
+    job_root: PathBuf,
+    serialize: bool,
+    retention: std::time::Duration,
+    spool_limit: u64,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     secure_fs: Arc<crate::secure_fs::SecureFs>,
 }
@@ -136,6 +188,202 @@ pub const MIN_BYTE_LIMIT: usize = 1024;
 /// Smallest accepted shell timeout.
 pub const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
 
+/// Private request metadata carried through rmcp by the in-process OpenAI
+/// adapter. These fields are trusted only when the opaque per-runtime token
+/// matches; public HTTP/stdio clients may send the same names but cannot affect
+/// execution semantics.
+pub(crate) const TRANSPORT_META_PREFIX: &str = "io.abird.dotlink/";
+pub(crate) const TRANSPORT_CONTEXT_TOKEN_META_KEY: &str = "io.abird.dotlink/transportContextToken";
+pub(crate) const SYNC_BUDGET_META_KEY: &str = "io.abird.dotlink/syncBudgetMs";
+pub(crate) const REQUEST_KEY_META_KEY: &str = "io.abird.dotlink/requestKey";
+pub(crate) const RESULT_BUDGET_META_KEY: &str = "io.abird.dotlink/resultBudgetBytes";
+
+pub(crate) fn serialized_text_content_len(text: &str) -> usize {
+    text.chars()
+        .map(|ch| match ch {
+            '"' | '\\' => 2,
+            '\u{08}' | '\t' | '\n' | '\u{0c}' | '\r' => 2,
+            ch if ch <= '\u{1f}' => 6,
+            ch => ch.len_utf8(),
+        })
+        .sum()
+}
+
+pub(crate) fn serialized_text_tool_result_fixed_len() -> usize {
+    static EMPTY_RESULT_BYTES: OnceLock<usize> = OnceLock::new();
+    *EMPTY_RESULT_BYTES.get_or_init(|| {
+        serde_json::to_vec(&CallToolResult::success(vec![ContentBlock::text("")]))
+            .expect("empty text tool result serializes")
+            .len()
+    })
+}
+
+pub(crate) fn serialized_text_tool_result_len(text: &str) -> usize {
+    serialized_text_tool_result_fixed_len().saturating_add(serialized_text_content_len(text))
+}
+
+pub(crate) fn serialized_text_tool_result_parts_len(parts: &[&str]) -> usize {
+    parts
+        .iter()
+        .fold(serialized_text_tool_result_fixed_len(), |total, part| {
+            total.saturating_add(serialized_text_content_len(part))
+        })
+}
+
+fn serialized_error_text_tool_result_fixed_len() -> usize {
+    static EMPTY_ERROR_BYTES: OnceLock<usize> = OnceLock::new();
+    *EMPTY_ERROR_BYTES.get_or_init(|| {
+        serde_json::to_vec(&CallToolResult::error(vec![ContentBlock::text("")]))
+            .expect("empty error tool result serializes")
+            .len()
+    })
+}
+
+fn fitted_tool_result_text(text: &str, budget: usize, is_error: bool, suffix: &str) -> String {
+    let fixed = if is_error {
+        serialized_error_text_tool_result_fixed_len()
+    } else {
+        serialized_text_tool_result_fixed_len()
+    };
+    if fixed.saturating_add(serialized_text_content_len(text)) <= budget {
+        return text.to_owned();
+    }
+    let suffix_cost = serialized_text_content_len(suffix);
+    let available = budget.saturating_sub(fixed).saturating_sub(suffix_cost);
+    let mut used = 0_usize;
+    let mut end = 0_usize;
+    let mut utf8 = [0_u8; 4];
+    for (index, ch) in text.char_indices() {
+        let cost = serialized_text_content_len(ch.encode_utf8(&mut utf8));
+        let Some(next) = used.checked_add(cost) else {
+            break;
+        };
+        if next > available {
+            break;
+        }
+        used = next;
+        end = index + ch.len_utf8();
+    }
+    if end == 0 && suffix_cost > budget.saturating_sub(fixed) {
+        return String::new();
+    }
+    let mut output = String::with_capacity(end.saturating_add(suffix.len()));
+    output.push_str(&text[..end]);
+    output.push_str(suffix);
+    output
+}
+
+fn fit_call_tool_response_to_budget(
+    tool: &str,
+    response: CallToolResponse,
+    budget: Option<usize>,
+) -> CallToolResponse {
+    let Some(budget) = budget else {
+        return response;
+    };
+    let CallToolResponse::Complete(result) = response else {
+        return response;
+    };
+    if serialized_json_len(&result).is_some_and(|size| size <= budget) {
+        return CallToolResponse::Complete(result);
+    }
+
+    let is_error = result.is_error.unwrap_or(false);
+    let original_text = result
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(|text| text.text.as_str()))
+        .unwrap_or(if is_error {
+            "tool returned an oversized error response"
+        } else {
+            "tool completed successfully"
+        });
+    let suffix = if is_error {
+        "\n… error details truncated to fit the transport response budget"
+    } else {
+        "\n… detailed result omitted because it exceeded the transport response budget"
+    };
+    let text = fitted_tool_result_text(original_text, budget, is_error, suffix);
+    if is_error {
+        CallToolResponse::Complete(CallToolResult::error(vec![ContentBlock::text(text)]))
+    } else {
+        tracing::error!(
+            tool,
+            budget,
+            "tool success result exceeded its transport response budget"
+        );
+        CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+}
+
+fn fit_mcp_error_to_budget(error: McpError, budget: Option<usize>) -> McpError {
+    let Some(budget) = budget else {
+        return error;
+    };
+    if serialized_json_len(&error).is_some_and(|size| size <= budget) {
+        return error;
+    }
+
+    let code = error.code;
+    let message = error.message.into_owned();
+    let without_data = McpError::new(code, message.clone(), None);
+    if serialized_json_len(&without_data).is_some_and(|size| size <= budget) {
+        return without_data;
+    }
+
+    let empty = McpError::new(code, "", None);
+    let fixed = serialized_json_len(&empty).unwrap_or(usize::MAX);
+    let suffix = " … error details truncated to fit the transport response budget";
+    let suffix_cost = serialized_text_content_len(suffix);
+    let available = budget.saturating_sub(fixed).saturating_sub(suffix_cost);
+    let mut used = 0_usize;
+    let mut end = 0_usize;
+    let mut utf8 = [0_u8; 4];
+    for (index, ch) in message.char_indices() {
+        let cost = serialized_text_content_len(ch.encode_utf8(&mut utf8));
+        let Some(next) = used.checked_add(cost) else {
+            break;
+        };
+        if next > available {
+            break;
+        }
+        used = next;
+        end = index + ch.len_utf8();
+    }
+    let fitted = if suffix_cost <= budget.saturating_sub(fixed) {
+        let mut fitted = String::with_capacity(end.saturating_add(suffix.len()));
+        fitted.push_str(&message[..end]);
+        fitted.push_str(suffix);
+        fitted
+    } else {
+        String::new()
+    };
+    McpError::new(code, fitted, None)
+}
+
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("serialized JSON size overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Exact serialized JSON length without allocating the serialized bytes.
+pub(crate) fn serialized_json_len(value: &impl serde::Serialize) -> Option<usize> {
+    let mut writer = CountingWriter(0);
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.0)
+}
+
 /// Worst-case JSON escaping of one payload byte: a control byte becomes
 /// `\u00XX`. Payloads bounded by `max_write_bytes` therefore never need a body
 /// larger than this multiple of it.
@@ -145,6 +393,22 @@ const MAX_NESTED_JSON_ESCAPE: usize = 7;
 const SHELL_OUTPUT_STREAMS: usize = 2;
 /// Base JSON-RPC framing, independent of payload and edit path strings.
 const MAX_REQUEST_FRAMING_BYTES: usize = 64 * 1024;
+
+/// Conservative upper bound for a complete ordinary shell CallToolResult at a
+/// given per-stream raw byte limit. Shell output is first embedded in an inner
+/// JSON string and then in the outer MCP text block, so one source byte can
+/// occupy up to seven serialized bytes. The fixed reserve covers status/path
+/// metadata and CallToolResult framing.
+pub(crate) fn shell_result_worst_case_bytes(per_stream: usize) -> usize {
+    per_stream
+        .saturating_mul(SHELL_OUTPUT_STREAMS)
+        .saturating_mul(MAX_NESTED_JSON_ESCAPE)
+        .saturating_add(MAX_REQUEST_FRAMING_BYTES)
+}
+
+pub(crate) fn shell_result_fits_budget(per_stream: usize, budget: usize) -> bool {
+    shell_result_worst_case_bytes(per_stream) <= budget
+}
 /// Separate headroom for every edit operation's possible pathname: the 512-op
 /// tool must remain reachable even with a small `max_write_bytes`. Budget a
 /// practical 4 KiB path with worst-case JSON escaping for each operation.
@@ -159,6 +423,31 @@ fn checked_limit<T: PartialOrd + std::fmt::Display>(name: &str, value: T, minimu
         )));
     }
     Ok(value)
+}
+
+fn checked_byte_limit(name: &str, value: usize) -> Result<usize> {
+    let value = checked_limit(name, value, MIN_BYTE_LIMIT)?;
+    if value > crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES {
+        return Err(crate::recovery::operator(anyhow!(
+            "{name} must not exceed {} bytes, the configured transfer ceiling below the OpenAI tunnel's {} byte serialized-message limit",
+            crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES,
+            crate::limits::OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES,
+        )));
+    }
+    Ok(value)
+}
+
+fn checked_job_retention(value: u64) -> Result<std::time::Duration> {
+    if !(crate::limits::MIN_JOB_RETENTION_SECS..=crate::limits::MAX_JOB_RETENTION_SECS)
+        .contains(&value)
+    {
+        return Err(crate::recovery::operator(anyhow!(
+            "job_retention_secs must be between {} and {} seconds, got {value}",
+            crate::limits::MIN_JOB_RETENTION_SECS,
+            crate::limits::MAX_JOB_RETENTION_SECS,
+        )));
+    }
+    Ok(std::time::Duration::from_secs(value))
 }
 
 /// Name of the shell tool this platform advertises. Derived from `TOOL_SPECS`
@@ -208,6 +497,7 @@ pub enum Capability {
     ReadWrite,
     ShellUnix,
     ShellWindows,
+    Job,
 }
 
 /// One row per advertised tool: the single place that records a tool's
@@ -278,6 +568,36 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         capability: Capability::ShellWindows,
         concurrent_read: false,
     },
+    ToolSpec {
+        name: "job_start",
+        capability: Capability::Job,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "job_list",
+        capability: Capability::Job,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "job_get",
+        capability: Capability::Job,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "job_output",
+        capability: Capability::Job,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "job_ack",
+        capability: Capability::Job,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "job_cancel",
+        capability: Capability::Job,
+        concurrent_read: false,
+    },
 ];
 
 impl Capabilities {
@@ -288,6 +608,7 @@ impl Capabilities {
             Capability::ReadWrite => self.read_write,
             Capability::ShellUnix => self.shell && !cfg!(windows),
             Capability::ShellWindows => self.shell && cfg!(windows),
+            Capability::Job => self.shell,
         }
     }
 }
@@ -337,6 +658,38 @@ async fn canonicalize_grant(base_dir: &Path, path: &Path) -> Result<PathBuf> {
         bail!("grant path is not a directory: {}", canonical.display());
     }
     Ok(canonical)
+}
+
+fn text_path_label(value: &str) -> String {
+    if value.is_empty() {
+        return ".".to_owned();
+    }
+    if value
+        .chars()
+        .any(|ch| ch == ':' || ch == '"' || ch == '\\' || ch.is_control())
+    {
+        return serde_json::to_string(value).expect("path text serializes as JSON string");
+    }
+    value.to_owned()
+}
+
+#[cfg(unix)]
+fn byte_path_label(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len().saturating_add(3));
+    output.push_str("b\"");
+    for &byte in bytes {
+        match byte {
+            b'"' => output.push_str("\\\""),
+            b'\\' => output.push_str("\\\\"),
+            0x20..=0x7e => output.push(char::from(byte)),
+            _ => {
+                write!(&mut output, "\\x{byte:02X}").expect("write to String cannot fail");
+            }
+        }
+    }
+    output.push('"');
+    output
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -650,6 +1003,31 @@ impl AccessPolicy {
         value.replace(std::path::MAIN_SEPARATOR, "/")
     }
 
+    /// Path label for line-oriented text protocols such as grep content mode.
+    /// Ordinary UTF-8 paths retain the familiar `path:line:` shape. Paths that
+    /// could inject delimiters/newlines are JSON-quoted; invalid UTF-8 Unix
+    /// names use an explicit byte string so distinct files never collapse via
+    /// lossy conversion.
+    fn relative_text_display(&self, path: &Path) -> String {
+        let relative = path.strip_prefix(&self.base_dir).unwrap_or(path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let bytes = relative.as_os_str().as_bytes();
+            if bytes.is_empty() {
+                return ".".to_owned();
+            }
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return text_path_label(text);
+            }
+            byte_path_label(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            text_path_label(&self.relative_display(path))
+        }
+    }
+
     fn sandbox_mounts(&self) -> Vec<(PathBuf, bool)> {
         if self.unrestricted_fs {
             return vec![(PathBuf::from("/"), true)];
@@ -940,33 +1318,159 @@ fn validate_host_mount_policy(
     Ok(())
 }
 
+pub(crate) fn authority_path_identity(path: &Path) -> serde_json::Value {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(&resolved).ok();
+        serde_json::json!({
+            "path": resolved,
+            "dev": metadata.as_ref().map(|value| value.dev()),
+            "ino": metadata.as_ref().map(|value| value.ino()),
+            "rdev": metadata.as_ref().map(|value| value.rdev()),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let identity = crate::windows_fs::path_identity(&resolved).ok();
+        serde_json::json!({
+            "path": resolved,
+            "volume": identity.map(|value| value.0),
+            "file_index": identity.map(|value| value.1),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        serde_json::json!({ "path": resolved })
+    }
+}
+
+fn prepared_authority_value(
+    config: &RuntimeConfig,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] secure_fs: &crate::secure_fs::SecureFs,
+) -> Result<serde_json::Value> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (read_roots, write_roots) = {
+        let (read, write) = secure_fs.authority_roots()?;
+        let render = |values: Vec<crate::secure_fs::RootIdentity>| {
+            values
+                .into_iter()
+                .map(|value| {
+                    serde_json::json!({
+                        "path": value.path,
+                        "dev": value.dev,
+                        "ino": value.ino,
+                        "rdev": value.rdev,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        (render(read), render(write))
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let (read_roots, write_roots) = (
+        config
+            .access
+            .read_roots
+            .iter()
+            .map(|path| authority_path_identity(path))
+            .collect::<Vec<_>>(),
+        config
+            .access
+            .write_roots
+            .iter()
+            .map(|path| authority_path_identity(path))
+            .collect::<Vec<_>>(),
+    );
+    let caches = config
+        .cache_mounts
+        .iter()
+        .map(|cache| {
+            serde_json::json!({
+                "source": authority_path_identity(&cache.source),
+                "target": cache.target,
+                "writable": cache.writable,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut authority = serde_json::json!({
+        "base_dir": authority_path_identity(&config.access.base_dir),
+        "read_roots": read_roots,
+        "write_roots": write_roots,
+        "deny_read_roots": config.access.deny_read_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
+        "deny_write_roots": config.access.deny_write_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
+        "protected_paths": config.protected_paths.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
+        "cache_mounts": caches,
+    });
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let mounts = config
+            .host_shell
+            .mounts
+            .iter()
+            .map(|mount| {
+                let metadata = mount.pinned.metadata().ok();
+                serde_json::json!({
+                    "source": mount.source,
+                    "resolved": mount.resolved,
+                    "target": mount.target,
+                    "kind": format!("{:?}", mount.kind),
+                    "dev": metadata.as_ref().map(|value| value.dev()),
+                    "ino": metadata.as_ref().map(|value| value.ino()),
+                    "rdev": metadata.as_ref().map(|value| value.rdev()),
+                })
+            })
+            .collect::<Vec<_>>();
+        authority["host_shell"] = serde_json::json!({
+            "mounts": mounts,
+            "environment": config.host_shell.environment,
+            "nix_daemon": config.host_shell.nix_daemon,
+            "ssh_agent": config.host_shell.ssh_agent,
+            "kvm": config.host_shell.kvm,
+            "gpu": config.host_shell.gpu,
+        });
+    }
+    Ok(authority)
+}
+
+impl PreparedMachine {
+    pub(crate) fn authority_value(&self) -> &serde_json::Value {
+        &self.authority
+    }
+}
+
 impl LocalMachine {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn new(args: MachineConfig) -> Result<Self> {
+        let retention = checked_job_retention(args.job_retention_secs)?;
+        let jobs = crate::jobs::JobManager::with_spool_limit(retention, args.job_spool_bytes)?;
+        Self::new_with_jobs(args, jobs).await
+    }
+
+    pub(crate) async fn prepare_with_job_root(
+        args: MachineConfig,
+        job_root: &Path,
+    ) -> Result<PreparedMachine> {
         let max_shell_timeout_secs = checked_limit(
             "max_shell_timeout_secs",
             args.max_shell_timeout_secs,
             MIN_SHELL_TIMEOUT_SECS,
         )?;
-        let max_output_bytes =
-            checked_limit("max_output_bytes", args.max_output_bytes, MIN_BYTE_LIMIT)?;
-        let max_read_bytes = checked_limit("max_read_bytes", args.max_read_bytes, MIN_BYTE_LIMIT)?;
-        let max_write_bytes =
-            checked_limit("max_write_bytes", args.max_write_bytes, MIN_BYTE_LIMIT)?;
+        let max_output_bytes = checked_byte_limit("max_output_bytes", args.max_output_bytes)?;
+        let max_read_bytes = checked_byte_limit("max_read_bytes", args.max_read_bytes)?;
+        let max_write_bytes = checked_byte_limit("max_write_bytes", args.max_write_bytes)?;
+        let retention = checked_job_retention(args.job_retention_secs)?;
 
         let access = AccessPolicy::resolve(args.access).await?;
-
-        // Keep both path identities. The lexical spelling protects the
-        // control-plane directory entry; the resolved spelling protects the
-        // target it currently names. Resolution must fail closed: a dangling
-        // final symlink still contributes the path it points at.
-        let protected_paths = resolve_guards(&access.base_dir, &args.protected_paths).await?;
+        let mut configured_protected = args.protected_paths.clone();
+        configured_protected.push(job_root.to_path_buf());
+        let protected_paths = resolve_guards(&access.base_dir, &configured_protected).await?;
 
         let mut cache_mounts = Vec::with_capacity(args.cache_mounts.len());
         let mut cache_targets = BTreeSet::new();
         for mount in args.cache_mounts {
-            // The target lives in the sandbox's own namespace, not on this
-            // host: judge it as a rooted POSIX path so the same profile is
-            // valid on a Windows build, which has no drive prefix to satisfy.
             if !mount.target.has_root()
                 || !mount.target.starts_with("/tmp/home")
                 || mount
@@ -980,7 +1484,6 @@ impl LocalMachine {
                 );
             }
             let target = lexical_normalize(&mount.target);
-
             let source = match fs::canonicalize(&mount.source).await {
                 Ok(source) => source,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -989,12 +1492,6 @@ impl LocalMachine {
             if !fs::metadata(&source).await?.is_dir() {
                 continue;
             }
-
-            // Cache sources are remapped, so a mask at the original deny or
-            // protected path cannot constrain them. Check both directions: a
-            // cache ancestor can expose a denied child, and a cache descendant
-            // can expose data below a denied ancestor. Targets receive the same
-            // treatment so a remapped cache cannot cover a sandbox policy path.
             if access.overlaps_deny_read(&source)
                 || access.overlaps_deny_read(&target)
                 || protected_paths.iter().any(|protected| {
@@ -1012,7 +1509,6 @@ impl LocalMachine {
                     target.display()
                 );
             }
-
             cache_mounts.push(SandboxCacheMount {
                 source,
                 target,
@@ -1020,9 +1516,6 @@ impl LocalMachine {
             });
         }
 
-        // Validate the actual mounted visibility (read-only as well as
-        // writable) before starting the sandbox. Missing targets do not relax
-        // this rule: an external host writer can create them during execution.
         #[cfg(target_os = "linux")]
         if args.allow_shell && args.sandbox_shell {
             let runtime = tools::shell::RuntimeLayout::for_shell(
@@ -1071,36 +1564,74 @@ impl LocalMachine {
             &access.write_roots,
         )?);
 
-        Ok(Self {
-            config: RuntimeConfig {
-                access,
-                cache_mounts,
-                shell_env: args.shell_env,
-                #[cfg(target_os = "linux")]
-                host_shell: args.host_shell,
-                log: args.log,
-                allow_shell: args.allow_shell,
-                sandbox_shell: args.sandbox_shell,
-                allow_network: args.allow_network,
-                shell_program,
-                bwrap_program,
-                max_shell_timeout_secs,
-                max_output_bytes,
-                max_read_bytes,
-                max_write_bytes,
-                protected_paths,
-            },
-            operation_gate: Arc::new(RwLock::new(())),
+        let config = RuntimeConfig {
+            access,
+            cache_mounts,
+            shell_env: args.shell_env,
+            #[cfg(target_os = "linux")]
+            host_shell: args.host_shell,
+            log: args.log,
+            allow_shell: args.allow_shell,
+            sandbox_shell: args.sandbox_shell,
+            allow_network: args.allow_network,
+            shell_program,
+            bwrap_program,
+            max_shell_timeout_secs,
+            max_output_bytes,
+            max_read_bytes,
+            max_write_bytes,
+            task_result_budget: args.task_result_budget,
+            protected_paths,
+        };
+        let authority = prepared_authority_value(
+            &config,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            &secure_fs,
+        )?;
+        Ok(PreparedMachine {
+            config,
+            authority,
+            job_root: job_root.to_path_buf(),
             serialize: args.serialize,
-            router: OnceLock::new(),
+            retention,
+            spool_limit: args.job_spool_bytes,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs,
         })
     }
 
+    pub(crate) fn from_prepared(
+        prepared: PreparedMachine,
+        jobs: crate::jobs::JobManager,
+    ) -> Result<Self> {
+        if prepared.job_root != jobs.protected_path() {
+            bail!("internal error: prepared machine belongs to a different job session");
+        }
+        jobs.set_limits(prepared.retention, prepared.spool_limit);
+        let operation_gate = jobs.operation_gate();
+        Ok(Self {
+            config: prepared.config,
+            jobs,
+            operation_gate,
+            serialize: prepared.serialize,
+            transport_context_token: TransportContextToken::random(),
+            router: OnceLock::new(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            secure_fs: prepared.secure_fs,
+        })
+    }
+
+    pub(crate) async fn new_with_jobs(
+        args: MachineConfig,
+        jobs: crate::jobs::JobManager,
+    ) -> Result<Self> {
+        let prepared = Self::prepare_with_job_root(args, jobs.protected_path()).await?;
+        Self::from_prepared(prepared, jobs)
+    }
+
     /// Re-resolve every guarded name and rerun the startup checks, so one
     /// sandbox command enforces exactly what the host names now.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     fn shell_guards(&self) -> Result<ShellGuards> {
         let access = self.config.access.refreshed()?;
         let protected = guard_identities(&access.base_dir, &self.config.protected_paths)?;
@@ -1169,11 +1700,10 @@ impl LocalMachine {
         }
     }
 
-    /// The largest request body a tool call can need, for transports that cap
-    /// bodies independently of the tools (the streamable-HTTP server and the
-    /// tunnel). It follows the write ceiling, so raising `max_write_bytes`
-    /// raises the transport ceiling with it instead of leaving a hidden 4 MiB
-    /// limit that refuses writes the tools accept.
+    /// The largest request body a tool call can need for profile-derived local
+    /// Streamable HTTP. It follows the write ceiling so local HTTP never keeps
+    /// rmcp's smaller hidden default. The OpenAI embedded endpoint deliberately
+    /// clamps this further to its fixed 9 MiB embedded-message budget.
     pub(crate) fn max_request_body_bytes(&self) -> usize {
         self.config
             .max_write_bytes
@@ -1182,19 +1712,18 @@ impl LocalMachine {
             .saturating_add(MAX_REQUEST_FRAMING_BYTES)
     }
 
-    /// Bound the embedded MCP response at the *same* configured read/output
-    /// ceilings as stdio and HTTP. Ordinary tool text can expand sixfold in
-    /// JSON. Shell has two independently capped streams inside a JSON string,
-    /// so one source byte can occupy seven outer-JSON bytes. There is no hidden
-    /// 16 MiB tunnel limit: larger configured limits raise this ceiling too.
+    /// Profile-derived local response ceiling. Ordinary tool text can expand
+    /// sixfold in JSON; shell has two independently capped streams nested in a
+    /// JSON string. Local HTTP can use this full bound. The OpenAI embedded MCP
+    /// endpoint clamps it to the fixed 9 MiB embedded-message budget.
     pub(crate) fn max_response_body_bytes(&self) -> usize {
-        let read = self.config.max_read_bytes.saturating_mul(MAX_JSON_ESCAPE);
-        let shell = self
+        let read = self
             .config
-            .max_output_bytes
-            .saturating_mul(SHELL_OUTPUT_STREAMS)
-            .saturating_mul(MAX_NESTED_JSON_ESCAPE);
-        read.max(shell).saturating_add(MAX_REQUEST_FRAMING_BYTES)
+            .max_read_bytes
+            .saturating_mul(MAX_JSON_ESCAPE)
+            .saturating_add(MAX_REQUEST_FRAMING_BYTES);
+        let shell = shell_result_worst_case_bytes(self.config.max_output_bytes);
+        read.max(shell)
     }
 
     pub fn access_summary(&self) -> String {
@@ -1423,6 +1952,7 @@ impl LocalMachine {
         router.merge(Self::patch_router());
         router.merge(Self::binary_router());
         router.merge(Self::shell_router());
+        router.merge(Self::jobs_router());
         if let Some(edit) = router.map.get_mut("edit") {
             tools::edit::with_edit_limits(&mut edit.attr);
         }
@@ -1446,6 +1976,60 @@ impl LocalMachine {
         self.config.access.capabilities(self.config.allow_shell)
     }
 
+    fn trusted_transport_meta<'a>(
+        &self,
+        context: &'a RequestContext<RoleServer>,
+    ) -> Option<&'a serde_json::Map<String, Value>> {
+        let meta = &context.meta.0;
+        (meta
+            .get(TRANSPORT_CONTEXT_TOKEN_META_KEY)
+            .and_then(Value::as_str)
+            == Some(self.transport_context_token.as_str()))
+        .then_some(meta)
+    }
+
+    pub(crate) fn request_result_budget(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Option<usize> {
+        self.trusted_transport_meta(context)?
+            .get(RESULT_BUDGET_META_KEY)?
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+    }
+
+    pub(crate) fn request_sync_budget_millis(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Option<u64> {
+        self.trusted_transport_meta(context)?
+            .get(SYNC_BUDGET_META_KEY)?
+            .as_u64()
+    }
+
+    pub(crate) fn request_job_key(&self, context: &RequestContext<RoleServer>) -> Option<String> {
+        self.trusted_transport_meta(context)?
+            .get(REQUEST_KEY_META_KEY)?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn transport_context_token(&self) -> &str {
+        self.transport_context_token.as_str()
+    }
+
+    pub(crate) fn task_result_budget(&self, request_budget: Option<usize>) -> Option<usize> {
+        match (self.config.task_result_budget, request_budget) {
+            (Some(runtime), Some(request)) => Some(runtime.min(request)),
+            (Some(runtime), None) => Some(runtime),
+            (None, request) => request,
+        }
+    }
+
+    pub(crate) fn acknowledge_job_request_delivery(&self, request_key: &str) {
+        self.jobs.acknowledge_request_delivery(request_key);
+    }
+
     fn policy_tool_router(&self) -> &ToolRouter<Self> {
         self.router
             .get_or_init(|| Arc::new(Self::tool_router_for_policy(self.capabilities())))
@@ -1464,6 +2048,17 @@ impl LocalMachine {
         TOOL_SPECS
             .iter()
             .any(|spec| spec.name == name && spec.concurrent_read)
+    }
+
+    /// Job observation/cancellation is control-plane traffic for work that may
+    /// itself own the execution gate. Putting these calls behind that same gate
+    /// would make a serialized job impossible to poll or cancel. Starting a job
+    /// is deliberately excluded: it acquires and transfers the gate to the job.
+    fn is_job_control_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "job_list" | "job_get" | "job_output" | "job_ack" | "job_cancel"
+        )
     }
 
     fn describe_tools(tools: impl IntoIterator<Item = Tool>) -> Vec<(String, String)> {
@@ -1516,7 +2111,7 @@ impl LocalMachine {
             return String::new();
         };
         let names = self.argument_names(name);
-        crate::logging::summarize_arguments(
+        self.config.log.summarize_arguments(
             name,
             arguments,
             names.iter().map(String::as_str),
@@ -1546,11 +2141,19 @@ impl rmcp::ServerHandler for LocalMachine {
                 .list_all()
                 .into_iter()
                 .map(|tool| {
-                    with_profile_limits(
+                    let mut tool = with_profile_limits(
                         tool,
                         self.config.max_shell_timeout_secs,
                         self.config.max_output_bytes,
-                    )
+                    );
+                    tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
+                    tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
+                    tools::jobs::with_job_limits(
+                        &mut tool,
+                        self.config.max_shell_timeout_secs,
+                        self.config.max_output_bytes,
+                    );
+                    tool
                 })
                 .collect(),
             meta: None,
@@ -1562,12 +2165,73 @@ impl rmcp::ServerHandler for LocalMachine {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.policy_tool_router().get(name).cloned().map(|tool| {
-            with_profile_limits(
+            let mut tool = with_profile_limits(
                 tool,
                 self.config.max_shell_timeout_secs,
                 self.config.max_output_bytes,
-            )
+            );
+            tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
+            tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
+            tools::jobs::with_job_limits(
+                &mut tool,
+                self.config.max_shell_timeout_secs,
+                self.config.max_output_bytes,
+            );
+            tool
         })
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+        .with_server_info(Implementation::new("dotlink", env!("CARGO_PKG_VERSION")))
+        .with_instructions("Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline.".to_owned())
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        self.jobs
+            .detailed_task(&request.task_id)
+            .map(GetTaskResult::new)
+            .map_err(crate::jobs::JobError::into_mcp)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        // Shell jobs never enter input_required. Validate the shared task id so
+        // unknown-task behavior stays precise, then reject an update that has no
+        // outstanding server request instead of silently accepting unused input.
+        self.jobs
+            .ensure_native_task(&request.task_id)
+            .map_err(crate::jobs::JobError::into_mcp)?;
+        Err(McpError::invalid_params(
+            "shell tasks do not request mid-task input",
+            None,
+        ))
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.jobs
+            .ensure_native_task(&request.task_id)
+            .map_err(crate::jobs::JobError::into_mcp)?;
+        self.jobs
+            .cancel(&request.task_id)
+            .map(|_| ())
+            .map_err(crate::jobs::JobError::into_mcp)
     }
 
     async fn call_tool(
@@ -1576,6 +2240,7 @@ impl rmcp::ServerHandler for LocalMachine {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
+        let result_budget = self.request_result_budget(&context);
         // Building the router to read the schema is not free, so only do it when
         // the detail line will actually be printed.
         let detail = match self.config.log.activity_enabled() {
@@ -1584,6 +2249,23 @@ impl rmcp::ServerHandler for LocalMachine {
         };
         let started = self.config.log.activity_start(&name, detail);
 
+        let shell_result = self
+            .handle_shell_call(&request, &context)
+            .await
+            .map_err(|error| fit_mcp_error_to_budget(error, result_budget))?;
+        if let Some(result) = shell_result {
+            let result = fit_call_tool_response_to_budget(&name, result, result_budget);
+            let outcome = match &result {
+                CallToolResponse::Complete(result) if result.is_error.unwrap_or(false) => {
+                    LogOutcome::error("error")
+                }
+                CallToolResponse::Task(_) => LogOutcome::neutral("task"),
+                _ => LogOutcome::success("ok"),
+            };
+            self.config.log.activity_done(&name, started, outcome);
+            return Ok(result);
+        }
+
         let context = ToolCallContext::new(self, request, context);
 
         // Linux native filesystem tools use descriptor-rooted operations;
@@ -1591,7 +2273,9 @@ impl rmcp::ServerHandler for LocalMachine {
         // --serialize opts into exclusive execution for predictable ordering.
         // Other platforms retain their conservative operation gate until
         // equivalent secure handle-based filesystem access is available.
-        let result = if self.serialize {
+        let result = if Self::is_job_control_tool(&name) {
+            self.policy_tool_router().call(context).await
+        } else if self.serialize {
             let _guard = self.operation_gate.write().await;
             self.policy_tool_router().call(context).await
         } else {
@@ -1615,13 +2299,18 @@ impl rmcp::ServerHandler for LocalMachine {
             }
         };
 
+        let result = result
+            .map(|response| fit_call_tool_response_to_budget(&name, response, result_budget))
+            .map_err(|error| fit_mcp_error_to_budget(error, result_budget));
         let outcome = match &result {
-            Ok(CallToolResponse::Complete(result)) if result.is_error.unwrap_or(false) => "error",
-            Ok(CallToolResponse::Complete(_)) => "ok",
-            Ok(CallToolResponse::InputRequired(_)) => "input-required",
-            Ok(CallToolResponse::Task(_)) => "task",
-            Ok(_) => "ok",
-            Err(_) => "protocol-error",
+            Ok(CallToolResponse::Complete(result)) if result.is_error.unwrap_or(false) => {
+                LogOutcome::error("error")
+            }
+            Ok(CallToolResponse::Complete(_)) => LogOutcome::success("ok"),
+            Ok(CallToolResponse::InputRequired(_)) => LogOutcome::neutral("input-required"),
+            Ok(CallToolResponse::Task(_)) => LogOutcome::neutral("task"),
+            Ok(_) => LogOutcome::success("ok"),
+            Err(_) => LogOutcome::error("protocol-error"),
         };
         self.config.log.activity_done(&name, started, outcome);
         result
@@ -1858,6 +2547,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -1866,6 +2560,57 @@ mod tests {
         assert!(machine.require_regular_file(&regular).await.is_ok());
         assert!(machine.require_regular_file(&missing).await.is_err());
         assert!(machine.require_regular_file(&directory).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn job_spool_root_is_implicitly_protected_from_filesystem_tools() {
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        let base = tempfile::tempdir_in(&temp_root).unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let jobs = crate::jobs::JobManager::new(std::time::Duration::from_secs(60)).unwrap();
+        let spool = jobs.protected_path().to_path_buf();
+        let machine = LocalMachine::new_with_jobs(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: base,
+                    read_roots: vec![temp_root.clone()],
+                    write_roots: vec![temp_root],
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                cache_mounts: Vec::new(),
+                shell_env: Vec::new(),
+                #[cfg(target_os = "linux")]
+                host_shell: crate::host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+
+                task_result_budget: None,
+                job_retention_secs: 60,
+
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            jobs,
+        )
+        .await
+        .unwrap();
+
+        assert!(machine.ensure_not_protected(&spool).is_err());
+        let error = machine
+            .resolve_existing(spool.to_str().unwrap(), AccessNeed::Read)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("protected by dotlink"), "{error}");
     }
 
     #[tokio::test]
@@ -1897,6 +2642,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: vec![secret],
         })
         .await
@@ -1944,6 +2694,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             // Exercise normalization as well as the lexical/resolved pair.
             protected_paths: vec![root.join("unused/../credential-link")],
         })
@@ -2007,6 +2762,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: vec![alias.clone()],
         })
         .await
@@ -2062,6 +2822,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: vec![secret],
         })
         .await
@@ -2184,9 +2949,39 @@ mod tests {
         .map(|tool| tool.name.to_string())
         .collect();
         if cfg!(windows) {
-            assert_eq!(names, ["bread", "grep", "ls", "powershell", "read"]);
+            assert_eq!(
+                names,
+                [
+                    "bread",
+                    "grep",
+                    "job_ack",
+                    "job_cancel",
+                    "job_get",
+                    "job_list",
+                    "job_output",
+                    "job_start",
+                    "ls",
+                    "powershell",
+                    "read"
+                ]
+            );
         } else {
-            assert_eq!(names, ["bash", "bread", "grep", "ls", "read"]);
+            assert_eq!(
+                names,
+                [
+                    "bash",
+                    "bread",
+                    "grep",
+                    "job_ack",
+                    "job_cancel",
+                    "job_get",
+                    "job_list",
+                    "job_output",
+                    "job_start",
+                    "ls",
+                    "read"
+                ]
+            );
         }
     }
 
@@ -2211,7 +3006,15 @@ mod tests {
                 .filter(|spec| spec.concurrent_read)
                 .map(|spec| spec.name)
                 .collect::<Vec<_>>(),
-            ["ls", "grep", "read", "bread"]
+            [
+                "ls",
+                "grep",
+                "read",
+                "bread",
+                "job_list",
+                "job_get",
+                "job_output"
+            ]
         );
     }
 
@@ -2274,6 +3077,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transport_postcondition_bounds_error_and_unexpected_success_results() {
+        let budget = 512;
+        let bulk = format!("{}{}", "\"\\\n".repeat(512), "tail");
+        for (is_error, response) in [
+            (
+                true,
+                CallToolResponse::Complete(CallToolResult::error(vec![ContentBlock::text(
+                    bulk.clone(),
+                )])),
+            ),
+            (
+                false,
+                CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(
+                    bulk.clone(),
+                )])),
+            ),
+        ] {
+            let fitted = fit_call_tool_response_to_budget("test", response, Some(budget));
+            let CallToolResponse::Complete(result) = fitted else {
+                panic!("complete result changed response kind")
+            };
+            assert_eq!(result.is_error.unwrap_or(false), is_error);
+            assert!(serialized_json_len(&result).unwrap() <= budget);
+            let text = result.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                text.contains("transport response budget") || text.is_empty(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_postcondition_bounds_protocol_errors_and_preserves_code() {
+        let budget = 512;
+        let error = McpError::new(
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            format!("bad {}", "\"\\\n".repeat(512)),
+            Some(serde_json::json!({"bulk": "x".repeat(4096)})),
+        );
+        let fitted = fit_mcp_error_to_budget(error, Some(budget));
+        assert_eq!(fitted.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(fitted.data.is_none());
+        assert!(serialized_json_len(&fitted).unwrap() <= budget);
+        assert!(fitted.message.contains("transport response budget"));
+    }
+
+    #[test]
+    fn transport_context_capability_debug_is_redacted() {
+        let token = TransportContextToken::from("secret-test-capability");
+        let rendered = format!("{token:?}");
+        assert_eq!(rendered, "TransportContextToken([redacted])");
+        assert!(!rendered.contains("secret-test-capability"));
+    }
+
     #[tokio::test]
     async fn configured_resource_ceilings_are_rejected_not_widened() {
         let temp = tempfile::tempdir().unwrap();
@@ -2300,6 +3158,10 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes,
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         };
 
@@ -2372,6 +3234,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         })
         .await
@@ -2500,6 +3367,11 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
         }
     }

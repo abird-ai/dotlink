@@ -130,10 +130,11 @@ complex growing multi-match cases retain the standard library implementation.
 
 The `grep` source reader retains its bounded byte buffer after the shared
 `text_bytes` validation, so search borrows the UTF-8 view rather than cloning
-it. A content page scans matching lines once to retain only bounded selected
-indices and their adjacent page boundaries; the renderer walks borrowed lines
-to merge context windows without materializing the file's full line/match
-indices. Files/count results count hits directly from iterators. Original
+it. A content page scans matching lines to retain only bounded selected
+indices and adjacent page boundaries, then captures their at-most-8-line
+contexts in one pass. The renderer reuses this bounded borrowed cache for
+output-fit prefixes, instead of rescanning deep source offsets for each
+rejected candidate; there is no full line/match index. Files/count results count hits directly from iterators. Discovery retains only the candidate paths the scan-file budget can actually visit (4096 in production), rather than the larger historical hard cap. Line-oriented content labels escape delimiter/control-bearing UTF-8 names and byte-escape invalid-UTF-8 Unix names, while ordinary paths keep the familiar format. Original
 paging, context clipping, markers and scan budgets remain intact.
 
 Standard-header HTTP preflight first deserializes only a borrowed method and
@@ -145,6 +146,42 @@ Binary input decoding consumes encoded owned strings instead of holding every
 encoded range beside the retained decoded buffers. Byte-identical `bedit`
 ranges are checked against the pinned source and its revalidated digest before
 returning without staging any temporary file.
+
+`patch` builds a borrowed `WorkingLine` index from `split_terminator('\n')`:
+real blank lines remain addressable, but a terminal LF does not create a
+phantom context line. Trailing-LF presence is tracked independently for exact
+output reconstruction; a CR in an LF-formatted patch hunk is literal content,
+whereas a CRLF patch header identifies delimiter CRs to strip from hunk
+syntax. CRs belonging to source CRLF delimiters are distinguished from
+literal trailing CRs. The shared `LineOutput` delays writing one line so an
+unterminated source line can gain a CRLF separator when appended to; its
+extra delimiter byte is counted before allocation. An unterminated line ending
+in literal CR also requires a *separate* CR for the new delimiter, even in an
+LF-style file; new lines with literal terminal CR follow the same rule.
+Turning a formerly terminated line into EOF clears its separator metadata. Context-only hunks
+advance the cursor without a replacement vector. Source-consuming context
+references use one pointer per parsed `PatchLine`, and their KMP scratch table
+is precharged against the existing mutation plan. The shared allocation-free `visit_hunk` enumerates context, removal and
+addition actions identically for byte-size preflight, direct output and
+in-place editing. Context boundaries separate edit groups. Added lines inherit their
+positionally corresponding removed lines' separators, with excess additions
+reusing the last removed line's style; pure insertions use their actual
+insertion site. Unrelated context cannot change separator bytes in
+mixed-ending files. `add_file_line` is also shared by `*** Add File` parsing/byte accounting
+and output: bare and prefixed CRLF blank lines are equivalent without per-line
+allocations. For a final mutating hunk,
+`LineOutput` writes prefix, replacement and suffix directly into the result
+without expanding the borrowed line index. Earlier hunks shift the index
+in place and save only the source lines they actually consume, instead of
+allocating a duplicate replacement-sized vector. Both preserve the shared
+64 MiB planning budget and the existing output-before-commit checks.
+
+`mcp::tools::matching::scan_sequence` implements a single generic KMP scan over
+ordered inputs. `patch` uses it to locate hunk context in linear comparisons
+rather than checking every candidate position against every context line. Exact
+matching takes priority; whitespace-trimmed matching runs only if no exact
+candidate exists. The helper reports overlapping occurrences through a callback,
+so ambiguity diagnostics retain only a bounded preview of matching line numbers.
 
 `edit` streams literal match positions for count and at most ten diagnostic
 lines, with no per-match offsets retained. `patch` keeps only bounded hunk
@@ -214,7 +251,7 @@ retried even if only generated credentials survive. Legacy profiles without
 selectors continue using their original credential files and owner hash.
 Profile-specific OAuth state lives under the Abird XDG state namespace (`$XDG_STATE_HOME/abird/dotlink/oauth[.<profile>].json`), while OpenAI Runtime keys remain under the Abird XDG config namespace. Both are protected control-plane paths.
 
-The process launch directory is the internal relative-path base. It is readable by default when `permissions.default_allow=true`; `--no-default-allow` removes that implicit grant for one run. Relative profile/CLI paths resolve from the launch directory. `allow_rw: ["."]` means rw on the launch directory; `allow_rw: ["/"]` is unrestricted filesystem read+write.
+The process launch directory is the internal relative-path base. It is readable by default when `permissions.default_allow=true`; `--no-default-allow` removes that implicit grant for one run. Relative profile/CLI paths resolve from the launch directory. Saved profiles can intentionally contain no filesystem grants; profile validation checks structural dependencies while `Policy::from_args` determines effective capabilities only after merging persisted defaults, one-run grants and denies. No effective capability, or a shell without readable directory access, still fails. `allow_rw: ["."]` means rw on the launch directory; `allow_rw: ["/"]` is unrestricted filesystem read+write.
 
 allow_shell enables the normal platform shell. allow_network controls network access for the normal sandboxed shell path. On Linux Bubblewrap still applies unless --allow-all --no-sandbox is explicitly selected.
 
@@ -274,7 +311,7 @@ OAuth issuer/resource identity stays bound to configured public origins.
 
 The ngrok HTTP supervisor owns both HTTP server tasks in a `JoinSet`, rather than detaching their handles. Axum receives the direct peer from TCP accept metadata and the public peer from ngrok's authenticated connection metadata; its redacted `Debug` form prevents framework tracing from logging network identities, and HTTP forwarding headers are not an identity source. Tunnel EOF/error, cancellation, or a supervisor panic cancels the MCP token and remaining tasks. Outermost route middleware drops in-flight MCP/OAuth handlers and body extraction on cancellation; normal exit then allows up to five seconds for graceful server shutdown. Accepted TCP/ngrok IO is force-close-aware if detached Axum connection tasks exceed that bound, and bounded ngrok tunnel/session close RPCs run concurrently with draining. The parent transport budget is six seconds, leaving a one-second reserve around the five-second HTTP shutdown budget. A drain timeout is itself a cleanup failure because synchronous handler work cannot be preempted by closing IO. Cleanup failures take precedence over restart requests and propagate through peer and runtime teardown, preventing a replacement runtime from overlapping old ingress. A restarted runtime cannot retain old listeners, tunnel connections, or active MCP calls.
 
-Interactive non-stdio runs also start a terminal-control loop: `v` mutates shared logging verbosity live, `Ctrl+R` cancels/drains the active transports and rebuilds the runtime from the current profile/CLI state, and `Ctrl+C` exits. stdio disables key capture so protocol stdin remains exclusive.
+Interactive non-stdio runs also start a terminal-control loop: `v` mutates shared logging verbosity live, `V` toggles full command output only while TOOL logging is enabled (otherwise the key and its hint are inactive/hidden), `Ctrl+R` cancels/drains the active transports and rebuilds the runtime from the current profile/CLI state, and `Ctrl+C` exits. The command modifier resets when controls stop and can never be enabled by stdio or a noninteractive service. stdio disables key capture so protocol stdin remains exclusive.
 
 ## stdio
 
@@ -460,25 +497,28 @@ such as `/bin -> usr/bin` becomes a sandbox symlink, so deny and protected
 masks, applied to canonical objects, cover every spelling.
 Read+write tools select the narrower pinned grant root, rather than relying
 only on the writable ancestor, and duplicate grants reuse the same inode.
-Native mutations share `src/mutation.rs`: 256 in-process shards followed by
-sorted hierarchical directory locks. Existing ancestors take shared intent
-locks; the deepest existing parent takes an exclusive lock across snapshot →
-commit. Missing parent creation is covered by that ancestor's exclusive lock,
-so another instance cannot bypass it by opening a newly created subdirectory.
-An unreadable directory fails closed rather than falling back to a different
-inode. Disjoint subdirectories remain concurrent across independent processes,
-while changes within a single directory serialize. Lock descriptors survive
-file replacement and release on task cancellation or process exit. Lock waits
-are bounded to 30 seconds; no workspace files, XDG coordination state or
-`/run/lock` service is needed. Windows retains a conservative in-process gate.
-External writers and shells remain outside advisory coordination.
+Native mutations share `src/mutation.rs`: sorted exact-path mutexes preserve
+pathname/topology ordering, and Unix additionally derives a stable target key
+from the nearest existing ancestor's `(dev, ino)` plus the remaining relative
+file path. This makes lexical/bind aliases of one directory entry converge on
+one in-process mutex without hash shards. Cross-process Unix directory locks
+are coalesced by directory `(dev, ino)` rather than lexical spelling, upgrading
+the deepest relevant identity to exclusive and verifying that the opened inode
+still matches the plan before locking. Existing ancestors take shared intent
+locks; missing-parent creation is covered by the nearest existing ancestor's
+exclusive lock. An unreadable/retargeted directory fails closed. Disjoint
+entries remain concurrent, and one 30-second deadline spans exact-path,
+stable-target and OS-level acquisition. No workspace files, XDG coordination
+state or `/run/lock` service is needed. Windows retains its conservative gate
+and named cross-process mutexes. External writers and shells remain outside
+advisory coordination.
 
 The tunnel polls, OAuth metadata fetches, and local MCP responses all use the
 same streaming byte-ceiling primitive (`src/bounded.rs`) before deserialization;
 OAuth metadata requests additionally use trusted-requester rolling/in-flight admission, a process-wide concurrent-fetch limit, native IP validation and no proxies.
-OpenAI tunnel poll bodies are bounded dynamically by the configured largest
-accepted single request plus framing (64 MiB minimum, 256 MiB maximum);
-profiles exceeding this safe capacity fail when starting the tunnel.
+Every bounded transport ultimately enforces a serialized `CallToolResult` postcondition at the shared `LocalMachine::call_tool` boundary. Normal success paths still size/preflight their own exact semantic result before mutation or expensive encoding; the shared guard primarily bounds arbitrary diagnostics/errors and acts as a last-resort invariant for unexpected successes.
+
+OpenAI Secure MCP Tunnel messages are bounded by the hosted 10 MiB serialized-envelope limit. dotlink caps the complete embedded MCP message at 9 MiB, reserving 1 MiB for tunnel wrapper/header metadata, while raw/tool transfer ceilings remain 8 MiB. The hosted request lifetime is a fixed 120 s and dotlink holds back 5 s for terminal delivery. Every shell call is durable from admission: the request waits only through its transport budget, then renders the ordinary result from terminal metadata plus leased spools if that complete result fits the response budget; otherwise it exposes the same stable job/task id, even when execution already finished. Execution timeouts are never rewritten.
 
 Only -s/--serialize runs all handlers through one exclusive gate. Linux
 uses openat2; macOS uses pinned-root, component-wise openat with O_NOFOLLOW.
@@ -508,7 +548,10 @@ discovery   ls     grep
 text        read   write   edit   patch
 binary      bread  bwrite  bedit
 shell       bash   powershell
+jobs        job_start job_list job_get job_output job_ack job_cancel
 ~~~
+
+`JobManager` is the single shell execution-lifetime owner below both protocol surfaces. Admission, request-key dedupe, runner registration and shutdown share one state lock, closing create/attach teardown races. Each job has queued/running/terminal phases; under `--serialize`/Windows the runner acquires the operation gate before path/mount preparation, and the execution timeout starts only after preparation and `mark_running`. The manager owns cancellation, stable ids, task TTL state, request-id replay mapping, explicit read leases, a 64 MiB retained prefix per stdout/stderr stream, and a configurable aggregate session quota (512 MiB default). OpenAI request-key jobs use terminal metadata plus the existing stdout/stderr spools as their exact replay source until terminal delivery is confirmed: failed, expired, or ambiguous delivery keeps that state, while only confirmed successful delivery retires the key and compacts hidden streams. `ActiveTransports` derives shared transport constraints. Private request constraints are carried through rmcp `_meta` only with a redacted opaque per-runtime capability token; OpenAI clears the complete `io.abird.dotlink/*` namespace before inserting trusted fields, and public HTTP/stdio values with the same names are ignored. There is no duplicate full task-result file. Native MCP Tasks reconstruct the exact original shell `CallToolResult` from leased spools and are exposed only when the configured ordinary-result ceiling is worst-case safe for the minimum native-task result budget of every active transport sharing the runtime (and the current request); otherwise the same execution is exposed through the compatibility job surface. `job_output` is pure/replayable; only `job_ack` advances cleanup watermarks, and active readers defer cleanup. Fully acknowledged compatibility output is deleted and its exposed metadata becomes reclaimable under capacity pressure; native Tasks compact it to the exact ordinary-result prefix required by future `tasks/get` calls and keep only that prefix through task retention. Cleanup/compaction failures remain pending and are retried by later acknowledgements/sweeps. `job_list` recovers exposed ids after a lost receipt. Automatic recovery prepares authority once into `PreparedMachine`: canonical policy, resolved guards/caches, pinned host resources, and pinned Unix/macOS `SecureFs` grant roots are frozen together with their object identities. That frozen snapshot is fingerprinted and then consumed directly by `LocalMachine`; construction performs no second authority traversal. Windows path identities use volume/file index. Reuse occurs only after a successful snapshot proves equality; preparation failure, identity change, manual reload or normal exit cancels+awaits the old session. New manager intent/policy binding is performed unconditionally in release builds, with debug assertions only checking the result. `Drop` remains only a fallback.
 
 The visible router is policy-specific.
 
@@ -638,7 +681,8 @@ Then add --allow-shell and/or --allow-network separately.
 
 Logging has two layers:
 
-- normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP produce the same TOOL lines: `p`/`d` before escaped full `c` for `bash`/`powershell`, with `b="N"`, `max_t`, and `max_b`. Paths inside launch cwd appear as `./...`, outside as absolute `/...` on Unix. Commands are intentionally auditable and may contain inline secrets; default is quiet;
+- normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP produce the same TOOL lines: complete `p`/`d` path names before escaped `c` for `bash`/`powershell`, with `b="N"`, `max_t`, and `max_b`. Paths inside launch cwd appear as `./...`, outside as absolute `/...` on Unix. Commands can contain inline secrets; default logging is quiet;
+- TOOL logging uses one shared argument renderer: `c=` defaults to at most 256 visible characters (including quotes and escapes), with `…` before the closing quote when truncated. Only interactive `V` **while TOOL logging is active** toggles the full escaped command; quiet/REQ-only mode hides the hint, ignores the key, and resets full mode. `p=`, `d=`, and all valid `edit` path names remain full; over-limit requests retain bounded operation/file counts. Interactive color formatting styles keys and values as structured elements rather than parsing user-supplied text, and highlights outcomes. Noninteractive argument summaries stay plain. Other payloads stay byte counts.
 - REQ logging records incoming request metadata at the transport boundary without dumping request bodies; all scopes are ASCII-sanitized/capped, HTTP method/path labels are bounded and control-character sanitized, ephemeral MCP paths are redacted, OpenAI command metadata uses strict protocol identifiers, and grep patterns are logged only as byte counts. Control-plane error bodies and malformed SSE payloads are excluded from propagated errors. rmcp tracing is suppressed independently of `RUST_LOG` because its debug events render complete protocol payloads.
 
 Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. In interactive non-stdio runs, `v` cycles `quiet → TOOL → TOOL + REQ → quiet` immediately across all logger clones. `-q/--quiet` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
@@ -695,8 +739,11 @@ Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases
   sections. Hunks are located by content, an ambiguous match fails, a path
   claimed by two sections (including two spellings through a symlink) is refused
   while planning, added lines inherit the target file's line ending, and the
-  Codex `*** End of File` marker is enforced: the hunk must end at the last line,
-  and no hunk may follow it in the same file. Strict
+  Codex `*** End of File` marker is enforced during context candidate selection:
+  only matches ending at the last real line are eligible for exact/trimmed search,
+  and no hunk may follow it in the same file. An addition-only hunk uses that
+  marker as an explicit EOF append anchor; without source context or the marker,
+  an insertion is ambiguous and rejected. Strict
   mode preflights every section before any commit and `best_effort` writes the
   clean ones; the shared mutation engine stages all eligible files before any
   commit and bounds the receipt before writes. Each file replacement is atomic,
@@ -739,7 +786,7 @@ module under `src/mcp/tools/`, each with its own `#[tool_router]`:
 ~~~text
 src/mcp.rs              policy, pinned descriptors, capability table, ServerHandler
 src/staging.rs          staging mode/naming policy + cancellation-safe path backend
-src/mutation.rs         process shards + stable cross-process mutation locks
+src/mutation.rs         exact + stable Unix target locks; cross-process directory locks
 src/secure_fs.rs        Linux descriptor-rooted IO and the fd-based staging backend
 src/mcp/tools/mod.rs    walk, glob grammar, limits, markers, snapshot commit
 src/mcp/tools/{ls,grep,text,edit,patch,binary,shell}.rs

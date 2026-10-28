@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use crate::logging::LogConfig;
 use crate::mcp::tools::dot;
 use crate::mcp::tools::grep::{GrepArgs, GrepOutputMode};
-use crate::mcp::{AccessPolicy, AccessSpec, LocalMachine, RuntimeConfig};
+use crate::mcp::{AccessPolicy, AccessSpec, LocalMachine, RuntimeConfig, TransportContextToken};
 
 pub(crate) fn test_machine(root: PathBuf) -> LocalMachine {
     test_machine_with(root, |_| {})
@@ -50,12 +50,19 @@ pub(crate) fn test_machine_with(
         max_output_bytes: 65536,
         max_read_bytes: 65536,
         max_write_bytes: 65536,
+
+        task_result_budget: None,
         protected_paths: Vec::new(),
     };
     configure(&mut config);
     LocalMachine {
         config,
+        jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+            crate::limits::DEFAULT_JOB_RETENTION_SECS,
+        ))
+        .unwrap(),
         operation_gate: Arc::new(RwLock::new(())),
+        transport_context_token: TransportContextToken::from("test-transport-context"),
         router: std::sync::OnceLock::new(),
         serialize: false,
         #[cfg(any(target_os = "linux", target_os = "macos"))]

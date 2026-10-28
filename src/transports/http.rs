@@ -39,7 +39,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    logging::{self, LogConfig},
+    logging::{self, LogConfig, LogOutcome},
     mcp::LocalMachine,
     oauth,
     requester::RequesterId,
@@ -1128,7 +1128,7 @@ async fn log_http_request(log: LogConfig, request: Request<Body>, next: Next) ->
         "http",
         &label,
         started,
-        response.status().as_u16().to_string(),
+        LogOutcome::http(response.status().as_u16()),
     );
     response
 }

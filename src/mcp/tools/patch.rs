@@ -34,7 +34,8 @@ pub(super) struct PatchArgs {
     dir: String,
 
     /// Codex patch text: `*** Begin Patch`, `*** Update File:` / `*** Add File:`
-    /// sections, then `*** End Patch`.
+    /// sections, then `*** End Patch`. Addition-only update hunks require
+    /// an explicit `*** End of File` marker to anchor their insertion.
     patch: String,
 
     /// Write the files that planned cleanly and report the rest instead of
@@ -65,16 +66,49 @@ enum PatchOp<'a> {
 #[derive(Debug)]
 struct PatchHunk<'a> {
     anchor: Option<&'a str>,
-    lines: Vec<PatchLine<'a>>,
+    /// Exact hunk body borrowed from the original request. Update hunks stay
+    /// compact regardless of line count; lines are decoded lazily when matching
+    /// or applying, after mutation scratch limits are known.
+    body: &'a str,
+    body_start: usize,
+    patch_crlf: bool,
     /// The Codex `*** End of File` marker: this hunk must end at the last line.
     at_end_of_file: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum PatchLine<'a> {
     Context(&'a str),
     Removed(&'a str),
     Added(&'a str),
+}
+
+impl<'a> PatchLine<'a> {
+    /// Only context and removed lines consume source lines. Added lines never
+    /// enter the search pattern.
+    fn source_text(self) -> Option<&'a str> {
+        match self {
+            Self::Context(text) | Self::Removed(text) => Some(text),
+            Self::Added(_) => None,
+        }
+    }
+}
+
+impl<'a> PatchHunk<'a> {
+    /// Re-decode borrowed hunk lines on demand instead of retaining one enum
+    /// descriptor per request line. The iterator is cloneable so edit groups
+    /// can be pre-scanned without buffering dense additions.
+    fn lines(&self) -> impl Iterator<Item = PatchLine<'a>> + Clone {
+        let patch_crlf = self.patch_crlf;
+        patch_lines(self.body).map(move |raw_line| {
+            let line = if patch_crlf {
+                raw_line.strip_suffix('\r').unwrap_or(raw_line)
+            } else {
+                raw_line
+            };
+            decode_hunk_line(line).expect("validated hunk lines stay valid")
+        })
+    }
 }
 
 /// Borrow an unchanged source line or a patch addition. The only extra
@@ -84,6 +118,10 @@ enum PatchLine<'a> {
 struct WorkingLine<'a> {
     text: &'a str,
     append_cr: bool,
+    // A CR belonging to a formerly terminated CRLF line must not be left
+    // dangling if this line becomes the un-terminated end of the edited file.
+    delimiter_cr: bool,
+    terminated: bool,
 }
 
 impl<'a> WorkingLine<'a> {
@@ -91,17 +129,32 @@ impl<'a> WorkingLine<'a> {
         Self {
             text,
             append_cr: false,
+            delimiter_cr: false,
+            terminated: false,
+        }
+    }
+
+    fn source_line(text: &'a str, terminated: bool) -> Self {
+        Self {
+            delimiter_cr: terminated && text.ends_with('\r'),
+            terminated,
+            ..Self::source(text)
         }
     }
 
     fn added(text: &'a str, crlf: bool) -> Self {
-        match (crlf, text.ends_with('\r')) {
-            (true, false) => Self {
-                text,
-                append_cr: true,
-            },
-            (false, true) => Self::source(text.strip_suffix('\r').unwrap()),
-            _ => Self::source(text),
+        // The parser removes CRLF *syntax* from patch lines. Anything still in
+        // `text`, including a final CR, is literal content and stays intact.
+        // If content itself ends with a literal CR, use a separate CR for
+        // the new delimiter; otherwise the literal byte would be consumed as
+        // CRLF syntax on the next line. The final-EOF path removes the extra
+        // delimiter CR without touching content when no LF follows.
+        let delimiter_cr = crlf || text.ends_with('\r');
+        Self {
+            text,
+            append_cr: delimiter_cr,
+            delimiter_cr,
+            terminated: true,
         }
     }
 
@@ -109,12 +162,23 @@ impl<'a> WorkingLine<'a> {
         self.text.len() + usize::from(self.append_cr)
     }
 
-    fn is_empty(self) -> bool {
-        self.text.is_empty() && !self.append_cr
-    }
-
-    fn ends_with_cr(self) -> bool {
-        self.append_cr || self.text.ends_with('\r')
+    fn drop_terminal_delimiter_cr(&mut self) -> bool {
+        // Becoming the unterminated last line also removes its *logical* LF
+        // separator, even when no CR byte has to be stripped.
+        self.terminated = false;
+        if !self.delimiter_cr {
+            return false;
+        }
+        if self.append_cr {
+            self.append_cr = false;
+        } else {
+            self.text = self
+                .text
+                .strip_suffix('\r')
+                .expect("CRLF marker is backed by trailing CR");
+        }
+        self.delimiter_cr = false;
+        true
     }
 
     fn contains(self, needle: &str) -> bool {
@@ -126,8 +190,10 @@ impl<'a> WorkingLine<'a> {
     }
 
     fn equals(self, patch: &str) -> bool {
-        if self.append_cr {
-            patch.strip_suffix('\r') == Some(self.text)
+        // Compare logical text, not the source line's CRLF delimiter. A CR
+        // without a following LF is literal content and is never removed.
+        if self.delimiter_cr && !self.append_cr {
+            self.text.strip_suffix('\r') == Some(patch)
         } else {
             self.text == patch
         }
@@ -145,38 +211,262 @@ impl<'a> WorkingLine<'a> {
     }
 }
 
+/// Use the edited line's delimiter when present. An unterminated final line
+/// inherits its predecessor's style when replaced; an append to that line
+/// joins with LF, preserving all existing bytes. Literal CR is not a delimiter.
+fn crlf_for_edit(lines: &[WorkingLine<'_>], start: usize, trailing_newline: bool) -> bool {
+    if let Some(current) = lines.get(start) {
+        if start + 1 < lines.len() || trailing_newline {
+            current.delimiter_cr
+        } else {
+            lines
+                .get(start.wrapping_sub(1))
+                .is_some_and(|line| line.delimiter_cr)
+        }
+    } else if trailing_newline {
+        lines.last().is_some_and(|line| line.delimiter_cr)
+    } else {
+        lines
+            .get(lines.len().wrapping_sub(2))
+            .is_some_and(|line| line.delimiter_cr)
+    }
+}
+
+/// When an unterminated source line gains a successor, a literal final
+/// CR must not become the newly inserted LF's delimiter CR. Add a separate
+/// CR even in an otherwise LF-style file; this retains the literal content.
+fn requires_bridge_cr(line: WorkingLine<'_>, preferred_crlf: bool) -> bool {
+    !line.terminated && (preferred_crlf || line.text.ends_with('\r'))
+}
+
+/// A borrowed view of source lines indexed by their absolute position in the
+/// working file. Earlier hunks snapshot only their consumed span plus the next
+/// boundary line, while final/preflight passes can borrow the full index.
+#[derive(Clone, Copy)]
+struct HunkSource<'s, 'a> {
+    lines: &'s [WorkingLine<'a>],
+    base: usize,
+}
+
+impl<'s, 'a> HunkSource<'s, 'a> {
+    fn get(self, index: usize) -> Option<WorkingLine<'a>> {
+        index
+            .checked_sub(self.base)
+            .and_then(|relative| self.lines.get(relative))
+            .copied()
+    }
+}
+
+/// A borrowed hunk action. Source indices are absolute working-file positions
+/// so pure insertions use the same boundary semantics whether or not a later
+/// context line happens to be present in the patch.
+#[derive(Clone, Copy)]
+enum HunkAction<'a> {
+    Keep {
+        source_index: usize,
+        line: WorkingLine<'a>,
+    },
+    Remove,
+    Add(WorkingLine<'a>),
+}
+
+/// Select an existing line's separator or inherit the nearest usable one at
+/// an insertion boundary. Never infer it from an unrelated context line.
+fn style_at(source: HunkSource<'_, '_>, at: usize, fallback: bool) -> bool {
+    if let Some(line) = source.get(at)
+        && line.terminated
+    {
+        return line.delimiter_cr;
+    }
+    for distance in [1, 2] {
+        if let Some(previous) = at.checked_sub(distance).and_then(|index| source.get(index))
+            && previous.terminated
+        {
+            return previous.delimiter_cr;
+        }
+    }
+    fallback
+}
+
+/// Visit each hunk action without retaining a per-line patch representation or
+/// a replacement-sized buffer. Each context boundary separates edit groups: a
+/// removed line determines the separator for additions in its group, while a
+/// pure insertion inspects its absolute source boundary (including the next
+/// unconsumed line when present).
+fn visit_hunk<'a>(
+    source: HunkSource<'_, 'a>,
+    source_start: usize,
+    hunk: &PatchHunk<'a>,
+    fallback_style: bool,
+    mut visit: impl FnMut(HunkAction<'a>),
+) {
+    let mut cursor = source_start;
+    let mut lines = hunk.lines().peekable();
+    while let Some(line) = lines.peek().copied() {
+        if matches!(line, PatchLine::Context(_)) {
+            lines.next();
+            visit(HunkAction::Keep {
+                source_index: cursor,
+                line: source
+                    .get(cursor)
+                    .expect("matched context has a corresponding source line"),
+            });
+            cursor += 1;
+            continue;
+        }
+
+        // Pre-scan this edit group using a cloned zero-copy iterator. This is
+        // what lets additions listed before removals inherit the same removed
+        // line separators without buffering the group.
+        let removed = lines
+            .clone()
+            .take_while(|line| !matches!(line, PatchLine::Context(_)))
+            .filter(|line| matches!(line, PatchLine::Removed(_)))
+            .count();
+        let group_start = cursor;
+        let mut added = 0_usize;
+        while let Some(line) = lines.peek().copied() {
+            if matches!(line, PatchLine::Context(_)) {
+                break;
+            }
+            match lines.next().expect("peeked edit-group line") {
+                PatchLine::Added(text) => {
+                    let source_index = if removed == 0 {
+                        group_start
+                    } else {
+                        group_start + added.min(removed - 1)
+                    };
+                    let style = style_at(source, source_index, fallback_style);
+                    visit(HunkAction::Add(WorkingLine::added(text, style)));
+                    added += 1;
+                }
+                PatchLine::Removed(_) => {
+                    visit(HunkAction::Remove);
+                    cursor += 1;
+                }
+                PatchLine::Context(_) => unreachable!("split on context"),
+            }
+        }
+    }
+}
+
+/// Shared single-pass final assembler. Delay emitting one source line until
+/// the next is known; when an unterminated line gains a successor, synthesize
+/// its separator without mistaking any literal CR for a CRLF delimiter.
+struct LineOutput<'a> {
+    text: String,
+    pending: Option<WorkingLine<'a>>,
+    written: usize,
+    total: usize,
+    trailing_newline: bool,
+    new_crlf: bool,
+}
+
+impl<'a> LineOutput<'a> {
+    fn new(bytes: usize, total: usize, trailing_newline: bool, new_crlf: bool) -> Self {
+        Self {
+            text: String::with_capacity(bytes),
+            pending: None,
+            written: 0,
+            total,
+            trailing_newline,
+            new_crlf,
+        }
+    }
+
+    fn push(&mut self, line: WorkingLine<'a>) {
+        if let Some(previous) = self.pending.replace(line) {
+            previous.append_to(&mut self.text);
+            if self.new_crlf && !previous.terminated {
+                self.text.push('\r');
+            }
+            self.text.push('\n');
+        }
+        self.written += 1;
+    }
+
+    fn finish(mut self) -> String {
+        debug_assert_eq!(self.written, self.total);
+        if let Some(mut final_line) = self.pending {
+            if !self.trailing_newline {
+                final_line.drop_terminal_delimiter_cr();
+            }
+            final_line.append_to(&mut self.text);
+        }
+        if self.trailing_newline {
+            self.text.push('\n');
+        }
+        self.text
+    }
+}
+
 /// Patch lines, split on `\n` only: a CRLF patch keeps its `\r`, and
 /// `apply_patch_hunks` normalizes added lines to the target file's terminator.
-fn patch_lines(text: &str) -> impl Iterator<Item = &str> {
+fn patch_lines(text: &str) -> impl Iterator<Item = &str> + Clone {
     text.split_inclusive('\n')
         .map(|line| line.strip_suffix('\n').unwrap_or(line))
 }
 
+/// Decode one already-normalized update-hunk line. Parsing and lazy replay use
+/// this one grammar helper so validation cannot drift from application.
+fn decode_hunk_line(line: &str) -> Option<PatchLine<'_>> {
+    match line.as_bytes().first() {
+        Some(b' ') => Some(PatchLine::Context(&line[1..])),
+        Some(b'-') => Some(PatchLine::Removed(&line[1..])),
+        Some(b'+') => Some(PatchLine::Added(&line[1..])),
+        _ if line.trim().is_empty() => Some(PatchLine::Context("")),
+        _ => None,
+    }
+}
+
+/// Shared, zero-copy add-file decoder for both byte preflight and output.
+/// Bare blank lines are accepted as shorthand for `+`, but their CRLF
+/// separator must be preserved just like an explicit `+\r\n` blank line.
+fn add_file_line(raw: &str) -> Option<&str> {
+    match raw.strip_prefix('+') {
+        Some(text) => Some(text),
+        None if raw.trim().is_empty() => Some(if raw.ends_with('\r') { "\r" } else { "" }),
+        None => None,
+    }
+}
+
 fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
-    // All file names, hunk anchors and lines borrow the original request
-    // buffer. Even million-line patches retain only short slice descriptors.
+    // File names and anchors borrow the request, while hunk/add-file bodies
+    // retain byte ranges into it. Parser storage is therefore O(files+hunks),
+    // not O(patch lines); dense additions are decoded only during planning.
     let mut ops: Vec<PatchOp<'_>> = Vec::new();
     let mut saw_begin = false;
     let mut saw_end = false;
     let mut hunks = 0_usize;
     let mut cursor = 0_usize;
+    let mut patch_crlf = false;
 
-    for (index, line) in patch_lines(text).enumerate() {
+    for (index, raw_line) in patch_lines(text).enumerate() {
         let number = index + 1;
         // The iterator strips only LF, not CR; the cursor keeps the exact
         // raw byte range so add-file bodies can be borrowed in one piece.
-        cursor +=
-            line.len() + usize::from(text.as_bytes().get(cursor + line.len()) == Some(&b'\n'));
+        cursor += raw_line.len()
+            + usize::from(text.as_bytes().get(cursor + raw_line.len()) == Some(&b'\n'));
         if !saw_begin {
+            let line = raw_line;
             if line.trim().is_empty() {
                 continue;
             }
             if line.trim_end() != "*** Begin Patch" {
                 bail!("patch: missing '*** Begin Patch' header");
             }
+            patch_crlf = raw_line.ends_with('\r');
             saw_begin = true;
             continue;
         }
+        // The header fixes the patch format: in CRLF patches, strip the CR
+        // belonging to the transport delimiter from update-hunk lines. In LF
+        // patches, a trailing CR in a hunk is literal text, not a delimiter.
+        let line = if patch_crlf {
+            raw_line.strip_suffix('\r').unwrap_or(raw_line)
+        } else {
+            raw_line
+        };
         if saw_end {
             if !line.trim().is_empty() {
                 bail!("patch: line {number}: unexpected text after '*** End Patch'");
@@ -193,6 +483,9 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
             if directive == "End of File" {
                 match ops.last_mut() {
                     Some(PatchOp::Update { hunks, .. }) => match hunks.last_mut() {
+                        Some(hunk) if hunk.at_end_of_file => {
+                            bail!("patch: line {number}: duplicate '*** End of File' marker")
+                        }
                         Some(hunk) => hunk.at_end_of_file = true,
                         None => bail!("patch: line {number}: '*** End of File' needs a hunk"),
                     },
@@ -261,7 +554,9 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
             }
             list.push(PatchHunk {
                 anchor: parse_patch_anchor(rest),
-                lines: Vec::new(),
+                body: &text[cursor..cursor],
+                body_start: cursor,
+                patch_crlf,
                 at_end_of_file: false,
             });
             continue;
@@ -272,24 +567,21 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
                 let Some(hunk) = list.last_mut() else {
                     bail!("patch: line {number}: text outside a hunk");
                 };
-                match line.as_bytes().first() {
-                    Some(b' ') => hunk.lines.push(PatchLine::Context(&line[1..])),
-                    Some(b'-') => hunk.lines.push(PatchLine::Removed(&line[1..])),
-                    Some(b'+') => hunk.lines.push(PatchLine::Added(&line[1..])),
-                    _ if line.trim().is_empty() => hunk.lines.push(PatchLine::Context("")),
-                    _ => {
-                        bail!("patch: line {number}: unexpected text '{line}'");
-                    }
+                if hunk.at_end_of_file {
+                    bail!("patch: line {number}: hunk data may not follow '*** End of File'");
                 }
+                if decode_hunk_line(line).is_none() {
+                    bail!("patch: line {number}: unexpected text '{line}'");
+                }
+                hunk.body = &text[hunk.body_start..cursor];
             }
             PatchOp::Add {
                 body, lines, bytes, ..
             } => {
-                let added_bytes = match line.as_bytes().first() {
-                    Some(b'+') => line.len(),         // remove '+' and append LF
-                    _ if line.trim().is_empty() => 1, // blank line becomes LF
-                    _ => bail!("patch: line {number}: unexpected text '{line}'"),
+                let Some(content) = add_file_line(raw_line) else {
+                    bail!("patch: line {number}: unexpected text '{line}'");
                 };
+                let added_bytes = content.len() + 1; // content plus LF
                 *bytes = bytes
                     .checked_add(added_bytes)
                     .ok_or_else(|| anyhow!("patch: added file byte count overflow"))?;
@@ -358,36 +650,48 @@ fn apply_patch_hunks<'a>(
     output_limit: usize,
     scratch_limit: usize,
 ) -> Result<(String, usize, usize)> {
-    // One borrowed slice per source line: unchanged text is never cloned.
-    // Keep this scratch index separate from the output-file byte ceiling.
-    // Patches add owned text only when line-ending normalization needs it.
-    let line_count = text
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        .saturating_add(1);
+    // Split on LF without manufacturing a phantom empty line after a
+    // terminator. Retain its presence separately for exact output assembly.
+    // `str::lines()` would strip CR and lose byte-for-byte source context.
+    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    let mut trailing_newline = text.ends_with('\n');
+    let line_count = newline_count + usize::from(!trailing_newline && !text.is_empty());
     let index_bytes = line_count.saturating_mul(std::mem::size_of::<WorkingLine<'_>>());
     if index_bytes > scratch_limit {
         bail!("patch source line index exceeds the remaining mutation plan budget");
     }
     let mut lines: Vec<WorkingLine<'_>> = Vec::with_capacity(line_count);
-    lines.extend(text.split('\n').map(WorkingLine::source));
-    let mut content_bytes = text.len() - lines.len().saturating_sub(1);
+    lines.extend(
+        text.split_terminator('\n')
+            .enumerate()
+            .map(|(index, line)| {
+                WorkingLine::source_line(line, index + 1 < line_count || trailing_newline)
+            }),
+    );
+    debug_assert_eq!(lines.len(), line_count);
+    let mut content_bytes = text.len() - newline_count;
     let mut from_line = 0_usize;
     let mut added = 0_usize;
     let mut removed = 0_usize;
 
     for (offset, hunk) in hunks.iter().enumerate() {
         let position = first_hunk + offset + 1;
-        let block = hunk
-            .lines
-            .iter()
-            .filter_map(|line| match line {
-                PatchLine::Context(text) => Some(*text),
-                PatchLine::Removed(text) => Some(*text),
-                PatchLine::Added(_) => None,
-            })
-            .collect::<Vec<_>>();
+        // Retain only source-consuming text for KMP, and only after the shared
+        // scratch budget is known. Dense pure-addition hunks allocate nothing
+        // here; the parser itself retains only the hunk's borrowed byte range.
+        let block_len = hunk.lines().filter_map(PatchLine::source_text).count();
+        let matcher_bytes = block_len
+            .checked_mul(std::mem::size_of::<&str>() + std::mem::size_of::<usize>())
+            .ok_or_else(|| anyhow!("patch match index size overflow"))?;
+        let live_index = lines
+            .capacity()
+            .checked_mul(std::mem::size_of::<WorkingLine<'_>>())
+            .ok_or_else(|| anyhow!("patch source index size overflow"))?;
+        if live_index.saturating_add(matcher_bytes) > scratch_limit {
+            bail!("patch context matching exceeds the remaining mutation plan budget");
+        }
+        let mut block = Vec::with_capacity(block_len);
+        block.extend(hunk.lines().filter_map(PatchLine::source_text));
         let mut search_start = from_line;
         if let Some(anchor) = hunk.anchor
             && let Some(at) = lines
@@ -401,169 +705,295 @@ fn apply_patch_hunks<'a>(
         }
         let near = search_start + 1;
 
-        if block.is_empty() {
-            bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
-        }
-
-        // Count ambiguity without retaining one usize per candidate line.
-        // A repetitive file can contain millions of matching lines; only a
-        // small diagnostic prefix is useful to the caller.
-        let (mut exact_count, mut lenient_count) = (0_usize, 0_usize);
-        let (mut exact_first, mut lenient_first) = (None, None);
-        let mut exact_preview = Vec::with_capacity(MAX_AMBIGUOUS_LINES);
-        let mut lenient_preview = Vec::with_capacity(MAX_AMBIGUOUS_LINES);
-        for start in search_start..lines.len() {
-            if start + block.len() > lines.len() {
-                break;
-            }
-            if lines[start..start + block.len()]
-                .iter()
-                .zip(&block)
-                .all(|(file, patch)| file.equals(patch))
-            {
-                exact_count += 1;
-                exact_first.get_or_insert(start);
-                if exact_preview.len() < MAX_AMBIGUOUS_LINES {
-                    exact_preview.push(start + 1);
-                }
-            } else if lines[start..start + block.len()]
-                .iter()
-                .zip(&block)
-                .all(|(file, patch)| file.equals_trimmed(patch))
-            {
-                lenient_count += 1;
-                lenient_first.get_or_insert(start);
-                if lenient_preview.len() < MAX_AMBIGUOUS_LINES {
-                    lenient_preview.push(start + 1);
-                }
-            }
-        }
-        let (first, matches, preview) = if exact_count > 0 {
-            (exact_first, exact_count, exact_preview)
-        } else {
-            (lenient_first, lenient_count, lenient_preview)
-        };
-        let Some(start) = first else {
-            bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
-        };
-        if matches > 1 {
-            let lines_listed = preview
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
+        // Only an explicit EOF marker can locate an insertion without any
+        // existing context. An empty hunk itself still has no work to apply.
+        if block.is_empty() && (!hunk.at_end_of_file || hunk.lines().next().is_none()) {
             bail!(
-                "hunk {position}/{total_hunks} ({display}): context matches {matches} locations (lines {lines_listed})"
+                "hunk {position}/{total_hunks} ({display}): context-free insertion requires '*** End of File' and an added line"
             );
         }
 
-        if hunk.at_end_of_file {
-            // `text.split('\n')` yields one empty tail for a trailing newline;
-            // it is not a line the marker can refer to.
-            let file_lines =
-                lines.len() - usize::from(lines.last().is_some_and(|line| line.is_empty()));
-            if start + block.len() != file_lines {
+        let start = if block.is_empty() {
+            lines.len()
+        } else {
+            // Match context once per policy, counting only positions eligible
+            // under an explicit EOF constraint. Exact matches outrank trimmed
+            // matches *among eligible positions*, not anywhere in the file.
+            let locate = |trimmed: bool| {
+                let mut count = 0_usize;
+                let mut first = None;
+                let mut preview = Vec::with_capacity(MAX_AMBIGUOUS_LINES);
+                super::matching::scan_sequence(
+                    &block,
+                    &lines,
+                    search_start,
+                    |a, b| match trimmed {
+                        true => a.trim_end() == b.trim_end(),
+                        false => a == b,
+                    },
+                    |line, pattern| match trimmed {
+                        true => line.equals_trimmed(pattern),
+                        false => line.equals(pattern),
+                    },
+                    |at| {
+                        if hunk.at_end_of_file && at + block_len != lines.len() {
+                            return;
+                        }
+                        count += 1;
+                        first.get_or_insert(at);
+                        if preview.len() < MAX_AMBIGUOUS_LINES {
+                            preview.push(at + 1);
+                        }
+                    },
+                );
+                (first, count, preview)
+            };
+            let (mut first, mut matches, mut preview) = locate(false);
+            if matches == 0 {
+                (first, matches, preview) = locate(true);
+            }
+            let Some(start) = first else {
+                if hunk.at_end_of_file {
+                    bail!(
+                        "hunk {position}/{total_hunks} ({display}): '*** End of File' requires the hunk to end at the end of the file (line {})",
+                        lines.len()
+                    );
+                }
                 bail!(
-                    "hunk {position}/{total_hunks} ({display}): '*** End of File' requires the hunk to end at the end of the file (line {file_lines})"
+                    "hunk {position}/{total_hunks} ({display}): context not found near line {near}"
+                );
+            };
+            if matches > 1 {
+                let lines_listed = preview
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "hunk {position}/{total_hunks} ({display}): context matches {matches} locations (lines {lines_listed})"
                 );
             }
+            start
+        };
+
+        // Pure context does not change the working line index. Avoid building
+        // and splicing a full duplicate replacement list for a no-op hunk.
+        if hunk
+            .lines()
+            .all(|line| matches!(line, PatchLine::Context(_)))
+        {
+            from_line = start + block.len();
+            continue;
         }
 
-        // Before allocating replacement lines or expanding the index, compute
-        // both the resulting file size and scratch usage. Very dense added
-        // lines can make the Cow index expensive even for a tiny source.
-        let file_crlf = lines.get(start).is_some_and(|line| line.ends_with_cr());
+        drop(block);
+
+        // Preflight final bytes and scratch usage before allocating. Dense
+        // added lines can need a large index even for a tiny source.
+        let file_crlf = crlf_for_edit(&lines, start, trailing_newline);
         let replacement_count = hunk
-            .lines
-            .iter()
+            .lines()
             .filter(|line| !matches!(line, PatchLine::Removed(_)))
             .count();
         let next_line_count = lines
             .len()
-            .checked_sub(block.len())
+            .checked_sub(block_len)
             .and_then(|n| n.checked_add(replacement_count))
             .ok_or_else(|| anyhow!("patch line count overflow"))?;
-        let removed_bytes = lines[start..start + block.len()]
+        let removed_bytes = lines[start..start + block_len]
             .iter()
             .try_fold(0_usize, |total, line| total.checked_add(line.len()))
             .ok_or_else(|| anyhow!("patch line size overflow"))?;
-        let mut replacement_bytes = 0_usize;
-        let mut original_line = 0_usize;
-        for line in &hunk.lines {
-            let size = match line {
-                PatchLine::Context(_) => {
-                    let size = lines[start + original_line].len();
-                    original_line += 1;
-                    size
+        // Use the same allocation-free hunk iterator for preflight, direct
+        // output and in-place edits. Group-local styles prevent preceding
+        // context from changing a replacement line's delimiter.
+        let mut replacement_bytes = Some(0_usize);
+        let mut produced_lines = start;
+        let original_unterminated =
+            !trailing_newline && lines.last().is_some_and(|line| !line.terminated);
+        let mut original_last_out = (original_unterminated && start == lines.len())
+            .then_some(lines.len().saturating_sub(1));
+        let mut last_replacement = None;
+        visit_hunk(
+            HunkSource {
+                lines: &lines,
+                base: 0,
+            },
+            start,
+            hunk,
+            file_crlf,
+            |action| {
+                let replacement = match action {
+                    HunkAction::Keep { source_index, line } => {
+                        if original_unterminated && source_index + 1 == lines.len() {
+                            original_last_out = Some(produced_lines);
+                        }
+                        produced_lines += 1;
+                        Some(line)
+                    }
+                    HunkAction::Remove => None,
+                    HunkAction::Add(line) => {
+                        produced_lines += 1;
+                        Some(line)
+                    }
+                };
+                if let Some(line) = replacement {
+                    last_replacement = Some(line);
+                    replacement_bytes =
+                        replacement_bytes.and_then(|sum| sum.checked_add(line.len()));
                 }
-                PatchLine::Removed(_) => {
-                    original_line += 1;
-                    0
-                }
-                PatchLine::Added(text) => WorkingLine::added(text, file_crlf).len(),
-            };
-            replacement_bytes = replacement_bytes
-                .checked_add(size)
-                .ok_or_else(|| anyhow!("patch replacement size overflow"))?;
-        }
+            },
+        );
+        let replacement_bytes =
+            replacement_bytes.ok_or_else(|| anyhow!("patch replacement size overflow"))?;
         let next_content = content_bytes
             .checked_sub(removed_bytes)
             .and_then(|size| size.checked_add(replacement_bytes))
             .ok_or_else(|| anyhow!("patch replacement size overflow"))?;
+        let next_trailing_newline = trailing_newline && next_line_count > 0;
+        let bridge_style = crlf_for_edit(&lines, lines.len().saturating_sub(1), trailing_newline);
+        let bridge_cr = original_last_out.is_some_and(|position| {
+            position + 1 < next_line_count
+                && lines
+                    .last()
+                    .is_some_and(|line| requires_bridge_cr(*line, bridge_style))
+        });
+        // When deleting an unterminated last line, a preceding CRLF's CR no
+        // longer has an LF to precede. Include that one-byte normalization in
+        // the *preflight* length, so a result at the exact byte ceiling fits.
+        let last_after = if start + block_len < lines.len() {
+            lines.last().copied()
+        } else {
+            last_replacement.or_else(|| start.checked_sub(1).map(|index| lines[index]))
+        };
+        let drop_final_cr =
+            !next_trailing_newline && last_after.is_some_and(|line| line.delimiter_cr);
         let next_size = next_content
             .checked_add(next_line_count.saturating_sub(1))
+            .and_then(|size| size.checked_add(usize::from(next_trailing_newline)))
+            .and_then(|size| size.checked_sub(usize::from(drop_final_cr)))
+            .and_then(|size| size.checked_add(usize::from(bridge_cr)))
             .ok_or_else(|| anyhow!("patch result size overflow"))?;
         if next_size > output_limit {
             bail!(
                 "patch result would be {next_size} bytes, above the {output_limit}-byte write limit"
             );
         }
-        let index_bytes = next_line_count
+        // A final hunk never needs a new line index. Construct the final text
+        // directly from the old index and borrowed patch lines. This is also
+        // what makes million-line additions use only their output buffer.
+        if offset + 1 == hunks.len() {
+            if live_index.saturating_add(next_size) > scratch_limit {
+                bail!("patch working buffers exceed the remaining mutation plan budget");
+            }
+            let mut output =
+                LineOutput::new(next_size, next_line_count, next_trailing_newline, bridge_cr);
+            for &line in &lines[..start] {
+                output.push(line);
+            }
+            visit_hunk(
+                HunkSource {
+                    lines: &lines,
+                    base: 0,
+                },
+                start,
+                hunk,
+                file_crlf,
+                |action| match action {
+                    HunkAction::Keep { line, .. } => output.push(line),
+                    HunkAction::Remove => removed += 1,
+                    HunkAction::Add(line) => {
+                        added += 1;
+                        output.push(line);
+                    }
+                },
+            );
+            for &line in &lines[start + block_len..] {
+                output.push(line);
+            }
+            let result = output.finish();
+            if result.len() != next_size {
+                bail!("patch output size changed during planning");
+            }
+            return Ok((result, added, removed));
+        }
+
+        // Earlier hunks need a live index for subsequent context matching.
+        // Copy only the consumed span plus one unconsumed boundary line. The
+        // boundary keeps pure-insertion separator selection identical to the
+        // full-source path without allocating a replacement-sized Vec.
+        let index_bytes = lines
+            .capacity()
+            .max(next_line_count)
             .checked_mul(std::mem::size_of::<WorkingLine<'_>>())
             .ok_or_else(|| anyhow!("patch line index size overflow"))?;
-        // The per-hunk replacement Vec exists briefly beside the main line
-        // index, so charge its Cow slots before allocating it as well.
-        let replacement_slots = replacement_count
-            .checked_mul(std::mem::size_of::<WorkingLine<'_>>())
-            .ok_or_else(|| anyhow!("patch replacement index size overflow"))?;
+        let snapshot_lines = block_len + usize::from(start + block_len < lines.len());
         if index_bytes
             .saturating_add(next_size)
-            .saturating_add(replacement_slots)
+            .saturating_add(snapshot_lines.saturating_mul(std::mem::size_of::<WorkingLine<'_>>()))
             > scratch_limit
         {
             bail!("patch working buffers exceed the remaining mutation plan budget");
         }
-
-        let mut replacement = Vec::with_capacity(replacement_count);
-        // Added lines inherit the terminator of the file they land in. The
-        // patch itself often carries LF because numbered `read` strips `\r`,
-        // so preserving only the patch's bytes would produce mixed endings in
-        // a CRLF file.
-        // Cursor into the consumed block: only context/removed lines consume
-        // existing file lines.
+        let consumed = lines[start..start + snapshot_lines].to_vec();
+        let old_len = lines.len();
+        if next_line_count > old_len {
+            lines.reserve_exact(next_line_count - old_len);
+            lines.resize(next_line_count, WorkingLine::source(""));
+            lines.copy_within(start + block_len..old_len, start + replacement_count);
+        } else if next_line_count < old_len {
+            lines.copy_within(start + block_len..old_len, start + replacement_count);
+            lines.truncate(next_line_count);
+        }
         let mut consumed_at = 0_usize;
-        for line in &hunk.lines {
-            match line {
-                // Keep the file's own bytes for context lines, so a lenient
-                // match never rewrites trailing whitespace it did not touch.
-                PatchLine::Context(_) => {
-                    replacement.push(lines[start + consumed_at]);
+        let mut write_at = start;
+        visit_hunk(
+            HunkSource {
+                lines: &consumed,
+                base: start,
+            },
+            start,
+            hunk,
+            file_crlf,
+            |action| match action {
+                HunkAction::Keep { line, .. } => {
+                    lines[write_at] = line;
+                    write_at += 1;
                     consumed_at += 1;
                 }
-                PatchLine::Removed(_) => {
+                HunkAction::Remove => {
                     removed += 1;
                     consumed_at += 1;
                 }
-                PatchLine::Added(text) => {
+                HunkAction::Add(line) => {
                     added += 1;
-                    replacement.push(WorkingLine::added(text, file_crlf));
+                    lines[write_at] = line;
+                    write_at += 1;
                 }
-            }
-        }
-        let replacement_len = replacement.len();
-        lines.splice(start..start + block.len(), replacement);
+            },
+        );
+        debug_assert_eq!(consumed_at, block_len);
+        debug_assert_eq!(write_at, start + replacement_count);
         content_bytes = next_content;
-        from_line = start + replacement_len;
+        if bridge_cr {
+            let previous = &mut lines[original_last_out.expect("bridge has a source line")];
+            previous.append_cr = true;
+            previous.terminated = true;
+            previous.delimiter_cr = true;
+            content_bytes += 1;
+        }
+        trailing_newline = next_trailing_newline;
+        if !trailing_newline
+            && lines
+                .last_mut()
+                .is_some_and(WorkingLine::drop_terminal_delimiter_cr)
+        {
+            content_bytes -= 1;
+            debug_assert!(drop_final_cr);
+        } else {
+            debug_assert!(!drop_final_cr);
+        }
+        from_line = start + replacement_count;
     }
 
     // Inspect the exact projected join size before allocating the final
@@ -572,6 +1002,7 @@ fn apply_patch_hunks<'a>(
         .iter()
         .try_fold(0_usize, |sum, line| sum.checked_add(line.len()))
         .and_then(|sum| sum.checked_add(lines.len().saturating_sub(1)))
+        .and_then(|sum| sum.checked_add(usize::from(trailing_newline)))
         .ok_or_else(|| anyhow!("patch result size overflow"))?;
     if bytes > output_limit {
         bail!("patch result would be {bytes} bytes, above the {output_limit}-byte write limit");
@@ -584,12 +1015,13 @@ fn apply_patch_hunks<'a>(
     if final_index.saturating_add(bytes) > scratch_limit {
         bail!("patch working buffers exceed the remaining mutation plan budget");
     }
-    let mut result = String::with_capacity(bytes);
-    for (index, line) in lines.iter().enumerate() {
-        if index != 0 {
-            result.push('\n');
-        }
-        line.append_to(&mut result);
+    let mut output = LineOutput::new(bytes, lines.len(), trailing_newline, false);
+    for line in lines {
+        output.push(line);
+    }
+    let result = output.finish();
+    if result.len() != bytes {
+        bail!("patch output size changed during planning");
     }
     Ok((result, added, removed))
 }
@@ -722,9 +1154,8 @@ impl LocalMachine {
         }
 
         // Hold every resolved target for the whole plan -> verify -> stage ->
-        // commit sequence. Shard indices are acquired in sorted order, so a
-        // multi-file patch cannot deadlock and independent files stay
-        // concurrent.
+        // commit sequence. Exact path locks are acquired in sorted order, so
+        // multi-file patches cannot deadlock or collide on hash shards.
         let _mutation = self
             .lock_mutations(
                 resolved_sections
@@ -810,9 +1241,9 @@ impl LocalMachine {
                         budget.add(0, *bytes)?;
                         let mut text = String::with_capacity(*bytes);
                         for line in patch_lines(&args.patch[body.clone()]) {
-                            if let Some(content) = line.strip_prefix('+') {
-                                text.push_str(content);
-                            }
+                            let content = add_file_line(line)
+                                .expect("validated add-file lines stay valid");
+                            text.push_str(content);
                             text.push('\n');
                         }
                         debug_assert_eq!(text.len(), *bytes);
@@ -902,7 +1333,7 @@ impl LocalMachine {
 #[tool_router(router = "patch_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Apply a Codex-grammar patch with per-file atomic replacement. Supports \"*** Update File:\" hunks and \"*** Add File:\" only; the Codex \"*** End of File\" marker is enforced (the hunk must end at the last line), while Delete and Move are rejected. At most 32 files and 64 hunks per call. Hunks are located by their context lines (exact first, then trailing-whitespace-tolerant), an ambiguous match fails, and hunks apply top-down within a file. `*** Add File` is create-only and a path claimed by two sections is refused. Every file is planned and re-checked before any commit; each file replacement is atomic, but the multi-file commit sequence is not a transaction, so a commit failure can leave earlier files replaced. best_effort writes the files that planned cleanly and reports the rest. Returns a receipt with per-file hunks/added/removed and mode (strict or best_effort).",
+        description = "Apply a Codex-grammar patch with per-file atomic replacement. Supports \"*** Update File:\" hunks and \"*** Add File:\" only; the Codex \"*** End of File\" marker restricts eligible context matches to EOF and can anchor an addition-only append; unanchored context-free hunks, Delete and Move are rejected. At most 32 files and 64 hunks per call. Hunks are located by their context lines (exact first, then trailing-whitespace-tolerant), an ambiguous match fails, and hunks apply top-down within a file. `*** Add File` is create-only and a path claimed by two sections is refused. Every file is planned and re-checked before any commit; each file replacement is atomic, but the multi-file commit sequence is not a transaction, so a commit failure can leave earlier files replaced. best_effort writes the files that planned cleanly and reports the rest. Returns a receipt with per-file hunks/added/removed and mode (strict or best_effort).",
         annotations(
             title = "Apply patch",
             read_only_hint = false,
@@ -934,19 +1365,123 @@ mod tests {
     }
 
     #[test]
+    fn literal_terminal_cr_and_crlf_syntax_are_distinct() {
+        // LF patch syntax: a CR in the content is literal, including a file
+        // without a final LF. Equal replacement never erases that content.
+        let literal =
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n-abc\r\n+abc\r\n*** End Patch\n";
+        let patch = parse_patch(literal).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        for source in ["abc\r", "before\nabc\r", "before\r\nabc\r"] {
+            let (got, ..) = apply_patch_hunks(source, hunks, "f.txt", 0, 1, 4096, 4096).unwrap();
+            assert_eq!(got, source, "source {source:?}");
+        }
+        let patch = parse_patch(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n-abc\r\n+abcd\r\n*** End Patch\n",
+        )
+        .unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        let (got, ..) =
+            apply_patch_hunks("before\nabc\r", hunks, "f.txt", 0, 1, 4096, 4096).unwrap();
+        assert_eq!(got, "before\nabcd\r");
+
+        // A CRLF *patch* has CRLF syntax on its header and its data lines.
+        // Those syntactic CRs must not leak into an LF target; a doubled CR
+        // still unambiguously expresses one literal CR before the delimiter.
+        let crlf_patch =
+            "*** Begin Patch\r\n*** Update File: f.txt\r\n@@\r\n-abc\r\n+ABC\r\n*** End Patch\r\n";
+        let patch = parse_patch(crlf_patch).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        for (source, expected) in [("abc\n", "ABC\n"), ("abc\r\n", "ABC\r\n")] {
+            let (got, ..) = apply_patch_hunks(source, hunks, "f.txt", 0, 1, 4096, 4096).unwrap();
+            assert_eq!(got, expected);
+        }
+        let patch = parse_patch("*** Begin Patch\r\n*** Update File: f.txt\r\n@@\r\n-abc\r\n+ABC\r\r\n*** End Patch\r\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        let (got, ..) = apply_patch_hunks("abc\n", hunks, "f.txt", 0, 1, 4096, 4096).unwrap();
+        assert_eq!(got, "ABC\r\r\n");
+    }
+
+    #[test]
+    fn added_line_literal_cr_gets_an_independent_separator() {
+        let patch = parse_patch(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new\r\n+next\n*** End Patch\n",
+        )
+        .unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        let (text, ..) = apply_patch_hunks("old\n", hunks, "f.txt", 0, 1, 4096, 4096).unwrap();
+        assert_eq!(text, "new\r\r\nnext\n");
+        assert!(apply_patch_hunks("old\n", hunks, "f.txt", 0, 1, text.len() - 1, 4096).is_err());
+        assert_eq!(
+            apply_patch_hunks("old\n", hunks, "f.txt", 0, 1, text.len(), 4096)
+                .unwrap()
+                .0,
+            text
+        );
+
+        let patch = parse_patch(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new\r\n*** End Patch\n",
+        )
+        .unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        assert_eq!(
+            apply_patch_hunks("old\n", hunks, "f.txt", 0, 1, 4096, 4096)
+                .unwrap()
+                .0,
+            "new\r\r\n"
+        );
+        assert_eq!(
+            apply_patch_hunks("old", hunks, "f.txt", 0, 1, 4096, 4096)
+                .unwrap()
+                .0,
+            "new\r"
+        );
+    }
+
+    #[test]
+    fn eof_append_inherits_separators_without_rewriting_literal_content() {
+        let patch = parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n+one\n+two\n*** End of File\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        for (source, expected) in [
+            ("a\r\nb", "a\r\nb\r\none\r\ntwo"),
+            ("a\r\nb\r", "a\r\nb\r\r\none\r\ntwo"),
+            ("a\r", "a\r\r\none\ntwo"),
+            ("a\r\nb\r\n", "a\r\nb\r\none\r\ntwo\r\n"),
+        ] {
+            let (got, ..) = apply_patch_hunks(source, hunks, "f.txt", 0, 1, 4096, 4096).unwrap();
+            assert_eq!(got, expected, "source {source:?}");
+        }
+    }
+
+    #[test]
     fn crlf_adjustment_is_borrowed_and_comparable_between_hunks() {
         let added = WorkingLine::added("hello", true);
         assert_eq!(added.len(), 6);
-        assert!(added.ends_with_cr());
-        assert!(added.equals("hello\r"));
+        assert!(added.delimiter_cr);
+        assert!(added.equals("hello"));
         assert!(added.equals_trimmed("hello"));
         assert!(added.contains("lo\r"));
         let mut output = String::new();
         added.append_to(&mut output);
         assert_eq!(output, "hello\r");
         let normalized = WorkingLine::added("hello\r", false);
-        assert!(normalized.equals("hello"));
-        assert!(!normalized.ends_with_cr());
+        assert!(normalized.equals("hello\r"));
+        assert!(normalized.delimiter_cr);
+        assert_eq!(normalized.len(), "hello\r\r".len());
         let patch = parse_patch("*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n@@\n-last\n+LAST\n*** End Patch\n").unwrap();
         let PatchOp::Update { hunks, .. } = &patch[0] else {
             panic!("expected update")
@@ -985,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn line_index_growth_is_rejected_before_expanding_temp_buffers() {
+    fn final_hunk_avoids_an_unnecessary_replacement_index() {
         let input = format!(
             "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n{}*** End Patch\n",
             "+x\n".repeat(250)
@@ -994,10 +1529,334 @@ mod tests {
         let PatchOp::Update { hunks, .. } = &patch[0] else {
             panic!("expected update")
         };
-        let error = apply_patch_hunks("old\n", hunks, "file.txt", 0, 1, 4096, 1024)
+        let (output, added, removed) =
+            apply_patch_hunks("old\n", hunks, "file.txt", 0, 1, 4096, 1024).unwrap();
+        assert_eq!(output, "x\n".repeat(250));
+        assert_eq!((added, removed), (250, 1));
+        let error = apply_patch_hunks("old\n", hunks, "file.txt", 0, 1, 4096, 250)
             .unwrap_err()
             .to_string();
         assert!(error.contains("working buffers"), "{error}");
+    }
+
+    #[test]
+    fn dense_early_hunk_uses_in_place_index_splice() {
+        let input = format!(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n anchor\n{}@@\n-end\n+END\n*** End Patch\n",
+            "+x\n".repeat(350_000)
+        );
+        let patch = parse_patch(&input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        let (output, added, removed) = apply_patch_hunks(
+            "anchor\nend\n",
+            hunks,
+            "file.txt",
+            0,
+            2,
+            2 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!((added, removed), (350_001, 1));
+        assert_eq!(output.len(), 700_011);
+        assert!(output.starts_with("anchor\nx\nx\n"));
+        assert!(output.ends_with("x\nEND\n"));
+    }
+
+    #[test]
+    fn adjacent_replacements_preserve_each_removed_line_separator() {
+        let source = "alpha\r\nbeta\nomega\n";
+        for additions_first in [false, true] {
+            let group = if additions_first {
+                "+ALPHA\n+BETA\n-alpha\n-beta\n"
+            } else {
+                "-alpha\n-beta\n+ALPHA\n+BETA\n"
+            };
+            for later_hunk in [false, true] {
+                let extra = if later_hunk {
+                    "@@\n-omega\n+OMEGA\n"
+                } else {
+                    ""
+                };
+                let patch = format!(
+                    "*** Begin Patch\n*** Update File: f.txt\n@@\n{group}{extra}*** End Patch\n"
+                );
+                let parsed = parse_patch(&patch).unwrap();
+                let PatchOp::Update { hunks, .. } = &parsed[0] else {
+                    panic!("update")
+                };
+                let actual = apply_patch_hunks(source, hunks, "f.txt", 0, hunks.len(), 4096, 8192)
+                    .unwrap()
+                    .0;
+                let expected = if later_hunk {
+                    "ALPHA\r\nBETA\nOMEGA\n"
+                } else {
+                    "ALPHA\r\nBETA\nomega\n"
+                };
+                assert_eq!(
+                    actual, expected,
+                    "additions_first={additions_first}, later_hunk={later_hunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unequal_replacement_groups_inherit_last_removed_separator_for_excess_additions() {
+        let source = "a\r\nb\nc\n";
+        let input = "*** Begin Patch\n*** Update File: f.txt\n@@\n-a\n-b\n+ONE\n+TWO\n+THREE\n*** End Patch\n";
+        let parsed = parse_patch(input).unwrap();
+        let PatchOp::Update { hunks, .. } = &parsed[0] else {
+            panic!("update")
+        };
+        assert_eq!(
+            apply_patch_hunks(source, hunks, "f.txt", 0, 1, 4096, 4096)
+                .unwrap()
+                .0,
+            "ONE\r\nTWO\nTHREE\nc\n"
+        );
+    }
+
+    #[test]
+    fn eof_append_preserves_literal_cr_as_content_across_both_hunk_paths() {
+        let append = "+next\n*** End of File\n";
+        let cases = [
+            ("original\r", "original\r\r\nnext"),
+            ("head\noriginal\r", "head\noriginal\r\r\nnext"),
+            ("head\r\noriginal\r", "head\r\noriginal\r\r\nnext"),
+            ("original", "original\nnext"),
+            ("head\r\noriginal", "head\r\noriginal\r\nnext"),
+        ];
+        for (source, expected) in cases {
+            let input =
+                format!("*** Begin Patch\n*** Update File: f.txt\n@@\n{append}*** End Patch\n");
+            let parsed = parse_patch(&input).unwrap();
+            let PatchOp::Update { hunks, .. } = &parsed[0] else {
+                panic!("update")
+            };
+            let (result, added, removed) =
+                apply_patch_hunks(source, hunks, "f.txt", 0, 1, expected.len(), 4096).unwrap();
+            assert_eq!(result, expected, "source={source:?}");
+            assert_eq!((added, removed), (1, 0));
+            // Preflight rejects the byte immediately below the exact result;
+            // no unsafe allocation or output can occur on a too-small plan.
+            if expected.len() > 1 {
+                assert!(
+                    apply_patch_hunks(source, hunks, "f.txt", 0, 1, expected.len() - 1, 4096)
+                        .is_err()
+                );
+            }
+            // First a matching no-op hunk, then EOF append. The final hunk's
+            // source may have passed through earlier planning unaffected.
+            if source.starts_with("head") {
+                let multi = format!(
+                    "*** Begin Patch\n*** Update File: f.txt\n@@\n head\n@@\n{append}*** End Patch\n"
+                );
+                let parsed = parse_patch(&multi).unwrap();
+                let PatchOp::Update { hunks, .. } = &parsed[0] else {
+                    panic!("update")
+                };
+                let got =
+                    apply_patch_hunks(source, hunks, "f.txt", 0, hunks.len(), expected.len(), 4096)
+                        .unwrap()
+                        .0;
+                assert_eq!(got, expected, "multi-hunk source={source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn literal_cr_on_both_sides_of_an_eof_append_preserves_all_content() {
+        let patch = parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n+one\r\n+two\r\n*** End of File\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        let expected = "original\r\r\none\r\r\ntwo\r";
+        let (got, added, removed) =
+            apply_patch_hunks("original\r", hunks, "f.txt", 0, 1, expected.len(), 4096).unwrap();
+        assert_eq!((added, removed), (2, 0));
+        assert_eq!(got, expected);
+        assert!(
+            apply_patch_hunks("original\r", hunks, "f.txt", 0, 1, expected.len() - 1, 4096)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn transitioning_to_unterminated_last_line_updates_line_metadata() {
+        let mut crlf = WorkingLine::source_line("foo\r", true);
+        assert!(crlf.drop_terminal_delimiter_cr());
+        assert!(!crlf.terminated);
+        assert_eq!(crlf.text, "foo");
+        let mut lf = WorkingLine::source_line("foo", true);
+        assert!(!lf.drop_terminal_delimiter_cr());
+        assert!(!lf.terminated);
+    }
+
+    #[test]
+    fn separator_selection_uses_replaced_lines_not_preceding_context() {
+        let scenarios = [
+            ("context\r\ntarget\nend\n", "context\r\nchanged\nend\n"),
+            ("context\ntarget\r\nend\n", "context\nchanged\r\nend\n"),
+            ("context\r\ntarget\nend", "context\r\nchanged\nend"),
+        ];
+        for (source, expected) in scenarios {
+            for with_context in [false, true] {
+                let context = if with_context { " context\n" } else { "" };
+                let input = format!(
+                    "*** Begin Patch\n*** Update File: f.txt\n@@\n{context}-target\n+changed\n*** End Patch\n"
+                );
+                let parsed = parse_patch(&input).unwrap();
+                let PatchOp::Update { hunks, .. } = &parsed[0] else {
+                    panic!("update")
+                };
+                let (actual, added, removed) =
+                    apply_patch_hunks(source, hunks, "f.txt", 0, 1, 4096, 4096).unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "source={source:?}, context={with_context}"
+                );
+                assert_eq!((added, removed), (1, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn group_local_styles_remain_correct_in_both_multi_hunk_and_final_hunk_paths() {
+        let original = "anchor\r\nfirst\ncontext\ntarget\r\nlast\n";
+        // Both groups are in one hunk: the first replacement is LF and the
+        // second CRLF, even though their context lines use the opposite style.
+        let combined = parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n anchor\n-first\n+FIRST\n context\n-target\n+TARGET\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &combined[0] else {
+            panic!("update")
+        };
+        let expected = "anchor\r\nFIRST\ncontext\nTARGET\r\nlast\n";
+        assert_eq!(
+            apply_patch_hunks(original, hunks, "f.txt", 0, 1, 4096, 8192)
+                .unwrap()
+                .0,
+            expected
+        );
+
+        // The same replacements with a later hunk exercise the in-place
+        // index path before the shared final-output assembler takes over.
+        let multiple = parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n anchor\n-first\n+FIRST\n context\n-target\n+TARGET\n@@\n-last\n+LAST\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &multiple[0] else {
+            panic!("update")
+        };
+        assert_eq!(
+            apply_patch_hunks(original, hunks, "f.txt", 0, 2, 4096, 8192)
+                .unwrap()
+                .0,
+            "anchor\r\nFIRST\ncontext\nTARGET\r\nLAST\n"
+        );
+    }
+
+    #[test]
+    fn insertion_groups_use_actual_insertion_site_style() {
+        let original = "context\r\nnext\nend\n";
+        let patch = parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n context\n+insert\n next\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        assert_eq!(
+            apply_patch_hunks(original, hunks, "f.txt", 0, 1, 4096, 4096)
+                .unwrap()
+                .0,
+            "context\r\ninsert\nnext\nend\n"
+        );
+    }
+
+    #[test]
+    fn trailing_pure_insertion_style_does_not_depend_on_optional_context() {
+        let original = "anchor\nnext\r\nend\n";
+        let expected = "anchor\ninsert\r\nnext\r\nend\n";
+        for trailing_context in ["", " next\n"] {
+            let input = format!(
+                "*** Begin Patch\n*** Update File: f.txt\n@@\n anchor\n+insert\n{trailing_context}*** End Patch\n"
+            );
+            let patch = parse_patch(&input).unwrap();
+            let PatchOp::Update { hunks, .. } = &patch[0] else {
+                panic!("update")
+            };
+            assert_eq!(
+                apply_patch_hunks(original, hunks, "f.txt", 0, 1, 4096, 4096)
+                    .unwrap()
+                    .0,
+                expected,
+                "trailing context={trailing_context:?}"
+            );
+        }
+
+        // The same boundary lookup must survive the in-place path used when a
+        // later hunk still needs the working line index.
+        let input = "*** Begin Patch\n*** Update File: f.txt\n@@\n anchor\n+insert\n@@\n-end\n+END\n*** End Patch\n";
+        let patch = parse_patch(input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        assert_eq!(
+            apply_patch_hunks(original, hunks, "f.txt", 0, 2, 4096, 8192)
+                .unwrap()
+                .0,
+            "anchor\ninsert\r\nnext\r\nEND\n"
+        );
+    }
+
+    #[test]
+    fn eof_constraints_select_only_eligible_context_candidates() {
+        let input = "*** Begin Patch\n*** Update File: file.txt\n@@\n-foo\n+BAR\n*** End of File\n*** End Patch\n";
+        let patch = parse_patch(input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        for (source, expected) in [
+            ("foo\nfoo\n", "foo\nBAR\n"),
+            ("foo\nfoo  \n", "foo\nBAR\n"),
+            ("foo  \nfoo\n", "foo  \nBAR\n"),
+            ("foo\r\nfoo\r\n", "foo\r\nBAR\r\n"),
+        ] {
+            let (actual, added, removed) =
+                apply_patch_hunks(source, hunks, "file.txt", 0, 1, 4096, 4096).unwrap();
+            assert_eq!(actual, expected, "source={source:?}");
+            assert_eq!((added, removed), (1, 1));
+        }
+        let error = apply_patch_hunks("foo\nbar\n", hunks, "file.txt", 0, 1, 4096, 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires the hunk to end"), "{error}");
+    }
+
+    #[test]
+    fn eof_only_insertions_append_without_inventing_source_context() {
+        let patch = parse_patch("*** Begin Patch\n*** Update File: file.txt\n@@\n+hello\n*** End of File\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        for (source, expected) in [
+            ("", "hello"),
+            ("foo", "foo\nhello"),
+            ("foo\n", "foo\nhello\n"),
+            ("foo\r\n", "foo\r\nhello\r\n"),
+            ("foo\r\nbar", "foo\r\nbar\r\nhello"),
+        ] {
+            let (actual, added, removed) =
+                apply_patch_hunks(source, hunks, "file.txt", 0, 1, 4096, 4096).unwrap();
+            assert_eq!(actual, expected, "source={source:?}");
+            assert_eq!((added, removed), (1, 0));
+        }
+        let unanchored =
+            parse_patch("*** Begin Patch\n*** Update File: file.txt\n@@\n+hello\n*** End Patch\n")
+                .unwrap();
+        let PatchOp::Update { hunks, .. } = &unanchored[0] else {
+            panic!("expected update")
+        };
+        let error = apply_patch_hunks("foo\n", hunks, "file.txt", 0, 1, 4096, 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires '*** End of File'"), "{error}");
     }
 
     #[test]
@@ -1028,13 +1887,42 @@ mod tests {
             PatchOp::Update { path, hunks } => {
                 assert!(inside(path));
                 assert!(inside(hunks[0].anchor.unwrap()));
-                assert!(hunks[0].lines.iter().all(|line| match line {
+                assert!(hunks[0].lines().all(|line| match line {
                     PatchLine::Context(s) | PatchLine::Removed(s) | PatchLine::Added(s) =>
                         inside(s),
                 }));
+                assert_eq!(hunks[0].body, "-before\n+after\n");
             }
             _ => panic!("expected update"),
         }
+    }
+
+    #[test]
+    fn add_file_blank_forms_share_exact_byte_preflight_and_output() {
+        let forms = [
+            "*** Begin Patch\r\n*** Add File: f.txt\r\n+first\r\n\r\n+last\r\n*** End Patch\r\n",
+            "*** Begin Patch\r\n*** Add File: f.txt\r\n+first\r\n+\r\n+last\r\n*** End Patch\r\n",
+            "*** Begin Patch\r\n*** Add File: f.txt\r\n+first\r\n  \r\n+last\r\n*** End Patch\r\n",
+        ];
+        for input in forms {
+            let parsed = parse_patch(input).unwrap();
+            let PatchOp::Add {
+                body, lines, bytes, ..
+            } = &parsed[0]
+            else {
+                panic!("add")
+            };
+            let actual = patch_lines(&input[body.clone()])
+                .map(|line| format!("{}\n", add_file_line(line).unwrap()))
+                .collect::<String>();
+            assert_eq!(actual, "first\r\n\r\nlast\r\n");
+            assert_eq!(*bytes, actual.len());
+            assert_eq!(*lines, 3);
+        }
+        for input in ["", "\r", " ", "  \t\r", "+", "+\r", "+a\r"] {
+            assert!(add_file_line(input).is_some(), "{input:?}");
+        }
+        assert_eq!(add_file_line("-invalid"), None);
     }
 
     #[test]
@@ -1050,12 +1938,9 @@ mod tests {
         };
         assert_eq!(*lines, 3);
         let actual = patch_lines(&input[body.clone()])
-            .map(|line| {
-                let content = line.strip_prefix('+').unwrap_or("");
-                format!("{content}\n")
-            })
+            .map(|line| format!("{}\n", add_file_line(line).unwrap()))
             .collect::<String>();
-        assert_eq!(actual, "hello\r\n\n\r\n");
+        assert_eq!(actual, "hello\r\n\r\n\r\n");
         assert_eq!(*bytes, actual.len());
     }
 
@@ -1068,6 +1953,24 @@ mod tests {
         patch.push_str("*** UNKNOWN INVALID DIRECTIVE\n");
         let error = parse_patch(&patch).unwrap_err().to_string();
         assert!(error.contains("file limit"), "{error}");
+    }
+
+    #[test]
+    fn dense_update_additions_remain_a_borrowed_hunk_body() {
+        let additions = 100_000;
+        let mut input = String::from("*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n");
+        input.push_str(&"+x\n".repeat(additions));
+        input.push_str("*** End Patch\n");
+        let patch = parse_patch(&input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("update")
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines().count(), additions + 1);
+        assert_eq!(
+            hunks[0].body,
+            &input[input.find("-old\n").unwrap()..input.find("*** End Patch").unwrap()]
+        );
     }
 
     #[tokio::test]
@@ -1232,6 +2135,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "patch: line 5: unexpected text 'stray text'");
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End of File\n-danger\n+safe\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "patch: line 7: hunk data may not follow '*** End of File'"
+        );
+
+        let error = machine
+            .patch_impl(patch_args(
+                "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End of File\n*** End of File\n*** End Patch",
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "patch: line 7: duplicate '*** End of File' marker");
     }
 
     #[tokio::test]
@@ -1267,6 +2191,288 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "same\nsame\nsame\n"
+        );
+    }
+
+    #[test]
+    fn sequence_matching_agrees_with_brute_force_on_crlf_and_whitespace() {
+        let alphabet = ["x", "x ", "x\r", "é", "é\r", "\t", "🙂", "", "y"];
+        for seed in 0_u32..420 {
+            let mut state = seed + 1;
+            let mut next = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                state
+            };
+            let source_len = (next() % 65) as usize;
+            let pattern_len = (next() % 12 + 1) as usize;
+            let source = (0..source_len)
+                .map(|_| {
+                    let text = alphabet[(next() as usize) % alphabet.len()];
+                    WorkingLine::added(text, next() % 3 == 0)
+                })
+                .collect::<Vec<_>>();
+            let pattern = (0..pattern_len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect::<Vec<_>>();
+            let start = (next() % 72) as usize;
+            for trimmed in [false, true] {
+                let mut actual = Vec::new();
+                super::super::matching::scan_sequence(
+                    &pattern,
+                    &source,
+                    start,
+                    |a, b| {
+                        if trimmed {
+                            a.trim_end() == b.trim_end()
+                        } else {
+                            a == b
+                        }
+                    },
+                    |line, pat| {
+                        if trimmed {
+                            line.equals_trimmed(pat)
+                        } else {
+                            line.equals(pat)
+                        }
+                    },
+                    |at| actual.push(at),
+                );
+                let mut expected = Vec::new();
+                if start < source.len() && pattern.len() <= source.len() - start {
+                    for at in start..=source.len() - pattern.len() {
+                        if source[at..at + pattern.len()]
+                            .iter()
+                            .zip(&pattern)
+                            .all(|(line, pat)| {
+                                if trimmed {
+                                    line.equals_trimmed(pat)
+                                } else {
+                                    line.equals(pat)
+                                }
+                            })
+                        {
+                            expected.push(at);
+                        }
+                    }
+                }
+                assert_eq!(actual, expected, "seed={seed} trimmed={trimmed}");
+            }
+        }
+    }
+
+    #[test]
+    fn unterminated_crlf_sources_preserve_neighboring_style_without_leaking_cr() {
+        let delete_last =
+            parse_patch("*** Begin Patch\n*** Update File: file.txt\n@@\n-b\n*** End Patch\n")
+                .unwrap();
+        let PatchOp::Update { hunks, .. } = &delete_last[0] else {
+            panic!("expected update")
+        };
+        let (actual, ..) =
+            apply_patch_hunks("a\r\nb", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, "a", "removed terminal LF must not strand a CR");
+        let (actual, ..) = apply_patch_hunks("a\r\nb", hunks, "file.txt", 0, 1, 1, 4096).unwrap();
+        assert_eq!(
+            actual, "a",
+            "the exact normalized byte ceiling must be accepted"
+        );
+        let (actual, ..) = apply_patch_hunks("a\nb", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, "a");
+
+        let replace_last = parse_patch(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n-b\n+one\n+two\n*** End Patch\n",
+        )
+        .unwrap();
+        let PatchOp::Update { hunks, .. } = &replace_last[0] else {
+            panic!("expected update")
+        };
+        let (actual, ..) =
+            apply_patch_hunks("a\r\nb", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, "a\r\none\r\ntwo");
+        let expected = "a\r\none\r\ntwo";
+        let (actual, ..) =
+            apply_patch_hunks("a\r\nb", hunks, "file.txt", 0, 1, expected.len(), 4096).unwrap();
+        assert_eq!(actual, expected);
+        let (actual, ..) = apply_patch_hunks("a\nb", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, "a\none\ntwo");
+        let (actual, ..) = apply_patch_hunks("b", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(
+            actual, "one\ntwo",
+            "a file without any line terminator defaults to LF"
+        );
+
+        // A literal trailing CR with no LF is part of the source text, not
+        // a delimiter to strip during a context-only hunk.
+        let unchanged =
+            parse_patch("*** Begin Patch\n*** Update File: file.txt\n@@\n a\n*** End Patch\n")
+                .unwrap();
+        let PatchOp::Update { hunks, .. } = &unchanged[0] else {
+            panic!("expected update")
+        };
+        let (actual, ..) = apply_patch_hunks("a\r", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, "a\r");
+    }
+
+    #[test]
+    fn matcher_scratch_is_rejected_before_allocating_the_context_tables() {
+        let input = format!(
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n{}*** End Patch\n",
+            " x\n".repeat(10)
+        );
+        let patch = parse_patch(&input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        let source = "x\n".repeat(10);
+        let line_index = 10 * std::mem::size_of::<WorkingLine<'_>>();
+        let matcher_index = 10 * (std::mem::size_of::<&str>() + std::mem::size_of::<usize>());
+        let error = apply_patch_hunks(
+            &source,
+            hunks,
+            "f.txt",
+            0,
+            1,
+            1024,
+            line_index + matcher_index - 1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("context matching"), "{error}");
+        let (actual, ..) = apply_patch_hunks(&source, hunks, "f.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, source);
+    }
+
+    #[test]
+    fn trailing_terminator_never_matches_an_invented_blank_line() {
+        let input = "*** Begin Patch\n*** Update File: file.txt\n@@\n \n+tail\n*** End Patch\n";
+        let patch = parse_patch(input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        for original in ["", "a", "a\n", "a\r\n"] {
+            let error = apply_patch_hunks(original, hunks, "file.txt", 0, 1, 1024, 4096)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("context not found"), "{original:?}: {error}");
+        }
+
+        for (original, expected) in [
+            ("\n", "\ntail\n"),
+            ("a\n\n", "a\n\ntail\n"),
+            ("a\r\n\r\n", "a\r\n\r\ntail\r\n"),
+        ] {
+            let (actual, added, removed) =
+                apply_patch_hunks(original, hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+            assert_eq!(actual, expected, "original={original:?}");
+            assert_eq!((added, removed), (1, 0));
+        }
+    }
+
+    #[test]
+    fn trailing_terminators_survive_updates_but_not_deletion_of_every_line() {
+        let replace =
+            parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n-a\n+A\n*** End Patch\n")
+                .unwrap();
+        let PatchOp::Update { hunks, .. } = &replace[0] else {
+            panic!("expected update")
+        };
+        for (original, expected) in [
+            ("a", "A"),
+            ("a\n", "A\n"),
+            ("a\n\n", "A\n\n"),
+            ("a\r\n", "A\r\n"),
+            ("a\r\n\r\n", "A\r\n\r\n"),
+        ] {
+            let (actual, ..) =
+                apply_patch_hunks(original, hunks, "f.txt", 0, 1, 1024, 4096).unwrap();
+            assert_eq!(actual, expected, "original={original:?}");
+        }
+
+        let delete =
+            parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n-a\n*** End Patch\n")
+                .unwrap();
+        let PatchOp::Update { hunks, .. } = &delete[0] else {
+            panic!("expected update")
+        };
+        for original in ["a", "a\n", "a\r\n"] {
+            let (actual, ..) =
+                apply_patch_hunks(original, hunks, "f.txt", 0, 1, 1024, 4096).unwrap();
+            assert_eq!(actual, "", "original={original:?}");
+        }
+        let delete_blank =
+            parse_patch("*** Begin Patch\n*** Update File: f.txt\n@@\n-\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &delete_blank[0] else {
+            panic!("expected update")
+        };
+        let (actual, ..) = apply_patch_hunks("\n", hunks, "f.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, "");
+    }
+
+    #[test]
+    fn end_of_file_marker_refers_to_last_real_line() {
+        let input = "*** Begin Patch\n*** Update File: file.txt\n@@\n \n+tail\n*** End of File\n*** End Patch\n";
+        let patch = parse_patch(input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        let (actual, ..) = apply_patch_hunks("a\n\n", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(actual, "a\n\ntail\n");
+        assert!(apply_patch_hunks("a\n", hunks, "file.txt", 0, 1, 1024, 4096).is_err());
+    }
+
+    #[test]
+    fn context_only_hunks_leave_source_unchanged_without_replacing_line_index() {
+        let original = "x\n".repeat(100_000);
+        let input = format!(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n{}*** End Patch\n",
+            " x\n".repeat(100_000)
+        );
+        let patch = parse_patch(&input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        let (actual, added, removed) = apply_patch_hunks(
+            &original,
+            hunks,
+            "file.txt",
+            0,
+            1,
+            1024 * 1024,
+            super::super::MAX_MUTATION_PLAN_BYTES / 2,
+        )
+        .unwrap();
+        assert_eq!(actual, original);
+        assert_eq!((added, removed), (0, 0));
+    }
+
+    #[test]
+    fn hunk_matching_preserves_exact_precedence_and_trimmed_ambiguity() {
+        let exact_precedence = parse_patch(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n-first\n+FIRST\n*** End Patch\n",
+        )
+        .unwrap();
+        let PatchOp::Update { hunks, .. } = &exact_precedence[0] else {
+            panic!("update")
+        };
+        // Both lines match after trimming, but only one is exactly `first`.
+        let (updated, added, removed) =
+            apply_patch_hunks("first   \nfirst\n", hunks, "file.txt", 0, 1, 1024, 4096).unwrap();
+        assert_eq!(updated, "first   \nFIRST\n");
+        assert_eq!((added, removed), (1, 1));
+
+        let fallback = parse_patch(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n-first\n+FIRST\n*** End Patch\n",
+        )
+        .unwrap();
+        let PatchOp::Update { hunks, .. } = &fallback[0] else {
+            panic!("update")
+        };
+        let error = apply_patch_hunks("first   \nfirst \n", hunks, "file.txt", 0, 1, 1024, 4096)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "hunk 1/1 (file.txt): context matches 2 locations (lines 1, 2)"
         );
     }
 
@@ -1500,7 +2706,7 @@ mod tests {
         match &ops[0] {
             PatchOp::Update { hunks, .. } => {
                 assert_eq!(hunks[0].anchor, Some("fn b()"));
-                assert_eq!(hunks[0].lines.len(), 2, "removed + added");
+                assert_eq!(hunks[0].lines().count(), 2, "removed + added");
             }
             other => panic!("{other:?}"),
         }

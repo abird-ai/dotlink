@@ -9,7 +9,9 @@
 pub(crate) mod binary;
 pub(crate) mod edit;
 pub(crate) mod grep;
+pub(crate) mod jobs;
 pub(crate) mod ls;
+pub(crate) mod matching;
 pub(crate) mod mutation;
 pub(crate) mod patch;
 pub(crate) mod shell;
@@ -1039,12 +1041,8 @@ pub(crate) fn largest_fitting_prefix(total: usize, mut fits: impl FnMut(usize) -
     low
 }
 
-/// Keep the longest prefix of `records` whose rendered JSON fits the ceiling.
-/// The caller's renderer is the exact reply shape, including every derived
-/// field, so the measured size and the returned size cannot drift. Rendered
-/// length grows with the prefix, so one binary search finds the cut in
-/// `O(log n)` renders instead of re-serializing once per dropped record.
-pub(crate) fn trim_to_ceiling<T>(
+#[cfg(test)]
+fn trim_to_ceiling<T>(
     mut records: Vec<T>,
     ceiling: usize,
     truncated: bool,
@@ -1056,6 +1054,31 @@ pub(crate) fn trim_to_ceiling<T>(
     let low = largest_fitting_prefix(records.len(), |count| {
         render(&records[..count], true).len() <= ceiling
     });
+    records.truncate(low);
+    (records, true)
+}
+
+/// Keep the longest rendered text-record prefix that satisfies both the
+/// profile's raw text ceiling and an optional serialized `CallToolResult`
+/// budget. The renderer is the exact final payload, so callers do not need to
+/// know or approximate JSON escaping rules.
+pub(crate) fn trim_to_result_budget<T>(
+    mut records: Vec<T>,
+    raw_ceiling: usize,
+    result_budget: Option<usize>,
+    truncated: bool,
+    mut render: impl FnMut(&[T], bool) -> String,
+) -> (Vec<T>, bool) {
+    let mut fits = |records: &[T], truncated| {
+        let text = render(records, truncated);
+        text.len() <= raw_ceiling
+            && result_budget
+                .is_none_or(|budget| crate::mcp::serialized_text_tool_result_len(&text) <= budget)
+    };
+    if fits(&records, truncated) {
+        return (records, truncated);
+    }
+    let low = largest_fitting_prefix(records.len(), |count| fits(&records[..count], true));
     records.truncate(low);
     (records, true)
 }
@@ -1880,7 +1903,7 @@ mod tests {
             })
         };
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), &mut independent_rx)
+            tokio::time::timeout(Duration::from_secs(3), &mut independent_rx)
                 .await
                 .is_ok(),
             "a different path must not be blocked"

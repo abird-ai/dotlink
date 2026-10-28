@@ -6,7 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- One durable shell execution layer now backs ordinary `bash`/`powershell`, native MCP Tasks and compatibility jobs. `job_start` returns immediately; `job_list` recovers exposed ids after a lost receipt; `job_get`, pure/replayable `job_output`, explicit idempotent `job_ack`, and `job_cancel` operate on the same stable job/task id.
+- Durable job state has a configurable aggregate `job_spool_bytes` quota (512 MiB default, 16 MiB–8 GiB) in addition to the 64 MiB retained prefix per stdout/stderr stream. stdout/stderr plus terminal metadata are the single durable result source; native MCP Tasks reconstruct the exact original `CallToolResult` from those spools and are selected only when that exact result is guaranteed to fit the task response budget. Otherwise dotlink uses the compatibility job surface; no duplicate full result artifact is stored.
+
 ### Changed
+
+- OpenAI's 120-second request lifetime and 5-second delivery reserve now bound only how long a shell request waits. Every shell call starts one durable execution; if it finishes in-window dotlink returns the ordinary result, otherwise the same execution is exposed as an MCP Task/job without changing its execution timeout. Omitted `timeout_secs` uses the profile ceiling. Tunnel request ids are scoped/deduplicated so redelivery cannot repeat shell side effects.
+- OpenAI limits are explicit at each layer: 8 MiB raw/tool transfer ceiling, 9 MiB complete embedded MCP-message ceiling, and 10 MiB hosted tunnel envelope. `bread` exposes the profile read ceiling and automatically chooses encoding-safe raw windows for MCP/base64/hex.
+- Job admission, runner ownership and shutdown are atomic in `JobManager`; queued serialized/Windows jobs acquire the operation gate before path/mount preparation, and execution timing begins only afterward. Automatic recovery reuses a job session only when the effective filesystem/shell/network/cache/host authority fingerprint is unchanged.
+- Unix mutation coordination now combines exact pathname locks with stable `(ancestor dev, ancestor inode, relative target)` in-process identities. Cross-process directory lock plans coalesce aliases by directory inode, upgrade to the strongest mode once, and verify the opened inode before locking.
+- New profile read/write/output defaults remain 1 MiB and configurable raw/tool ceilings remain 8 MiB; `read.max_read_bytes`, `bread.limit`, shell/job output schemas expose concrete profile bounds.
+
+### Fixed
+
+- Long OpenAI shell calls no longer die around 114–115 seconds, and a fast command with a long requested timeout no longer gets needlessly forced into background mode. Conversely, an omitted-timeout command that outlives the response window continues under its profile execution timeout and returns a durable handle.
+- Closing/reloading a job session can no longer race creation and leave a detached runner; partial spool-file admission rolls back transactionally, active readers defer cleanup, and infrastructure spool/result failures surface as failed MCP Tasks rather than invalid parameters/completed tool errors.
+- Durable output no longer performs hidden acknowledgement/deletion during a read; cleanup advances only through `job_ack`, so retries are replay-safe.
+- Fully acknowledged compatibility-job output is deleted immediately; native-task spools compact to only the exact ordinary-result prefix required by `tasks/get` and retain that bounded prefix until task TTL.
+- OpenAI request replay state is retained until delivery is positively confirmed: deadline expiry and ambiguous 404 responses keep the request key plus stream spools, while successful delivery releases the key and compacts hidden output state.
+- Completed shell output is rendered from durable spools under the shared MCP result budget; a terminal result that cannot fit hands off the same completed job/task for paging instead of failing after side effects. Escape-heavy `read` pages likewise shorten at whole-line boundaries to fit the serialized MCP result budget.
+- Active transports now derive one shared constraint set. Private OpenAI transport constraints are authenticated with a redacted opaque per-runtime capability token; the adapter clears the full reserved `io.abird.dotlink/*` metadata namespace before inserting trusted values, so stdio/local-HTTP clients cannot spoof current or future sync/result/replay fields. Native Task creation uses the tightest result budget across every active transport sharing the runtime.
+- Serialized result budgeting now covers `grep` content/files/count and `ls` as well as read/bread/shell/job pages; escape-heavy discovery results page at whole-record/whole-line boundaries before the MCP envelope overflows.
+- The shared `call_tool` boundary now enforces the trusted serialized-result ceiling on every tool result and protocol error, including arbitrary diagnostics; oversized errors are explicitly shortened, while an unexpected oversized success keeps success status to avoid unsafe side-effect retries.
+- Runtime authority is prepared once into an immutable `PreparedMachine` and the same object is both fingerprinted and consumed by `LocalMachine`, removing the recovery resolve/fingerprint/re-resolve race. Unix/macOS grant fingerprints come from pinned `SecureFs` root descriptors, Windows authority uses volume/file-index identity, preparation failure revokes the old session, and required intent/policy binding no longer hides side effects inside `debug_assert!`.
+- `grep` content escapes grammar-breaking or invalid-UTF-8 path labels, and candidate retention now matches the actual 4096-file production scan budget instead of retaining the unreachable 65,536-path hard cap; work-budget/incomplete semantics are preserved.
+- Automatic job-session recovery fingerprints the resolved deny/protected guard identities, so a symlink retarget revokes old jobs even when the configured pathname is unchanged. Fully acknowledged compatibility metadata is reclaimable under capacity pressure, and transient spool cleanup/compaction failures remain pending and retry until successful; `job_get` reports actual retained bytes after native-task compaction.
+
+## [0.14.0] - 2026-10-28
+
+### Changed
+
+- TOOL logs default to a 256-rendered-character `c=` shell command excerpt (including quotes/escapes) with `…` before the closing quote when truncated. Interactive non-stdio `V` toggles full commands only while TOOL logging is active; quiet and REQ-only modes hide/ignore the key and clear full mode when TOOL logging turns off. Services and stdio stay capped. `p=`/`d=` values and all distinct paths of valid `edit` calls are always complete. Interactive colored logs distinguish keys, values and outcomes; redirected logs remain plain. Bulk payloads stay byte counts.
 
 - CRLF patch hunks now store borrowed text plus a one-bit trailing-CR adjustment; the shared final output builder emits it without allocating a per-added-line `String`. This preserves context matching, whitespace tolerance and source line endings for dense updates.
 - `grep` reuses the shared UTF-8-classified source bytes without cloning them. Content pages collect only the selected hit indices and adjacent page boundaries (at most the per-file hit cap), and render context by walking borrowed lines. Files/count modes count via iterators, without per-line or per-hit vectors. Pagination, result markers and I/O ceilings are unchanged.
@@ -15,6 +47,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - HTTP standard tool preflight inspects the tool selector without allocating a second JSON `Value` tree for known tools; the OpenAI embedded adapter likewise clones JSON only for unknown-tool canonicalization. Existing unknown-tool schema-cache and header validation behavior is unchanged. Encoded binary inputs are consumed promptly rather than retaining all encoded strings beside their decoded range buffers.
 
 ### Fixed
+
+- Multi-line patch replacements now retain each removed line's LF/CRLF separator by position, regardless of whether additions precede removals. Unequal groups reuse the last removed line's style for excess additions; pure insertions use their insertion site. All three hunk execution paths share the same borrowed action iterator and byte preflight.
+- EOF appends after a literal terminal CR now add a separate delimiter CR before LF, so the original byte stays content instead of becoming part of CRLF syntax. The same protection applies to newly added lines ending in a literal CR. Planning accounts for the bridging byte, and a line becoming the unterminated final line updates its separator metadata.
+- Patch additions now choose line endings per contiguous edit group from the actual removed source line, not an unrelated leading context line. One borrowed, allocation-free hunk-action iterator is shared by size preflight, direct final output, and in-place multi-hunk updates; explicit context cannot accidentally change mixed-LF/CRLF replacement bytes.
+- `*** Add File` uses one borrowed line decoder for both byte counting and output. Bare blank lines and explicit `+` blank lines in CRLF patches now create the same CRLF separator, including whitespace-only shorthand, without per-line allocations or a hidden one-byte write-ceiling discrepancy.
+- Patch update lines now distinguish CRLF syntax (identified by the patch header) from literal trailing CR content in LF patches. LF/CRLF added-line terminators are normalized to nearby source delimiters without dropping a literal CR or introducing mixed separators when appending to an unterminated CRLF file. Shared line output and size accounting include the additional bridging delimiter byte.
+- One 30-second mutation-lock deadline now starts before the first in-process path mutex and is carried through the Unix directory or Windows named-mutex acquisition. Waiting behind another request can no longer silently extend that lock deadline; failed multi-path acquisitions release their earlier mutexes automatically.
+- Dense deep-offset `grep` pages cache only the bounded surrounding lines of selected hits in one source traversal; output-fit retries render these borrowed lines rather than rescanning the entire file up to 50 times. Existing hit/page/context semantics are retained.
+- EOF-constrained patch hunks now select only context matches that actually end at EOF before counting ambiguity or falling back to trimmed matching. An addition-only update hunk may append to an existing file when explicitly anchored by `*** End of File`; unanchored context-free insertions remain rejected.
+- Dense `*** Update File` additions no longer require both a replacement-sized and a resulting line-index allocation. The final hunk writes directly to one output buffer; earlier hunks shift their index in place using only the consumed source span. The shared 64 MiB planning budget remains enforced without raising it.
+- Mutation concurrency now uses exact per-target in-process locks instead of 256 hash shards. Unrelated files cannot collide and spuriously serialize; a weak-reference registry reclaims idle mutexes, while Unix hierarchical directory locks and Windows cross-process mutexes remain unchanged. Added a regression deliberately choosing two paths that previously hashed to the same shard.
+- `patch` no longer mistakes the artificial empty tail from `split('\n')` for an actual blank line. It matches only real lines while preserving LF/CRLF and trailing-newline state, including empty files, actual blank final lines, and deletions at an unterminated CRLF file end. No context-only hunk builds a duplicate replacement index. Matcher context references are pointer-sized, with the KMP failure table charged to the existing scratch plan before allocation.
+- CRLF patch updates to an unterminated final line now inherit the adjacent delimiter style; normalization and exact-output-byte checks account for a separator CR that becomes nonterminal after deletion.
+- Profiles with no persisted filesystem grants (including a shell preference without a stored read root) are valid defaults. Minimum effective read/write/shell capabilities are enforced once after merging per-run CLI additions and denies, rather than rejecting usable one-run configurations during profile validation. An ungranted runtime still fails closed.
+- `patch` searches hunk context with a shared linear-time KMP sequence scanner instead of re-comparing long prefixes at every source line. Exact matches still win over trimmed matches; overlapping candidates, ambiguity previews, anchors, and ordered hunks retain their original behavior.
 
 - `bedit` now detects byte-identical, length-preserving ranges before staging. It revalidates the pinned source digest and returns a bounded `changed=false` receipt without writing a whole temporary file; shifting edits and edits that are not provably identical still use atomic streamed staging.
 - `bedit` retains its documented 64 MiB source/result ceiling with a streamed, descriptor-pinned update: source and output SHA-256 verification, original-offset range splicing and atomic staging use fixed-size IO buffers rather than two full file copies. Both Unix and Windows staging use the same write-producer API, preserve file permissions, and remove failed temporaries. Identical edits preserve the original mtime.
@@ -425,7 +472,9 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/abird-ai/dotlink/compare/v0.13.1...v0.14.0
+[0.13.1]: https://github.com/abird-ai/dotlink/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/abird-ai/dotlink/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/abird-ai/dotlink/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/abird-ai/dotlink/compare/v0.10.0...v0.11.0
