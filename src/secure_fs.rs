@@ -1086,6 +1086,42 @@ mod tests {
     }
 
     #[test]
+    fn streamed_update_preserves_mode_and_cleans_failed_temporary() {
+        use std::io::Write as _;
+        let (_temp, root) = resolved_tempdir();
+        let path = root.join("private.txt");
+        std::fs::write(&path, b"before").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sandbox =
+            SecureFs::new(std::slice::from_ref(&root), std::slice::from_ref(&root)).unwrap();
+        let expected = (6, crate::mcp::sha256(b"before"));
+        let error = sandbox
+            .stage_update_with(&path, expected, |file| {
+                file.write_all(b"partial")?;
+                anyhow::bail!("synthetic streaming failure")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("synthetic streaming failure"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        let staged = sandbox
+            .stage_update_with(&path, expected, |file| {
+                file.write_all(b"after")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        staged.commit().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
     fn securely_denies_redirected_symlinks_and_writes_inside_grant() {
         let (_temp, base) = resolved_tempdir();
         let root = base.join("root");

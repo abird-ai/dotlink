@@ -1,8 +1,8 @@
 //! `patch`: Codex grammar with strict preflight and per-file atomic commits.
 
 use std::{
-    borrow::Cow,
     collections::BTreeSet,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -47,24 +47,102 @@ pub(super) struct PatchArgs {
 /// `*** Add File:` only. Delete and Move are rejected explicitly rather than
 /// silently ignored.
 #[derive(Debug)]
-enum PatchOp {
-    Update { path: String, hunks: Vec<PatchHunk> },
-    Add { path: String, lines: Vec<String> },
+enum PatchOp<'a> {
+    Update {
+        path: &'a str,
+        hunks: Vec<PatchHunk<'a>>,
+    },
+    Add {
+        path: &'a str,
+        // Add-file source is contiguous in the original request; one byte
+        // range replaces a per-line Vec even for million-line additions.
+        body: Range<usize>,
+        lines: usize,
+        bytes: usize,
+    },
 }
 
 #[derive(Debug)]
-struct PatchHunk {
-    anchor: Option<String>,
-    lines: Vec<PatchLine>,
+struct PatchHunk<'a> {
+    anchor: Option<&'a str>,
+    lines: Vec<PatchLine<'a>>,
     /// The Codex `*** End of File` marker: this hunk must end at the last line.
     at_end_of_file: bool,
 }
 
 #[derive(Debug)]
-enum PatchLine {
-    Context(String),
-    Removed(String),
-    Added(String),
+enum PatchLine<'a> {
+    Context(&'a str),
+    Removed(&'a str),
+    Added(&'a str),
+}
+
+/// Borrow an unchanged source line or a patch addition. The only extra
+/// representation needed by CRLF normalization is a single trailing CR bit;
+/// adding CR never allocates a String per line.
+#[derive(Clone, Copy)]
+struct WorkingLine<'a> {
+    text: &'a str,
+    append_cr: bool,
+}
+
+impl<'a> WorkingLine<'a> {
+    fn source(text: &'a str) -> Self {
+        Self {
+            text,
+            append_cr: false,
+        }
+    }
+
+    fn added(text: &'a str, crlf: bool) -> Self {
+        match (crlf, text.ends_with('\r')) {
+            (true, false) => Self {
+                text,
+                append_cr: true,
+            },
+            (false, true) => Self::source(text.strip_suffix('\r').unwrap()),
+            _ => Self::source(text),
+        }
+    }
+
+    fn len(self) -> usize {
+        self.text.len() + usize::from(self.append_cr)
+    }
+
+    fn is_empty(self) -> bool {
+        self.text.is_empty() && !self.append_cr
+    }
+
+    fn ends_with_cr(self) -> bool {
+        self.append_cr || self.text.ends_with('\r')
+    }
+
+    fn contains(self, needle: &str) -> bool {
+        self.text.contains(needle)
+            || (self.append_cr
+                && needle
+                    .strip_suffix('\r')
+                    .is_some_and(|prefix| self.text.ends_with(prefix)))
+    }
+
+    fn equals(self, patch: &str) -> bool {
+        if self.append_cr {
+            patch.strip_suffix('\r') == Some(self.text)
+        } else {
+            self.text == patch
+        }
+    }
+
+    fn equals_trimmed(self, patch: &str) -> bool {
+        self.text.trim_end() == patch.trim_end()
+    }
+
+    fn append_to(self, output: &mut String) {
+        output.push_str(self.text);
+        if self.append_cr {
+            output.push('\r');
+        }
+    }
 }
 
 /// Patch lines, split on `\n` only: a CRLF patch keeps its `\r`, and
@@ -74,14 +152,21 @@ fn patch_lines(text: &str) -> impl Iterator<Item = &str> {
         .map(|line| line.strip_suffix('\n').unwrap_or(line))
 }
 
-fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
-    let mut ops: Vec<PatchOp> = Vec::new();
+fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
+    // All file names, hunk anchors and lines borrow the original request
+    // buffer. Even million-line patches retain only short slice descriptors.
+    let mut ops: Vec<PatchOp<'_>> = Vec::new();
     let mut saw_begin = false;
     let mut saw_end = false;
     let mut hunks = 0_usize;
+    let mut cursor = 0_usize;
 
     for (index, line) in patch_lines(text).enumerate() {
         let number = index + 1;
+        // The iterator strips only LF, not CR; the cursor keeps the exact
+        // raw byte range so add-file bodies can be borrowed in one piece.
+        cursor +=
+            line.len() + usize::from(text.as_bytes().get(cursor + line.len()) == Some(&b'\n'));
         if !saw_begin {
             if line.trim().is_empty() {
                 continue;
@@ -124,7 +209,7 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
                         ops.len() + 1
                     );
                 }
-                let path = path.trim().to_owned();
+                let path = path.trim();
                 if path.is_empty() {
                     bail!("patch: line {number}: '*** Update File' needs a path");
                 }
@@ -141,13 +226,15 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
                         ops.len() + 1
                     );
                 }
-                let path = path.trim().to_owned();
+                let path = path.trim();
                 if path.is_empty() {
                     bail!("patch: line {number}: '*** Add File' needs a path");
                 }
                 ops.push(PatchOp::Add {
                     path,
-                    lines: Vec::new(),
+                    body: cursor..cursor,
+                    lines: 0,
+                    bytes: 0,
                 });
                 continue;
             }
@@ -186,22 +273,29 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
                     bail!("patch: line {number}: text outside a hunk");
                 };
                 match line.as_bytes().first() {
-                    Some(b' ') => hunk.lines.push(PatchLine::Context(line[1..].to_owned())),
-                    Some(b'-') => hunk.lines.push(PatchLine::Removed(line[1..].to_owned())),
-                    Some(b'+') => hunk.lines.push(PatchLine::Added(line[1..].to_owned())),
-                    _ if line.trim().is_empty() => {
-                        hunk.lines.push(PatchLine::Context(String::new()))
-                    }
+                    Some(b' ') => hunk.lines.push(PatchLine::Context(&line[1..])),
+                    Some(b'-') => hunk.lines.push(PatchLine::Removed(&line[1..])),
+                    Some(b'+') => hunk.lines.push(PatchLine::Added(&line[1..])),
+                    _ if line.trim().is_empty() => hunk.lines.push(PatchLine::Context("")),
                     _ => {
                         bail!("patch: line {number}: unexpected text '{line}'");
                     }
                 }
             }
-            PatchOp::Add { lines, .. } => match line.as_bytes().first() {
-                Some(b'+') => lines.push(line[1..].to_owned()),
-                _ if line.trim().is_empty() => lines.push(String::new()),
-                _ => bail!("patch: line {number}: unexpected text '{line}'"),
-            },
+            PatchOp::Add {
+                body, lines, bytes, ..
+            } => {
+                let added_bytes = match line.as_bytes().first() {
+                    Some(b'+') => line.len(),         // remove '+' and append LF
+                    _ if line.trim().is_empty() => 1, // blank line becomes LF
+                    _ => bail!("patch: line {number}: unexpected text '{line}'"),
+                };
+                *bytes = bytes
+                    .checked_add(added_bytes)
+                    .ok_or_else(|| anyhow!("patch: added file byte count overflow"))?;
+                *lines += 1;
+                body.end = cursor;
+            }
         }
     }
 
@@ -226,7 +320,7 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
 /// `@@` content is either anchor text or unified-diff line numbers. Both may
 /// appear (`@@ -5,1 +5,1 @@ fn b()`), so leading `-`/`+` number tokens are
 /// dropped and whatever follows them narrows the search.
-fn parse_patch_anchor(rest: &str) -> Option<String> {
+fn parse_patch_anchor(rest: &str) -> Option<&str> {
     let mut rest = rest.trim();
     loop {
         // `@@ -3,1 +3,1 @@ fn b()`: drop the range tokens, then the closing `@@`.
@@ -248,16 +342,16 @@ fn parse_patch_anchor(rest: &str) -> Option<String> {
     }
     match rest.is_empty() {
         true => None,
-        false => Some(rest.to_owned()),
+        false => Some(rest),
     }
 }
 
 /// Hunk location is content-based: exact match first, then a per-line
 /// `trim_end` comparison. Ambiguity is an error, and hunks within a file apply
 /// top-down without re-scanning above the previous match.
-fn apply_patch_hunks(
-    text: &str,
-    hunks: &[PatchHunk],
+fn apply_patch_hunks<'a>(
+    text: &'a str,
+    hunks: &'a [PatchHunk<'a>],
     display: &str,
     first_hunk: usize,
     total_hunks: usize,
@@ -272,11 +366,13 @@ fn apply_patch_hunks(
         .filter(|byte| *byte == b'\n')
         .count()
         .saturating_add(1);
-    let index_bytes = line_count.saturating_mul(std::mem::size_of::<Cow<'_, str>>());
+    let index_bytes = line_count.saturating_mul(std::mem::size_of::<WorkingLine<'_>>());
     if index_bytes > scratch_limit {
         bail!("patch source line index exceeds the remaining mutation plan budget");
     }
-    let mut lines: Vec<Cow<'_, str>> = text.split('\n').map(Cow::Borrowed).collect();
+    let mut lines: Vec<WorkingLine<'_>> = Vec::with_capacity(line_count);
+    lines.extend(text.split('\n').map(WorkingLine::source));
+    let mut content_bytes = text.len() - lines.len().saturating_sub(1);
     let mut from_line = 0_usize;
     let mut added = 0_usize;
     let mut removed = 0_usize;
@@ -287,13 +383,13 @@ fn apply_patch_hunks(
             .lines
             .iter()
             .filter_map(|line| match line {
-                PatchLine::Context(text) => Some(text.as_str()),
-                PatchLine::Removed(text) => Some(text.as_str()),
+                PatchLine::Context(text) => Some(*text),
+                PatchLine::Removed(text) => Some(*text),
                 PatchLine::Added(_) => None,
             })
             .collect::<Vec<_>>();
         let mut search_start = from_line;
-        if let Some(anchor) = hunk.anchor.as_deref()
+        if let Some(anchor) = hunk.anchor
             && let Some(at) = lines
                 .iter()
                 .enumerate()
@@ -323,7 +419,7 @@ fn apply_patch_hunks(
             if lines[start..start + block.len()]
                 .iter()
                 .zip(&block)
-                .all(|(file, patch)| file.as_ref() == *patch)
+                .all(|(file, patch)| file.equals(patch))
             {
                 exact_count += 1;
                 exact_first.get_or_insert(start);
@@ -333,7 +429,7 @@ fn apply_patch_hunks(
             } else if lines[start..start + block.len()]
                 .iter()
                 .zip(&block)
-                .all(|(file, patch)| file.trim_end() == patch.trim_end())
+                .all(|(file, patch)| file.equals_trimmed(patch))
             {
                 lenient_count += 1;
                 lenient_first.get_or_insert(start);
@@ -373,12 +469,76 @@ fn apply_patch_hunks(
             }
         }
 
-        let mut replacement = Vec::with_capacity(hunk.lines.len());
+        // Before allocating replacement lines or expanding the index, compute
+        // both the resulting file size and scratch usage. Very dense added
+        // lines can make the Cow index expensive even for a tiny source.
+        let file_crlf = lines.get(start).is_some_and(|line| line.ends_with_cr());
+        let replacement_count = hunk
+            .lines
+            .iter()
+            .filter(|line| !matches!(line, PatchLine::Removed(_)))
+            .count();
+        let next_line_count = lines
+            .len()
+            .checked_sub(block.len())
+            .and_then(|n| n.checked_add(replacement_count))
+            .ok_or_else(|| anyhow!("patch line count overflow"))?;
+        let removed_bytes = lines[start..start + block.len()]
+            .iter()
+            .try_fold(0_usize, |total, line| total.checked_add(line.len()))
+            .ok_or_else(|| anyhow!("patch line size overflow"))?;
+        let mut replacement_bytes = 0_usize;
+        let mut original_line = 0_usize;
+        for line in &hunk.lines {
+            let size = match line {
+                PatchLine::Context(_) => {
+                    let size = lines[start + original_line].len();
+                    original_line += 1;
+                    size
+                }
+                PatchLine::Removed(_) => {
+                    original_line += 1;
+                    0
+                }
+                PatchLine::Added(text) => WorkingLine::added(text, file_crlf).len(),
+            };
+            replacement_bytes = replacement_bytes
+                .checked_add(size)
+                .ok_or_else(|| anyhow!("patch replacement size overflow"))?;
+        }
+        let next_content = content_bytes
+            .checked_sub(removed_bytes)
+            .and_then(|size| size.checked_add(replacement_bytes))
+            .ok_or_else(|| anyhow!("patch replacement size overflow"))?;
+        let next_size = next_content
+            .checked_add(next_line_count.saturating_sub(1))
+            .ok_or_else(|| anyhow!("patch result size overflow"))?;
+        if next_size > output_limit {
+            bail!(
+                "patch result would be {next_size} bytes, above the {output_limit}-byte write limit"
+            );
+        }
+        let index_bytes = next_line_count
+            .checked_mul(std::mem::size_of::<WorkingLine<'_>>())
+            .ok_or_else(|| anyhow!("patch line index size overflow"))?;
+        // The per-hunk replacement Vec exists briefly beside the main line
+        // index, so charge its Cow slots before allocating it as well.
+        let replacement_slots = replacement_count
+            .checked_mul(std::mem::size_of::<WorkingLine<'_>>())
+            .ok_or_else(|| anyhow!("patch replacement index size overflow"))?;
+        if index_bytes
+            .saturating_add(next_size)
+            .saturating_add(replacement_slots)
+            > scratch_limit
+        {
+            bail!("patch working buffers exceed the remaining mutation plan budget");
+        }
+
+        let mut replacement = Vec::with_capacity(replacement_count);
         // Added lines inherit the terminator of the file they land in. The
         // patch itself often carries LF because numbered `read` strips `\r`,
         // so preserving only the patch's bytes would produce mixed endings in
         // a CRLF file.
-        let file_crlf = lines.get(start).is_some_and(|line| line.ends_with('\r'));
         // Cursor into the consumed block: only context/removed lines consume
         // existing file lines.
         let mut consumed_at = 0_usize;
@@ -387,7 +547,7 @@ fn apply_patch_hunks(
                 // Keep the file's own bytes for context lines, so a lenient
                 // match never rewrites trailing whitespace it did not touch.
                 PatchLine::Context(_) => {
-                    replacement.push(lines[start + consumed_at].clone());
+                    replacement.push(lines[start + consumed_at]);
                     consumed_at += 1;
                 }
                 PatchLine::Removed(_) => {
@@ -396,17 +556,13 @@ fn apply_patch_hunks(
                 }
                 PatchLine::Added(text) => {
                     added += 1;
-                    let line = match (file_crlf, text.ends_with('\r')) {
-                        (true, false) => Cow::Owned(format!("{text}\r")),
-                        (false, true) => Cow::Borrowed(text.strip_suffix('\r').unwrap()),
-                        _ => Cow::Borrowed(text.as_str()),
-                    };
-                    replacement.push(line);
+                    replacement.push(WorkingLine::added(text, file_crlf));
                 }
             }
         }
         let replacement_len = replacement.len();
         lines.splice(start..start + block.len(), replacement);
+        content_bytes = next_content;
         from_line = start + replacement_len;
     }
 
@@ -420,13 +576,22 @@ fn apply_patch_hunks(
     if bytes > output_limit {
         bail!("patch result would be {bytes} bytes, above the {output_limit}-byte write limit");
     }
-    // The source snapshot remains pinned while the borrowed index and final
-    // output coexist. Count the index plus owned result separately from the
-    // independent output policy, without charging unchanged lines twice.
-    if index_bytes.saturating_add(bytes) > scratch_limit {
+    // The source snapshot and borrowed index coexist with the final output.
+    // Count their live bytes separately from the output-file write ceiling.
+    let final_index = lines
+        .len()
+        .saturating_mul(std::mem::size_of::<WorkingLine<'_>>());
+    if final_index.saturating_add(bytes) > scratch_limit {
         bail!("patch working buffers exceed the remaining mutation plan budget");
     }
-    Ok((lines.join("\n"), added, removed))
+    let mut result = String::with_capacity(bytes);
+    for (index, line) in lines.iter().enumerate() {
+        if index != 0 {
+            result.push('\n');
+        }
+        line.append_to(&mut result);
+    }
+    Ok((result, added, removed))
 }
 
 /// Patch paths are relative to the patch's `dir`, not to the launch directory.
@@ -491,13 +656,13 @@ impl LocalMachine {
             }
         };
 
-        struct ResolvedSection<'a> {
-            op: &'a PatchOp,
+        struct ResolvedSection<'a, 'b> {
+            op: &'a PatchOp<'b>,
             path: PathBuf,
             display: String,
             first_hunk: usize,
         }
-        let mut resolved_sections: Vec<ResolvedSection<'_>> = Vec::with_capacity(ops.len());
+        let mut resolved_sections: Vec<ResolvedSection<'_, '_>> = Vec::with_capacity(ops.len());
 
         for op in &ops {
             // Both sections resolve the same way, and both must reject a path
@@ -621,7 +786,9 @@ impl LocalMachine {
                         }
                     }
                 }
-                PatchOp::Add { lines, .. } => {
+                PatchOp::Add {
+                    body, lines, bytes, ..
+                } => {
                     // Create-only twice over: refuse an existing target while
                     // planning, and install exclusively when writing, so a file
                     // that appears in between cannot be clobbered.
@@ -634,25 +801,28 @@ impl LocalMachine {
                                 if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => return Err(error.into()),
                         }
-                        let text = match lines.is_empty() {
-                            true => String::new(),
-                            false => format!("{}\n", lines.join("\n")),
-                        };
-                        if text.len() > self.config.max_write_bytes {
+                        if *bytes > self.config.max_write_bytes {
                             anyhow::bail!(
-                                "{display}: added file would be {} bytes, above the {} byte write limit",
-                                text.len(),
+                                "{display}: added file would be {bytes} bytes, above the {} byte write limit",
                                 self.config.max_write_bytes
                             );
                         }
-                        budget.add(0, text.len())?;
+                        budget.add(0, *bytes)?;
+                        let mut text = String::with_capacity(*bytes);
+                        for line in patch_lines(&args.patch[body.clone()]) {
+                            if let Some(content) = line.strip_prefix('+') {
+                                text.push_str(content);
+                            }
+                            text.push('\n');
+                        }
+                        debug_assert_eq!(text.len(), *bytes);
                         Ok(PlannedFile {
                             path: resolved,
                             display: display.clone(),
                             kind: PlanKind::Create,
                             text,
                             hunks: 0,
-                            added: lines.len(),
+                            added: *lines,
                             removed: 0,
                         })
                     }
@@ -761,6 +931,132 @@ mod tests {
             patch: patch.to_owned(),
             best_effort: false,
         }
+    }
+
+    #[test]
+    fn crlf_adjustment_is_borrowed_and_comparable_between_hunks() {
+        let added = WorkingLine::added("hello", true);
+        assert_eq!(added.len(), 6);
+        assert!(added.ends_with_cr());
+        assert!(added.equals("hello\r"));
+        assert!(added.equals_trimmed("hello"));
+        assert!(added.contains("lo\r"));
+        let mut output = String::new();
+        added.append_to(&mut output);
+        assert_eq!(output, "hello\r");
+        let normalized = WorkingLine::added("hello\r", false);
+        assert!(normalized.equals("hello"));
+        assert!(!normalized.ends_with_cr());
+        let patch = parse_patch("*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n@@\n-last\n+LAST\n*** End Patch\n").unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        let (text, added, removed) =
+            apply_patch_hunks("old\r\nlast\r\n", hunks, "a.txt", 0, 2, 1024, 4096).unwrap();
+        assert_eq!((added, removed), (2, 2));
+        assert_eq!(text, "new\r\nLAST\r\n");
+    }
+
+    #[test]
+    fn borrowed_line_index_handles_dense_source_independent_of_write_limit() {
+        let mut source = "x\n".repeat(300_000);
+        source.push_str("last\n");
+        let patch = parse_patch(
+            "*** Begin Patch\n*** Update File: dense.txt\n@@\n-last\n+LAST\n*** End Patch\n",
+        )
+        .unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        let (result, added, removed) = apply_patch_hunks(
+            &source,
+            hunks,
+            "dense.txt",
+            0,
+            1,
+            1024 * 1024,
+            super::super::MAX_MUTATION_PLAN_BYTES - source.len(),
+        )
+        .unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(removed, 1);
+        assert!(result.ends_with("LAST\n"));
+        assert_eq!(result.len(), source.len());
+    }
+
+    #[test]
+    fn line_index_growth_is_rejected_before_expanding_temp_buffers() {
+        let input = format!(
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n{}*** End Patch\n",
+            "+x\n".repeat(250)
+        );
+        let patch = parse_patch(&input).unwrap();
+        let PatchOp::Update { hunks, .. } = &patch[0] else {
+            panic!("expected update")
+        };
+        let error = apply_patch_hunks("old\n", hunks, "file.txt", 0, 1, 4096, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("working buffers"), "{error}");
+    }
+
+    #[test]
+    fn parsed_patch_borrows_paths_and_content_from_the_input_buffer() {
+        let input = "*** Begin Patch\n*** Add File: dir/new.txt\n+hello\n+world\n*** Update File: dir/old.txt\n@@ fn test\n-before\n+after\n*** End Patch\n";
+        let ops = parse_patch(input).unwrap();
+        let inside = |value: &str| {
+            let start = input.as_ptr() as usize;
+            let end = start + input.len();
+            let addr = value.as_ptr() as usize;
+            addr >= start && addr + value.len() <= end
+        };
+        match &ops[0] {
+            PatchOp::Add {
+                path,
+                body,
+                lines,
+                bytes,
+            } => {
+                assert!(inside(path));
+                assert_eq!(*lines, 2);
+                assert_eq!(*bytes, "hello\nworld\n".len());
+                assert_eq!(&input[body.clone()], "+hello\n+world\n");
+            }
+            _ => panic!("expected add"),
+        }
+        match &ops[1] {
+            PatchOp::Update { path, hunks } => {
+                assert!(inside(path));
+                assert!(inside(hunks[0].anchor.unwrap()));
+                assert!(hunks[0].lines.iter().all(|line| match line {
+                    PatchLine::Context(s) | PatchLine::Removed(s) | PatchLine::Added(s) =>
+                        inside(s),
+                }));
+            }
+            _ => panic!("expected update"),
+        }
+    }
+
+    #[test]
+    fn add_body_range_preserves_crlf_and_blank_line_semantics() {
+        let input =
+            "*** Begin Patch\r\n*** Add File: path.txt\r\n+hello\r\n\r\n+\r\n*** End Patch\r\n";
+        let ops = parse_patch(input).unwrap();
+        let PatchOp::Add {
+            body, lines, bytes, ..
+        } = &ops[0]
+        else {
+            panic!("expected add")
+        };
+        assert_eq!(*lines, 3);
+        let actual = patch_lines(&input[body.clone()])
+            .map(|line| {
+                let content = line.strip_prefix('+').unwrap_or("");
+                format!("{content}\n")
+            })
+            .collect::<String>();
+        assert_eq!(actual, "hello\r\n\n\r\n");
+        assert_eq!(*bytes, actual.len());
     }
 
     #[test]
@@ -1170,7 +1466,6 @@ mod tests {
             path: root.join("crates/y/src/lib.rs"),
             display: "crates/y/src/lib.rs".to_owned(),
             bytes: b"planned".to_vec(),
-            limit: 65536,
         };
         let error = stale
             .verify(&machine, "patching")
@@ -1194,23 +1489,17 @@ mod tests {
 
     #[test]
     fn patch_anchor_text_is_kept_and_line_numbers_are_ignored() {
-        assert_eq!(
-            parse_patch_anchor(" fn main() {"),
-            Some("fn main() {".to_owned())
-        );
+        assert_eq!(parse_patch_anchor(" fn main() {"), Some("fn main() {"));
         assert_eq!(parse_patch_anchor(" -12,3 +12,4"), None);
         assert_eq!(parse_patch_anchor(" +12,4"), None);
-        assert_eq!(
-            parse_patch_anchor(" -3,1 +3,1 @@ fn b()"),
-            Some("fn b()".to_owned())
-        );
+        assert_eq!(parse_patch_anchor(" -3,1 +3,1 @@ fn b()"), Some("fn b()"));
         let ops = parse_patch(
             "*** Begin Patch\n*** Update File: a.rs\n@@ -3,1 +3,1 @@ fn b()\n-let x = 1;\n+let x = 2;\n*** End Patch",
         )
         .unwrap();
         match &ops[0] {
             PatchOp::Update { hunks, .. } => {
-                assert_eq!(hunks[0].anchor.as_deref(), Some("fn b()"));
+                assert_eq!(hunks[0].anchor, Some("fn b()"));
                 assert_eq!(hunks[0].lines.len(), 2, "removed + added");
             }
             other => panic!("{other:?}"),

@@ -101,7 +101,11 @@ size/DFA limits of 1 MiB, 8 context lines per side, 64 KiB / 1024 lines per
 `.gitignore` file with invalid patterns failing closed, and a rendered-output
 budget that stops collection at `max_output_bytes` in every mode. `content`
 pages select matching lines and clip context at adjacent matching lines outside
-the page, so a later page does not repeat a hit as context. A `content` page
+the page, so a later page does not repeat a hit as context. The source's
+UTF-8 view borrows the validated byte buffer, and content pages retain only
+bounded selected-hit indices plus adjacent match boundaries. They do not
+allocate a String copy or complete per-line/per-match vectors; files/count
+modes count through iterators. A `content` page
 reserves room for its truncation marker before accepting a hit, so it ends with
 whole hit lines only; a page that stops on the per-file cap says so in the
 marker, and an offset past the last hit answers with an explicit marker. The candidate bound
@@ -525,12 +529,34 @@ cannot turn into an OpenAI-tunnel response-size 502 solely because of the
 success receipt. Actual commit failures can still leave previously committed
 files changed, and those errors report the partial-commit risk explicitly.
 
-`edit`, `patch`, and `bedit` charge retained original and editable/decoded
-buffers against a single 64 MiB planning limit, in addition to their per-file
-and operation ceilings. `edit` counts literal matches without a per-match Vec;
-`patch` retains only bounded ambiguity previews, charges its source line-index
-work, and rejects section 33 while parsing. `bedit` rejects range 33 at wire
-decoding, not after allocating a range list.
+Large text mutation requests borrow `patch` update-hunk lines, names and
+anchors from the request buffer. Add-file sections retain only an input byte
+range and counters, without per-line heap allocations;
+`Snapshot::verify` streams one pinned verification read in 64 KiB chunks,
+rejecting content changes, truncation and appended bytes. Single exact text
+replacements reuse their String allocation where possible, and non-growing
+`replace_all` compacts in place. Standard HTTP known-tool preflight only
+parses borrowed selector fields, leaving actual request validation to rmcp;
+unknown-tool rewriting is unchanged. The embedded OpenAI adapter avoids
+cloning a complete large JSON request unless unknown-tool rewriting is needed.
+`bedit` no-ops are proven by comparing the requested ranges and rehashing the
+current authorized file before returning without staging; ordinary binary
+updates preserve the existing staged-update and commit-time verification.
+
+`edit`, `patch`, and `bedit` use the shared 64 MiB retained-buffer
+planning budget alongside their per-file and operation ceilings. `edit` counts
+literal matches without a per-match Vec. `patch` retains only bounded ambiguity
+previews and uses borrowed unchanged/added lines, representing CRLF
+normalization with an append-CR flag instead of allocating one String per
+added line. It charges the temporary line-index
+and projected result separately from `max_write_bytes` before allocating each
+hunk; it rejects section 33 while parsing. `bedit` rejects range 33 at wire
+decoding and streams its source (up to `min(max_write_bytes, 64 MiB)`) and
+updated output through the same atomic staging safeguards in fixed-size chunks.
+The decoded range payloads, not the whole original and output files, consume
+its retained-buffer budget. Source data is hashed during both the initial
+read and staged write, and the backend verifies that digest at commit; a
+byte-identical edit discards its staged temporary without changing mtime.
 
 `edit` accepts at most 512 operations across 64 distinct files per request.
 Those global bounds are enforced in wire decoding, planning, advertised tool

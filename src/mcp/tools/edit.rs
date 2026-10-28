@@ -115,12 +115,12 @@ impl<'de> Deserialize<'de> for EditArgs {
 
 /// Planning state for one file: the snapshot every entry is applied against and
 /// the resulting text.
-struct FilePlan {
+struct FilePlan<'a> {
     snapshot: Snapshot,
     text: String,
     edits: usize,
     /// Replacement texts applied so far, for the substring guard.
-    new_texts: Vec<String>,
+    new_texts: Vec<&'a str>,
 }
 
 /// A changed file that passed verification and is ready to be written.
@@ -179,7 +179,7 @@ impl LocalMachine {
             .lock_mutations(resolved_paths.iter().map(|path| path.as_path()))
             .await?;
 
-        let mut files: Vec<FilePlan> = Vec::new();
+        let mut files: Vec<FilePlan<'_>> = Vec::new();
         // Bound all simultaneously retained source snapshots and current text
         // buffers, not just the size of individual files or request payload.
         let mut budget = PlanBudget::default();
@@ -282,12 +282,30 @@ impl LocalMachine {
                 );
             }
             budget.replace_work(file.text.len(), next_len)?;
-            file.text = match op.replace_all {
-                true => file.text.replace(&op.old_text, &op.new_text),
-                false => file.text.replacen(&op.old_text, &op.new_text, 1),
-            };
+            if count == 1 {
+                // Most edits are single matches. Replace directly rather than
+                // retaining a second full file-sized String during planning.
+                let at = file
+                    .text
+                    .find(&op.old_text)
+                    .expect("match was counted above");
+                file.text
+                    .replace_range(at..at + op.old_text.len(), &op.new_text);
+            } else if op.new_text.len() <= op.old_text.len() {
+                // Shrinking or byte-equal replace_all can compact in place,
+                // even when there are millions of matches.
+                super::mutation::replace_literal_in_place(
+                    &mut file.text,
+                    &op.old_text,
+                    &op.new_text,
+                );
+            } else {
+                // Growing multi-match replacements use the standard library's
+                // optimized builder instead of a complicated in-place scheme.
+                file.text = file.text.replace(&op.old_text, &op.new_text);
+            }
             file.edits += 1;
-            file.new_texts.push(op.new_text.clone());
+            file.new_texts.push(&op.new_text);
         }
 
         // Verify every file before the first write: a file that changed since it
@@ -591,7 +609,6 @@ mod tests {
             path: root.join(target),
             display: target.to_owned(),
             bytes: b"planned".to_vec(),
-            limit: 65536,
         };
         let error = stale
             .verify(&machine, "editing")

@@ -1069,9 +1069,6 @@ pub(crate) struct Snapshot {
     pub(crate) path: PathBuf,
     pub(crate) display: String,
     pub(crate) bytes: Vec<u8>,
-    /// Ceiling for the planning read and the verification re-read. Text tools
-    /// use the profile read limit; `bedit` uses the patchable-file size.
-    limit: usize,
 }
 
 impl Snapshot {
@@ -1099,7 +1096,6 @@ impl Snapshot {
             path,
             display: display.into(),
             bytes,
-            limit,
         })
     }
 
@@ -1123,8 +1119,7 @@ impl Snapshot {
     /// for every existing-file text update.
     pub(crate) async fn verify(self, machine: &LocalMachine, verb: &str) -> Result<Verified> {
         let mut file = machine.open_edit_file(&self.path).await?;
-        let current = LocalMachine::read_bounded(&mut file, self.limit).await?;
-        if current != self.bytes {
+        if !mutation::matches_snapshot(&mut file, &self.bytes).await? {
             // The caller states the consequence: an atomic tool wrote nothing,
             // `best_effort` skipped this file and kept the rest.
             bail!("{} changed while {verb}", self.display);
@@ -1809,7 +1804,6 @@ mod tests {
             path: path.clone(),
             display: "a.txt".to_owned(),
             bytes: b"planned\n".to_vec(),
-            limit: 65536,
         };
         let error = stale
             .verify(&machine, "editing")

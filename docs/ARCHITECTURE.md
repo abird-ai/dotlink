@@ -117,10 +117,48 @@ precommits its result envelope, while `write` and `bwrite` precompute bounded
 success text. The lower-level `largest_fitting_prefix` serves `ls`, `grep`, and
 multi-file receipts, rather than maintaining independent binary searches.
 
+The request-grammar AST for `patch` borrows paths, anchors and update-hunk
+lines from its owned `PatchArgs.patch` string through planning. An add-file
+section retains just a byte range and precomputed output size/line count,
+then writes the output in one pass; it allocates no per-line strings or slice
+vector, even for dense additions. `Snapshot::verify` compares the open pinned
+source against its retained plan with a fixed 64 KiB buffer and one extra-byte
+probe instead of allocating another complete snapshot. `edit` mutates common
+single matches in place and compacts non-growing multi-match replacements via
+byte-level `memchr` search, avoiding repeated full-suffix UTF-8 validation;
+complex growing multi-match cases retain the standard library implementation.
+
+The `grep` source reader retains its bounded byte buffer after the shared
+`text_bytes` validation, so search borrows the UTF-8 view rather than cloning
+it. A content page scans matching lines once to retain only bounded selected
+indices and their adjacent page boundaries; the renderer walks borrowed lines
+to merge context windows without materializing the file's full line/match
+indices. Files/count results count hits directly from iterators. Original
+paging, context clipping, markers and scan budgets remain intact.
+
+Standard-header HTTP preflight first deserializes only a borrowed method and
+tool name; for known tools the unchanged request goes straight to rmcp without
+a redundant JSON `Value` tree. Unknown tools still use the original complete
+canonicalization, including header-consistency checks. The embedded OpenAI
+adapter clones a JSON-RPC request only when rewriting an unknown tool name.
+Binary input decoding consumes encoded owned strings instead of holding every
+encoded range beside the retained decoded buffers. Byte-identical `bedit`
+ranges are checked against the pinned source and its revalidated digest before
+returning without staging any temporary file.
+
 `edit` streams literal match positions for count and at most ten diagnostic
 lines, with no per-match offsets retained. `patch` keeps only bounded hunk
-ambiguity locations, bounds its temporary line-index work, and rejects file
-section 33 while parsing; `bedit` rejects range 33 during deserialization.
+ambiguity locations and represents source/added lines as borrowed
+`WorkingLine` descriptors. For LF patch additions to CRLF files, a one-bit
+trailing-CR flag is emitted directly into the final String rather than
+allocating `Cow::Owned` for every line; its temporary line-index work is
+accounted separately from the output-file
+write limit, including growth projected before each hunk. It rejects section
+33 while parsing. `bedit` rejects range 33 during deserialization and streams
+source hashing and range replacement in 64 KiB chunks. Shared staged-update
+writer callbacks in the Unix descriptor backend and Windows path backend
+retain mode/DACL preservation, cancellation cleanup and the commit-time
+SHA-256 precondition without retaining source plus output in memory.
 
 ## Profiles and persisted defaults
 
@@ -758,4 +796,6 @@ bedit applies many byte ranges against original-file offsets, rejects overlaps
 and out-of-bounds ranges, applies them in a deterministic order (offset, then
 span so an insert precedes a replacement at the same offset, then request
 position), supports an optional `sha256` precondition, and caps both the source
-and the result at `min(max_write_bytes, 64 MiB)`.
+and the result at `min(max_write_bytes, 64 MiB)`; unlike multi-file text
+plans, binary updates stream source and output in fixed-size buffers, so the
+full 64 MiB file ceiling does not require a 128 MiB working set.

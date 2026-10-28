@@ -13,7 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::{
     LocalMachine,
-    mutation::{ByteSplice, PlanBudget, compact_receipt, digest_limited, stream_splice},
+    mutation::{
+        ByteSplice, PlanBudget, compact_receipt, digest_limited, splices_are_unchanged,
+        stream_splice,
+    },
     ok_text, tool_error,
 };
 use crate::mcp::AccessNeed;
@@ -22,7 +25,7 @@ use crate::mcp::sha256;
 
 /// Maximum source/result size of a streamed binary edit. Input/output bytes
 /// need not be simultaneously retained in memory.
-const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BINARY_EDIT_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BEDIT_RANGES: usize = 32;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
@@ -120,6 +123,17 @@ fn bounded_bedit_ranges<'de, D: serde::Deserializer<'de>>(
         "bedit",
         "ranges",
     )
+}
+
+/// Take ownership of the wire string so its encoded storage is dropped as
+/// soon as decoding finishes, rather than living beside every decoded range
+/// throughout binary planning and staging.
+fn decode_binary_owned(
+    data: String,
+    encoding: BinaryEncoding,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    decode_binary(&data, encoding, max_bytes)
 }
 
 fn decode_binary(data: &str, encoding: BinaryEncoding, max_bytes: usize) -> Result<Vec<u8>> {
@@ -233,7 +247,7 @@ impl LocalMachine {
     }
 
     async fn bwrite_impl(&self, args: BwriteArgs) -> Result<String> {
-        let bytes = decode_binary(&args.data, args.encoding, self.config.max_write_bytes)?;
+        let bytes = decode_binary_owned(args.data, args.encoding, self.config.max_write_bytes)?;
         let reply = super::mutation::compact_text_receipt(
             format!("wrote {} bytes to {}", bytes.len(), args.path),
             format!("wrote {} bytes (path omitted)", bytes.len()),
@@ -268,7 +282,7 @@ impl LocalMachine {
         // chunks. The full 64 MiB advertised file ceiling is independent of
         // the memory budget for decoded replacements and other live buffers.
         let mut budget = PlanBudget::default();
-        let limit = self.config.max_write_bytes.min(MAX_PATCH_FILE_BYTES);
+        let limit = self.config.max_write_bytes.min(MAX_BINARY_EDIT_FILE_BYTES);
         let mut source = self.open_edit_file(&path).await?.into_std().await;
         let (size_before, digest) = crate::blocking::run(|| digest_limited(&mut source, limit))?;
         if let Some(expected) = args.sha256.as_deref() {
@@ -283,7 +297,7 @@ impl LocalMachine {
         // worth of bytes in memory while its ranges are validated.
         let mut decoded_bytes = 0_usize;
         let mut ranges = Vec::with_capacity(total);
-        for (index, range) in args.edits.iter().enumerate() {
+        for (index, range) in args.edits.into_iter().enumerate() {
             let position = index + 1;
             if range.offset > size_before {
                 anyhow::bail!(
@@ -291,7 +305,7 @@ impl LocalMachine {
                     range.offset
                 );
             }
-            let data = decode_binary(&range.data, range.encoding, limit)
+            let data = decode_binary_owned(range.data, range.encoding, limit)
                 .with_context(|| format!("bedit {position}/{total}"))?;
             decoded_bytes = decoded_bytes.saturating_add(data.len());
             if decoded_bytes > limit {
@@ -348,6 +362,37 @@ impl LocalMachine {
         if size_after > limit {
             anyhow::bail!("bedit: patched file would exceed the {limit} byte limit");
         }
+        let splices = ranges
+            .iter()
+            .map(|range| ByteSplice {
+                offset: range.offset,
+                end: range.end,
+                data: &range.data,
+            })
+            .collect::<Vec<_>>();
+
+        // Prove byte-identical edits without writing a full staging file.
+        // Re-open by the authorized path and hash it again so the no-op reply
+        // cannot silently accept a changed or replaced source during planning.
+        if splices_are_unchanged(&mut source, &splices)? {
+            let mut current = self.open_edit_file(&path).await?.into_std().await;
+            let found = crate::blocking::run(|| digest_limited(&mut current, limit))?;
+            if found != (size_before, digest) {
+                anyhow::bail!("bedit: source changed while checking a no-op; nothing was written");
+            }
+            return compact_receipt(
+                serde_json::json!({
+                    "path": display,
+                    "changed": false,
+                    "ranges": total,
+                    "bytes_written": 0,
+                    "size_before": size_before,
+                    "size_after": size_after,
+                }),
+                self.config.max_output_bytes,
+            );
+        }
+
         // Stream the original spans and replacements straight into the same
         // protected staging backend used by every write. Hash all original
         // bytes as we go, including deleted ranges, and reject a changed
@@ -356,14 +401,6 @@ impl LocalMachine {
         let mut changed = false;
         let pending = self
             .stage_update_with(&path, (size_before as u64, digest), |output| {
-                let splices = ranges
-                    .iter()
-                    .map(|range| ByteSplice {
-                        offset: range.offset,
-                        end: range.end,
-                        data: &range.data,
-                    })
-                    .collect::<Vec<_>>();
                 changed = stream_splice(&mut source, output, (size_before, digest), &splices)?;
                 Ok(())
             })
@@ -481,6 +518,54 @@ mod tests {
             error.contains(&format!("at most {MAX_BEDIT_RANGES} ranges")),
             "{error}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bedit_streams_full_64_mib_file_and_does_not_rewrite_noop() {
+        use std::io::Write as _;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("full.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"A").unwrap();
+        file.set_len(MAX_BINARY_EDIT_FILE_BYTES as u64).unwrap();
+        drop(file);
+        let mut machine = test_machine(root.clone());
+        machine.config.max_read_bytes = 1024 * 1024;
+        machine.config.max_write_bytes = MAX_BINARY_EDIT_FILE_BYTES;
+        let edit = || BeditArgs {
+            path: "full.bin".into(),
+            edits: vec![bedit_range(0, Some(1), "B")],
+            sha256: None,
+        };
+        let changed: Value =
+            serde_json::from_str(&machine.bedit_impl(edit()).await.unwrap()).unwrap();
+        assert_eq!(changed["changed"], true);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_BINARY_EDIT_FILE_BYTES as u64
+        );
+        let before_noop = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let unchanged: Value =
+            serde_json::from_str(&machine.bedit_impl(edit()).await.unwrap()).unwrap();
+        assert_eq!(unchanged["changed"], false);
+        assert_eq!(unchanged["bytes_written"], 0);
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "a proven no-op must not create a staging temporary"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before_noop
+        );
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut first = [0_u8; 1];
+        use std::io::Read as _;
+        file.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"B");
     }
 
     #[test]

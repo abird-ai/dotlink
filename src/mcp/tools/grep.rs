@@ -153,7 +153,7 @@ impl OutputBudget {
 }
 
 enum SearchRead {
-    Text(String, usize),
+    Text(Vec<u8>, usize),
     Skipped(usize),
     Unreadable(usize),
     WorkBudgetExceeded,
@@ -235,7 +235,7 @@ impl LocalMachine {
             Some(SearchSize::Read(_)) => {}
         }
         match super::text_bytes(&bytes) {
-            Some(text) => SearchRead::Text(text.to_owned(), scanned),
+            Some(_) => SearchRead::Text(bytes, scanned),
             None => SearchRead::Skipped(scanned),
         }
     }
@@ -375,49 +375,44 @@ impl LocalMachine {
                     break;
                 }
             };
+            let text =
+                super::text_bytes(&text).expect("search input already classified as UTF-8 text");
             let display = self.config.access.relative_display(path);
-            let lines = text.lines().collect::<Vec<_>>();
 
             match args.output_mode {
                 GrepOutputMode::Content => {
-                    let matches = lines
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, line)| regex.is_match(line))
-                        .map(|(index, _)| index)
-                        .collect::<Vec<_>>();
-                    if matches.is_empty() {
+                    let requested_skip = paging.offset.saturating_sub(paging.skipped);
+                    let selection = select_hit_page(
+                        text,
+                        &regex,
+                        requested_skip,
+                        paging
+                            .limit
+                            .saturating_sub(paging.emitted)
+                            .min(MAX_GREP_PER_FILE),
+                    );
+                    paging.skipped = paging.skipped.saturating_add(selection.skipped);
+                    if selection.selected.is_empty() && selection.next.is_none() {
                         continue;
                     }
-                    let to_skip = paging
-                        .offset
-                        .saturating_sub(paging.skipped)
-                        .min(matches.len());
-                    paging.skipped = paging.skipped.saturating_add(to_skip);
-                    if to_skip == matches.len() {
-                        continue;
-                    }
-                    let remaining = paging.limit.saturating_sub(paging.emitted);
-                    if remaining == 0 {
+                    if paging.full() {
                         stop = Some(StopReason::PageFull);
                         break;
                     }
-                    let take_max = remaining
-                        .min(matches.len() - to_skip)
-                        .min(MAX_GREP_PER_FILE);
-                    // Select the largest contiguous prefix of hits that fits
-                    // both the hit limits and the remaining byte budget. A
-                    // single oversized batch must not blank the whole page.
+                    let take_max = selection.selected.len();
+                    // Preserve the largest prefix that fits. A page can have
+                    // overlapping context windows; clipping only whole hits
+                    // keeps pagination stable even near the byte ceiling.
                     let mut take = take_max;
                     let rendered = loop {
                         if take == 0 {
                             break None;
                         }
                         let candidate = render_hit_page(
-                            &lines,
-                            &matches,
-                            to_skip,
-                            take,
+                            text,
+                            &selection.selected[..take],
+                            selection.previous,
+                            selection.selected.get(take).copied().or(selection.next),
                             HitRender {
                                 before,
                                 after,
@@ -437,7 +432,7 @@ impl LocalMachine {
                     let _ = budget.take(group.len());
                     content.push_str(&group);
                     paging.emit_many(take);
-                    let more_in_file = to_skip + take < matches.len();
+                    let more_in_file = take < selection.selected.len() || selection.next.is_some();
                     if take < take_max {
                         stop = Some(StopReason::ByteBudget);
                         break;
@@ -452,7 +447,7 @@ impl LocalMachine {
                     }
                 }
                 GrepOutputMode::Files | GrepOutputMode::Count => {
-                    let hits = lines.iter().filter(|line| regex.is_match(line)).count();
+                    let hits = text.lines().filter(|line| regex.is_match(line)).count();
                     if hits == 0 {
                         continue;
                     }
@@ -592,14 +587,48 @@ struct HitRender<'a> {
     display: &'a str,
 }
 
-/// Render one page of matching lines with optional context. Selected hits are
-/// exactly the page's hit records; context never reaches into an unselected
-/// matching line, so a later page cannot repeat a hit as context.
+/// Retain only a bounded page of hit indices plus the adjacent matches
+/// needed to keep context from crossing a page boundary. Neither line count
+/// nor total match count allocate memory proportional to a dense input file.
+struct HitSelection {
+    skipped: usize,
+    previous: Option<usize>,
+    selected: Vec<usize>,
+    next: Option<usize>,
+}
+
+fn select_hit_page(text: &str, regex: &regex::Regex, offset: usize, limit: usize) -> HitSelection {
+    let mut selection = HitSelection {
+        skipped: 0,
+        previous: None,
+        selected: Vec::with_capacity(limit),
+        next: None,
+    };
+    for (line_number, line) in text.lines().enumerate() {
+        if !regex.is_match(line) {
+            continue;
+        }
+        if selection.skipped < offset {
+            selection.skipped += 1;
+            selection.previous = Some(line_number);
+        } else if selection.selected.len() < limit {
+            selection.selected.push(line_number);
+        } else {
+            selection.next = Some(line_number);
+            break;
+        }
+    }
+    selection
+}
+
+/// Render one page with the original context and paging semantics. The input
+/// is traversed without collecting its lines; only at most 50 selected hits
+/// and their merged context ranges are retained.
 fn render_hit_page(
-    lines: &[&str],
-    matches: &[usize],
-    selected_start: usize,
-    selected_len: usize,
+    text: &str,
+    selected: &[usize],
+    previous_match: Option<usize>,
+    next_match: Option<usize>,
     render: HitRender<'_>,
 ) -> String {
     let HitRender {
@@ -608,18 +637,16 @@ fn render_hit_page(
         numbered,
         display,
     } = render;
-    let previous_match = selected_start.checked_sub(1).map(|index| matches[index]);
-    let next_match = matches.get(selected_start + selected_len).copied();
-    let last_line = lines.len().saturating_sub(1);
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(selected_len);
-    for &hit in &matches[selected_start..selected_start + selected_len] {
+    // The rendering iterator itself stops at EOF. No full-file line count is
+    // needed, especially when a short page is retried under a byte ceiling.
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(selected.len());
+    for &hit in selected {
         let start = hit
             .saturating_sub(before)
             .max(previous_match.map_or(0, |line| line + 1));
         let end = hit
             .saturating_add(after)
-            .min(next_match.map_or(last_line, |line| line.saturating_sub(1)))
-            .min(last_line);
+            .min(next_match.map_or(usize::MAX, |line| line.saturating_sub(1)));
         if start > end {
             continue;
         }
@@ -630,11 +657,16 @@ fn render_hit_page(
     }
 
     let mut output = String::new();
-    for (index, (start, end)) in ranges.iter().enumerate() {
+    let mut lines = text.lines().enumerate().peekable();
+    for (index, (start, end)) in ranges.into_iter().enumerate() {
         if index > 0 && (before > 0 || after > 0) {
             output.push_str("--\n");
         }
-        for (number, line) in lines.iter().enumerate().take(end + 1).skip(*start) {
+        while lines.peek().is_some_and(|(line, _)| *line < start) {
+            lines.next();
+        }
+        while lines.peek().is_some_and(|(line, _)| *line <= end) {
+            let (number, line) = lines.next().expect("peeked a line");
             match numbered {
                 true => output.push_str(&format!("{display}:{}: {line}\n", number + 1)),
                 false => output.push_str(&format!("{display}: {line}\n")),
@@ -701,6 +733,61 @@ mod tests {
     use super::*;
     use crate::mcp::tools::test_support::{grep_args, grep_tree, test_machine};
     use serde_json::Value;
+
+    #[test]
+    fn dense_hit_selection_keeps_only_the_requested_page() {
+        let text = "hit\n".repeat(200_000);
+        let regex = regex::Regex::new("hit").unwrap();
+        let selection = select_hit_page(&text, &regex, 199_990, 2);
+        assert_eq!(selection.skipped, 199_990);
+        assert_eq!(selection.previous, Some(199_989));
+        assert_eq!(selection.selected, [199_990, 199_991]);
+        assert_eq!(selection.next, Some(199_992));
+        let result = render_hit_page(
+            &text,
+            &selection.selected,
+            selection.previous,
+            selection.next,
+            HitRender {
+                before: 8,
+                after: 8,
+                numbered: true,
+                display: "file.txt",
+            },
+        );
+        assert_eq!(result, "file.txt:199991: hit\nfile.txt:199992: hit\n");
+    }
+
+    #[test]
+    fn selected_hit_indices_match_complete_scan_under_paging() {
+        let regex = regex::Regex::new("hit").unwrap();
+        for seed in 0_usize..280 {
+            let mut state = seed + 1;
+            let mut text = String::new();
+            for line in 0..75 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let value = if state % 4 == 0 { "hit" } else { "other" };
+                text.push_str(value);
+                if line < 74 || seed % 2 == 0 {
+                    text.push('\n');
+                }
+            }
+            let matches = text
+                .lines()
+                .enumerate()
+                .filter_map(|(index, line)| regex.is_match(line).then_some(index))
+                .collect::<Vec<_>>();
+            let offset = seed % 43;
+            let limit = seed % (MAX_GREP_PER_FILE + 1);
+            let found = select_hit_page(&text, &regex, offset, limit);
+            let skipped = offset.min(matches.len());
+            let end = skipped + limit.min(matches.len() - skipped);
+            assert_eq!(found.skipped, skipped, "seed={seed}");
+            assert_eq!(found.previous, skipped.checked_sub(1).map(|i| matches[i]));
+            assert_eq!(found.selected, matches[skipped..end]);
+            assert_eq!(found.next, matches.get(end).copied());
+        }
+    }
 
     #[tokio::test]
     async fn grep_source_reads_never_probe_past_declared_or_aggregate_limits() {
@@ -793,7 +880,7 @@ mod tests {
         let machine = test_machine(root);
         match machine.read_search_file(&path, 7).await {
             SearchRead::Text(text, scanned) => {
-                assert_eq!(text, "needle\n");
+                assert_eq!(text, b"needle\n");
                 assert_eq!(scanned, 7);
             }
             _ => panic!("a stable regular file exactly at the aggregate limit must be accepted"),
@@ -916,6 +1003,49 @@ mod tests {
              src/nested/deep.rs: deep needle\n\
              top.txt: needle one"
         );
+    }
+
+    #[tokio::test]
+    async fn grep_context_is_clipped_at_unselected_page_boundary_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("file.txt"),
+            "hit0\ncontext1\nhit2\ncontext3\nhit4\ncontext5\n",
+        )
+        .unwrap();
+        let machine = test_machine(root);
+        let mut args = grep_args("hit");
+        args.offset = Some(1);
+        args.limit = Some(1);
+        args.before = Some(2);
+        args.after = Some(2);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert_eq!(
+            content,
+            "file.txt:2: context1\nfile.txt:3: hit2\nfile.txt:4: context3\n… truncated at 1 hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn dense_file_reaches_deep_hit_pages_and_exact_count_without_hit_vectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("dense.txt"), "hit\n".repeat(150_000)).unwrap();
+        let machine = test_machine(root);
+        let mut args = grep_args("hit");
+        args.offset = Some(50_000);
+        args.limit = Some(2);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert_eq!(
+            content,
+            "dense.txt:50001: hit\ndense.txt:50002: hit\n… truncated at 2 hits"
+        );
+        let mut args = grep_args("hit");
+        args.output_mode = GrepOutputMode::Count;
+        let count: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
+        assert_eq!(count["page_total"], 150_000);
+        assert_eq!(count["counts"][0]["count"], 150_000);
     }
 
     #[tokio::test]

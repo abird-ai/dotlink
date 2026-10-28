@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- CRLF patch hunks now store borrowed text plus a one-bit trailing-CR adjustment; the shared final output builder emits it without allocating a per-added-line `String`. This preserves context matching, whitespace tolerance and source line endings for dense updates.
+- `grep` reuses the shared UTF-8-classified source bytes without cloning them. Content pages collect only the selected hit indices and adjacent page boundaries (at most the per-file hit cap), and render context by walking borrowed lines. Files/count modes count via iterators, without per-line or per-hit vectors. Pagination, result markers and I/O ceilings are unchanged.
+
+- MCP text `patch` parses file paths, hunk anchors and update lines as borrowed slices of the request instead of cloning them; add-file sections retain one contiguous byte range rather than allocating even a per-line slice vector. Snapshot preflight compares file content with a single 64 KiB scratch buffer, and ordinary one-match edits mutate their existing `String` directly. Multi-match non-growing edits compact in place using `memchr`'s SIMD-aware byte-pattern search, avoiding both full-file copies and quadratic UTF-8 validation.
+- HTTP standard tool preflight inspects the tool selector without allocating a second JSON `Value` tree for known tools; the OpenAI embedded adapter likewise clones JSON only for unknown-tool canonicalization. Existing unknown-tool schema-cache and header validation behavior is unchanged. Encoded binary inputs are consumed promptly rather than retaining all encoded strings beside their decoded range buffers.
+
+### Fixed
+
+- `bedit` now detects byte-identical, length-preserving ranges before staging. It revalidates the pinned source digest and returns a bounded `changed=false` receipt without writing a whole temporary file; shifting edits and edits that are not provably identical still use atomic streamed staging.
+- `bedit` retains its documented 64 MiB source/result ceiling with a streamed, descriptor-pinned update: source and output SHA-256 verification, original-offset range splicing and atomic staging use fixed-size IO buffers rather than two full file copies. Both Unix and Windows staging use the same write-producer API, preserve file permissions, and remove failed temporaries. Identical edits preserve the original mtime.
+- `patch` borrows unchanged source lines instead of allocating one owned string per line. Scratch line-index bytes are charged independently of the resulting file's write limit; projected line-index and output growth are checked before each hunk allocates replacements. Dense-line files no longer fail merely because a small write ceiling was confused with the temporary-memory budget.
+
+### Changed
+
 - Multi-file text `edit` now permits 512 operations and 64 distinct files per call, both from two shared constants. Its wire decoder, advertised `maxItems`/description, planner, and TOOL-log preview use the same bounds; invalid oversized batches stop during decoding and cannot trigger quadratic log work.
 - Sandbox `--allow-rw=/ --allow-shell` remains an intentional full-filesystem opt-out while preserving Bubblewrap's process/network isolation. Without an explicit root RW grant, fine-grained guards stay strict; user-specified deny rules still cannot be silently bypassed. Unrestricted sandboxed shells intentionally do not mount Dotlink-private path masks; this grants filesystem access to those secrets while keeping the separate namespace/network controls.
 - Multi-file mutation planning now uses a 64 MiB aggregate budget for retained source and working buffers; both text and binary edits plan replies within the configured output ceiling before any commit. This prevents success-after-write tunnel 502s caused by oversized receipts.

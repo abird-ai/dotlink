@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 use std::{
     fmt,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
 };
 
@@ -83,6 +83,56 @@ impl PlanBudget {
     }
 }
 
+/// Compare a pinned snapshot using a fixed scratch buffer rather than a
+/// second complete read. Used by every text mutator during pre-commit verify;
+/// type/authority checks remain in the descriptor-rooted file opener.
+pub(crate) async fn matches_snapshot(file: &mut tokio::fs::File, expected: &[u8]) -> Result<bool> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
+    let mut cursor = 0;
+    while cursor < expected.len() {
+        let remaining = (expected.len() - cursor).min(buffer.len());
+        let read = file.read(&mut buffer[..remaining]).await?;
+        if read == 0 || buffer[..read] != expected[cursor..cursor + read] {
+            return Ok(false);
+        }
+        cursor += read;
+    }
+    // An additional byte is sufficient to detect concurrent file extension.
+    let mut extra = [0];
+    Ok(file.read(&mut extra).await? == 0)
+}
+
+/// Replace a shorter or equal-length literal in place without allocating a
+/// second full text buffer. Safe byte compaction cannot overwrite unread input
+/// when the replacement's encoded length does not exceed the match length.
+/// More expensive growing replacements stay with std's optimized `replace`.
+pub(crate) fn replace_literal_in_place(text: &mut String, needle: &str, replacement: &str) {
+    debug_assert!(!needle.is_empty() && replacement.len() <= needle.len());
+    let finder = memchr::memmem::Finder::new(needle.as_bytes());
+    let mut bytes = std::mem::take(text).into_bytes();
+    let (mut read, mut write) = (0_usize, 0_usize);
+    while read < bytes.len() {
+        // The original text and needle are UTF-8; their byte-pattern matches
+        // always begin on a character boundary. Searching bytes avoids
+        // repeatedly validating the entire suffix for dense matches.
+        let at = finder.find(&bytes[read..]).map(|offset| read + offset);
+        let Some(at) = at else {
+            let left = bytes.len() - read;
+            bytes.copy_within(read.., write);
+            write += left;
+            break;
+        };
+        bytes.copy_within(read..at, write);
+        write += at - read;
+        bytes[write..write + replacement.len()].copy_from_slice(replacement.as_bytes());
+        write += replacement.len();
+        read = at + needle.len();
+    }
+    bytes.truncate(write);
+    *text = String::from_utf8(bytes).expect("UTF-8 spans and replacements preserve UTF-8");
+}
+
 /// Streaming binary replacements never need to retain the original source or
 /// a full output buffer. The staged writer below can be reused by any tool
 /// whose edits refer to offsets in the *original* file.
@@ -118,6 +168,29 @@ pub(crate) fn digest_limited(source: &mut impl Read, limit: usize) -> Result<(us
         hasher.update(&buffer[..size]);
     }
     Ok((total, hasher.finalize().into()))
+}
+
+/// Prove a common binary edit is a no-op by comparing only touched spans.
+/// Insertion/deletion shifts and unequal-length replacements fall back to
+/// the regular streamed writer; this path never allocates a full file buffer.
+pub(crate) fn splices_are_unchanged(
+    source: &mut (impl Read + Seek),
+    splices: &[ByteSplice<'_>],
+) -> Result<bool> {
+    let mut scratch = [0_u8; STREAM_CHUNK_BYTES];
+    for splice in splices {
+        if splice.end.checked_sub(splice.offset) != Some(splice.data.len()) {
+            return Ok(false);
+        }
+        source.seek(SeekFrom::Start(splice.offset as u64))?;
+        for chunk in splice.data.chunks(scratch.len()) {
+            source.read_exact(&mut scratch[..chunk.len()])?;
+            if &scratch[..chunk.len()] != chunk {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Stream only the requested changed ranges to the staged file, hashing every
@@ -447,6 +520,171 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn in_place_literal_replacement_matches_std_on_unicode_and_overlaps() {
+        for (source, needle, replacement) in [
+            ("aaaaa", "aa", "b"),
+            ("éé🙂éé", "é", "a"),
+            ("🙂🙂🙂", "🙂", "é"),
+            ("αβγβγ", "βγ", "aa"),
+            ("aaabababaa", "aba", ""),
+            ("a", "a", "a"),
+            ("no match", "hello", ""),
+        ] {
+            let mut changed = source.to_owned();
+            replace_literal_in_place(&mut changed, needle, replacement);
+            assert_eq!(changed, source.replace(needle, replacement));
+        }
+    }
+
+    #[test]
+    fn in_place_compaction_scales_to_millions_of_adjacent_matches() {
+        let mut text = "ab".repeat(1_000_000);
+        replace_literal_in_place(&mut text, "ab", "x");
+        assert_eq!(text, "x".repeat(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn snapshot_verification_streams_without_allocating_duplicate_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("file");
+        let expected = vec![b'a'; 128 * 1024];
+        std::fs::write(&path, &expected).unwrap();
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        assert!(matches_snapshot(&mut file, &expected).await.unwrap());
+        std::fs::write(&path, [&expected[..], b"extra"].concat()).unwrap();
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        assert!(!matches_snapshot(&mut file, &expected).await.unwrap());
+        std::fs::write(&path, b"short").unwrap();
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        assert!(!matches_snapshot(&mut file, &expected).await.unwrap());
+    }
+
+    #[test]
+    fn binary_noop_detection_reads_only_changed_ranges() {
+        use std::io::Cursor;
+        let mut source = Cursor::new(b"0123456789".to_vec());
+        assert!(
+            splices_are_unchanged(
+                &mut source,
+                &[
+                    ByteSplice {
+                        offset: 2,
+                        end: 5,
+                        data: b"234"
+                    },
+                    ByteSplice {
+                        offset: 7,
+                        end: 8,
+                        data: b"7"
+                    },
+                ]
+            )
+            .unwrap()
+        );
+        assert!(
+            !splices_are_unchanged(
+                &mut source,
+                &[ByteSplice {
+                    offset: 2,
+                    end: 5,
+                    data: b"X34"
+                }]
+            )
+            .unwrap()
+        );
+        assert!(
+            !splices_are_unchanged(
+                &mut source,
+                &[ByteSplice {
+                    offset: 2,
+                    end: 2,
+                    data: b"X"
+                }]
+            )
+            .unwrap()
+        );
+        assert!(
+            !splices_are_unchanged(
+                &mut source,
+                &[ByteSplice {
+                    offset: 2,
+                    end: 4,
+                    data: b"X"
+                }]
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn streaming_binary_edits_preserve_order_and_validate_original_bytes() {
+        use std::io::Cursor;
+        let original = b"0123456789";
+        let expected = digest_limited(&mut Cursor::new(original), original.len()).unwrap();
+        assert_eq!(expected.0, original.len());
+        let splices = [
+            ByteSplice {
+                offset: 2,
+                end: 2,
+                data: b"AA",
+            },
+            ByteSplice {
+                offset: 2,
+                end: 4,
+                data: b"B",
+            },
+            ByteSplice {
+                offset: 7,
+                end: 9,
+                data: b"",
+            },
+        ];
+        let mut output = Vec::new();
+        assert!(
+            stream_splice(&mut Cursor::new(original), &mut output, expected, &splices).unwrap()
+        );
+        assert_eq!(output, b"01AAB4569");
+
+        // Identical replacement is a no-op, even though staging wrote bytes.
+        let mut identical = Vec::new();
+        assert!(
+            !stream_splice(
+                &mut Cursor::new(original),
+                &mut identical,
+                expected,
+                &[ByteSplice {
+                    offset: 0,
+                    end: 1,
+                    data: b"0"
+                }]
+            )
+            .unwrap()
+        );
+        assert_eq!(identical, original);
+
+        // A same-size change must be detected by the source digest, not merely
+        // by the expected file size; a concurrent extension must also fail.
+        for changed in [&b"0123x56789"[..], &b"01234567890"[..], &b"012345678"[..]] {
+            assert!(
+                stream_splice(
+                    &mut Cursor::new(changed),
+                    &mut Vec::new(),
+                    expected,
+                    &splices
+                )
+                .is_err()
+            );
+        }
+        assert!(digest_limited(&mut Cursor::new(original), original.len() - 1).is_err());
+        assert_eq!(
+            digest_limited(&mut Cursor::new(&original[..3]), 3)
+                .unwrap()
+                .0,
+            3
+        );
+    }
 
     #[test]
     fn shared_receipt_retains_failure_totals_without_exceeding_ceiling() {

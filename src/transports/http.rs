@@ -1055,7 +1055,11 @@ async fn guard_standard_tool_call(
             );
         }
     };
-    let body = if let Ok(mut message) = serde_json::from_slice(&bytes) {
+    let body = if super::known_standard_tool_body(&bytes, &machine) {
+        // Do not materialize a duplicate serde_json::Value for a known tool.
+        // rmcp owns the actual validation and parse of this unchanged body.
+        Body::from(bytes)
+    } else if let Ok(mut message) = serde_json::from_slice(&bytes) {
         if super::canonicalize_unknown_standard_tool(&mut parts.headers, &mut message, &machine) {
             Body::from(
                 serde_json::to_vec(&message)

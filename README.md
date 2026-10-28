@@ -358,7 +358,10 @@ retain the best sorted candidates within the scanned entries in bounded memory.
 Both bound their JSON replies at `max_output_bytes`, keeping the longest prefix
 that fits. `ls` derives its default depth from the pattern (one level per segment,
 unbounded for `**`) so a deep pattern never silently returns nothing, and
-`grep` pages only ever contain whole matching lines. `grep count` reports
+`grep` pages only ever contain whole matching lines. File contents are
+UTF-8-validated without copying; each content page keeps only a bounded
+selection of matching line indices and streams context from the same buffer,
+not a vector of every line or hit. `grep count` reports
 `page_total` for the returned page. `read` streams a line window, so
 `max_read_bytes` bounds the returned window, its marker and one line rather than
 rejecting a large file outright; the page is assembled in one buffer, and lines
@@ -481,12 +484,25 @@ how many per-file details were omitted, while the operation count remains exact.
 Legacy requests with a
 single top-level default path still work, but are no longer advertised.
 
-`edit`, `patch`, and `bedit` share a 64 MiB retained source/working-buffer
-budget. `edit` (512 edits / 64 files), `patch` (32 files / 64 hunks) and `bedit`
-(32 ranges) reject excess operations early. Large multi-file success receipts
+`edit`, `patch`, and `bedit` share a 64 MiB retained-buffer budget.
+`edit` (512 edits / 64 files), `patch` (32 files / 64 hunks) and `bedit`
+(32 ranges) reject excess operations early. `patch` borrows unchanged file
+lines, so dense-line patches do not multiply per-line string allocations or
+consume the output write limit as scratch memory. `bedit` hashes and stages
+binary changes in fixed-size chunks: its source and resulting file can still
+be up to 64 MiB (subject to `max_write_bytes`) without holding two copies in
+memory, and unchanged results preserve mtime. Large multi-file success receipts
 fit the profile output ceiling using `truncated` and omitted counts, checked
 before any commits; `write`/`bwrite` likewise avoid overly long path messages.
-The shared staging engine preserves strict all-stage-before-commit and
+Patch file names and update-hunk lines are borrowed from the request; add-file
+sections retain one contiguous source range rather than even a per-line slice
+vector. CRLF target adjustments are represented as borrowed lines plus a flag;
+no `String` allocation is needed for each added line. This avoids millions of tiny allocations for large patches. Existing-file
+snapshots are rechecked with a fixed scratch buffer; common text replacements
+edit in place. Identical binary ranges avoid staging a temporary while still
+checking that the source has not changed. Known HTTP/embedded MCP calls also
+avoid an unnecessary second JSON tree where practical. The shared staging
+engine preserves strict all-stage-before-commit and
 `patch` best-effort behavior. Individual file replacements remain atomic;
 a multi-file commit is not a cross-file transaction.
 

@@ -258,6 +258,7 @@ mod path_backend {
             }
         }
 
+        #[cfg(test)]
         pub(super) fn file(&mut self) -> &mut fs::File {
             self.file
                 .as_mut()
@@ -389,7 +390,16 @@ mod path_backend {
             // original restrictive ACL has been applied successfully.
             protect_temporary(&pending.path, dacl)?;
         }
-        let mut file = pending.file.take().unwrap().into_std().await;
+        // This file has never scheduled Tokio IO. Convert without an await:
+        // no cancellation window may exist between taking the FD from the
+        // cleanup guard and returning it after the synchronous write.
+        let mut file = match pending.file.take().unwrap().try_into_std() {
+            Ok(file) => file,
+            Err(file) => {
+                pending.file = Some(file);
+                bail!("staged temporary has pending IO");
+            }
+        };
         let outcome = crate::blocking::run(|| -> Result<()> {
             write(&mut file)?;
             if let Some(permissions) = existing_permissions {
@@ -560,6 +570,35 @@ pub(crate) use path_backend::{StagedWrite, stage as stage_path, stage_with as st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streamed_path_staging_cleans_cancelled_work_and_commits() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("file.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let expected = (6, crate::mcp::sha256(b"before"));
+        let error = super::path_backend::stage_with(&target, false, Some(expected), |file| {
+            file.write_all(b"partial")?;
+            anyhow::bail!("synthetic streaming error")
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("synthetic streaming error"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+
+        let staged = super::path_backend::stage_with(&target, false, Some(expected), |file| {
+            file.write_all(b"after")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        staged.commit().await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"after");
+    }
 
     #[test]
     fn staging_mode_never_widens_an_existing_target() {

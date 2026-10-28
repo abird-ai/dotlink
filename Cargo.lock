@@ -626,6 +626,7 @@ dependencies = [
  "http-body-util",
  "ignore",
  "libc",
+ "memchr",
  "mime_guess",
  "ngrok",
  "regex",

@@ -354,7 +354,6 @@ impl EmbeddedMcp {
         jsonrpc: &Value,
         notifications: mpsc::Sender<Value>,
     ) -> Result<LocalResponse> {
-        let mut message = jsonrpc.clone();
         let body = serde_json::to_vec(jsonrpc).context("failed to serialize MCP command")?;
         let mut request = Request::builder()
             .method("POST")
@@ -381,16 +380,21 @@ impl EmbeddedMcp {
             .body(Full::new(Bytes::from(body)))
             .context("failed to build in-process MCP request")?;
         if body_len <= self.max_request_bytes
-            && super::canonicalize_unknown_standard_tool(
+            && super::unknown_standard_tool_value(request.headers(), jsonrpc, &self.machine)
+        {
+            // Only an unknown tool needs a second owned JSON tree. Known tools
+            // keep their original body and avoid cloning huge payload strings.
+            let mut message = jsonrpc.clone();
+            if super::canonicalize_unknown_standard_tool(
                 request.headers_mut(),
                 &mut message,
                 &self.machine,
-            )
-        {
-            *request.body_mut() = Full::new(Bytes::from(
-                serde_json::to_vec(&message)
-                    .context("failed to canonicalize unknown MCP tool request")?,
-            ));
+            ) {
+                *request.body_mut() = Full::new(Bytes::from(
+                    serde_json::to_vec(&message)
+                        .context("failed to canonicalize unknown MCP tool request")?,
+                ));
+            }
         }
         let response = self.service.handle(request).await;
         let status = response.status().as_u16();

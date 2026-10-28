@@ -28,6 +28,7 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 ignore = "0.4"
+memchr = "2"
 mime_guess = "2"
 ngrok = { version = "0.19", default-features = false, features = ["ring"] }
 regex = "1"

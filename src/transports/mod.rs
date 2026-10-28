@@ -2,6 +2,7 @@ use ::http::{HeaderMap, HeaderValue};
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use rmcp::{model::ProtocolVersion, transport::streamable_http_server::StreamableHttpServerConfig};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::{task::JoinSet, time};
 use tokio_util::sync::CancellationToken;
@@ -51,6 +52,43 @@ pub(crate) fn uses_standard_mcp_headers(headers: &HeaderMap) -> bool {
         .is_some_and(|version| version >= ProtocolVersion::STANDARD_HEADERS.as_str())
 }
 
+/// Inspect only the MCP method and tool name, borrowing from a complete JSON
+/// request. Serde skips the potentially enormous `arguments` object without
+/// constructing a second Value tree. Ordinary known-tool requests then pass
+/// to rmcp unchanged; unknown tools still use the canonicalization below.
+#[derive(Deserialize)]
+struct ToolSelector<'a> {
+    method: &'a str,
+    params: ToolSelectorParams<'a>,
+}
+
+#[derive(Deserialize)]
+struct ToolSelectorParams<'a> {
+    name: &'a str,
+}
+
+pub(crate) fn known_standard_tool_body(bytes: &[u8], machine: &LocalMachine) -> bool {
+    serde_json::from_slice::<ToolSelector<'_>>(bytes).is_ok_and(|message| {
+        message.method == "tools/call" && machine.has_tool_for_policy(message.params.name)
+    })
+}
+
+/// Whether the *structured* request needs unknown-tool rewriting. Use before
+/// cloning the OpenAI tunnel's already-parsed Value; common known-tool calls
+/// should not clone every embedded binary or text payload.
+pub(crate) fn unknown_standard_tool_value(
+    headers: &HeaderMap,
+    message: &Value,
+    machine: &LocalMachine,
+) -> bool {
+    uses_standard_mcp_headers(headers)
+        && message.get("method").and_then(Value::as_str) == Some("tools/call")
+        && message
+            .pointer("/params/name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !machine.has_tool_for_policy(name))
+}
+
 /// Canonicalize the one attacker-controlled key rmcp would otherwise add to
 /// its SEP-2243 schema cache. Everything else continues through rmcp unchanged
 /// so its normal HTTP, protocol metadata and standard-header validation wins.
@@ -59,27 +97,19 @@ pub(crate) fn canonicalize_unknown_standard_tool(
     message: &mut Value,
     machine: &LocalMachine,
 ) -> bool {
-    if !uses_standard_mcp_headers(headers)
-        || message.get("method").and_then(Value::as_str) != Some("tools/call")
-    {
+    if !unknown_standard_tool_value(headers, message, machine) {
         return false;
     }
-    let Some(original_name) = message
+    let original_name = message
         .pointer("/params/name")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-    else {
-        return false;
-    };
-    if machine.has_tool_for_policy(&original_name) {
-        return false;
-    }
+        .expect("the preflight found the name above");
     assert!(
         !machine.has_tool_for_policy(UNKNOWN_TOOL_SENTINEL),
         "reserved unknown-tool sentinel collides with a policy tool"
     );
 
-    canonicalize_mcp_name_header(headers, &original_name);
+    canonicalize_mcp_name_header(headers, original_name);
     *message
         .pointer_mut("/params/name")
         .expect("the tool name was present above") =
@@ -297,6 +327,30 @@ mod tests {
             ::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
         );
         assert!(!uses_standard_mcp_headers(&headers));
+    }
+
+    #[test]
+    fn known_tool_preflight_borrows_large_arguments_and_leaves_unknowns_to_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::test_machine(temp.path().canonicalize().unwrap());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"write", "arguments":{
+                "path":"file.txt", "content":"é".repeat(2 * 1024 * 1024)
+            }}
+        }))
+        .unwrap();
+        assert!(known_standard_tool_body(&body, &machine));
+        let unknown =
+            String::from_utf8(body.clone())
+                .unwrap()
+                .replacen("\"write\"", "\"other\"", 1);
+        assert!(!known_standard_tool_body(unknown.as_bytes(), &machine));
+        assert!(!known_standard_tool_body(
+            b"{\"method\":\"tools/call\",\"params\":{\"name\":3}}",
+            &machine
+        ));
+        assert!(!known_standard_tool_body(b"{invalid json", &machine));
     }
 
     #[test]
