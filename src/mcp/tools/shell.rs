@@ -285,21 +285,25 @@ fn sandbox_runtime_paths(network: bool, accounts: bool) -> Vec<PathBuf> {
 }
 
 /// Runtime paths as the sandbox sees them. Each host object is bound once,
-/// read-only, at its canonical path, where the resolved guard identities mask
-/// it; any other spelling becomes a sandbox symlink to that path. Binding an
+/// read-only, at its canonical path, with protected/read-denied overlap
+/// rejected up front. Any other spelling becomes a sandbox symlink. Binding an
 /// alias such as `/bin -> usr/bin` by name would expose the same content under
 /// a second name that no mask covers.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Default, PartialEq)]
-struct RuntimeLayout {
+pub(crate) struct RuntimeLayout {
     /// Canonical paths to bind; none lies below another.
-    binds: Vec<PathBuf>,
+    pub(crate) binds: Vec<PathBuf>,
     /// `(alias, canonical)` symlinks for spellings no bind already reaches.
-    links: Vec<(PathBuf, PathBuf)>,
+    pub(crate) links: Vec<(PathBuf, PathBuf)>,
 }
 
 #[cfg(target_os = "linux")]
 impl RuntimeLayout {
+    pub(crate) fn for_shell(network: bool, accounts: bool) -> Result<Self> {
+        Self::resolve(&sandbox_runtime_paths(network, accounts))
+    }
+
     fn resolve(paths: &[PathBuf]) -> Result<Self> {
         let mut canonical_paths = BTreeSet::new();
         let mut aliases = Vec::new();
@@ -715,16 +719,12 @@ impl LocalMachine {
         if !access.unrestricted_fs {
             // Runtime links go in before any policy bind: created later, a
             // link inside a writable grant would land on the host.
-            let runtime = RuntimeLayout::resolve(&sandbox_runtime_paths(
-                self.config.allow_network,
-                self.config.host_shell.ssh_agent,
-            ))?;
-            for path in &runtime.binds {
+            for path in &guards.runtime.binds {
                 prepare_mount_target_dirs(&mut command, path);
                 let source = crate::secure_fs::SecureFs::pin_canonical(path)?;
                 bind_fd(&mut command, source, path, false, false);
             }
-            for (alias, canonical) in &runtime.links {
+            for (alias, canonical) in &guards.runtime.links {
                 prepare_parent_dirs(&mut command, alias);
                 command.arg("--symlink").arg(canonical).arg(alias);
             }
@@ -754,11 +754,10 @@ impl LocalMachine {
             );
         }
 
-        // Guards act on canonical objects. Every other spelling resolves to an
-        // identity in the same list, and a mount on a spelling would follow
-        // its symlinks anyway. `shell_guards` proved that any guard a writable
-        // mount could reach lies below an immutable boundary, so a missing one
-        // cannot be created by the command and needs no placeholder.
+        // Guards act on canonical objects. Shared admission already rejects
+        // guard overlap with user and implicit runtime mounts, regardless of
+        // whether a host path is momentarily present. The following masks
+        // remain defense in depth for other sandbox-visible sources.
         for denied in existing_canonical(&access.deny_write_roots)? {
             if access.denied_read(&denied)
                 || !access.grant_read(&denied)
@@ -776,8 +775,13 @@ impl LocalMachine {
         for guarded in existing_canonical(&access.deny_read_roots)? {
             mask_path(&mut command, &guarded)?;
         }
-        for guarded in existing_canonical(&guards.protected)? {
-            mask_path(&mut command, &guarded)?;
+        // An explicit root RW grant is the user's filesystem opt-out, not a
+        // promise of partial isolation. Do not add ineffective private-file
+        // masks that would contradict the unrestricted filesystem choice.
+        if !access.explicit_root_rw_grant() {
+            for guarded in existing_canonical(&guards.protected)? {
+                mask_path(&mut command, &guarded)?;
+            }
         }
 
         if !self.config.host_shell.nix_daemon {
@@ -1436,7 +1440,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bubblewrap_accepts_a_missing_protected_child_below_a_read_only_boundary() {
+    fn bubblewrap_rejects_missing_protected_child_in_host_visible_tree() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let locked = root.join("locked");
@@ -1445,14 +1449,18 @@ mod tests {
 
         let mut machine = sandbox_machine(&root, vec![locked]);
         machine.config.protected_paths = vec![missing];
-        machine
+        let error = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .expect("the deny-write mount point protects a missing child from the writable parent");
+            .expect_err("a host process can populate a missing guard while a shell runs");
+        assert!(
+            error.to_string().contains("host process can replace"),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bubblewrap_accepts_a_protected_symlink_in_a_policy_read_only_parent() {
+    fn bubblewrap_rejects_protected_symlink_even_under_read_only_rebind() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1466,9 +1474,13 @@ mod tests {
 
         let mut machine = sandbox_machine(&root, vec![locked]);
         machine.config.protected_paths = vec![alias, target];
-        machine
+        let error = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .expect("the deny-write mount point protects both symlink names");
+            .expect_err("read-only mounts remain mutable by external host processes");
+        assert!(
+            error.to_string().contains("host process can replace"),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1494,23 +1506,32 @@ mod tests {
             writable: true,
         }];
         machine.config.protected_paths = vec![alias.clone(), safe];
-        machine
+        let initial = machine
             .shell_guards()
-            .expect("the startup spelling is safe");
+            .err()
+            .expect("the protected path is visible under the read-only grant");
+        assert!(
+            initial
+                .to_string()
+                .contains("overlaps readable shell mount"),
+            "{initial}"
+        );
 
         std::fs::remove_file(&alias).unwrap();
         symlink(&cache, &alias).unwrap();
         let error = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
             .expect_err("the current symlink target must be checked on every command");
-        assert!(error.to_string().contains("cache mount"), "{error}");
+        assert!(
+            error.to_string().contains("cache mount")
+                || error.to_string().contains("readable shell mount"),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn runtime_mount_is_masked_without_an_access_grant() {
-        use std::ffi::OsStr;
-
+    fn runtime_mount_rejects_protected_content_even_without_a_user_grant() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let protected = sandbox_runtime_paths(false, false)
@@ -1524,24 +1545,52 @@ mod tests {
         machine.config.protected_paths = vec![protected.clone()];
         assert!(!machine.config.access.grant_read(&protected));
         assert!(!machine.config.access.grant_write(&protected));
-
-        let command = machine
+        let error = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .unwrap();
-        let args = command.as_std().get_args().collect::<Vec<_>>();
-        assert!(args.windows(2).any(|window| {
-            window[0] == OsStr::new("--tmpfs") && window[1] == protected.as_os_str()
-        }));
+            .unwrap_err();
+        assert!(error.to_string().contains("runtime mount"), "{error}");
     }
 
-    /// A deny-write root may name one file. It is enforced by the read-only
-    /// rebind pass, never by the directory-mount list: opening a file as a
-    /// directory used to make every sandboxed shell call fail.
     #[cfg(target_os = "linux")]
     #[test]
-    fn deny_write_roots_are_rebound_read_only_whether_file_or_directory() {
-        use std::ffi::OsStr;
+    fn implicit_runtime_mount_cannot_expose_a_recreated_private_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let allowed = root.join("allowed");
+        let profile = root.join("profile");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&profile).unwrap();
+        let guard = profile.join("config.jsonc");
+        std::fs::write(&guard, b"private").unwrap();
+        let mut machine = sandbox_machine(&allowed, Vec::new());
+        machine.config.access.write_roots.clear();
+        let runtime = RuntimeLayout::resolve(std::slice::from_ref(&profile)).unwrap();
+        for exists in [true, false, true] {
+            if exists {
+                std::fs::write(&guard, b"private").unwrap();
+            } else {
+                std::fs::remove_file(&guard).unwrap();
+            }
+            let error = crate::mcp::validate_shell_guards(
+                &machine.config.access,
+                &[],
+                std::slice::from_ref(&guard),
+                &runtime,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("runtime mount"), "{error}");
+        }
+        // A mount that is disjoint from the protected object remains usable.
+        let safe = RuntimeLayout::resolve(std::slice::from_ref(&allowed)).unwrap();
+        crate::mcp::validate_shell_guards(&machine.config.access, &[], &[guard], &safe).unwrap();
+    }
 
+    /// A deny-write root may name a file as well as a directory. A writable
+    /// ancestor grant cannot safely rely on a per-path rebind for the full
+    /// command lifetime; the policy rejects such conflicts before invocation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deny_write_files_and_directories_conflict_with_writable_grants() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let locked_dir = root.join("locked-dir");
@@ -1550,29 +1599,16 @@ mod tests {
         std::fs::write(&locked_file, b"secret").unwrap();
 
         let machine = sandbox_machine(&root, vec![locked_dir.clone(), locked_file.clone()]);
-        let command = machine
+        let error = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .expect("a file deny-write must not break the sandbox command");
-        let args: Vec<_> = command.as_std().get_args().collect();
-
-        for path in [&locked_dir, &locked_file] {
-            assert!(
-                args.windows(3).any(|window| {
-                    window[0] == OsStr::new("--ro-bind-fd") && window[2] == path.as_os_str()
-                }),
-                "{} must be rebound read-only from a pinned descriptor: {args:?}",
-                path.display()
+            .expect_err(
+                "a writable host ancestor could replace either denied object during the command",
             );
-            assert!(
-                !machine
-                    .config
-                    .access
-                    .sandbox_mounts()
-                    .iter()
-                    .any(|(mount, _)| mount == path),
-                "a deny-write root must not reach the directory-mount list"
-            );
-        }
+        assert!(
+            error.to_string().contains("overlaps writable shell mount"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("narrow the grant"), "{error}");
     }
 
     #[tokio::test]
@@ -1870,13 +1906,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let denied = root.join("denied");
+        let allowed = root.join("allowed");
         std::fs::create_dir(&denied).unwrap();
+        std::fs::create_dir(&allowed).unwrap();
 
         let machine = LocalMachine {
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.clone(),
-                    read_roots: vec![root.clone()],
+                    read_roots: vec![allowed.clone()],
                     write_roots: Vec::new(),
                     deny_read_roots: vec![denied.clone()],
                     deny_write_roots: vec![denied.clone()],
@@ -1904,12 +1942,12 @@ mod tests {
             serialize: false,
             #[cfg(target_os = "linux")]
             secure_fs: Arc::new(
-                crate::secure_fs::SecureFs::new(std::slice::from_ref(&root), &[]).unwrap(),
+                crate::secure_fs::SecureFs::new(std::slice::from_ref(&allowed), &[]).unwrap(),
             ),
         };
 
         let command = machine
-            .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
+            .bubblewrap_command(Path::new("/bin/bash"), &allowed, "true")
             .unwrap();
         let args: Vec<_> = command.as_std().get_args().collect();
 
@@ -1962,7 +2000,7 @@ mod tests {
         let mut networked = machine.clone();
         networked.config.allow_network = true;
         let command = networked
-            .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
+            .bubblewrap_command(Path::new("/bin/bash"), &allowed, "true")
             .unwrap();
         assert!(
             !command
@@ -3114,17 +3152,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let writable = root.join("writable");
+        let readable = root.join("readable");
         let denied = root.join("denied");
         std::fs::create_dir(&writable).unwrap();
+        std::fs::create_dir(&readable).unwrap();
         std::fs::create_dir(&denied).unwrap();
-        std::fs::write(root.join("visible.txt"), b"visible").unwrap();
+        std::fs::write(readable.join("visible.txt"), b"visible").unwrap();
         std::fs::write(denied.join("secret.txt"), b"secret").unwrap();
 
         let machine = LocalMachine {
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.clone(),
-                    read_roots: vec![root.clone()],
+                    // Denied content is outside both mounted grants, so
+                    // external host rename/recreation cannot expose it.
+                    read_roots: vec![readable.clone(), writable.clone()],
                     write_roots: vec![writable.clone()],
                     deny_read_roots: vec![denied.clone()],
                     deny_write_roots: vec![denied],
@@ -3153,7 +3195,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             secure_fs: Arc::new(
                 crate::secure_fs::SecureFs::new(
-                    std::slice::from_ref(&root),
+                    &[readable.clone(), writable.clone()],
                     std::slice::from_ref(&writable),
                 )
                 .unwrap(),
@@ -3165,15 +3207,15 @@ mod tests {
                 ShellArgs {
                     command: concat!(
                         "set -eu; ",
-                        "cat visible.txt >/dev/null; ",
-                        "if cat denied/secret.txt >/dev/null 2>&1; then exit 11; fi; ",
+                        "cat ../readable/visible.txt >/dev/null; ",
+                        "if cat ../denied/secret.txt >/dev/null 2>&1; then exit 11; fi; ",
                         "for d in /proc/self/fd/*; do if cat \"$d/denied/secret.txt\" >/dev/null 2>&1; then exit 14; fi; done; ",
-                        "if touch should-not-work >/dev/null 2>&1; then exit 12; fi; ",
-                        "touch writable/works; ",
+                        "if touch ../readable/should-not-work >/dev/null 2>&1; then exit 12; fi; ",
+                        "touch works; ",
                         "test ! -e /etc/resolv.conf"
                     )
                     .to_owned(),
-                    dir: ".".to_owned(),
+                    dir: "writable".to_owned(),
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
@@ -3188,14 +3230,14 @@ mod tests {
             "sandbox smoke failed: {serialized}"
         );
         assert!(writable.join("works").exists());
-        assert!(!root.join("should-not-work").exists());
+        assert!(!readable.join("should-not-work").exists());
 
         let late = writable.join("late");
         let background = machine
             .execute_shell(
                 ShellArgs {
-                    command: "(sleep 2; touch writable/late) >/dev/null 2>&1 &".to_owned(),
-                    dir: ".".to_owned(),
+                    command: "(sleep 2; touch late) >/dev/null 2>&1 &".to_owned(),
+                    dir: "writable".to_owned(),
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
@@ -3220,30 +3262,23 @@ mod tests {
         }
     }
 
-    /// A deny alias retargeted after startup masks both its startup and its
-    /// current target; runtime and network aliases stay reachable as links.
+    /// A configured deny whose parent is visible through a host bind must be
+    /// rejected before Bubblewrap is invoked, regardless of alias retargets.
+    /// Rebinding a pathname mask is not stable against host-side rename.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn bubblewrap_masks_every_deny_alias_identity_when_requested() {
+    async fn sandbox_rejects_retargeted_alias_under_readable_grant() {
         use std::os::unix::fs::symlink;
-
-        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
-            return;
-        }
-        let bwrap = resolve_executable("bwrap").expect("DOTLINK_TEST_BWRAP needs bwrap");
-        let bash = resolve_executable("bash").expect("DOTLINK_TEST_BWRAP needs bash");
-
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let secret = root.join("secret");
         let other = root.join("other");
         let alias = root.join("alias");
-        for directory in [&secret, &other] {
-            std::fs::create_dir(directory).unwrap();
-            std::fs::write(directory.join("file"), b"data").unwrap();
+        for dir in [&secret, &other] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("file"), b"secret").unwrap();
         }
         symlink(&secret, &alias).unwrap();
-
         let access = AccessPolicy::resolve(AccessSpec {
             base_dir: root.clone(),
             read_roots: vec![root.clone()],
@@ -3256,37 +3291,20 @@ mod tests {
         .unwrap();
         let mut machine = sandbox_machine(&root, Vec::new());
         machine.config.access = access;
-        machine.config.allow_network = true;
-        machine.config.bwrap_program = Some(bwrap);
         machine.secure_fs =
             Arc::new(crate::secure_fs::SecureFs::new(std::slice::from_ref(&root), &[]).unwrap());
-
-        std::fs::remove_file(&alias).unwrap();
-        symlink(&other, &alias).unwrap();
-
-        let mut script = String::from(
-            "set -u; for f in alias/file secret/file other/file; do \
-             if cat \"$f\" >/dev/null 2>&1; then echo \"exposed $f\"; exit 11; fi; done",
-        );
-        for network in sandbox_runtime_paths(true, false) {
-            if network.starts_with("/etc") {
-                script.push_str(&format!(
-                    "; test -e {0} || {{ echo missing {0}; exit 12; }}",
-                    network.display()
-                ));
+        for target in [&secret, &other] {
+            if target == &other {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&other, &alias).unwrap();
             }
+            let error = machine
+                .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("readable shell mount"),
+                "{error}"
+            );
         }
-        let command = machine
-            .bubblewrap_command(&bash, &root, &script)
-            .unwrap()
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            command.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&command.stdout),
-            String::from_utf8_lossy(&command.stderr)
-        );
     }
 }

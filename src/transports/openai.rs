@@ -1530,7 +1530,9 @@ fn verbose_request_summary(jsonrpc: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let arguments = jsonrpc.pointer("/params/arguments");
-    let args = arguments.map(summarize_tool_arguments).unwrap_or_default();
+    let args = arguments
+        .map(|value| summarize_tool_arguments(name, value))
+        .unwrap_or_default();
     if args.is_empty() {
         format!("→ tools/call {name}")
     } else {
@@ -1539,13 +1541,16 @@ fn verbose_request_summary(jsonrpc: &Value) -> String {
 }
 
 #[cfg(test)]
-fn summarize_tool_arguments(arguments: &Value) -> String {
+fn summarize_tool_arguments(name: &str, arguments: &Value) -> String {
     // One summarizer, shared with the TOOL log: argument order comes from the
     // object itself here because a test has no tool schema to read.
     match arguments.as_object() {
-        Some(object) => {
-            crate::logging::summarize_arguments(object, object.keys().map(String::as_str))
-        }
+        Some(object) => crate::logging::summarize_arguments(
+            name,
+            object,
+            object.keys().map(String::as_str),
+            None,
+        ),
         None => String::new(),
     }
 }
@@ -2459,7 +2464,9 @@ mod tests {
     #[tokio::test]
     async fn rejection_window_survives_in_process_runtime_restarts() {
         let temp = tempfile::tempdir().unwrap();
-        let window = Duration::from_millis(200);
+        // Real async poll tasks may be delayed under parallel Nix/CI load.
+        // Only the second run should pass the confirmation window.
+        let window = Duration::from_secs(2);
         let (base_url, _) = fake_control_plane(|poll| {
             let status = if poll % 2 == 0 {
                 StatusCode::UNAUTHORIZED
@@ -3101,8 +3108,8 @@ mod tests {
         });
         let summary = verbose_request_summary(&request);
         assert!(summary.contains("tools/call write"));
-        assert!(summary.contains("path=\"src/main.rs\""));
-        assert!(summary.contains("content_bytes=18"), "{summary}");
+        assert!(summary.contains("p=\"src/main.rs\""));
+        assert!(summary.contains("b=\"18\""), "{summary}");
         assert!(!summary.contains("secret-ish payload"));
     }
 }

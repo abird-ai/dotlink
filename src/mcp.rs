@@ -7,6 +7,7 @@
 mod tools;
 #[cfg(test)]
 pub(crate) use tools::test_support::test_machine;
+pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 
 use std::{
     collections::BTreeSet,
@@ -142,8 +143,12 @@ const MAX_JSON_ESCAPE: usize = 6;
 /// A control byte encoded in an inner JSON string needs one more outer escape.
 const MAX_NESTED_JSON_ESCAPE: usize = 7;
 const SHELL_OUTPUT_STREAMS: usize = 2;
-/// Room for what surrounds a payload: paths, patterns, edit anchors, framing.
+/// Base JSON-RPC framing, independent of payload and edit path strings.
 const MAX_REQUEST_FRAMING_BYTES: usize = 64 * 1024;
+/// Separate headroom for every edit operation's possible pathname: the 512-op
+/// tool must remain reachable even with a small `max_write_bytes`. Budget a
+/// practical 4 KiB path with worst-case JSON escaping for each operation.
+const EDIT_PATH_ENVELOPE_BYTES: usize = 4 * 1024 * MAX_JSON_ESCAPE;
 
 /// A configured limit is a hard ceiling: reject a value the runtime cannot
 /// honour instead of quietly raising it.
@@ -517,6 +522,16 @@ impl AccessPolicy {
             .any(|root| paths_overlap(path, root))
     }
 
+    /// Explicit `--allow-rw=/` is an intentional filesystem opt-out for the
+    /// sandboxed shell. It is *not* `--allow-all --no-sandbox`: network, device
+    /// and process isolation stay independent, and explicit user denies still
+    /// take precedence. Only the mandatory private-path overlap rule is waived.
+    #[cfg(target_os = "linux")]
+    fn explicit_root_rw_grant(&self) -> bool {
+        self.read_roots.iter().any(|root| root == Path::new("/"))
+            && self.write_roots.iter().any(|root| root == Path::new("/"))
+    }
+
     fn grant_read(&self, path: &Path) -> bool {
         self.unrestricted_fs || self.read_roots.iter().any(|root| path.starts_with(root))
     }
@@ -660,43 +675,6 @@ impl AccessPolicy {
         mounts
     }
 
-    fn deny_read_roots(&self) -> &[PathBuf] {
-        &self.deny_read_roots
-    }
-
-    fn deny_write_roots(&self) -> &[PathBuf] {
-        &self.deny_write_roots
-    }
-
-    #[cfg(target_os = "linux")]
-    fn writable_shell_mounts(&self) -> Vec<PathBuf> {
-        self.sandbox_mounts()
-            .into_iter()
-            .filter_map(|(path, writable)| writable.then_some(path))
-            .collect()
-    }
-
-    /// Inside a writable bind, a guarded path holds only below a deny mount
-    /// point that is a direct child of the bind root: Linux refuses to rename
-    /// or unlink either mount point. Deeper, an intermediate directory could
-    /// be renamed with every nested mount and the original pathname recreated.
-    /// A symlink never becomes a mount point (the mount lands on its target),
-    /// and a missing path has none yet, so neither is a boundary.
-    #[cfg(target_os = "linux")]
-    fn has_immutable_boundary(&self, writable: &Path, guarded: &Path) -> bool {
-        guarded.starts_with(writable)
-            && self
-                .deny_read_roots
-                .iter()
-                .chain(&self.deny_write_roots)
-                .any(|boundary| {
-                    guarded.starts_with(boundary)
-                        && boundary.parent() == Some(writable)
-                        && std::fs::symlink_metadata(boundary)
-                            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-                })
-    }
-
     fn has_read_capability(&self) -> bool {
         self.unrestricted_fs && !self.denied_read(Path::new("/"))
             || self.read_roots.iter().any(|root| !self.denied_read(root))
@@ -817,6 +795,7 @@ impl AccessPolicy {
 struct ShellGuards {
     access: AccessPolicy,
     protected: Vec<PathBuf>,
+    runtime: tools::shell::RuntimeLayout,
 }
 
 /// A sandbox policy the shell cannot enforce as configured. Retrying with the
@@ -826,19 +805,28 @@ fn shell_policy_conflict(message: String) -> anyhow::Error {
     crate::recovery::operator(anyhow!(message))
 }
 
-/// Masks and read-only rebinds are pathname mounts. Each guarded path needs an
-/// immutable boundary wherever a writable mount could move or replace it, and
-/// must stay off remapped caches, which expose the host object under a name
-/// that no mask covers. One rule for protected, deny-read and deny-write paths.
+/// An exposed bind directory shares its *live* host inode tree with the
+/// sandbox, even when the bind is read-only. Path-mounted masks can lose their
+/// target when another host process renames/recreates that entry during an
+/// already-running command. No sequence of pre-launch pathname checks closes
+/// this lifetime race. Reject overlapping exposure instead of constructing a
+/// mask that is only temporarily authoritative.
+///
+/// Read denies/protected paths conflict with any readable bind; write denies
+/// conflict only with writable binds. Cache/host integrations are checked by
+/// the same overlap rules at their existing authority boundaries.
 #[cfg(target_os = "linux")]
 fn validate_shell_guards(
     access: &AccessPolicy,
     cache_mounts: &[SandboxCacheMount],
     protected_paths: &[PathBuf],
+    runtime: &tools::shell::RuntimeLayout,
 ) -> Result<()> {
-    // (label, path, whether any visibility exposes it)
     let guards = protected_paths
         .iter()
+        // An explicit root rw grant is a deliberate opt-out of private-file
+        // isolation for this shell, but does not waive user-configured denies.
+        .filter(|_| !access.explicit_root_rw_grant())
         .map(|path| ("protected path", path, true))
         .chain(
             access
@@ -852,9 +840,9 @@ fn validate_shell_guards(
                 .iter()
                 .map(|path| ("deny-write path", path, false)),
         );
-    let writable_mounts = access.writable_shell_mounts();
-    for (label, guarded, hidden) in guards {
-        for cache in cache_mounts.iter().filter(|cache| hidden || cache.writable) {
+    let mounts = access.sandbox_mounts();
+    for (label, guarded, hide) in guards {
+        for cache in cache_mounts.iter().filter(|cache| hide || cache.writable) {
             if paths_overlap(guarded, &cache.source) || paths_overlap(guarded, &cache.target) {
                 return Err(shell_policy_conflict(format!(
                     "cache mount {} -> {} overlaps {label} {}; remove that cache grant",
@@ -864,20 +852,51 @@ fn validate_shell_guards(
                 )));
             }
         }
-        for writable in &writable_mounts {
-            if !paths_overlap(guarded, writable) || access.has_immutable_boundary(writable, guarded)
-            {
-                continue;
+        for (mount, writable) in &mounts {
+            if (hide || *writable) && paths_overlap(guarded, mount) {
+                return Err(shell_policy_conflict(format!(
+                    "{label} {} overlaps {} shell mount {}. A host process can replace a masked name while the shell runs, even when its mount is read-only; narrow the grant to exclude this path, or disable shell for this profile",
+                    guarded.display(),
+                    if *writable { "writable" } else { "readable" },
+                    mount.display()
+                )));
             }
-            let remedy = if guarded.starts_with(writable) {
-                "make that mount read-only, or deny an existing non-symlink direct child of it that contains the path"
-            } else {
-                "remove that write grant"
-            };
+        }
+        // Runtime directories are live host-backed binds too. In particular,
+        // ~/.nix-profile can contain an explicitly selected config or secret.
+        // A read-only bind does not prevent host-side recreation after masks.
+        if hide {
+            for bind in &runtime.binds {
+                if paths_overlap(guarded, bind) {
+                    return Err(shell_policy_conflict(format!(
+                        "runtime mount {} overlaps {label} {}; move the guarded file outside the shell runtime mount or disable shell in this profile",
+                        bind.display(),
+                        guarded.display()
+                    )));
+                }
+            }
+            for (alias, canonical) in &runtime.links {
+                if paths_overlap(guarded, alias) || paths_overlap(guarded, canonical) {
+                    return Err(shell_policy_conflict(format!(
+                        "runtime alias {} -> {} overlaps {label} {}; move the guarded file outside the runtime mount or disable shell in this profile",
+                        alias.display(),
+                        canonical.display(),
+                        guarded.display()
+                    )));
+                }
+            }
+        }
+        // Procfs and devtmpfs are separately exposed by Bubblewrap even when
+        // no user grant mentions them. Their dynamic objects cannot be
+        // protected by pathname masks either.
+        if hide
+            && ["/proc", "/dev"]
+                .iter()
+                .any(|root| guarded.starts_with(root))
+        {
             return Err(shell_policy_conflict(format!(
-                "{label} {} overlaps writable shell mount {}, where a sandboxed command could move or replace it; {remedy}",
-                guarded.display(),
-                writable.display()
+                "{label} {} is exposed by the sandbox's virtual /proc or /dev mount; this guard cannot be enforced by a path mask",
+                guarded.display()
             )));
         }
     }
@@ -905,9 +924,10 @@ fn validate_host_mount_policy(
         .any(|path| {
             access.overlaps_deny_read(path)
                 || (mount.kind.is_operational() && access.overlaps_deny_write(path))
-                || protected_paths
-                    .iter()
-                    .any(|protected| paths_overlap(path, protected))
+                || (!access.explicit_root_rw_grant()
+                    && protected_paths
+                        .iter()
+                        .any(|protected| paths_overlap(path, protected)))
         });
         if blocked {
             return Err(shell_policy_conflict(format!(
@@ -1000,29 +1020,16 @@ impl LocalMachine {
             });
         }
 
-        // Validate policy before resolving sandbox tooling so a violation fails
-        // closed even when bwrap/bash are absent from PATH (for example in a
-        // Nix build). A missing deny target is absent state, which may still
-        // appear; a policy that cannot hold is the operator's to change.
+        // Validate the actual mounted visibility (read-only as well as
+        // writable) before starting the sandbox. Missing targets do not relax
+        // this rule: an external host writer can create them during execution.
         #[cfg(target_os = "linux")]
         if args.allow_shell && args.sandbox_shell {
-            for denied in access.deny_read_roots() {
-                if (access.grant_read(denied) || access.grant_write(denied)) && !denied.exists() {
-                    bail!(
-                        "sandboxed deny-read paths inside granted trees must already exist: {}",
-                        denied.display()
-                    );
-                }
-            }
-            for denied in access.deny_write_roots() {
-                if access.grant_read(denied) && access.grant_write(denied) && !denied.exists() {
-                    bail!(
-                        "sandboxed deny-write paths inside read+write trees must already exist: {}",
-                        denied.display()
-                    );
-                }
-            }
-            validate_shell_guards(&access, &cache_mounts, &protected_paths)?;
+            let runtime = tools::shell::RuntimeLayout::for_shell(
+                args.allow_network,
+                args.host_shell.ssh_agent,
+            )?;
+            validate_shell_guards(&access, &cache_mounts, &protected_paths, &runtime)?;
         }
         #[cfg(target_os = "linux")]
         validate_host_mount_policy(&access, &args.host_shell, &protected_paths)?;
@@ -1097,9 +1104,17 @@ impl LocalMachine {
     fn shell_guards(&self) -> Result<ShellGuards> {
         let access = self.config.access.refreshed()?;
         let protected = guard_identities(&access.base_dir, &self.config.protected_paths)?;
-        validate_shell_guards(&access, &self.config.cache_mounts, &protected)?;
+        let runtime = tools::shell::RuntimeLayout::for_shell(
+            self.config.allow_network,
+            self.config.host_shell.ssh_agent,
+        )?;
+        validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
         validate_host_mount_policy(&access, &self.config.host_shell, &protected)?;
-        Ok(ShellGuards { access, protected })
+        Ok(ShellGuards {
+            access,
+            protected,
+            runtime,
+        })
     }
 
     pub fn log(&self) -> &LogConfig {
@@ -1163,6 +1178,7 @@ impl LocalMachine {
         self.config
             .max_write_bytes
             .saturating_mul(MAX_JSON_ESCAPE)
+            .saturating_add(tools::MAX_EDIT_OPS.saturating_mul(EDIT_PATH_ENVELOPE_BYTES))
             .saturating_add(MAX_REQUEST_FRAMING_BYTES)
     }
 
@@ -1306,6 +1322,30 @@ impl LocalMachine {
             .await
     }
 
+    /// Descriptor-pinned streamed replacement. Unlike `stage_update_write`,
+    /// the caller produces output in bounded chunks instead of allocating a
+    /// full replacement. Both backends reuse their existing temp ownership,
+    /// mode/ACL handling, digest precondition and atomic commit path.
+    pub(crate) async fn stage_update_with(
+        &self,
+        path: &Path,
+        expected: (u64, [u8; 32]),
+        write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+    ) -> Result<PendingWrite> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            Ok(PendingWrite(crate::blocking::run(|| {
+                self.secure_fs.stage_update_with(path, expected, write)
+            })?))
+        }
+        #[cfg(windows)]
+        {
+            Ok(PendingWrite(
+                crate::staging::stage_with_path(path, false, Some(expected), write).await?,
+            ))
+        }
+    }
+
     /// Prepare a create-or-replace write that needs only write authority.
     pub(crate) async fn stage_replace_write(
         &self,
@@ -1383,6 +1423,12 @@ impl LocalMachine {
         router.merge(Self::patch_router());
         router.merge(Self::binary_router());
         router.merge(Self::shell_router());
+        if let Some(edit) = router.map.get_mut("edit") {
+            tools::edit::with_edit_limits(&mut edit.attr);
+        }
+        if let Some(bedit) = router.map.get_mut("bedit") {
+            tools::binary::with_bedit_limits(&mut bedit.attr);
+        }
         router
     }
 
@@ -1470,7 +1516,12 @@ impl LocalMachine {
             return String::new();
         };
         let names = self.argument_names(name);
-        crate::logging::summarize_arguments(arguments, names.iter().map(String::as_str))
+        crate::logging::summarize_arguments(
+            name,
+            arguments,
+            names.iter().map(String::as_str),
+            Some(&self.config.access.base_dir),
+        )
     }
 }
 
@@ -2187,8 +2238,8 @@ mod tests {
         );
         assert_eq!(
             config.max_request_body_bytes,
-            write_ceiling * 6 + 64 * 1024,
-            "one encoded byte is at most six, plus framing"
+            write_ceiling * 6 + MAX_EDIT_OPS * EDIT_PATH_ENVELOPE_BYTES + 64 * 1024,
+            "write payload and all edit path strings have independent JSON headroom"
         );
         assert!(
             config.max_request_body_bytes > 4 * 1024 * 1024,
@@ -2458,7 +2509,7 @@ mod tests {
     /// Startup refuses it before any tool runs, as an operator error.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn sandboxed_denies_need_an_immutable_boundary_in_writable_mounts() {
+    async fn sandbox_guards_cannot_be_lifetime_safe_with_exposed_ancestors() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -2489,11 +2540,120 @@ mod tests {
             );
         }
 
-        // A direct child is its own boundary, and contains deeper denies.
+        // A direct-child mask is not stable under an external host rename,
+        // even though an in-sandbox rename of that mount point would fail.
         let access = AccessPolicy::resolve(sandboxed_config(&root, vec![project, nested]).access)
             .await
             .unwrap();
-        validate_shell_guards(&access, &[], &[]).unwrap();
+        let error =
+            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                .unwrap_err();
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn explicit_root_rw_is_unrestricted_for_shell_but_explicit_denies_still_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let protected = base.join("config.jsonc");
+        std::fs::write(&protected, b"private").unwrap();
+        let mut spec = AccessSpec {
+            base_dir: base,
+            read_roots: vec![PathBuf::from("/")],
+            write_roots: vec![PathBuf::from("/")],
+            deny_read_roots: Vec::new(),
+            deny_write_roots: Vec::new(),
+            unrestricted_fs: false,
+        };
+        let runtime = tools::shell::RuntimeLayout::default();
+        let policy = AccessPolicy::resolve(spec.clone()).await.unwrap();
+        assert!(policy.explicit_root_rw_grant());
+        validate_shell_guards(&policy, &[], std::slice::from_ref(&protected), &runtime).unwrap();
+        // Explicit denies are not opted out. A root bind with a descendant
+        // deny cannot truthfully enforce it across external host mutations.
+        spec.deny_read_roots.push(protected);
+        let denied = AccessPolicy::resolve(spec).await.unwrap();
+        let error = validate_shell_guards(&denied, &[], &[], &runtime).unwrap_err();
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+        assert!(error.to_string().contains("deny-read"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn guard_visibility_remains_forbidden_before_and_after_host_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let guard = root.join(".env");
+        std::fs::write(&guard, b"protected").unwrap();
+        let access = AccessPolicy::resolve(sandboxed_config(&root, vec![guard.clone()]).access)
+            .await
+            .unwrap();
+        for state in 0..3 {
+            if state == 1 {
+                std::fs::remove_file(&guard).unwrap();
+            }
+            if state == 2 {
+                std::fs::write(&guard, b"restored").unwrap();
+            }
+            let error =
+                validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("host process can replace"),
+                "{error}"
+            );
+            assert_eq!(
+                crate::recovery::Recovery::of(&error),
+                crate::recovery::Recovery::Operator
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn readable_mounts_also_cannot_expose_guarded_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let secret = root.join(".secret");
+        let mut config = sandboxed_config(&root, vec![secret.clone()]);
+        config.access.write_roots.clear();
+        let access = AccessPolicy::resolve(config.access).await.unwrap();
+        for present in [false, true] {
+            if present {
+                std::fs::write(&secret, b"secret").unwrap();
+            }
+            let error =
+                validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("overlaps readable shell mount"),
+                "{error}"
+            );
+            assert_eq!(
+                crate::recovery::Recovery::of(&error),
+                crate::recovery::Recovery::Operator
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn writable_mount_only_conflicts_with_write_denies_when_exposed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let denied = root.join("no-write");
+        let mut config = sandboxed_config(&root, vec![]);
+        config.access.write_roots.clear();
+        config.access.deny_write_roots.push(denied);
+        let access = AccessPolicy::resolve(config.access).await.unwrap();
+        validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default()).unwrap();
     }
 
     #[cfg(target_os = "linux")]

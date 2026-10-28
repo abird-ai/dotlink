@@ -67,10 +67,7 @@ mod path_backend {
     use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result, anyhow, bail};
-    use tokio::{
-        fs,
-        io::{AsyncReadExt, AsyncWriteExt},
-    };
+    use tokio::{fs, io::AsyncReadExt};
 
     use super::{staging_mode, staging_name};
 
@@ -316,6 +313,25 @@ mod path_backend {
         create_only: bool,
         expected: Option<(u64, [u8; 32])>,
     ) -> Result<StagedWrite> {
+        use std::io::Write;
+        stage_with(path, create_only, expected, |file| {
+            file.write_all(bytes)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// All staged writes, including streamed binary updates, share the same
+    /// Windows parent pinning, DACL preservation, cancellation cleanup and
+    /// durable temp-file publication. The producer runs synchronously inside
+    /// `blocking::run`, so cancellation cannot release its mutation guard
+    /// while a background writer is still working.
+    pub(crate) async fn stage_with(
+        path: &Path,
+        create_only: bool,
+        expected: Option<(u64, [u8; 32])>,
+        write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+    ) -> Result<StagedWrite> {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("cannot replace a root directory: {}", path.display()))?;
@@ -373,11 +389,17 @@ mod path_backend {
             // original restrictive ACL has been applied successfully.
             protect_temporary(&pending.path, dacl)?;
         }
-        pending.file().write_all(bytes).await?;
-        if let Some(permissions) = existing_permissions {
-            pending.file().set_permissions(permissions).await?;
-        }
-        pending.file().sync_all().await?;
+        let mut file = pending.file.take().unwrap().into_std().await;
+        let outcome = crate::blocking::run(|| -> Result<()> {
+            write(&mut file)?;
+            if let Some(permissions) = existing_permissions {
+                file.set_permissions(permissions)?;
+            }
+            file.sync_all()?;
+            Ok(())
+        });
+        pending.file = Some(fs::File::from_std(file));
+        outcome?;
         let temporary = pending.finish();
         Ok(StagedWrite {
             target: path.to_path_buf(),
@@ -533,7 +555,7 @@ mod path_backend {
 }
 
 #[cfg(windows)]
-pub(crate) use path_backend::{StagedWrite, stage as stage_path};
+pub(crate) use path_backend::{StagedWrite, stage as stage_path, stage_with as stage_with_path};
 
 #[cfg(test)]
 mod tests {

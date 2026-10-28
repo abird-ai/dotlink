@@ -10,6 +10,7 @@ pub(crate) mod binary;
 pub(crate) mod edit;
 pub(crate) mod grep;
 pub(crate) mod ls;
+pub(crate) mod mutation;
 pub(crate) mod patch;
 pub(crate) mod shell;
 #[cfg(test)]
@@ -32,7 +33,14 @@ use tokio::fs;
 
 use super::LocalMachine;
 
-/// Shared bounds. Per-tool bounds live with the tool that owns them.
+/// Per-call text edit ceilings shared by schema, planner, and activity logging.
+/// Limits are across the whole ordered call, never per file.
+pub(crate) const MAX_EDIT_OPS: usize = 512;
+pub(crate) const MAX_EDIT_FILES: usize = 64;
+/// Aggregate retained original/working bytes per mutating tool call.
+/// Staging and transient allocations add overhead; keep multi-file work bounded.
+pub(crate) const MAX_MUTATION_PLAN_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) const GITIGNORE_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const GITIGNORE_MAX_LINES: usize = 1024;
 /// Aggregate independent of grep's content budget: ignore files are also I/O
@@ -249,6 +257,12 @@ pub(crate) struct DirHandleInner {
 type DirHandle = Arc<crate::windows_fs::PinnedDirectory>;
 
 /// One directory entry produced by the shared walk.
+struct WalkedMetadata {
+    kind: &'static str,
+    size: u64,
+    mtime: Option<SystemTime>,
+}
+
 pub(crate) struct WalkedEntry {
     /// Logical, policy-checked path, used for denies, display and recursion.
     pub(crate) path: PathBuf,
@@ -646,6 +660,48 @@ impl LocalMachine {
         Ok(Some(bytes))
     }
 
+    /// Inspect a discovered child relative to the directory we enumerated.
+    /// Pathname metadata is safe only on Windows, where every ancestor is held
+    /// open without delete sharing. Unix must not reopen a path that can be
+    /// renamed or replaced with a symlink between enumeration and inspection.
+    async fn child_metadata(
+        &self,
+        handle: Option<&DirHandle>,
+        name: &OsStr,
+        _path: &Path,
+    ) -> Result<WalkedMetadata> {
+        #[cfg(unix)]
+        {
+            let handle =
+                handle.ok_or_else(|| anyhow::anyhow!("directory has no pinned descriptor"))?;
+            let metadata = crate::secure_fs::child_metadata(&handle.fd, name, handle.resolve)?;
+            Ok(WalkedMetadata {
+                kind: metadata.kind,
+                size: metadata.len,
+                mtime: metadata.modified,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let _ = (handle, name);
+            let metadata = fs::symlink_metadata(_path).await?;
+            let kind = if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.is_dir() {
+                "dir"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            Ok(WalkedMetadata {
+                kind,
+                size: metadata.len(),
+                mtime: metadata.modified().ok(),
+            })
+        }
+    }
+
     /// Read this directory's `.gitignore` through the pinned handle and turn it
     /// into a matcher rooted at its own directory. Bounded at 64 KiB and 1024
     /// lines; an invalid pattern fails the whole call (fail closed).
@@ -870,39 +926,28 @@ impl LocalMachine {
                 // Inspect the already opened directory rather than reopening the
                 // containing path. Entries may disappear while other tools work
                 // concurrently; skip them rather than failing the listing.
-                let metadata = match fs::symlink_metadata(&path).await {
+                let metadata = match self.child_metadata(handle.as_ref(), &name, &path).await {
                     Ok(metadata) => metadata,
-                    Err(error) if skippable_io_error(&error) => {
+                    Err(error) if skippable_directory_error(&error) => {
                         progress.traversal_incomplete = true;
                         continue;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(error),
                 };
-                let file_type = metadata.file_type();
-                let kind = if file_type.is_symlink() {
-                    "symlink"
-                } else if file_type.is_dir() {
-                    "dir"
-                } else if file_type.is_file() {
-                    "file"
-                } else {
-                    "other"
-                };
-
                 // Deeper `.gitignore` files win, and a whitelist stops the
                 // search: that is git's precedence order.
-                if !ignores.is_empty() && is_gitignored(&ignores, &path, file_type.is_dir()) {
+                if !ignores.is_empty() && is_gitignored(&ignores, &path, metadata.kind == "dir") {
                     continue;
                 }
 
                 let descend =
-                    remaining > 1 && file_type.is_dir() && self.config.access.can_read(&path);
+                    remaining > 1 && metadata.kind == "dir" && self.config.access.can_read(&path);
                 let walked = WalkedEntry {
                     relative: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
                     path: path.clone(),
-                    kind,
-                    size: metadata.len(),
-                    mtime: metadata.modified().ok(),
+                    kind: metadata.kind,
+                    size: metadata.size,
+                    mtime: metadata.mtime,
                 };
                 if !on_entry(walked) {
                     progress.ignore_incomplete = ignore_work.incomplete;
@@ -923,11 +968,6 @@ impl LocalMachine {
         progress.ignore_incomplete = ignore_work.incomplete;
         Ok(progress)
     }
-}
-
-/// Byte offsets of every occurrence of `needle` in `haystack`.
-pub(crate) fn match_indices(haystack: &str, needle: &str) -> Vec<usize> {
-    haystack.match_indices(needle).map(|(at, _)| at).collect()
 }
 
 /// 1-based line number of a byte offset.
@@ -984,6 +1024,21 @@ pub(crate) fn retain_best<T: Ord>(heap: &mut BinaryHeap<T>, candidate: T, limit:
     true
 }
 
+/// Largest prefix satisfying a monotonic output-size predicate. Shared by
+/// listing/search result trimming and multi-file mutation receipts.
+pub(crate) fn largest_fitting_prefix(total: usize, mut fits: impl FnMut(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, total);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
+}
+
 /// Keep the longest prefix of `records` whose rendered JSON fits the ceiling.
 /// The caller's renderer is the exact reply shape, including every derived
 /// field, so the measured size and the returned size cannot drift. Rendered
@@ -998,15 +1053,9 @@ pub(crate) fn trim_to_ceiling<T>(
     if render(&records, truncated).len() <= ceiling {
         return (records, truncated);
     }
-    let (mut low, mut high) = (0_usize, records.len());
-    while low < high {
-        let middle = low + (high - low).div_ceil(2);
-        if render(&records[..middle], true).len() <= ceiling {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
+    let low = largest_fitting_prefix(records.len(), |count| {
+        render(&records[..count], true).len() <= ceiling
+    });
     records.truncate(low);
     (records, true)
 }
@@ -1026,6 +1075,7 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    #[cfg(test)]
     pub(crate) async fn read(
         machine: &LocalMachine,
         path: PathBuf,
@@ -1126,7 +1176,9 @@ impl Verified {
         ))
     }
 
-    /// Stage and immediately commit one file.
+    /// Stage and immediately commit one file (test helper; production tools
+    /// use the same staging primitive through the shared mutation engine).
+    #[cfg(test)]
     pub(crate) async fn commit(self, machine: &LocalMachine, text: &[u8]) -> Result<bool> {
         match self.stage(machine, text).await? {
             Some(pending) => machine.commit_write(pending).await.map(|()| true),
@@ -1346,6 +1398,64 @@ mod tests {
             paths.iter().any(|path| path.ends_with("inside.rs")),
             searchable,
             "{paths:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_child_metadata_ignores_replaced_parent_path() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let child = root.join("child");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(child.join("same.txt"), b"x").unwrap();
+        std::fs::write(outside.join("same.txt"), vec![b'z'; 999]).unwrap();
+        symlink(outside.join("same.txt"), child.join("link.txt")).unwrap();
+        let machine = test_machine(root.clone());
+        let parent = machine.pin_root_directory(&root).unwrap();
+        let handle = machine
+            .pin_child_directory(parent.as_ref(), OsStr::new("child"), &child)
+            .unwrap();
+
+        // Redirect the former pathname outside the grant *after* the child
+        // descriptor is pinned. This used to return the outside size (999).
+        std::fs::rename(&child, root.join("renamed-child")).unwrap();
+        symlink(&outside, &child).unwrap();
+        let info = machine
+            .child_metadata(
+                handle.as_ref(),
+                OsStr::new("same.txt"),
+                &child.join("same.txt"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.kind, "file");
+        assert_eq!(info.size, 1);
+        assert!(info.mtime.is_some());
+        assert_eq!(
+            std::fs::symlink_metadata(child.join("same.txt"))
+                .unwrap()
+                .len(),
+            999
+        );
+        let link = machine
+            .child_metadata(
+                handle.as_ref(),
+                OsStr::new("link.txt"),
+                &child.join("link.txt"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(link.kind, "symlink");
+        assert_eq!(link.size, outside.join("same.txt").as_os_str().len() as u64);
+        assert!(
+            machine
+                .child_metadata(handle.as_ref(), OsStr::new("absent"), &child.join("absent"))
+                .await
+                .is_err()
         );
     }
 

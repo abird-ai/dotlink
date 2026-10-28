@@ -9,7 +9,7 @@ use rmcp::{
 use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
-use super::{LocalMachine, marker_lines, ok_text, tool_error};
+use super::{LocalMachine, marker_lines, mutation::compact_text_receipt, ok_text, tool_error};
 use crate::mcp::AccessNeed;
 
 const DEFAULT_READ_LINES: usize = 4 * 1024;
@@ -292,17 +292,18 @@ impl LocalMachine {
                 self.config.max_write_bytes
             );
         }
+        let reply = compact_text_receipt(
+            format!("wrote {} bytes to {}", args.content.len(), args.path),
+            format!("wrote {} bytes (path omitted)", args.content.len()),
+            self.config.max_output_bytes,
+        )?;
         let path = self
             .resolve_for_create(&args.path, AccessNeed::Write)
             .await?;
         let _mutation = self.lock_mutations([path.as_path()]).await?;
         self.write_file_atomic(&path, args.content.as_bytes())
             .await?;
-        Ok(format!(
-            "wrote {} bytes to {}",
-            args.content.len(),
-            args.path
-        ))
+        Ok(reply)
     }
 }
 

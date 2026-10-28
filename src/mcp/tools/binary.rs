@@ -4,16 +4,24 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ResourceContents},
+    model::{CallToolResult, ContentBlock, ResourceContents, Tool},
     schemars, tool, tool_router,
 };
 use serde::Deserialize;
+use std::io::Seek as _;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use super::{LocalMachine, Snapshot, ok_text, tool_error};
-use crate::mcp::{AccessNeed, sha256};
+use super::{
+    LocalMachine,
+    mutation::{ByteSplice, PlanBudget, compact_receipt, digest_limited, stream_splice},
+    ok_text, tool_error,
+};
+use crate::mcp::AccessNeed;
+#[cfg(test)]
+use crate::mcp::sha256;
 
-/// The largest file any binary tool will hold in memory.
+/// Maximum source/result size of a streamed binary edit. Input/output bytes
+/// need not be simultaneously retained in memory.
 const MAX_PATCH_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BEDIT_RANGES: usize = 32;
 
@@ -71,6 +79,7 @@ pub(super) struct BeditArgs {
     path: String,
 
     /// Byte ranges, all relative to the original file. Applied ascending.
+    #[serde(deserialize_with = "bounded_bedit_ranges")]
     edits: Vec<BeditRange>,
 
     /// Optional hex SHA-256 of the current file content, in any case. A
@@ -96,6 +105,21 @@ pub(super) struct BeditRange {
     /// Encoding of data.
     #[serde(default)]
     encoding: BinaryEncoding,
+}
+
+/// Reject excess ranges in the decoder, before allocating a large Vec.
+pub(crate) fn with_bedit_limits(tool: &mut Tool) {
+    super::mutation::set_array_max_items(tool, "edits", MAX_BEDIT_RANGES);
+}
+
+fn bounded_bedit_ranges<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<BeditRange>, D::Error> {
+    super::mutation::bounded_array::<D, BeditRange, MAX_BEDIT_RANGES>(
+        deserializer,
+        "bedit",
+        "ranges",
+    )
 }
 
 fn decode_binary(data: &str, encoding: BinaryEncoding, max_bytes: usize) -> Result<Vec<u8>> {
@@ -210,12 +234,17 @@ impl LocalMachine {
 
     async fn bwrite_impl(&self, args: BwriteArgs) -> Result<String> {
         let bytes = decode_binary(&args.data, args.encoding, self.config.max_write_bytes)?;
+        let reply = super::mutation::compact_text_receipt(
+            format!("wrote {} bytes to {}", bytes.len(), args.path),
+            format!("wrote {} bytes (path omitted)", bytes.len()),
+            self.config.max_output_bytes,
+        )?;
         let path = self
             .resolve_for_create(&args.path, AccessNeed::Write)
             .await?;
         let _mutation = self.lock_mutations([path.as_path()]).await?;
         self.write_file_atomic(&path, &bytes).await?;
-        Ok(format!("wrote {} bytes to {}", bytes.len(), args.path))
+        Ok(reply)
     }
 
     /// Multi-range binary edit against original-file offsets. Ranges are decoded
@@ -235,17 +264,15 @@ impl LocalMachine {
             .await?;
         let _mutation = self.lock_mutations([path.as_path()]).await?;
         let display = self.config.access.relative_display(&path);
-        // `max_write_bytes` is the profile's write ceiling; the larger constant
-        // is only a hard upper bound for binary planning memory.
+        // Binary edits use a pinned source descriptor and hash it in 64 KiB
+        // chunks. The full 64 MiB advertised file ceiling is independent of
+        // the memory budget for decoded replacements and other live buffers.
+        let mut budget = PlanBudget::default();
         let limit = self.config.max_write_bytes.min(MAX_PATCH_FILE_BYTES);
-        let snapshot = Snapshot::read_within(self, path, display.clone(), limit)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("{error} (bedit accepts files up to {limit} bytes)")
-            })?;
-        let size_before = snapshot.bytes().len();
+        let mut source = self.open_edit_file(&path).await?.into_std().await;
+        let (size_before, digest) = crate::blocking::run(|| digest_limited(&mut source, limit))?;
         if let Some(expected) = args.sha256.as_deref() {
-            let found = hex::encode(sha256(snapshot.bytes()));
+            let found = hex::encode(digest);
             if !expected.eq_ignore_ascii_case(&found) {
                 anyhow::bail!("bedit: sha256 mismatch (expected {expected}, found {found})");
             }
@@ -272,6 +299,7 @@ impl LocalMachine {
                     "bedit: replacement payloads total {decoded_bytes} bytes, above the {limit} byte limit"
                 );
             }
+            budget.add(0, data.len())?;
             let length = range.length.unwrap_or(data.len());
             let Some(end) = range
                 .offset
@@ -320,34 +348,50 @@ impl LocalMachine {
         if size_after > limit {
             anyhow::bail!("bedit: patched file would exceed the {limit} byte limit");
         }
+        // Stream the original spans and replacements straight into the same
+        // protected staging backend used by every write. Hash all original
+        // bytes as we go, including deleted ranges, and reject a changed
+        // source before publishing. Commit re-verifies the original digest.
+        source.rewind()?;
+        let mut changed = false;
+        let pending = self
+            .stage_update_with(&path, (size_before as u64, digest), |output| {
+                let splices = ranges
+                    .iter()
+                    .map(|range| ByteSplice {
+                        offset: range.offset,
+                        end: range.end,
+                        data: &range.data,
+                    })
+                    .collect::<Vec<_>>();
+                changed = stream_splice(&mut source, output, (size_before, digest), &splices)?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}; nothing was written"))?;
 
-        let mut edited = Vec::with_capacity(size_after);
-        let mut cursor = 0_usize;
-        for range in &ranges {
-            edited.extend_from_slice(&snapshot.bytes()[cursor..range.offset]);
-            edited.extend_from_slice(&range.data);
-            cursor = range.end;
+        // The reply shape depends on whether bytes actually changed. Prepare
+        // it before commit so a long path cannot cause a post-write 502.
+        let receipt = compact_receipt(
+            serde_json::json!({
+                "path": display,
+                "changed": changed,
+                "ranges": total,
+                "bytes_written": if changed { bytes_written } else { 0 },
+                "size_before": size_before,
+                "size_after": size_after,
+            }),
+            self.config.max_output_bytes,
+        )?;
+        if changed {
+            self.commit_write(pending)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}; nothing was written"))?;
+        } else {
+            // The staged identical bytes are never installed: preserve mtime.
+            drop(pending);
         }
-        edited.extend_from_slice(&snapshot.bytes()[cursor..]);
-        debug_assert_eq!(edited.len(), size_after);
-
-        let verified = snapshot
-            .verify(self, "editing")
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}; nothing was written"))?;
-        let changed = verified
-            .commit(self, &edited)
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}; nothing was written"))?;
-        Ok(serde_json::json!({
-            "path": display,
-            "changed": changed,
-            "ranges": total,
-            "bytes_written": if changed { bytes_written } else { 0 },
-            "size_before": size_before,
-            "size_after": size_after,
-        })
-        .to_string())
+        Ok(receipt)
     }
 }
 
@@ -408,6 +452,36 @@ impl LocalMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bedit_schema_advertises_the_same_range_ceiling_as_its_decoder() {
+        let schema = LocalMachine::all_tools()
+            .get("bedit")
+            .unwrap()
+            .input_schema
+            .clone();
+        assert_eq!(schema["properties"]["edits"]["maxItems"], MAX_BEDIT_RANGES);
+    }
+
+    #[test]
+    fn bedit_wire_rejects_oversized_range_array_during_deserialization() {
+        let ranges = (0..=MAX_BEDIT_RANGES)
+            .map(|offset| {
+                serde_json::json!({
+                    "offset":offset, "length":0, "data":""
+                })
+            })
+            .collect::<Vec<_>>();
+        let error = serde_json::from_value::<BeditArgs>(serde_json::json!({
+            "path":"file.bin", "edits":ranges
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(&format!("at most {MAX_BEDIT_RANGES} ranges")),
+            "{error}"
+        );
+    }
 
     #[test]
     fn binary_resource_uri_encodes_each_path_segment() {

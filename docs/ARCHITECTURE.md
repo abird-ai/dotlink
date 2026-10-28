@@ -67,6 +67,61 @@ cancellation release the complete lease immediately; missing system DNS
 disables CIMD only, not registered-client OAuth. No anonymous global minute
 counter is used.
 
+## Descriptor-rooted discovery and shell guard lifetime
+
+On Linux/macOS, directory names and each entry's metadata are obtained from
+the same pinned directory capability. Linux uses `openat2` with no-follow
+`O_PATH` and the directory's mount-resolution mask; macOS uses no-follow
+`fstatat` with device-boundary enforcement. Both prevent pathname redirection,
+with Linux also rejecting bind-mount crossings even on the same device.
+Windows holds ancestor directories without delete sharing. Sandbox mounts
+expose live host objects, so a host process can replace a pathname mask after
+preflight or while an existing command runs. `validate_shell_guards` therefore
+rejects any read-visible user bind overlapping protected/read-denied paths,
+and any writable user bind overlapping write-denied paths. Implicit runtime
+binds and aliases are checked against the same read-visible guards, using the
+exact RuntimeLayout subsequently assembled by Bubblewrap. This includes
+read-only binds and direct-child deny mounts: mount-point immutability inside
+the sandbox does not prevent host-side renames. An explicit root read+write
+grant (`--allow-rw=/`) intentionally waives private-path isolation for the
+shell, but retains Bubblewrap and its separate network/process/host controls;
+explicit deny rules are not waived. A profile should give shell
+a narrow host directory grant, leaving denied/private paths outside it;
+native MCP tools still enforce fine-grained denies per operation. Cache/host
+integration overlap checks stay conservative.
+
+For multi-file `edit`, each ordered `edits[].path` is the single public target
+source; the compatibility deserializer accepts an older top-level default
+without exposing it in the tool schema. Two global constants bound a call to
+512 operations and 64 distinct files: the parser rejects oversize input,
+planner enforces unique canonical file count, and advertised metadata and TOOL
+log work use the same ceilings. A 64 MiB aggregate budget bounds retained
+original snapshots and working text, and success receipts are trimmed to
+`max_output_bytes` *before* any commit. TOOL logs derive a bounded `paths`
+preview from operations rather than a redundant target list.
+
+## Shared mutation lifecycle
+
+`mcp::tools::mutation` is the common boundary for bounded multi-file work.
+`edit` and `patch` retain their respective text/patch grammars, but share one
+64 MiB `PlanBudget` for live source and working bytes, one bounded
+`MutationReceipt`, and one `stage_and_commit` engine with typed verified
+updates versus create-only targets. Strict commits stage every file first;
+`patch` best-effort records per-file staging/commit failures. The latter is
+not a transaction, and commit errors explicitly identify partial results.
+
+The receipt budget is verified before the first stage; large success lists are
+trimmed with exact omitted counts, and dynamically generated best-effort
+failures use the same bounded builder. `bedit` shares the planning ledger and
+precommits its result envelope, while `write` and `bwrite` precompute bounded
+success text. The lower-level `largest_fitting_prefix` serves `ls`, `grep`, and
+multi-file receipts, rather than maintaining independent binary searches.
+
+`edit` streams literal match positions for count and at most ten diagnostic
+lines, with no per-match offsets retained. `patch` keeps only bounded hunk
+ambiguity locations, bounds its temporary line-index work, and rejects file
+section 33 while parsing; `bedit` rejects range 33 during deserialization.
+
 ## Profiles and persisted defaults
 
 The default config is `~/.config/abird/dotlink/config.jsonc`. Named profiles use `config.<profile>.jsonc` and are selected with `-p/--profile`. Setup can target the same profile with `-S/--setup -p <name>`. Schema v10 JSONC supports line/block comments and trailing commas. Compatible older schemas migrate forward in memory through explicit version-to-version migration steps (currently v9 → v10); newer schemas and older versions without a defined migration path are rejected. Migrated profiles are serialized as the current schema when they are next edited or saved.
@@ -214,8 +269,10 @@ Runtime override:
 HTTP uses `LocalSessionManager` for normal Streamable HTTP sessions. The
 streamable-HTTP settings are built once, in `transports::streamable_config`,
 for both this server and the in-process tunnel service. That config owns the
-request-body ceiling: it is derived from `max_write_bytes` (six times that
-payload, for worst-case JSON escaping, plus 64 KiB of framing). rmcp's 4 MiB
+request-body ceiling: six times `max_write_bytes` for JSON escaping, plus
+64 KiB of base framing and practical, worst-case-escaped pathname headroom
+for every edit allowed by `MAX_EDIT_OPS`. Edit path strings must not hit an
+independent transport limit when the profile sets a small write-byte ceiling. rmcp's 4 MiB
 default would otherwise refuse a write the tools accept. Network HTTP/ngrok keeps rmcp's SSE keepalives for intermediary idle timeouts; only the in-process OpenAI adapter disables wire keepalive/retry events. For SEP-2243 calls, network HTTP and the embedded adapter reject unknown policy tool names before rmcp's schema cache; the network preflight buffers under the same exact request-body ceiling.
 
 When OAuth is enabled for a route, the Axum topology is deliberately split:
@@ -543,7 +600,7 @@ Then add --allow-shell and/or --allow-network separately.
 
 Logging has two layers:
 
-- normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP all produce the same timestamped TOOL start/completion lines;
+- normal activity logging is emitted centrally around the MCP tool router, so OpenAI, stdio, and HTTP produce the same TOOL lines: `p`/`d` before escaped full `c` for `bash`/`powershell`, with `b="N"`, `max_t`, and `max_b`. Paths inside launch cwd appear as `./...`, outside as absolute `/...` on Unix. Commands are intentionally auditable and may contain inline secrets; default is quiet;
 - REQ logging records incoming request metadata at the transport boundary without dumping request bodies; all scopes are ASCII-sanitized/capped, HTTP method/path labels are bounded and control-character sanitized, ephemeral MCP paths are redacted, OpenAI command metadata uses strict protocol identifiers, and grep patterns are logged only as byte counts. Control-plane error bodies and malformed SSE payloads are excluded from propagated errors. rmcp tracing is suppressed independently of `RUST_LOG` because its debug events render complete protocol payloads.
 
 Default activity logging is quiet. `-v` enables TOOL logs; `-vv` also enables REQ diagnostics. In interactive non-stdio runs, `v` cycles `quiet → TOOL → TOOL + REQ → quiet` immediately across all logger clones. `-q/--quiet` suppresses TOOL logs. `--color=auto|always|never` controls ANSI rendering; auto follows whether stderr is interactive.
@@ -592,7 +649,7 @@ Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases
   With `numbered: false` the window is returned byte for byte, so line endings
   and a trailing newline survive a read → write round trip. An offset past the
   end of the file is an error, never a silently empty answer.
-- `edit` takes an ordered `edits[]` array across up to 16 files, requires each
+- `edit` takes an ordered `edits[]` array across up to 64 files and 512 total operations, requires each
   `old_text` to be unique (or `replace_all`), and re-hashes every snapshot
   before the first commit: a mismatch detected there writes nothing, while each
   file replacement remains atomic and the commit sequence is not a transaction.
@@ -603,8 +660,9 @@ Dist outputs use stable filenames plus SHA-256 sidecars so CI and local releases
   Codex `*** End of File` marker is enforced: the hunk must end at the last line,
   and no hunk may follow it in the same file. Strict
   mode preflights every section before any commit and `best_effort` writes the
-  clean ones; each file replacement is atomic, but the commit sequence is not a
-  multi-file transaction.
+  clean ones; the shared mutation engine stages all eligible files before any
+  commit and bounds the receipt before writes. Each file replacement is atomic,
+  but the commit sequence is not a multi-file transaction.
 - `ls`, `grep`, `read`, `bread`, `write`, `bwrite`, `edit`, `patch` and `bedit`
   operate only inside canonicalized grants; denies and protected paths are
   dropped before patterns, sorts, or limits apply.

@@ -15,7 +15,7 @@ and the launch directory is the only implicit readable directory. `--no-default-
 
 ## Service and file-backed credentials
 
-The NixOS module runs dotlink as the explicitly selected Unix user (non-root strongly recommended), retains that user's ordinary XDG credential discovery by default, and requires an explicit working directory so the dynamic `.` read grant never silently expands to a surprise directory. Optional systemd `LoadCredential` runtime/ngrok key files are not embedded in generated Nix settings, systemd arguments, or the journal. Their paths are protected from MCP file access, and credential variables are removed from every child process; systemd notification variables never leave dotlink. The systemd-255-or-newer unit restarts all process terminations except statuses 2 and 78 and the non-failure `NOTCONFIGURED` (6), which leaves an unconfigured unit inactive, but systemd stop/restart jobs remain authoritative and suppress automatic restart. The selected Unix user's own filesystem permissions remain a separate boundary; an intentionally unrestricted, unsandboxed shell running as the same user must not be considered isolated from that user's private credentials. Journald tool logging may expose filesystem paths and command excerpts and should be enabled only when desired. See `.agents/docs/nixos-service.md`.
+The NixOS module runs dotlink as the explicitly selected Unix user (non-root strongly recommended), retains that user's ordinary XDG credential discovery by default, and requires an explicit working directory so the dynamic `.` read grant never silently expands to a surprise directory. Optional systemd `LoadCredential` runtime/ngrok key files are not embedded in generated Nix settings, systemd arguments, or the journal. Their paths are protected from MCP file access, and credential variables are removed from every child process; systemd notification variables never leave dotlink. The systemd-255-or-newer unit restarts all process terminations except statuses 2 and 78 and the non-failure `NOTCONFIGURED` (6), which leaves an unconfigured unit inactive, but systemd stop/restart jobs remain authoritative and suppress automatic restart. The selected Unix user's own filesystem permissions remain a separate boundary; an intentionally unrestricted, unsandboxed shell running as the same user must not be considered isolated from that user's private credentials. Opted-in TOOL logging intentionally stores full shell command text and paths in journald, including any inline secrets; restrict journal readers and retention accordingly. See `.agents/docs/nixos-service.md`.
 
 ## Profiles and permission precedence
 
@@ -52,7 +52,11 @@ re-opens each candidate through the same descriptor-rooted reader beneath the
 pinned grant root, one file at a time. Edit and patch operations that require
 both read and write access use the narrower pinned grant root, and identical
 read/write grants share one pinned directory identity. Recursive enumeration is
-anchored to a pinned directory handle and never follows symlink entries.
+anchored to a pinned directory handle. On Linux, child metadata opens are
+`openat2`-rooted with `O_PATH|O_NOFOLLOW` and the same `RESOLVE_NO_XDEV` mask as
+actual file opens, preventing both pathname swaps and prohibited mountpoint
+metadata disclosure. On macOS, no-follow `fstatat` uses the same device test as
+the native component-wise openat backend. Symlinks are listed but not followed.
 Filesystem operations fail closed if Linux does not support `openat2` or if a
 path cannot satisfy those constraints.
 Directory handles are capabilities, including if an unrelated process later
@@ -357,7 +361,27 @@ Canonical JSONC config files are `config.jsonc` or `config.<profile>.jsonc`. On 
 
 The Admin key used to create a tunnel is never persisted. A profile with OpenAI disabled does not require a runtime key.
 
-Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are removed from child shell environments. Active file-supplied Runtime/ngrok credentials are opened once; the descriptor identity must match the resolved protected target, and the captured value is carried into transport startup without a second pathname read. Protected control-plane paths and deny rules retain both their normalized lexical name and resolved target, including missing targets behind dangling symlinks; resolution follows each symlink before a later `..`, as the kernel does. Unlinking or retargeting a configured alias therefore never frees its name, and every sandboxed command re-resolves aliases and masks what they name at that moment as well. Sandboxed shells reject any protected or denied path inside a writable bind unless it lies below an existing, non-symlink deny that is the bind's direct child: only such a mount point cannot be renamed or unlinked, so an ancestor cannot be moved around a path mask and the denied name recreated. Cache and host remapping cannot bypass protected or denied roots. Runtime and network paths are bound read-only by pinned descriptor at their canonical location, where masks apply; an alias such as `/bin -> usr/bin` becomes a sandbox symlink rather than a second, unmasked bind. Runtime mounts are masked even without a matching filesystem grant. A policy the sandbox cannot enforce exits `CONFIG`/78. Dormant credential-file variables are not opened.
+Known OpenAI/tunnel credential environment variables and NGROK_AUTHTOKEN are removed from child shell environments. Active file-supplied Runtime/ngrok credentials are opened once; the descriptor identity must match the resolved protected target, and the captured value is carried into transport startup without a second pathname read. Protected control-plane paths and deny rules retain both their normalized lexical name and resolved target, including missing targets behind dangling symlinks; resolution follows each symlink before a later `..`, as the kernel does. Unlinking or retargeting a configured alias therefore never frees its name, and every sandboxed command re-resolves aliases and masks what they name at that moment as well. Sandboxed shells cannot safely expose a host grant overlapping a
+protected/read-denied path, even through a read-only bind: external host
+processes can rename and recreate the masked name while a shell runs. A
+write-denied path similarly cannot be under a writable grant. Pathname masks,
+including ones placed on an existing direct-child mount point, are not
+lifetime-safe against host-side renames. `validate_shell_guards` therefore
+rejects the conflicting mount before launching Bubblewrap and returns an
+actionable narrow-grant error (`CONFIG`/78 at startup). Narrow the shell grants
+to subdirectories excluding protected/denied objects. Native MCP filesystem
+tools still enforce those denies individually, and separate cache/host
+integration policies stay restrictive. The same validation also includes
+implicit runtime bind directories and aliases (including user Nix profiles):
+a private config/credential under a runtime mount must be rejected even if no
+user filesystem grant touches that directory. Runtime layout is computed once
+per shell request and reused for mount assembly. The explicit
+`--allow-rw=/ --allow-shell` combination is an intentional *unrestricted host
+filesystem* opt-out within Bubblewrap: protection against host-side path
+replacement is intentionally waived for Dotlink's private files, whose contents become
+accessible to that shell. The protected-path masks are not installed in this
+explicit mode; user deny rules still fail closed if they cannot be implemented. Bubblewrap's PID/network isolation and
+separate host-service opt-ins remain enabled. Cache and host remapping cannot bypass protected or denied roots. Runtime and network paths are bound read-only by pinned descriptor at their canonical location, where masks apply; an alias such as `/bin -> usr/bin` becomes a sandbox symlink rather than a second, unmasked bind. Runtime mounts are masked even without a matching filesystem grant. A policy the sandbox cannot enforce exits `CONFIG`/78. Dormant credential-file variables are not opened.
 
 ## Automatic transport recovery
 
@@ -408,7 +432,11 @@ The only unsandboxed shell mode is:
 
 The flags require each other and grant root filesystem read+write, shell, and network with no Bubblewrap isolation. Deny rules are not accepted in this mode because an arbitrary unsandboxed child process cannot be constrained by Rust path checks.
 
-For unrestricted filesystem access while keeping Linux sandboxing, use `--allow-rw=/` and add shell/network capabilities separately.
+For intentionally unrestricted filesystem access while keeping Linux sandboxing,
+use `--allow-rw=/ --allow-shell`. This opts out of guaranteed private-path
+isolation for the shell (unlike fine-grained grants), but does not enable
+network/host-service access or remove Bubblewrap. Native MCP filesystem tools
+still protect Dotlink's own configuration and credentials.
 
 ## Windows and macOS
 
@@ -417,7 +445,9 @@ On macOS the pinned-root Unix backend uses a component-wise openat/O_NOFOLLOW
 walk where Linux openat2 is unavailable. Directory enumeration stays
 rooted in the descriptor too: macOS `/dev/fd` nodes are character devices, so
 entries come from `fdopendir` on a duplicate of the pinned directory and are
-buffered within the walk's own entry ceiling. Windows pins ancestor directories
+buffered within the walk's own entry ceiling. On both Linux and macOS,
+`fstatat(AT_SYMLINK_NOFOLLOW)` inspects each name relative to that pinned
+directory without reopening a raceable path. Windows pins ancestor directories
 against rename, refuses reparse points during file opens, and coordinates
 same-path writers across processes with a named Global kernel mutex. The
 acquiring thread releases the mutex when its guard drops; a process crash
@@ -470,16 +500,56 @@ deserialization rather than after buffering a response.
 
 ## Logging privacy
 
-At `-v`, TOOL logs show metadata such as paths, directories, flags, status, latency, and timestamps. Arguments that carry a payload are reduced to a byte count — `content`, `stdin`, `data`, `old_text`, `new_text` and `patch` — so file contents, patches and piped input never reach the journal.
+At `-v` (or NixOS `logging.verbosity = "tools"`), TOOL logs intentionally
+record the **complete `bash`/`powershell` command**, as a quoted single-line
+representation with newlines and control characters escaped. This is an
+explicit operator audit feature, not an accidental payload leak; Dotlink does
+not truncate or substitute `command_bytes`. **Commands can contain inline
+passwords, access tokens and other secrets, which will be stored in journald.**
+Enable TOOL logging only with suitable journal permissions and retention. It
+is quiet by default. Logs order `p` (path), `d` (working directory), then
+complete `c` (shell command), followed by `max_t`/`max_b` and other fields.
+Existing symlink targets are resolved for the audit label when possible:
+paths whose targets are within launch cwd display as `./...`, and outside
+paths as absolute. Failed resolutions retain a lexical display and never
+change native authorization.
+The compact `b="N"` field summarizes the aggregate bytes of other payloads;
+`edit` uses a capped `paths=[...]` display for its file targets.
 
-`bash` and `powershell` commands also count as sensitive payloads: even a short
-command may embed a credential, so TOOL and REQ logs record `command_bytes`
-instead of an excerpt. Time, tool, working directory, outcome and latency
-remain available for operational auditing; the MCP client retains the command
-transcript for replay. Journald does not become a second, uncontrolled secret
-store.
+Mutating tools share one output-before-commit contract. `edit` and `patch`
+use the same staged update/create engine and bounded receipt builder, including
+best-effort failures. `bedit` precomputes its receipt before the verified
+commit, and `write`/`bwrite` use a compact success message when a very long
+path would exceed the response limit. Consequently, a successful local write
+cannot turn into an OpenAI-tunnel response-size 502 solely because of the
+success receipt. Actual commit failures can still leave previously committed
+files changed, and those errors report the partial-commit risk explicitly.
 
-At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/protocol metadata is added. HTTP logs bounded, control-character-sanitized method/path labels (with ephemeral MCP paths redacted) and status; stdio logs JSON-RPC method names; OpenAI Tunnel logs strict bounded protocol labels. Generic log scopes are ASCII-sanitized and capped, and grep patterns join commands/content/stdin as byte counts rather than literal text. OpenAI control-plane response bodies and malformed local SSE payloads are not copied into errors. rmcp tracing targets are always suppressed—even when `RUST_LOG` requests them—because upstream debug events render complete MCP request/response payloads. Raw request bodies, file contents, binary payloads, runtime keys, and other secrets are not intentionally emitted by the dotlink request logger.
+`edit`, `patch`, and `bedit` charge retained original and editable/decoded
+buffers against a single 64 MiB planning limit, in addition to their per-file
+and operation ceilings. `edit` counts literal matches without a per-match Vec;
+`patch` retains only bounded ambiguity previews, charges its source line-index
+work, and rejects section 33 while parsing. `bedit` rejects range 33 at wire
+decoding, not after allocating a range list.
+
+`edit` accepts at most 512 operations across 64 distinct files per request.
+Those global bounds are enforced in wire decoding, planning, advertised tool
+metadata, and bounded log summarization. Oversized batches are rejected before
+unbounded per-path allocations or quadratic deduplication. Its 64 MiB aggregate
+planning budget counts original snapshots and current editable text, not just
+request payload bytes. Per-file success details are trimmed to the configured
+output ceiling *before* staging/committing; `truncated`/`omitted_files` keep
+the receipt explicit when some details are omitted.
+
+Other payloads (`content`, `stdin`, `data`, `old_text`, `new_text`, `patch` and
+grep `pattern`) remain byte counts, not raw content. At `-vv`, REQ logs add
+bounded transport/protocol metadata, not raw request bodies. HTTP labels and
+generic log scopes are control-character sanitized; ephemeral paths are
+redacted. OpenAI control-plane response bodies and malformed local SSE payloads
+are excluded from propagated errors, and rmcp tracing stays suppressed even
+if `RUST_LOG` requests it because upstream debug events include complete MCP
+payloads. Dotlink does not intentionally log file contents or plaintext
+runtime keys separately from an explicitly logged shell command.
 
 `--quiet` suppresses TOOL activity. With `-vv`, it leaves REQ diagnostics visible while hiding TOOL lines.
 
@@ -492,11 +562,11 @@ At `-vv` (or after cycling to TOOL + REQ with `v`), request-level transport/prot
 - the shared traversal boundary records unreadable descendant directories and metadata errors (including races with deletions), exposes `traversal_error` to `ls` and `grep`, and distinguishes intentionally filtered entries; grep also marks individually unreadable discovered files. JSON keeps compatibility `incomplete_reason` and adds `incomplete_reasons` so simultaneous causes remain visible;
 - UTF-8 text tools share binary-control rejection, and grep skips non-text candidates; byte-oriented files use bread/bwrite/bedit; grep caps a request at 32 MiB content I/O and 4096 candidate files, reporting incomplete search coverage; optional gitignore work is separately capped at 4 MiB and 256 non-absent file reads, charging bytes returned before failed reads and rejecting any per-file overflow of 64 KiB or 1024 lines instead of silently discarding rules; unreadable or policy-denied ignore files mark discovery incomplete (`ignore_rules`) without reading denied bytes;
 - text/binary reads and writes are bounded; `read` streams a line window instead of preloading the whole file, builds the page in one output buffer, and its reply — truncation marker included — fits `max_read_bytes`; a source-level limiter ensures buffered prefetch cannot exceed the separate 32 MiB skipped-line I/O budget, while preserving already-prefetched selected-window bytes; a preceding line larger than the output ceiling still works within that budget;
-- the streamable-HTTP request-body ceiling is derived from the profile, not from the transport's default: a request body may be six times `max_write_bytes` (the worst-case JSON escaping of a payload the tools accept) plus 64 KiB of framing, for the local HTTP server and the OpenAI tunnel alike;
+- the streamable-HTTP request-body ceiling is derived from the profile and shared edit bounds, not from the transport's default: six times `max_write_bytes` for worst-case JSON escaping, plus 64 KiB framing and per-edit pathname headroom derived from the 512-operation ceiling. Local HTTP and embedded OpenAI use the same limit;
 - local MCP response bodies are bounded during streaming according to the configured `max_read_bytes` and `max_output_bytes`: ordinary text gets sixfold JSON-escape headroom, while shell reserves sevenfold nested-JSON headroom for each independently capped stdout/stderr stream, plus framing; unlike a fixed 16 MiB tunnel cap, larger configured limits can be returned consistently via HTTP, stdio, and the embedded tunnel;
 - shell progress heartbeats are best-effort with a 100 ms delivery budget clipped to the command's absolute deadline, never an unbounded wait or delayed timeout inside the child-process supervision loop;
 - shell calls use one absolute timeout covering stdin delivery, process execution, and stdout/stderr collection (including inherited pipes from descendants), chosen per call by the client, bounded by the tunnel client's own `response_timeout` window when present, and clamped to the profile `max_shell_timeout_secs` ceiling; a timeout still returns a bounded, non-secret error result with any partial output;
-- protected and denied paths beneath writable shell mounts need an immutable deny boundary (see above), so a missing one cannot be created by the command and needs no host-side placeholder. Existing paths are masked at their canonical object by inaccessible tmpfs or /dev/null;
+- user shell mounts must not expose protected/read-denied objects (even through read-only binds), nor writable write-denied objects: external host renames invalidate pathname masks over the lifetime of a command. The shell policy fails closed with an actionable narrow-grant error; separate runtime/cache/host mounts have their own checks;
 - shell cancellation and timeout abort request-owned pipe tasks and terminate the associated Unix process group or Windows Job Object; Windows creates the process suspended until it joins the Job Object. Unsandboxed Unix descendants that call `setsid` can escape process-group cleanup by design; Bubblewrap's PID namespace provides the stronger default boundary. Successful commands can deliberately start background work;
 - HTTP and transport lifecycles share cancellation; outer middleware drops every accepted MCP/OAuth route future (including body extraction) during shutdown, force-close-aware accepted IO wakes detached Axum connection tasks at the drain bound, and the ngrok HTTP supervisor owns the local listener and direct tunnel server tasks, explicitly closes the public tunnel and parent session with bounded RPCs concurrent with connection draining, treats a drain timeout as cleanup failure because synchronous handler work cannot be preempted, gives cleanup failures precedence over restart requests, and aborts tasks on unexpected termination;
 - OAuth request bodies/client metadata, pending DCR registrations, authorization requests/codes, access tokens, refresh grants, and approved DCR clients are all explicitly bounded; SEP-2243 HTTP/OpenAI tool calls preflight unknown names against the fixed policy router before rmcp's schema cache, with the network preflight enforcing the same exact request-body ceiling; public revocation rejects malformed tokens before disk I/O and admits at most two concurrent calls without an anonymous minute quota that could deny legitimate revocation; public token exchange admits at most four concurrent calls; the shared read-only state index also caches approved client metadata, using the separate namespaces of DCR IDs and CIMD URLs to avoid touching private state for arbitrary public URL requests. Definite misses are rejected, contention/version races fall through to authoritative work, and a stable malformed snapshot returns retryable 503 without repeated parsing. OAuth state (16 MiB), saved profile JSONC (4 MiB), and Runtime/explicit key files (16 KiB) share symmetric read/write ceilings, with serialization checked before replacement and Unix FIFOs/devices rejected through nonblocking descriptor validation; on Windows the OAuth state index uses native volume/file identity to recognize atomic replacements; public responses never echo private filesystem error details; pending owner authorizations use one bounded store that restores claimed requests after transient internal errors, while expired/full DCR promotions return actionable terminal errors; access-token poison recovery is consistent across publication, validation and revocation;

@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Multi-file text `edit` now permits 512 operations and 64 distinct files per call, both from two shared constants. Its wire decoder, advertised `maxItems`/description, planner, and TOOL-log preview use the same bounds; invalid oversized batches stop during decoding and cannot trigger quadratic log work.
+- Sandbox `--allow-rw=/ --allow-shell` remains an intentional full-filesystem opt-out while preserving Bubblewrap's process/network isolation. Without an explicit root RW grant, fine-grained guards stay strict; user-specified deny rules still cannot be silently bypassed. Unrestricted sandboxed shells intentionally do not mount Dotlink-private path masks; this grants filesystem access to those secrets while keeping the separate namespace/network controls.
+- Multi-file mutation planning now uses a 64 MiB aggregate budget for retained source and working buffers; both text and binary edits plan replies within the configured output ceiling before any commit. This prevents success-after-write tunnel 502s caused by oversized receipts.
+- Streamable HTTP and embedded tunnel request ceilings now include independent path/framing headroom derived from the 512-edit operation ceiling. With a small `max_write_bytes`, valid multi-edit calls with moderately long paths no longer receive an unexpected 413 before execution.
+- TOOL path labels resolve symlinked targets for accurate `./` vs outside-absolute display, falling back to lexical labels when resolution is unavailable; this never changes the access decision.
+- TOOL activity uses compact fields: `p`, `d`, then complete quoted/escaped `c` for shell commands, with combined payload bytes `b="N"`, `max_t`, and `max_b`. Paths under Dotlink's launch directory appear as `./...`; outside paths remain absolute (`/...` on Unix). Multi-file `edit` shows a bounded plural `paths=[...]` preview, with omitted counts.
+
+### Fixed
+
+- Consolidated `edit` and `patch` multi-file stage/commit lifecycle in `mcp::tools::mutation`: one verified-update/create-only transaction engine stages all changes before any commit, with strict and best-effort modes. `edit`, `patch`, and `bedit` share one 64 MiB source/work-buffer ledger; text/binary `write` and `bwrite` use the same pre-write response-size discipline. A successful mutation cannot exceed the configured response budget solely because of its receipt; multi-file replies retain exact counts with `truncated`, `omitted_files`, and `omitted_failures` when necessary.
+- `edit` counts exact-text matches without collecting every match offset; `patch` counts ambiguous hunk locations without unbounded candidate vectors and charges its temporary source-line index to available plan work. `patch` enforces its 32-section ceiling during parsing; `bedit` enforces its 32-range ceiling during deserialization instead of after constructing an oversized array.
+
+- `ls` and `grep` now inspect children under the pinned directory's full authority: Linux uses `openat2` with `O_PATH|O_NOFOLLOW` and the root's mount-resolution mask; macOS uses no-follow `fstatat` with the same device boundary as its native openat walk. Neither pathname races nor prohibited mountpoints leak outside metadata. Windows retains its delete-sharing directory pins.
+- Sandboxed shells reject overlapping user *and implicit runtime* mounts that expose a protected/read-denied path (even read-only binds) or make a write-denied path writable. A host-side rename can bypass a pathname mask both after preflight and after the sandbox starts, even with an existing direct-child deny mount; rejecting conflicting live directory binds at the common policy boundary closes both races. Narrow the grant to the directories actually needed and keep private config/credentials outside runtime mounts; native file tools continue honoring fine-grained denies. Runtime bind/alias plans are shared between policy checks and mount assembly, while cache/host integrations retain their own overlap checks.
+- OpenAI rejection-window runtime-restart regression test uses a two-second confirmation window, avoiding scheduler-load flakiness from a 200 ms assertion.
+- Multi-file text `edit` advertises only `edits: [{path, old_text, new_text, replace_all?}]`, with each operation's path required; a legacy top-level default `path` is still accepted at deserialization for existing callers. TOOL logs show the deduplicated `paths=[...]` target set once, without a redundant singular `path` field.
+- Shared TOOL summaries put `path`/`dir` before limits and offsets for every tool. Opted-in TOOL logging (`-v`, including NixOS `logging.verbosity = "tools"`) records the full `bash`/`powershell` command as one losslessly escaped line, restoring the intentionally auditable command history; other payloads remain byte counts.
+
 ## [0.13.0] - 2026-10-27
 
 Native macOS and Windows filesystem tools are the focus: macOS directory

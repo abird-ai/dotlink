@@ -100,11 +100,11 @@ Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity
 
 ✓ Connected — ready
 
-[10:59:19.184] TOOL read       → path=.agents/plans/TODO.md
+[10:59:19.184] TOOL read       → p="./.agents/plans/TODO.md"
 [10:59:19.194] TOOL read       ← ok  9ms
 ~~~
 
-`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` without restarting. Each change emits a compact `LOG verbosity …` line. `Ctrl+R` fully reloads the profile/policy/transports; `Ctrl+C` exits. Runtime key controls are disabled when stdio MCP is active so protocol stdin is never intercepted. File contents, binary payloads, shell command bodies, API keys, and raw request bodies are not intentionally logged.
+`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` without restarting. Each change emits a compact `LOG verbosity …` line. `Ctrl+R` fully reloads the profile/policy/transports; `Ctrl+C` exits. Runtime key controls are disabled when stdio MCP is active so protocol stdin is never intercepted. TOOL logging intentionally records full shell commands (including embedded arguments and secrets) as quoted, escaped one-line text. File contents, binary payloads, explicit Runtime keys, and raw request bodies are not intentionally logged.
 
 ## Connect dotlink to ChatGPT
 
@@ -472,6 +472,33 @@ Useful locations:
 - ChatGPT Workspace ID: <https://chatgpt.com/admin>
 - OpenAI Organization ID: <https://platform.openai.com/settings/organization/general>
 
+For multi-file text edits, pass an ordered `edits` array with a `path` on
+every operation (up to 512 operations and 64 distinct files per call). The `edit` tool has **no top-level `path` or `paths` input**;
+it derives the distinct target set from the edits. Planning retains at most
+64 MiB of original snapshots and editable text combined. Long success receipts
+are shortened *before* committing writes; `truncated` and `omitted_files` state
+how many per-file details were omitted, while the operation count remains exact.
+Legacy requests with a
+single top-level default path still work, but are no longer advertised.
+
+`edit`, `patch`, and `bedit` share a 64 MiB retained source/working-buffer
+budget. `edit` (512 edits / 64 files), `patch` (32 files / 64 hunks) and `bedit`
+(32 ranges) reject excess operations early. Large multi-file success receipts
+fit the profile output ceiling using `truncated` and omitted counts, checked
+before any commits; `write`/`bwrite` likewise avoid overly long path messages.
+The shared staging engine preserves strict all-stage-before-commit and
+`patch` best-effort behavior. Individual file replacements remain atomic;
+a multi-file commit is not a cross-file transaction.
+
+On Linux, normal fine-grained shell grants reject readable mounts overlapping
+protected/read-denied paths (even read-only binds). For an intentional
+unrestricted filesystem grant, **`--allow-rw=/ --allow-shell` works with
+Bubblewrap still enabled**; this explicitly opts out of guaranteed private-file
+isolation in the sandboxed shell. Dotlink-private paths are accessible to that shell by design; its native MCP
+tools still protect them. Explicit deny rules that cannot be enforced are not silently discarded. Shell
+network, PID namespace and host integrations retain independent controls.
+Native filesystem tools continue enforcing Dotlink's protected paths.
+
 ## Logging
 
 Logging is quiet by default:
@@ -486,9 +513,25 @@ default   no TOOL / REQ activity
 Example with `-v`:
 
 ~~~text
-[01:06:47.410] TOOL read       → path=README.md limit=1
+[01:06:47.410] TOOL read       → p="./README.md" limit=1
 [01:06:47.411] TOOL read       ← ok  1ms
 ~~~
+
+Shell commands are logged in full when TOOL verbosity is enabled, using a compact
+single-line, escaped format:
+
+~~~text
+[01:06:48.410] TOOL bash       → d="./src" c="echo hello\nls -la" max_b=30000 max_t=60
+[01:06:48.418] TOOL bash       ← ok  8ms
+~~~
+
+`p` and `d` show `./...` for resolved paths inside Dotlink's launch directory
+and absolute `/...` paths outside it. The labels follow existing symlinks on a
+best-effort basis, so a symlink pointing outside normally logs its outside
+target; actual permission checks remain independent. For writes, `b="N"` reports payload bytes;
+`edit` uses a bounded, deduplicated `paths=[...]` preview. These are audit
+labels only: permissions use the original paths. Enable TOOL logs deliberately,
+since shell commands may include inline credentials.
 
 With `-vv`, transport diagnostics are added:
 
@@ -497,7 +540,7 @@ With `-vv`, transport diagnostics are added:
 [01:06:47.427] REQ  stdio      → tools/call
 ~~~
 
-Logs include safe metadata such as paths, methods, status, and latency. Shell commands (including short ones) and other payload arguments are logged only as byte counts, so inline credentials are not copied into the journal.
+TOOL logs prioritize `p` (path), `d` (working directory), then complete `c` (shell command). By design, `-v` logs the **complete** shell command as `c="..."`, with newlines/control characters escaped onto one journal line—not `command_bytes` and not a truncated excerpt. **Inline passwords or tokens inside commands will be stored in journald** when TOOL logging is enabled. Keep that setting intentional and restrict journal access/retention accordingly. File contents, patches, search patterns, binary data and stdin remain byte counts; the default is quiet.
 
 Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
 

@@ -1,6 +1,7 @@
 //! `patch`: Codex grammar with strict preflight and per-file atomic commits.
 
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     path::{Path, PathBuf},
 };
@@ -12,9 +13,12 @@ use rmcp::{
 use serde::Deserialize;
 use tokio::fs;
 
-use super::{LocalMachine, Snapshot, Verified, dot, ok_text, tool_error};
+use super::{
+    LocalMachine, Snapshot, dot,
+    mutation::{MutationReceipt, MutationTarget, PlanBudget, PlannedMutation, stage_and_commit},
+    ok_text, tool_error,
+};
 use crate::mcp::AccessNeed;
-use crate::mcp::PendingWrite;
 use crate::mcp::lexical_normalize;
 
 const MAX_PATCH_FILES: usize = 32;
@@ -114,6 +118,12 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
                 continue;
             }
             if let Some(path) = directive.strip_prefix("Update File:") {
+                if ops.len() == MAX_PATCH_FILES {
+                    bail!(
+                        "patch: {} files, above the {MAX_PATCH_FILES} file limit",
+                        ops.len() + 1
+                    );
+                }
                 let path = path.trim().to_owned();
                 if path.is_empty() {
                     bail!("patch: line {number}: '*** Update File' needs a path");
@@ -125,6 +135,12 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
                 continue;
             }
             if let Some(path) = directive.strip_prefix("Add File:") {
+                if ops.len() == MAX_PATCH_FILES {
+                    bail!(
+                        "patch: {} files, above the {MAX_PATCH_FILES} file limit",
+                        ops.len() + 1
+                    );
+                }
                 let path = path.trim().to_owned();
                 if path.is_empty() {
                     bail!("patch: line {number}: '*** Add File' needs a path");
@@ -195,12 +211,6 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp>> {
     if !saw_end {
         bail!("patch: missing '*** End Patch' terminator");
     }
-    if ops.len() > MAX_PATCH_FILES {
-        bail!(
-            "patch: {} files, above the {MAX_PATCH_FILES} file limit",
-            ops.len()
-        );
-    }
     for op in &ops {
         if let PatchOp::Update { path, hunks } = op
             && hunks.is_empty()
@@ -251,8 +261,22 @@ fn apply_patch_hunks(
     display: &str,
     first_hunk: usize,
     total_hunks: usize,
+    output_limit: usize,
+    scratch_limit: usize,
 ) -> Result<(String, usize, usize)> {
-    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    // One borrowed slice per source line: unchanged text is never cloned.
+    // Keep this scratch index separate from the output-file byte ceiling.
+    // Patches add owned text only when line-ending normalization needs it.
+    let line_count = text
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_add(1);
+    let index_bytes = line_count.saturating_mul(std::mem::size_of::<Cow<'_, str>>());
+    if index_bytes > scratch_limit {
+        bail!("patch source line index exceeds the remaining mutation plan budget");
+    }
+    let mut lines: Vec<Cow<'_, str>> = text.split('\n').map(Cow::Borrowed).collect();
     let mut from_line = 0_usize;
     let mut added = 0_usize;
     let mut removed = 0_usize;
@@ -285,8 +309,13 @@ fn apply_patch_hunks(
             bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
         }
 
-        let mut exact = Vec::new();
-        let mut lenient = Vec::new();
+        // Count ambiguity without retaining one usize per candidate line.
+        // A repetitive file can contain millions of matching lines; only a
+        // small diagnostic prefix is useful to the caller.
+        let (mut exact_count, mut lenient_count) = (0_usize, 0_usize);
+        let (mut exact_first, mut lenient_first) = (None, None);
+        let mut exact_preview = Vec::with_capacity(MAX_AMBIGUOUS_LINES);
+        let mut lenient_preview = Vec::with_capacity(MAX_AMBIGUOUS_LINES);
         for start in search_start..lines.len() {
             if start + block.len() > lines.len() {
                 break;
@@ -294,40 +323,49 @@ fn apply_patch_hunks(
             if lines[start..start + block.len()]
                 .iter()
                 .zip(&block)
-                .all(|(file, patch)| file == patch)
+                .all(|(file, patch)| file.as_ref() == *patch)
             {
-                exact.push(start);
-                continue;
-            }
-            if lines[start..start + block.len()]
+                exact_count += 1;
+                exact_first.get_or_insert(start);
+                if exact_preview.len() < MAX_AMBIGUOUS_LINES {
+                    exact_preview.push(start + 1);
+                }
+            } else if lines[start..start + block.len()]
                 .iter()
                 .zip(&block)
                 .all(|(file, patch)| file.trim_end() == patch.trim_end())
             {
-                lenient.push(start);
+                lenient_count += 1;
+                lenient_first.get_or_insert(start);
+                if lenient_preview.len() < MAX_AMBIGUOUS_LINES {
+                    lenient_preview.push(start + 1);
+                }
             }
         }
-        let matches = if exact.is_empty() { lenient } else { exact };
-        let Some(&start) = matches.first() else {
+        let (first, matches, preview) = if exact_count > 0 {
+            (exact_first, exact_count, exact_preview)
+        } else {
+            (lenient_first, lenient_count, lenient_preview)
+        };
+        let Some(start) = first else {
             bail!("hunk {position}/{total_hunks} ({display}): context not found near line {near}");
         };
-        if matches.len() > 1 {
-            let lines_listed = matches
+        if matches > 1 {
+            let lines_listed = preview
                 .iter()
-                .take(MAX_AMBIGUOUS_LINES)
-                .map(|line| (line + 1).to_string())
+                .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "hunk {position}/{total_hunks} ({display}): context matches {} locations (lines {lines_listed})",
-                matches.len()
+                "hunk {position}/{total_hunks} ({display}): context matches {matches} locations (lines {lines_listed})"
             );
         }
 
         if hunk.at_end_of_file {
             // `text.split('\n')` yields one empty tail for a trailing newline;
             // it is not a line the marker can refer to.
-            let file_lines = lines.len() - usize::from(lines.last().is_some_and(String::is_empty));
+            let file_lines =
+                lines.len() - usize::from(lines.last().is_some_and(|line| line.is_empty()));
             if start + block.len() != file_lines {
                 bail!(
                     "hunk {position}/{total_hunks} ({display}): '*** End of File' requires the hunk to end at the end of the file (line {file_lines})"
@@ -358,14 +396,11 @@ fn apply_patch_hunks(
                 }
                 PatchLine::Added(text) => {
                     added += 1;
-                    let mut line = text.clone();
-                    match file_crlf {
-                        true if !line.ends_with('\r') => line.push('\r'),
-                        false if line.ends_with('\r') => {
-                            line.pop();
-                        }
-                        _ => {}
-                    }
+                    let line = match (file_crlf, text.ends_with('\r')) {
+                        (true, false) => Cow::Owned(format!("{text}\r")),
+                        (false, true) => Cow::Borrowed(text.strip_suffix('\r').unwrap()),
+                        _ => Cow::Borrowed(text.as_str()),
+                    };
                     replacement.push(line);
                 }
             }
@@ -375,6 +410,22 @@ fn apply_patch_hunks(
         from_line = start + replacement_len;
     }
 
+    // Inspect the exact projected join size before allocating the final
+    // result. Retained source and output must fit the shared plan budget.
+    let bytes = lines
+        .iter()
+        .try_fold(0_usize, |sum, line| sum.checked_add(line.len()))
+        .and_then(|sum| sum.checked_add(lines.len().saturating_sub(1)))
+        .ok_or_else(|| anyhow!("patch result size overflow"))?;
+    if bytes > output_limit {
+        bail!("patch result would be {bytes} bytes, above the {output_limit}-byte write limit");
+    }
+    // The source snapshot remains pinned while the borrowed index and final
+    // output coexist. Count the index plus owned result separately from the
+    // independent output policy, without charging unchanged lines twice.
+    if index_bytes.saturating_add(bytes) > scratch_limit {
+        bail!("patch working buffers exceed the remaining mutation plan budget");
+    }
     Ok((lines.join("\n"), added, removed))
 }
 
@@ -403,17 +454,6 @@ struct PlannedFile {
     removed: usize,
 }
 
-/// A planned file that passed verification (updates) or is a fresh create.
-struct ReadyFile {
-    path: PathBuf,
-    display: String,
-    verified: Option<Verified>,
-    text: String,
-    hunks: usize,
-    added: usize,
-    removed: usize,
-}
-
 impl LocalMachine {
     async fn patch_impl(&self, args: PatchArgs) -> Result<String> {
         super::require_text_bytes(args.patch.as_bytes(), "bwrite/bedit")?;
@@ -433,6 +473,7 @@ impl LocalMachine {
             })
             .sum::<usize>();
 
+        let mut budget = PlanBudget::default();
         let mut planned: Vec<PlannedFile> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();
         let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
@@ -537,18 +578,28 @@ impl LocalMachine {
             match op {
                 PatchOp::Update { hunks, .. } => {
                     let outcome = async {
+                        let limit = budget.copy_read_limit(self.config.max_read_bytes)?;
+                        let bound = if limit < self.config.max_read_bytes {
+                            "aggregate mutation plan budget"
+                        } else {
+                            "configured read limit"
+                        };
                         let snapshot =
-                            Snapshot::read(self, resolved.clone(), display.clone()).await?;
-                        let text = snapshot.text()?.to_owned();
-                        let (edited, added, removed) =
-                            apply_patch_hunks(&text, hunks, &display, first_hunk, total_hunks)?;
-                        if edited.len() > self.config.max_write_bytes {
-                            anyhow::bail!(
-                                "{display}: patched file would be {} bytes, above the {} byte write limit",
-                                edited.len(),
-                                self.config.max_write_bytes
-                            );
-                        }
+                            Snapshot::read_within(self, resolved.clone(), display.clone(), limit)
+                                .await
+                                .map_err(|error| anyhow!("{display}: {bound}: {error}"))?;
+                        let scratch_limit =
+                            budget.remaining().saturating_sub(snapshot.bytes().len());
+                        let (edited, added, removed) = apply_patch_hunks(
+                            snapshot.text()?,
+                            hunks,
+                            &display,
+                            first_hunk,
+                            total_hunks,
+                            self.config.max_write_bytes,
+                            scratch_limit,
+                        )?;
+                        budget.add(snapshot.bytes().len(), edited.len())?;
                         Ok(PlannedFile {
                             path: resolved,
                             display: display.clone(),
@@ -594,6 +645,7 @@ impl LocalMachine {
                                 self.config.max_write_bytes
                             );
                         }
+                        budget.add(0, text.len())?;
                         Ok(PlannedFile {
                             path: resolved,
                             display: display.clone(),
@@ -620,7 +672,7 @@ impl LocalMachine {
 
         // Verify every update before the first write. Atomic fails the whole
         // call; `best_effort` reports the file and keeps the rest.
-        let mut ready: Vec<ReadyFile> = Vec::with_capacity(planned.len());
+        let mut ready: Vec<PlannedMutation> = Vec::with_capacity(planned.len());
         for file in planned {
             let verified = match file.kind {
                 PlanKind::Update(snapshot) => match snapshot.verify(self, "patching").await {
@@ -633,114 +685,47 @@ impl LocalMachine {
                 },
                 PlanKind::Create => None,
             };
-            ready.push(ReadyFile {
-                path: file.path,
+            let record = serde_json::json!({
+                "path": file.display,
+                "hunks": file.hunks,
+                "added": file.added,
+                "removed": file.removed,
+            });
+            ready.push(PlannedMutation {
+                target: match verified {
+                    Some(verified) => MutationTarget::Update(verified),
+                    None => MutationTarget::Create(file.path),
+                },
                 display: file.display,
-                verified,
-                text: file.text,
-                hunks: file.hunks,
-                added: file.added,
-                removed: file.removed,
+                bytes: file.text.into_bytes(),
+                record,
             });
         }
 
-        // Write. Every file is staged first and only then renamed into place, so
-        // a failure while writing cannot leave earlier files changed. A patch
-        // that reproduces a file byte for byte touches nothing and stays out of
-        // the receipt.
-        struct Staged {
-            file: ReadyFile,
-            pending: PendingWrite,
-        }
-        let mut staged: Vec<Staged> = Vec::with_capacity(ready.len());
-        let mut written: Vec<ReadyFile> = Vec::new();
-        let mut abort: Option<anyhow::Error> = None;
-        for file in ready {
-            let ReadyFile {
-                path,
-                display,
-                verified,
-                text,
-                hunks,
-                added,
-                removed,
-            } = file;
-            let outcome = match verified {
-                Some(verified) => verified.stage(self, text.as_bytes()).await,
-                // Create-only: the target is absent until commit, so a reader
-                // never sees an empty file and a failure leaves nothing behind.
-                None => self
-                    .stage_create_write(&path, text.as_bytes())
-                    .await
-                    .map(Some),
-            };
-            let staged_file = ReadyFile {
-                path,
-                display,
-                verified: None,
-                text,
-                hunks,
-                added,
-                removed,
-            };
-            match outcome {
-                Ok(Some(pending)) => staged.push(Staged {
-                    file: staged_file,
-                    pending,
-                }),
-                Ok(None) => {} // byte-identical: nothing to write
-                Err(error) if args.best_effort => {
-                    failures.push((staged_file.display.clone(), error.to_string()))
-                }
-                Err(error) => {
-                    abort = Some(error);
-                    break;
-                }
-            }
-        }
-        if let Some(error) = abort {
-            drop(staged);
-            return Err(error);
-        }
-
-        for Staged { file, pending } in staged {
-            match self.commit_write(pending).await {
-                Ok(()) => written.push(file),
-                Err(error) if args.best_effort => failures.push((file.display, error.to_string())),
-                Err(error) => {
-                    return Err(anyhow!(
-                        "{}: commit failed after staging; earlier files in this patch may already have been replaced: {error}",
-                        file.display
-                    ));
-                }
-            }
-        }
-
-        let mode = match args.best_effort {
-            true => "best_effort",
-            false => "strict",
+        // Construct the reply budget before any staging or commit. The shared
+        // receipt always fits, including dynamic best-effort failure strings;
+        // an oversized reply must never turn committed mutations into a 502.
+        let mode = if args.best_effort {
+            "best_effort"
+        } else {
+            "strict"
         };
-        let mut receipt = serde_json::json!({
-            "files": written
-                .iter()
-                .map(|file| serde_json::json!({
-                    "path": file.display,
-                    "hunks": file.hunks,
-                    "added": file.added,
-                    "removed": file.removed,
-                }))
-                .collect::<Vec<_>>(),
-            "mode": mode,
-        });
-        if !failures.is_empty() {
-            receipt["failures"] = serde_json::json!(
-                failures
-                    .iter()
-                    .map(|(path, error)| serde_json::json!({"path": path, "error": error}))
-                    .collect::<Vec<_>>()
-            );
-        }
-        Ok(receipt.to_string())
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("mode".into(), serde_json::json!(mode));
+        let receipt_plan = MutationReceipt::new(self.config.max_output_bytes, metadata)?;
+
+        let outcome = stage_and_commit(self, "patch", args.best_effort, ready).await?;
+        failures.extend(outcome.failures);
+        let errors = failures
+            .iter()
+            .map(|(path, error)| {
+                serde_json::json!({
+                    "path": path,
+                    "error": error,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(receipt_plan.finish(&outcome.records, &errors))
     }
 }
 
@@ -775,6 +760,90 @@ mod tests {
             dir: dot(),
             patch: patch.to_owned(),
             best_effort: false,
+        }
+    }
+
+    #[test]
+    fn parser_rejects_excess_sections_before_processing_later_invalid_lines() {
+        let mut patch = String::from("*** Begin Patch\n");
+        for index in 0..=MAX_PATCH_FILES {
+            patch.push_str(&format!("*** Add File: f{index}.txt\n+x\n"));
+        }
+        patch.push_str("*** UNKNOWN INVALID DIRECTIVE\n");
+        let error = parse_patch(&patch).unwrap_err().to_string();
+        assert!(error.contains("file limit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn patch_receipt_bounds_post_commit_result_and_preserves_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut dir = root.clone();
+        for _ in 0..4 {
+            dir = dir.join("x".repeat(205));
+            std::fs::create_dir(&dir).unwrap();
+        }
+        let mut input = String::from("*** Begin Patch\n");
+        for file in 0..MAX_PATCH_FILES {
+            let relative = dir
+                .strip_prefix(&root)
+                .unwrap()
+                .join(format!("new-{file:03}.txt"));
+            input.push_str(&format!("*** Add File: {}\n+hello\n", relative.display()));
+        }
+        input.push_str("*** End Patch\n");
+        let mut machine = test_machine(root);
+        machine.config.max_write_bytes = 64 * 1024;
+        machine.config.max_output_bytes = 1024;
+        let receipt = machine.patch_impl(patch_args(&input)).await.unwrap();
+        assert!(receipt.len() <= 1024, "receipt={} bytes", receipt.len());
+        let json: Value = serde_json::from_str(&receipt).unwrap();
+        let displayed = json["files"].as_array().unwrap().len();
+        assert_eq!(json["mode"], "strict");
+        assert_eq!(json["truncated"], true);
+        assert_eq!(
+            json["omitted_files"].as_u64().unwrap() as usize + displayed,
+            MAX_PATCH_FILES
+        );
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), MAX_PATCH_FILES);
+    }
+
+    #[tokio::test]
+    async fn patch_aggregate_budget_rejects_before_any_strict_commit() {
+        use super::super::MAX_MUTATION_PLAN_BYTES;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut patch = String::from("*** Begin Patch\n");
+        let file_bytes = MAX_MUTATION_PLAN_BYTES / 5;
+        for file in 0..3 {
+            let path = root.join(format!("large-{file}.txt"));
+            let mut bytes = Vec::with_capacity(file_bytes);
+            bytes.extend_from_slice(b"before\n");
+            bytes.resize(file_bytes, b'x');
+            std::fs::write(path, bytes).unwrap();
+            patch.push_str(&format!(
+                "*** Update File: large-{file}.txt\n@@\n-before\n+after\n"
+            ));
+        }
+        patch.push_str("*** End Patch\n");
+        let mut machine = test_machine(root.clone());
+        machine.config.max_read_bytes = file_bytes + 1024;
+        machine.config.max_write_bytes = file_bytes + 1024;
+        let error = machine
+            .patch_impl(patch_args(&patch))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("aggregate") || error.contains("budget"),
+            "{error}"
+        );
+        for file in 0..3 {
+            assert!(
+                std::fs::read(root.join(format!("large-{file}.txt")))
+                    .unwrap()
+                    .starts_with(b"before\n")
+            );
         }
     }
 

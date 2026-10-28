@@ -271,7 +271,7 @@ systemd applies this policy:
 | Exit | Cause | systemd |
 | --- | --- | --- |
 | 2 (usage) | Unknown or invalid flags, e.g. an older binary than the module expects | Leaves the unit failed |
-| 78 (`CONFIG`) | Profile, policy or credential content fails to resolve, including a selector-pinned Runtime key generation that is missing (selected generations are immutable, so it cannot appear later); a sandbox policy the shell cannot enforce (a protected or deny path in a writable shell mount without an immutable boundary, or an opted-in host integration that is denied/protected); a resource limit below its minimum; OpenAI keeps rejecting the Runtime key (401/403) or tunnel ID (404) for 60 s, counted across in-process runtime restarts | Leaves the unit failed |
+| 78 (`CONFIG`) | Profile, policy or credential content fails to resolve, including a selector-pinned Runtime key generation that is missing (selected generations are immutable, so it cannot appear later); a sandbox policy the shell cannot enforce (a protected/read-denied path inside a fine-grained readable shell grant, including a read-only grant; a write-denied path inside a writable grant; or an opted-in host integration that is denied/protected); a resource limit below its minimum; OpenAI keeps rejecting the Runtime key (401/403) or tunnel ID (404) for 60 s, counted across in-process runtime restarts | Leaves the unit failed |
 | 6 (`NOTCONFIGURED`) | Nothing is configured yet: no saved profile, no explicit settings or config file, and stdin is not interactive | Leaves the unit inactive; nothing restarted, nothing failed |
 | 0 or a clean signal | The long-running service ended cleanly outside a systemd stop/restart job | Restarts with backoff |
 | Any other status or signal | Unreadable local state, or absent state that may still appear: late mounts, explicit credential files (`DOTLINK_API_KEY_FILE`, `LoadCredential`) not yet provisioned or swapped, grant or deny paths not created yet; listener address unavailable, network or ngrok outage, host socket/device missing, transport lost, cleanup timeout, panic, crash | Restarts with backoff |
@@ -359,7 +359,13 @@ tunnel IDs, public MCP URLs and bounded request metadata; commands, grep
 patterns and bulk payloads are represented only by size. rmcp tracing remains
 suppressed regardless of `RUST_LOG` because upstream debug events render full
 MCP payloads. Journald retention/access remains under the host's policy. Avoid
-request logging on shared systems unless needed.
+request logging on shared systems unless needed. `logging.verbosity = "tools"`
+intentionally records each complete shell command as `c="..."` in journald,
+with newlines escaped onto one record. Logged paths are relative to Dotlink's
+launch directory (`./...`) when inside it; external paths remain absolute.
+`p`/`d` precede `c`, and `max_t`/`max_b` show tool ceilings. Inline credentials
+in shell commands are recorded too;
+limit journal access and retention if you enable this audit mode.
 
 systemd hardening must preserve dotlink's Bubblewrap namespaces, user-owned
 project directories, and writable developer caches. The module intentionally

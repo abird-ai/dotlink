@@ -146,6 +146,116 @@ fn openat2(dir: &OwnedFd, path: &Path, flags: i32, mode: u32, resolve: u64) -> i
     openat_beneath(dir, path, flags, mode, resolve)
 }
 
+/// Inspect a single child under the same constraints as descriptor-rooted
+/// opens. An `AT_SYMLINK_NOFOLLOW` stat alone is insufficient: a mountpoint
+/// must not leak metadata where the grant forbids RESOLVE_NO_XDEV.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChildMetadata {
+    pub(crate) kind: &'static str,
+    pub(crate) len: u64,
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+pub(crate) fn child_metadata(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    resolve: u64,
+) -> io::Result<ChildMetadata> {
+    if !matches!(
+        Path::new(name).components().next(),
+        Some(Component::Normal(_))
+    ) || Path::new(name).components().count() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected one child name",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // O_PATH|O_NOFOLLOW allows an FD referring to the symlink itself.
+        // Kernel-enforced RESOLVE_NO_XDEV also detects bind mounts on the
+        // same device, unlike comparing st_dev after an ordinary fstatat.
+        let fd = open_child(parent, name, PATH_ONLY | libc::O_NOFOLLOW, resolve)?;
+        let metadata = File::from(fd).metadata()?;
+        let kind = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        Ok(ChildMetadata {
+            kind,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::time::{Duration, UNIX_EPOCH};
+        // Darwin cannot O_PATH-open a symlink; preserve no-follow reporting
+        // with fstatat and apply the same filesystem-device check used by the
+        // component-wise macOS openat backend.
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in child name"))?;
+        let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: pinned directory FD, NUL-terminated child, valid output.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                info.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: success initialized the stat structure.
+        let info = unsafe { info.assume_init() };
+        if resolve & RESOLVE_NO_XDEV != 0 {
+            let mut parent_info = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: parent is a live pinned FD and output is initialized on success.
+            if unsafe { libc::fstat(parent.as_raw_fd(), parent_info.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstat succeeded.
+            if info.st_dev != unsafe { parent_info.assume_init() }.st_dev {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
+        }
+        let kind = match info.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => "dir",
+            libc::S_IFREG => "file",
+            libc::S_IFLNK => "symlink",
+            _ => "other",
+        };
+        let seconds = info.st_mtimespec.tv_sec;
+        let nanos = info.st_mtimespec.tv_nsec;
+        let modified = u32::try_from(nanos)
+            .ok()
+            .filter(|nanos| *nanos < 1_000_000_000)
+            .and_then(|nanos| {
+                let duration = Duration::from_secs(seconds.unsigned_abs());
+                let base = if seconds < 0 {
+                    UNIX_EPOCH.checked_sub(duration)
+                } else {
+                    UNIX_EPOCH.checked_add(duration)
+                };
+                base.and_then(|time| time.checked_add(Duration::from_nanos(u64::from(nanos))))
+            });
+        Ok(ChildMetadata {
+            kind,
+            len: info.st_size.max(0) as u64,
+            modified,
+        })
+    }
+}
+
 /// Flags every child open must carry, whatever mask the caller supplies. The
 /// mask is an implementation detail of the pinned root; keeping the security
 /// boundary inside this function means a future caller cannot relax it by
@@ -596,6 +706,23 @@ impl SecureFs {
         self.stage_in_root(self.root(path, true)?.0, path, bytes, StageMode::Create)
     }
 
+    /// Stream a verified update into its descriptor-rooted temporary. The
+    /// caller controls byte production; this layer owns ACL/mode, cleanup,
+    /// fsync and commit-time content preconditions for every update format.
+    pub fn stage_update_with(
+        &self,
+        path: &Path,
+        expected: (u64, [u8; 32]),
+        write: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<StagedWrite> {
+        self.stage_in_root_with(
+            self.replacement_root(path)?,
+            path,
+            StageMode::Update(expected),
+            write,
+        )
+    }
+
     fn stage_in_root(
         &self,
         root: &Root,
@@ -603,11 +730,25 @@ impl SecureFs {
         bytes: &[u8],
         mode: StageMode,
     ) -> Result<StagedWrite> {
+        use std::io::Write;
+        self.stage_in_root_with(root, path, mode, |file| {
+            file.write_all(bytes)?;
+            Ok(())
+        })
+    }
+
+    fn stage_in_root_with(
+        &self,
+        root: &Root,
+        path: &Path,
+        mode: StageMode,
+        write: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<StagedWrite> {
         let rel = path
             .strip_prefix(&root.path)
             .map_err(|_| anyhow!("path has no authorized root: {}", path.display()))?;
         let (parent, file_name) = open_parent_dir(root, rel, path, true)?;
-        self.stage_at(&parent, file_name, root.resolve, path, bytes, mode)
+        self.stage_at(&parent, file_name, root.resolve, path, mode, write)
     }
 
     /// The replacement root is the deeper of the read and write grants: an
@@ -630,11 +771,9 @@ impl SecureFs {
         name: &std::ffi::OsStr,
         resolve: u64,
         target: &Path,
-        bytes: &[u8],
         mode: StageMode,
+        write: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<StagedWrite> {
-        use std::io::Write;
-
         let resolve = mandatory_resolve(resolve);
         let create_only = matches!(mode, StageMode::Create);
         // Keep the mode of an existing regular file (`+x` scripts, 0600 keys).
@@ -684,7 +823,7 @@ impl SecureFs {
         let mut file = File::from(fd);
 
         let written = (|| -> Result<()> {
-            file.write_all(bytes)?;
+            write(&mut file)?;
             if let Some(mode) = existing_mode {
                 let mode = libc::mode_t::try_from(mode)
                     .expect("masked Unix permission bits must fit mode_t");
@@ -904,6 +1043,46 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_metadata_obeys_mount_boundary_and_explicit_root_exception() {
+        use std::os::unix::fs::MetadataExt as _;
+        let directory: OwnedFd = File::open("/").unwrap().into();
+        let root_device = fs::metadata("/").unwrap().dev();
+        // Common Linux mountpoints; skip only on unusual test hosts without a
+        // distinct mount. No privileged mount namespace is required.
+        let mount = ["proc", "sys", "dev"].into_iter().find(|name| {
+            fs::metadata(format!("/{name}")).is_ok_and(|meta| meta.dev() != root_device)
+        });
+        let Some(mount) = mount else { return };
+        let denied = child_metadata(&directory, mount.as_ref(), SAFE_RESOLVE).unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(libc::EXDEV));
+        let allowed = child_metadata(
+            &directory,
+            mount.as_ref(),
+            RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        )
+        .unwrap();
+        assert_eq!(allowed.kind, "dir");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_metadata_lists_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("file"), b"a").unwrap();
+        symlink("file", root.join("alias")).unwrap();
+        let directory: OwnedFd = File::open(&root).unwrap().into();
+        let file = child_metadata(&directory, "file".as_ref(), SAFE_RESOLVE).unwrap();
+        let alias = child_metadata(&directory, "alias".as_ref(), SAFE_RESOLVE).unwrap();
+        assert_eq!(file.kind, "file");
+        assert_eq!(file.len, 1);
+        assert_eq!(alias.kind, "symlink");
+        assert_eq!(alias.len, 4);
     }
 
     #[test]
