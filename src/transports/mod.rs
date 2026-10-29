@@ -682,7 +682,7 @@ mod constraint_tests {
                 organization_id: None,
                 new_tunnel: false,
                 log: crate::logging::LogConfig::default(),
-                rejections: openai::RejectionLedger::default(),
+                process_state: openai::ProcessState::default(),
             }),
             stdio: true,
             http: None,

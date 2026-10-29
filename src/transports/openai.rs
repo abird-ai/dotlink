@@ -1,6 +1,6 @@
 use std::{
-    collections::BTreeMap,
-    sync::Arc,
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::{Semaphore, mpsc, watch},
     task::JoinSet,
     time,
 };
@@ -53,10 +53,9 @@ fn poll_response_ceiling() -> usize {
     MAX_POLL_RESPONSE_BYTES
 }
 
-fn durable_request_key(tunnel_id: &str, request_id: &str) -> String {
+fn durable_request_key(namespace: &[u8; 32], request_id: &str) -> String {
     let mut digest = Sha256::new();
-    digest.update((tunnel_id.len() as u64).to_be_bytes());
-    digest.update(tunnel_id.as_bytes());
+    digest.update(namespace);
     digest.update((request_id.len() as u64).to_be_bytes());
     digest.update(request_id.as_bytes());
     hex::encode(digest.finalize())
@@ -248,8 +247,8 @@ pub struct Config {
     pub organization_id: Option<String>,
     pub new_tunnel: bool,
     pub log: LogConfig,
-    /// Process-wide; shared by every runtime the process builds.
-    pub rejections: RejectionLedger,
+    /// Process-wide replay/rejection state; shared by every runtime the process builds.
+    pub process_state: ProcessState,
 }
 
 pub async fn run(
@@ -663,7 +662,12 @@ pub(crate) struct TunnelClient {
     concurrency: Arc<Semaphore>,
     tuning: Arc<TunnelTuning>,
     identity: [u8; 32],
+    /// Stable logical request namespace: endpoint + tunnel + organization, but
+    /// deliberately not the credential so API-key rotation cannot make a late
+    /// redelivery look like a new side effect.
+    request_namespace: [u8; 32],
     rejections: RejectionLedger,
+    replays: RequestReplayLedger,
 }
 
 /// What OpenAI accepts or rejects: endpoint, tunnel, key and organization.
@@ -722,7 +726,7 @@ impl TunnelCommand {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct TunnelResponse {
     request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -733,6 +737,12 @@ struct TunnelResponse {
     resp_headers: BTreeMap<String, Vec<String>>,
     resp_code: u16,
     resp_type: String,
+}
+
+fn serialize_tunnel_response(response: &TunnelResponse) -> Result<Bytes> {
+    Ok(Bytes::from(
+        serde_json::to_vec(response).context("failed to serialize tunnel response")?,
+    ))
 }
 
 #[derive(Debug)]
@@ -818,6 +828,531 @@ impl RejectionLedger {
     }
 }
 
+/// Process-lifetime OpenAI state. Rejection history and request replay survive
+/// an in-process transport/runtime rebuild, while replay namespaces are retired
+/// explicitly when the logical endpoint/tunnel/organization changes.
+#[derive(Clone, Default)]
+pub struct ProcessState {
+    rejections: RejectionLedger,
+    replays: RequestReplayLedger,
+}
+
+impl ProcessState {
+    fn activate_namespace(&self, namespace: [u8; 32]) {
+        self.replays.activate_namespace(namespace);
+    }
+}
+
+/// Delivered tombstones are tiny but must cover the full hosted redelivery
+/// horizon. Replayable terminal bodies have the much tighter byte bound below.
+const MAX_REQUEST_REPLAY_ENTRIES: usize = 65_536;
+const MAX_REQUEST_REPLAY_BYTES: usize = 256 * 1024 * 1024;
+const REQUEST_REPLAY_RESERVATION_BYTES: usize =
+    crate::limits::OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES;
+const REQUEST_REPLAY_RETENTION: Duration = crate::limits::OPENAI_TUNNEL_REQUEST_DEADLINE;
+
+#[derive(Clone, Default)]
+struct RequestReplayLedger(Arc<Mutex<RequestReplayState>>);
+
+#[derive(Default)]
+struct RequestReplayState {
+    entries: HashMap<String, RequestReplayRecord>,
+    reserved_bytes: usize,
+    expirations: VecDeque<ReplayExpiration>,
+    active_namespace: Option<[u8; 32]>,
+}
+
+struct RequestReplayRecord {
+    namespace: [u8; 32],
+    fingerprint: [u8; 32],
+    state: RequestReplayEntry,
+}
+
+#[derive(Clone)]
+struct ReplayTerminal {
+    response: TunnelResponse,
+    finalize_job_delivery: bool,
+    requires_job_owner: bool,
+    /// This response reports a retryable outer delivery/admission failure for an
+    /// already-owned shell execution. Delivering it must not retire the inner key.
+    recoverable_shell: bool,
+}
+
+#[derive(Clone)]
+struct CachedReplayTerminal {
+    body: Bytes,
+    finalize_job_delivery: bool,
+    requires_job_owner: bool,
+    /// Once the large cached body ages out, a committed shell response can be
+    /// reconstructed from the still-owned JobManager request instead of becoming
+    /// permanently uncertain.
+    recover_after_body_expiry: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayExpirationKind {
+    DropReadyBody,
+    RemoveTombstone,
+}
+
+struct ReplayExpiration {
+    until: Instant,
+    key: String,
+    kind: ReplayExpirationKind,
+}
+
+enum RequestReplayEntry {
+    InFlight {
+        signal: watch::Sender<()>,
+    },
+    /// The outer response attempt disappeared, but the current JobManager may
+    /// still own the exact durable shell request.
+    RecoverableShell,
+    /// Execution may have committed and no replay-safe owner can prove otherwise.
+    Uncertain,
+    Ready {
+        terminal: Arc<CachedReplayTerminal>,
+        reserved_bytes: usize,
+        body_until: Instant,
+    },
+    Delivered {
+        until: Instant,
+    },
+    /// The logical tunnel namespace was deactivated. Retain a short fail-closed
+    /// tombstone for the old hosted request horizon, but release response bytes.
+    Retired {
+        until: Instant,
+    },
+}
+
+enum RequestReplayClaim {
+    Leader,
+    Wait(watch::Receiver<()>),
+    RecoverableShell,
+    Uncertain,
+    Ready(Arc<CachedReplayTerminal>),
+    Delivered,
+    Conflict,
+}
+
+struct ReplayRequestContext<'a> {
+    command: &'a TunnelCommand,
+    jsonrpc: &'a Value,
+    request_key: &'a str,
+    namespace: [u8; 32],
+    fingerprint: [u8; 32],
+    dispatch_deadline: Option<Instant>,
+    deadline: Option<Instant>,
+}
+
+struct ReplayLeaderGuard {
+    ledger: RequestReplayLedger,
+    key: String,
+    namespace: [u8; 32],
+    fingerprint: [u8; 32],
+    retryable_by_inner_owner: bool,
+    armed: bool,
+}
+
+impl ReplayLeaderGuard {
+    fn new(
+        ledger: RequestReplayLedger,
+        key: &str,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+        retryable_by_inner_owner: bool,
+    ) -> Self {
+        Self {
+            ledger,
+            key: key.to_owned(),
+            namespace,
+            fingerprint,
+            retryable_by_inner_owner,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReplayLeaderGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ledger.abandon(
+                &self.key,
+                self.namespace,
+                self.fingerprint,
+                self.retryable_by_inner_owner,
+            );
+        }
+    }
+}
+
+impl RequestReplayLedger {
+    fn slot(&self) -> std::sync::MutexGuard<'_, RequestReplayState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn same_identity(
+        record: &RequestReplayRecord,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+    ) -> bool {
+        record.namespace == namespace && record.fingerprint == fingerprint
+    }
+
+    fn state_bytes(state: &RequestReplayEntry) -> usize {
+        match state {
+            RequestReplayEntry::InFlight { .. } => REQUEST_REPLAY_RESERVATION_BYTES,
+            RequestReplayEntry::Ready { reserved_bytes, .. } => *reserved_bytes,
+            RequestReplayEntry::RecoverableShell
+            | RequestReplayEntry::Uncertain
+            | RequestReplayEntry::Delivered { .. }
+            | RequestReplayEntry::Retired { .. } => 0,
+        }
+    }
+
+    fn prune_expired(state: &mut RequestReplayState, now: Instant) {
+        while state
+            .expirations
+            .front()
+            .is_some_and(|expiration| expiration.until <= now)
+        {
+            let expiration = state.expirations.pop_front().expect("front checked above");
+            match expiration.kind {
+                ReplayExpirationKind::RemoveTombstone => {
+                    let remove = state.entries.get(&expiration.key).is_some_and(|record| {
+                        matches!(
+                            record.state,
+                            RequestReplayEntry::Delivered { until }
+                                | RequestReplayEntry::Retired { until }
+                                if until == expiration.until
+                        )
+                    });
+                    if remove {
+                        state.entries.remove(&expiration.key);
+                    }
+                }
+                ReplayExpirationKind::DropReadyBody => {
+                    let transition = state.entries.get(&expiration.key).and_then(|record| {
+                        let RequestReplayEntry::Ready {
+                            terminal,
+                            reserved_bytes,
+                            body_until,
+                        } = &record.state
+                        else {
+                            return None;
+                        };
+                        (*body_until == expiration.until)
+                            .then(|| (*reserved_bytes, terminal.recover_after_body_expiry))
+                    });
+                    if let Some((released, recoverable_shell)) = transition {
+                        state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
+                        if let Some(record) = state.entries.get_mut(&expiration.key) {
+                            record.state = if recoverable_shell {
+                                RequestReplayEntry::RecoverableShell
+                            } else {
+                                RequestReplayEntry::Uncertain
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn prune(&self) {
+        let mut state = self.slot();
+        Self::prune_expired(&mut state, Instant::now());
+    }
+
+    fn activate_namespace(&self, namespace: [u8; 32]) {
+        let signals = {
+            let mut state = self.slot();
+            let now = Instant::now();
+            let until = now.checked_add(REQUEST_REPLAY_RETENTION).unwrap_or(now);
+            Self::prune_expired(&mut state, now);
+            if state.active_namespace == Some(namespace) {
+                return;
+            }
+            state.active_namespace = Some(namespace);
+            let mut signals = Vec::new();
+            let mut expirations = Vec::new();
+            let mut released = 0_usize;
+            for (key, record) in &mut state.entries {
+                if record.namespace == namespace
+                    || matches!(
+                        record.state,
+                        RequestReplayEntry::Delivered { .. } | RequestReplayEntry::Retired { .. }
+                    )
+                {
+                    continue;
+                }
+                released = released.saturating_add(Self::state_bytes(&record.state));
+                if let RequestReplayEntry::InFlight { signal } = &record.state {
+                    signals.push(signal.clone());
+                }
+                record.state = RequestReplayEntry::Retired { until };
+                expirations.push(ReplayExpiration {
+                    until,
+                    key: key.clone(),
+                    kind: ReplayExpirationKind::RemoveTombstone,
+                });
+            }
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
+            state.expirations.extend(expirations);
+            signals
+        };
+        for signal in signals {
+            signal.send_replace(());
+        }
+    }
+
+    fn claim(
+        &self,
+        key: &str,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+    ) -> Result<RequestReplayClaim> {
+        let mut state = self.slot();
+        Self::prune_expired(&mut state, Instant::now());
+        if state.active_namespace != Some(namespace) {
+            bail!("tunnel request replay namespace is not active");
+        }
+        if let Some(record) = state.entries.get(key) {
+            if !Self::same_identity(record, namespace, fingerprint) {
+                return Ok(RequestReplayClaim::Conflict);
+            }
+            return Ok(match &record.state {
+                RequestReplayEntry::InFlight { signal } => {
+                    RequestReplayClaim::Wait(signal.subscribe())
+                }
+                RequestReplayEntry::RecoverableShell => RequestReplayClaim::RecoverableShell,
+                RequestReplayEntry::Uncertain | RequestReplayEntry::Retired { .. } => {
+                    RequestReplayClaim::Uncertain
+                }
+                RequestReplayEntry::Ready { terminal, .. } => {
+                    RequestReplayClaim::Ready(terminal.clone())
+                }
+                RequestReplayEntry::Delivered { .. } => RequestReplayClaim::Delivered,
+            });
+        }
+        if state.entries.len() >= MAX_REQUEST_REPLAY_ENTRIES {
+            bail!(
+                "too many retained tunnel request replays ({MAX_REQUEST_REPLAY_ENTRIES}); retry after older request identities expire or outstanding responses are delivered"
+            );
+        }
+        if state
+            .reserved_bytes
+            .checked_add(REQUEST_REPLAY_RESERVATION_BYTES)
+            .is_none_or(|bytes| bytes > MAX_REQUEST_REPLAY_BYTES)
+        {
+            bail!(
+                "tunnel request replay memory is at its {} MiB safety ceiling; retry after an earlier side-effecting response is delivered or its namespace is retired",
+                MAX_REQUEST_REPLAY_BYTES / (1024 * 1024)
+            );
+        }
+        let (signal, _receiver) = watch::channel(());
+        state.entries.insert(
+            key.to_owned(),
+            RequestReplayRecord {
+                namespace,
+                fingerprint,
+                state: RequestReplayEntry::InFlight { signal },
+            },
+        );
+        state.reserved_bytes += REQUEST_REPLAY_RESERVATION_BYTES;
+        Ok(RequestReplayClaim::Leader)
+    }
+
+    fn resume_recoverable_shell(
+        &self,
+        key: &str,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+    ) -> Result<RequestReplayClaim> {
+        let mut state = self.slot();
+        Self::prune_expired(&mut state, Instant::now());
+        let Some(record) = state.entries.get(key) else {
+            return Ok(RequestReplayClaim::Uncertain);
+        };
+        if !Self::same_identity(record, namespace, fingerprint) {
+            return Ok(RequestReplayClaim::Conflict);
+        }
+        match &record.state {
+            RequestReplayEntry::RecoverableShell => {}
+            RequestReplayEntry::InFlight { signal } => {
+                return Ok(RequestReplayClaim::Wait(signal.subscribe()));
+            }
+            RequestReplayEntry::Uncertain | RequestReplayEntry::Retired { .. } => {
+                return Ok(RequestReplayClaim::Uncertain);
+            }
+            RequestReplayEntry::Ready { terminal, .. } => {
+                return Ok(RequestReplayClaim::Ready(terminal.clone()));
+            }
+            RequestReplayEntry::Delivered { .. } => return Ok(RequestReplayClaim::Delivered),
+        }
+        if state
+            .reserved_bytes
+            .checked_add(REQUEST_REPLAY_RESERVATION_BYTES)
+            .is_none_or(|bytes| bytes > MAX_REQUEST_REPLAY_BYTES)
+        {
+            bail!(
+                "tunnel request replay memory is at its {} MiB safety ceiling; retry after an earlier side-effecting response is delivered or its namespace is retired",
+                MAX_REQUEST_REPLAY_BYTES / (1024 * 1024)
+            );
+        }
+        let (signal, _receiver) = watch::channel(());
+        let record = state.entries.get_mut(key).expect("record checked above");
+        record.state = RequestReplayEntry::InFlight { signal };
+        state.reserved_bytes += REQUEST_REPLAY_RESERVATION_BYTES;
+        Ok(RequestReplayClaim::Leader)
+    }
+
+    fn mark_uncertain_if_recoverable(&self, key: &str, namespace: [u8; 32], fingerprint: [u8; 32]) {
+        let mut state = self.slot();
+        if let Some(record) = state.entries.get_mut(key)
+            && Self::same_identity(record, namespace, fingerprint)
+            && matches!(record.state, RequestReplayEntry::RecoverableShell)
+        {
+            record.state = RequestReplayEntry::Uncertain;
+        }
+    }
+
+    fn invalidate_ready_dependency(&self, key: &str, namespace: [u8; 32], fingerprint: [u8; 32]) {
+        let mut state = self.slot();
+        let released = state.entries.get(key).and_then(|record| {
+            (Self::same_identity(record, namespace, fingerprint)
+                && matches!(record.state, RequestReplayEntry::Ready { .. }))
+            .then(|| Self::state_bytes(&record.state))
+        });
+        if let Some(released) = released {
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
+            if let Some(record) = state.entries.get_mut(key) {
+                record.state = RequestReplayEntry::Uncertain;
+            }
+        }
+    }
+
+    fn complete(
+        &self,
+        key: &str,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+        terminal: ReplayTerminal,
+    ) -> Result<()> {
+        let body = serialize_tunnel_response(&terminal.response)?;
+        if body.len() > REQUEST_REPLAY_RESERVATION_BYTES {
+            bail!(
+                "terminal tunnel response exceeded the {} byte replay reservation",
+                REQUEST_REPLAY_RESERVATION_BYTES
+            );
+        }
+        let terminal = CachedReplayTerminal {
+            body,
+            finalize_job_delivery: terminal.finalize_job_delivery,
+            requires_job_owner: terminal.requires_job_owner,
+            recover_after_body_expiry: terminal.finalize_job_delivery,
+        };
+        let signal = {
+            let mut state = self.slot();
+            let Some(record) = state.entries.get(key) else {
+                return Ok(());
+            };
+            if !Self::same_identity(record, namespace, fingerprint) {
+                bail!("tunnel replay identity changed while execution was active");
+            }
+            let RequestReplayEntry::InFlight { signal } = &record.state else {
+                return Ok(());
+            };
+            let signal = signal.clone();
+            let reserved_bytes = terminal.body.len().max(1);
+            let now = Instant::now();
+            let body_until = now.checked_add(REQUEST_REPLAY_RETENTION).unwrap_or(now);
+            state.reserved_bytes = state
+                .reserved_bytes
+                .saturating_sub(REQUEST_REPLAY_RESERVATION_BYTES)
+                .saturating_add(reserved_bytes);
+            let record = state.entries.get_mut(key).expect("record checked above");
+            record.state = RequestReplayEntry::Ready {
+                terminal: Arc::new(terminal),
+                reserved_bytes,
+                body_until,
+            };
+            state.expirations.push_back(ReplayExpiration {
+                until: body_until,
+                key: key.to_owned(),
+                kind: ReplayExpirationKind::DropReadyBody,
+            });
+            signal
+        };
+        signal.send_replace(());
+        Ok(())
+    }
+
+    fn abandon(
+        &self,
+        key: &str,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+        retryable_by_inner_owner: bool,
+    ) {
+        let signal = {
+            let mut state = self.slot();
+            let Some(record) = state.entries.get(key) else {
+                return;
+            };
+            if !Self::same_identity(record, namespace, fingerprint) {
+                return;
+            }
+            let RequestReplayEntry::InFlight { signal } = &record.state else {
+                return;
+            };
+            let signal = signal.clone();
+            state.reserved_bytes = state
+                .reserved_bytes
+                .saturating_sub(REQUEST_REPLAY_RESERVATION_BYTES);
+            let record = state.entries.get_mut(key).expect("record checked above");
+            record.state = if retryable_by_inner_owner {
+                RequestReplayEntry::RecoverableShell
+            } else {
+                RequestReplayEntry::Uncertain
+            };
+            signal
+        };
+        signal.send_replace(());
+    }
+
+    fn mark_delivered(&self, key: &str, namespace: [u8; 32], fingerprint: [u8; 32]) {
+        let mut state = self.slot();
+        let now = Instant::now();
+        let until = now.checked_add(REQUEST_REPLAY_RETENTION).unwrap_or(now);
+        Self::prune_expired(&mut state, now);
+        let Some(record) = state.entries.get(key) else {
+            return;
+        };
+        if !Self::same_identity(record, namespace, fingerprint) {
+            return;
+        }
+        let released = Self::state_bytes(&record.state);
+        if matches!(record.state, RequestReplayEntry::Delivered { .. }) {
+            return;
+        }
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
+        let record = state.entries.get_mut(key).expect("record checked above");
+        record.state = RequestReplayEntry::Delivered { until };
+        state.expirations.push_back(ReplayExpiration {
+            until,
+            key: key.to_owned(),
+            kind: ReplayExpirationKind::RemoveTombstone,
+        });
+    }
+}
+
 /// Race one shutdown-sensitive operation with cancellation. Bias is
 /// load-bearing: a simultaneously ready HTTP result or semaphore permit must
 /// not turn an already-requested shutdown into a transport failure or new work.
@@ -855,7 +1390,7 @@ impl TunnelClient {
             organization_id,
             new_tunnel,
             log,
-            rejections,
+            process_state,
         } = config;
         if tunnel_id.trim().is_empty() || api_key.trim().is_empty() {
             bail!("tunnel id and runtime API key are required");
@@ -865,6 +1400,12 @@ impl TunnelClient {
             Some(&base_url),
             Some(&tunnel_id),
             Some(&api_key),
+            organization_id.as_deref(),
+        ]);
+        let request_namespace = tunnel_identity([
+            Some(&base_url),
+            Some(&tunnel_id),
+            None,
             organization_id.as_deref(),
         ]);
         let tuning = Arc::new(tuning.validated()?);
@@ -883,6 +1424,9 @@ impl TunnelClient {
             .connect_timeout(tuning.connect_timeout)
             .timeout(tuning.request_timeout)
             .build()?;
+        // Namespace retirement is externally visible replay state. Perform it
+        // only after every fallible client-construction step has succeeded.
+        process_state.activate_namespace(request_namespace);
         Ok(Self {
             http,
             base_url: Arc::from(base_url),
@@ -896,7 +1440,9 @@ impl TunnelClient {
             concurrency: Arc::new(Semaphore::new(tuning.max_in_flight)),
             tuning,
             identity,
-            rejections,
+            request_namespace,
+            rejections: process_state.rejections.clone(),
+            replays: process_state.replays.clone(),
         })
     }
 
@@ -909,6 +1455,10 @@ impl TunnelClient {
         let mut reconnect_reason = None;
 
         'run: loop {
+            // Replay body/tombstone expiry is FIFO/incremental. Prune once per
+            // control-plane poll so stale response memory is released promptly
+            // even when no new side-effecting request arrives.
+            self.replays.prune();
             while let Some(result) = tasks.try_join_next() {
                 if let Err(join_error) = result {
                     error!(%join_error, "tunnel command task failed");
@@ -1180,6 +1730,360 @@ impl TunnelClient {
         Ok(local)
     }
 
+    async fn build_replay_terminal(
+        &self,
+        mcp: &EmbeddedMcp,
+        replay: &ReplayRequestContext<'_>,
+    ) -> Result<ReplayTerminal> {
+        let request_label = verbose_request_label(replay.jsonrpc);
+        let started = self.log.request("openai", &request_label);
+        let local = self
+            .dispatch_and_forward(
+                mcp,
+                replay.command,
+                replay.jsonrpc,
+                replay.dispatch_deadline,
+            )
+            .await
+            .context("local MCP dispatch failed")?;
+        self.log.request_done(
+            "openai",
+            &request_label,
+            started,
+            LogOutcome::http(local.status),
+        );
+
+        let mut terminal = None;
+        let mut notifications_deliverable = true;
+        for message in local.messages {
+            if is_terminal_jsonrpc(&message) {
+                terminal = Some(message);
+            } else if is_jsonrpc_notification(&message) && notifications_deliverable {
+                let response = TunnelResponse {
+                    request_id: replay.command.request_id.clone(),
+                    channel: replay.command.channel.clone(),
+                    resp_json: Some(message),
+                    resp_headers: BTreeMap::new(),
+                    resp_code: 200,
+                    resp_type: "jsonrpc_notify".to_owned(),
+                };
+                notifications_deliverable = self
+                    .post_notification(replay.command, response, replay.dispatch_deadline)
+                    .await;
+            }
+        }
+        let terminal = terminal.ok_or_else(|| {
+            anyhow!("embedded MCP response ended without a terminal JSON-RPC message")
+        })?;
+        let delivery_state = mcp.machine.job_request_delivery_state(replay.request_key);
+        let response_is_error = terminal.get("error").is_some();
+        let (finalize_job_delivery, requires_job_owner, recoverable_shell) =
+            match (delivery_state, response_is_error) {
+                (Some(crate::jobs::RequestDeliveryState::Pending), _) | (Some(_), true) => {
+                    (false, false, true)
+                }
+                (Some(crate::jobs::RequestDeliveryState::Synchronous), false) => {
+                    (true, false, false)
+                }
+                (Some(crate::jobs::RequestDeliveryState::Durable), false) => (true, true, false),
+                (None, _) => (false, false, false),
+            };
+        Ok(ReplayTerminal {
+            response: TunnelResponse {
+                request_id: replay.command.request_id.clone(),
+                channel: replay.command.channel.clone(),
+                resp_json: Some(terminal),
+                resp_headers: local.headers,
+                resp_code: local.status,
+                resp_type: "jsonrpc_response".to_owned(),
+            },
+            finalize_job_delivery,
+            requires_job_owner,
+            recoverable_shell,
+        })
+    }
+
+    fn recovered_shell_terminal(
+        &self,
+        mcp: &EmbeddedMcp,
+        replay: &ReplayRequestContext<'_>,
+    ) -> Result<Option<ReplayTerminal>> {
+        let Some((result, requires_job_owner)) = mcp
+            .machine
+            .recover_job_request_result(
+                replay.request_key,
+                Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+            )
+            .map_err(|error| anyhow!(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let id = replay
+            .jsonrpc
+            .get("id")
+            .map(bounded_jsonrpc_id)
+            .unwrap_or(Value::Null);
+        Ok(Some(ReplayTerminal {
+            response: TunnelResponse {
+                request_id: replay.command.request_id.clone(),
+                channel: replay.command.channel.clone(),
+                resp_json: Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                })),
+                resp_headers: BTreeMap::new(),
+                resp_code: StatusCode::OK.as_u16(),
+                resp_type: "jsonrpc_response".to_owned(),
+            },
+            finalize_job_delivery: true,
+            requires_job_owner,
+            recoverable_shell: false,
+        }))
+    }
+
+    fn uncertain_terminal(&self, replay: &ReplayRequestContext<'_>) -> ReplayTerminal {
+        ReplayTerminal {
+            response: TunnelResponse {
+                request_id: replay.command.request_id.clone(),
+                channel: replay.command.channel.clone(),
+                resp_json: Some(synthesized_jsonrpc_error(
+                    replay.jsonrpc,
+                    "execution_uncertain",
+                )),
+                resp_headers: BTreeMap::new(),
+                resp_code: StatusCode::BAD_GATEWAY.as_u16(),
+                resp_type: "jsonrpc_response".to_owned(),
+            },
+            finalize_job_delivery: false,
+            requires_job_owner: false,
+            recoverable_shell: false,
+        }
+    }
+
+    async fn execute_replay_leader(
+        &self,
+        mcp: &EmbeddedMcp,
+        replay: &ReplayRequestContext<'_>,
+        recoverable_shell: bool,
+    ) -> Result<bool> {
+        let mut leader = ReplayLeaderGuard::new(
+            self.replays.clone(),
+            replay.request_key,
+            replay.namespace,
+            replay.fingerprint,
+            recoverable_shell,
+        );
+        let built = await_before_deadline(
+            replay.dispatch_deadline,
+            self.build_replay_terminal(mcp, replay),
+        )
+        .await?;
+        let terminal = match built {
+            None => {
+                drop(leader);
+                return Ok(false);
+            }
+            Some(Ok(terminal)) if terminal.recoverable_shell => {
+                match mcp.machine.job_request_delivery_state(replay.request_key) {
+                    Some(
+                        crate::jobs::RequestDeliveryState::Synchronous
+                        | crate::jobs::RequestDeliveryState::Durable,
+                    ) => match self.recovered_shell_terminal(mcp, replay)? {
+                        Some(recovered) => recovered,
+                        None => {
+                            drop(leader);
+                            return Ok(false);
+                        }
+                    },
+                    Some(crate::jobs::RequestDeliveryState::Pending) | None => {
+                        // The JSON-RPC error belongs only to this response attempt
+                        // (for example retained-job capacity). Publishing it would
+                        // make the caller believe the durable execution failed and
+                        // invite a new-id retry. Keep the same outer request
+                        // recoverable instead; no terminal POST is emitted.
+                        drop(leader);
+                        return Ok(false);
+                    }
+                }
+            }
+            Some(Ok(terminal)) => terminal,
+            Some(Err(error)) => {
+                warn!(request_id = %replay.command.request_id_label(), "local MCP replay dispatch failed");
+                debug!(request_id = %replay.command.request_id_label(), %error, "local MCP replay dispatch failure detail");
+                if recoverable_shell
+                    && mcp.machine.has_job_request_delivery(replay.request_key)
+                    && let Some(terminal) = self.recovered_shell_terminal(mcp, replay)?
+                {
+                    terminal
+                } else {
+                    self.uncertain_terminal(replay)
+                }
+            }
+        };
+        self.replays.complete(
+            replay.request_key,
+            replay.namespace,
+            replay.fingerprint,
+            terminal,
+        )?;
+        leader.disarm();
+        Ok(true)
+    }
+
+    async fn wait_replay_signal(
+        &self,
+        mut signal: watch::Receiver<()>,
+        dispatch_deadline: Option<Instant>,
+    ) -> Result<bool> {
+        let Some(waited) = cancellation_first(
+            &self.cancellation,
+            await_before_deadline(dispatch_deadline, signal.changed()),
+        )
+        .await
+        else {
+            return Ok(false);
+        };
+        Ok(waited?.is_some())
+    }
+
+    async fn process_replay_protected_jsonrpc(
+        &self,
+        mcp: &EmbeddedMcp,
+        replay: ReplayRequestContext<'_>,
+    ) -> Result<()> {
+        loop {
+            match self
+                .replays
+                .claim(replay.request_key, replay.namespace, replay.fingerprint)?
+            {
+                RequestReplayClaim::Leader => {
+                    if !self
+                        .execute_replay_leader(
+                            mcp,
+                            &replay,
+                            durable_shell_tool_call(replay.jsonrpc),
+                        )
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                RequestReplayClaim::Wait(signal) => {
+                    if !self
+                        .wait_replay_signal(signal, replay.dispatch_deadline)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                RequestReplayClaim::RecoverableShell => {
+                    if !mcp.machine.has_job_request_delivery(replay.request_key) {
+                        self.replays.mark_uncertain_if_recoverable(
+                            replay.request_key,
+                            replay.namespace,
+                            replay.fingerprint,
+                        );
+                        continue;
+                    }
+                    match self.replays.resume_recoverable_shell(
+                        replay.request_key,
+                        replay.namespace,
+                        replay.fingerprint,
+                    )? {
+                        RequestReplayClaim::Leader => {
+                            if !self.execute_replay_leader(mcp, &replay, true).await? {
+                                return Ok(());
+                            }
+                        }
+                        RequestReplayClaim::Wait(signal) => {
+                            if !self
+                                .wait_replay_signal(signal, replay.dispatch_deadline)
+                                .await?
+                            {
+                                return Ok(());
+                            }
+                        }
+                        RequestReplayClaim::RecoverableShell
+                        | RequestReplayClaim::Uncertain
+                        | RequestReplayClaim::Ready(_)
+                        | RequestReplayClaim::Delivered
+                        | RequestReplayClaim::Conflict => continue,
+                    }
+                }
+                RequestReplayClaim::Uncertain => {
+                    let response = TunnelResponse {
+                        request_id: replay.command.request_id.clone(),
+                        channel: replay.command.channel.clone(),
+                        resp_json: Some(synthesized_jsonrpc_error(
+                            replay.jsonrpc,
+                            "execution_uncertain",
+                        )),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: StatusCode::BAD_GATEWAY.as_u16(),
+                        resp_type: "jsonrpc_response".to_owned(),
+                    };
+                    if self
+                        .post_terminal(replay.command, response, replay.deadline)
+                        .await?
+                    {
+                        self.replays.mark_delivered(
+                            replay.request_key,
+                            replay.namespace,
+                            replay.fingerprint,
+                        );
+                    }
+                    return Ok(());
+                }
+                RequestReplayClaim::Ready(terminal) => {
+                    if terminal.requires_job_owner
+                        && !mcp.machine.has_job_request_delivery(replay.request_key)
+                    {
+                        self.replays.invalidate_ready_dependency(
+                            replay.request_key,
+                            replay.namespace,
+                            replay.fingerprint,
+                        );
+                        continue;
+                    }
+                    let delivered = self
+                        .post_terminal_bytes(replay.command, terminal.body.clone(), replay.deadline)
+                        .await?;
+                    if delivered {
+                        self.replays.mark_delivered(
+                            replay.request_key,
+                            replay.namespace,
+                            replay.fingerprint,
+                        );
+                        if terminal.finalize_job_delivery {
+                            mcp.machine
+                                .acknowledge_job_request_delivery(replay.request_key);
+                        }
+                    }
+                    return Ok(());
+                }
+                RequestReplayClaim::Delivered => return Ok(()),
+                RequestReplayClaim::Conflict => {
+                    let response = TunnelResponse {
+                        request_id: replay.command.request_id.clone(),
+                        channel: replay.command.channel.clone(),
+                        resp_json: Some(synthesized_jsonrpc_error(
+                            replay.jsonrpc,
+                            "request_identity_conflict",
+                        )),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: StatusCode::CONFLICT.as_u16(),
+                        resp_type: "jsonrpc_response".to_owned(),
+                    };
+                    let _ = self
+                        .post_terminal(replay.command, response, replay.deadline)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     async fn process_command(
         &self,
         mcp: EmbeddedMcp,
@@ -1214,7 +2118,7 @@ impl TunnelClient {
                 .checked_sub(self.tuning.delivery_reserve)
                 .unwrap_or_else(Instant::now)
         });
-        let durable_request_key = durable_request_key(&self.tunnel_id, &command.request_id);
+        let durable_request_key = durable_request_key(&self.request_namespace, &command.request_id);
         if let Some(remaining) =
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
             && let Some(jsonrpc) = command.jsonrpc.as_mut()
@@ -1273,6 +2177,23 @@ impl TunnelClient {
                     return Ok(());
                 };
                 let has_request_id = jsonrpc.get("id").is_some();
+                if replay_protected_tool_call(jsonrpc) {
+                    let fingerprint = replay_request_fingerprint(jsonrpc)?;
+                    return self
+                        .process_replay_protected_jsonrpc(
+                            &mcp,
+                            ReplayRequestContext {
+                                command: &command,
+                                jsonrpc,
+                                request_key: &durable_request_key,
+                                namespace: self.request_namespace,
+                                fingerprint,
+                                dispatch_deadline,
+                                deadline,
+                            },
+                        )
+                        .await;
+                }
                 let request_label = verbose_request_label(jsonrpc);
                 let started = self.log.request("openai", &request_label);
                 let dispatch =
@@ -1416,7 +2337,15 @@ impl TunnelClient {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return false;
         }
-        match self.post_once(command, &response, deadline).await {
+        let body = match serialize_tunnel_response(&response) {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(request_id = %command.request_id_label(), "dropping intermediate tunnel notification after serialization failure");
+                debug!(request_id = %command.request_id_label(), %error, "intermediate tunnel notification serialization detail");
+                return false;
+            }
+        };
+        match self.post_once(command, body, deadline).await {
             Ok(PostOutcome::Delivered) => true,
             Ok(PostOutcome::Undeliverable | PostOutcome::Cancelled) => false,
             Ok(PostOutcome::Retry(error)) | Ok(PostOutcome::Fatal(error)) | Err(error) => {
@@ -1433,6 +2362,16 @@ impl TunnelClient {
         response: TunnelResponse,
         deadline: Option<Instant>,
     ) -> Result<bool> {
+        self.post_terminal_bytes(command, serialize_tunnel_response(&response)?, deadline)
+            .await
+    }
+
+    async fn post_terminal_bytes(
+        &self,
+        command: &TunnelCommand,
+        response_body: Bytes,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
         let mut attempt = 0_u32;
         loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1442,7 +2381,10 @@ impl TunnelClient {
                 );
                 return Ok(false);
             }
-            match self.post_once(command, &response, deadline).await {
+            match self
+                .post_once(command, response_body.clone(), deadline)
+                .await
+            {
                 Ok(PostOutcome::Delivered) => return Ok(true),
                 Ok(PostOutcome::Undeliverable | PostOutcome::Cancelled) => return Ok(false),
                 Ok(PostOutcome::Fatal(error)) => return Err(error),
@@ -1473,14 +2415,15 @@ impl TunnelClient {
     async fn post_once(
         &self,
         command: &TunnelCommand,
-        response_body: &TunnelResponse,
+        response_body: Bytes,
         deadline: Option<Instant>,
     ) -> Result<PostOutcome> {
         let url = format!("{}/v1/tunnels/{}/response", self.base_url, self.tunnel_id);
         let future = self
             .common_headers(self.http.post(url))
             .header("X-Tunnel-Shard-Token", command.shard_token.as_str())
-            .json(response_body)
+            .header("Content-Type", "application/json")
+            .body(response_body)
             .send();
 
         let Some(response) =
@@ -1674,6 +2617,63 @@ fn annotate_response_context(
     Ok(Some(shell_timeout_within(window, reserve)))
 }
 
+fn tool_call_name(jsonrpc: &Value) -> Option<&str> {
+    (jsonrpc.get("id").is_some()
+        && jsonrpc.get("method").and_then(Value::as_str) == Some("tools/call"))
+    .then(|| jsonrpc.pointer("/params/name").and_then(Value::as_str))
+    .flatten()
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_value_digest(value: &Value) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    serde_json::to_writer(DigestWriter(&mut digest), value)
+        .context("failed to fingerprint JSON value")?;
+    Ok(digest.finalize().into())
+}
+
+/// Bind exactly-once replay to both the side effect and the JSON-RPC response
+/// correlation identity. Transport-private metadata is intentionally excluded:
+/// it affects response handling, not what the tool does.
+fn replay_request_fingerprint(jsonrpc: &Value) -> Result<[u8; 32]> {
+    let name = tool_call_name(jsonrpc)
+        .ok_or_else(|| anyhow!("replay fingerprint requires a tools/call request"))?;
+    let id = jsonrpc
+        .get("id")
+        .ok_or_else(|| anyhow!("replay fingerprint requires a JSON-RPC id"))?;
+    let version = jsonrpc.get("jsonrpc").unwrap_or(&Value::Null);
+    let arguments = jsonrpc.pointer("/params/arguments").unwrap_or(&Value::Null);
+    let mut digest = Sha256::new();
+    digest.update(b"tools/call\0");
+    digest.update(json_value_digest(version)?);
+    digest.update((name.len() as u64).to_be_bytes());
+    digest.update(name.as_bytes());
+    digest.update(json_value_digest(id)?);
+    digest.update(json_value_digest(arguments)?);
+    Ok(digest.finalize().into())
+}
+
+fn replay_protected_tool_call(jsonrpc: &Value) -> bool {
+    tool_call_name(jsonrpc).is_some_and(crate::mcp::tool_requires_request_replay)
+}
+
+fn durable_shell_tool_call(jsonrpc: &Value) -> bool {
+    tool_call_name(jsonrpc)
+        .is_some_and(|name| crate::mcp::is_shell_tool(name) || name == "job_start")
+}
+
 fn verbose_request_label(jsonrpc: &Value) -> String {
     crate::logging::jsonrpc_request_label(jsonrpc, true)
 }
@@ -1729,13 +2729,25 @@ fn is_jsonrpc_notification(value: &Value) -> bool {
 }
 
 fn synthesized_jsonrpc_error(request: &Value, source: &str) -> Value {
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let id = request
+        .get("id")
+        .map(bounded_jsonrpc_id)
+        .unwrap_or(Value::Null);
+    let message = match source {
+        "execution_uncertain" => {
+            "Execution outcome is uncertain; the side effect may already have committed. Do not automatically retry this operation with a new request id."
+        }
+        "request_identity_conflict" => {
+            "Tunnel request id was reused with a different side-effecting tool payload; execution was refused."
+        }
+        _ => "Bad Gateway",
+    };
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": -32603,
-            "message": "Bad Gateway",
+            "message": message,
             "data": {
                 "tunnel_failure": {
                     "version": 1,
@@ -1775,7 +2787,7 @@ mod tests {
             organization_id: None,
             new_tunnel: false,
             log: LogConfig::default(),
-            rejections: RejectionLedger::default(),
+            process_state: ProcessState::default(),
         }
     }
 
@@ -2010,6 +3022,429 @@ mod tests {
             b"x",
             "redelivery ran a second shell"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_shell_tunnel_delivery_retires_inner_request_key() {
+        use std::sync::atomic::Ordering;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let effect = root.join("shell-delivery.txt");
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let (base_url, posts) = fake_control_plane(|_| (StatusCode::OK, Duration::ZERO)).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let command = TunnelCommand {
+            request_id: "successful-shell-delivery".to_owned(),
+            shard_token: "test-shard".to_owned(),
+            command_type: "jsonrpc".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: Some(json!("20s")),
+            headers: BTreeMap::new(),
+            jsonrpc: Some(json!({
+                "jsonrpc":"2.0", "id":55, "method":"tools/call",
+                "params": {
+                    "name": crate::mcp::shell_tool_name(),
+                    "arguments": {"command": format!("printf x > '{}'", effect.display())}
+                }
+            })),
+        };
+        let request_key = durable_request_key(&client.request_namespace, &command.request_id);
+        let fingerprint = replay_request_fingerprint(command.jsonrpc.as_ref().unwrap()).unwrap();
+        client
+            .process_command(mcp.clone(), command, Instant::now())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&effect).unwrap(), b"x");
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert!(
+            !mcp.machine.has_job_request_delivery(&request_key),
+            "positive committed shell delivery must retire the inner dedupe key"
+        );
+        assert!(matches!(
+            client
+                .replays
+                .claim(&request_key, client.request_namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Delivered
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_idempotent_mutation_replay_is_process_wide_and_tombstoned() {
+        use std::sync::atomic::Ordering;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let target = root.join("data.bin");
+        std::fs::write(&target, b"A").unwrap();
+        let machine = test_machine_with_write(&root, true).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let process_state = ProcessState::default();
+        let (base_url, posts) = fake_control_plane(|_| (StatusCode::OK, Duration::ZERO)).await;
+        let make_client = || {
+            TunnelClient::new(
+                Config {
+                    base_url: base_url.clone(),
+                    process_state: process_state.clone(),
+                    ..test_config()
+                },
+                TunnelTuning::default(),
+                CancellationToken::new(),
+            )
+            .unwrap()
+        };
+        let command = TunnelCommand {
+            request_id: "same-mutation".to_owned(),
+            shard_token: "test-shard".to_owned(),
+            command_type: "jsonrpc".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: Some(json!("20s")),
+            headers: BTreeMap::new(),
+            jsonrpc: Some(json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "tools/call",
+                "params": {
+                    "name": "bedit",
+                    "arguments": {
+                        "path": "data.bin",
+                        "edits": [{"offset": 1, "length": 0, "data": "Qg=="}]
+                    }
+                }
+            })),
+        };
+
+        let client = make_client();
+        let received_at = Instant::now();
+        let (first, duplicate) = tokio::join!(
+            client.process_command(mcp.clone(), command.clone(), received_at),
+            client.process_command(mcp.clone(), command.clone(), received_at),
+        );
+        first.unwrap();
+        duplicate.unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"AB",
+            "concurrent redelivery must execute the insertion exactly once"
+        );
+
+        let posts_after_delivery = posts.load(Ordering::SeqCst);
+        assert!(posts_after_delivery >= 1);
+
+        let mut conflicting = command.clone();
+        conflicting.jsonrpc.as_mut().unwrap()["params"]["arguments"]["edits"][0]["data"] =
+            Value::String("Qw==".to_owned());
+        make_client()
+            .process_command(mcp.clone(), conflicting, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"AB",
+            "same request id with different mutation arguments must be refused"
+        );
+        let posts_after_conflict = posts.load(Ordering::SeqCst);
+        assert_eq!(posts_after_conflict, posts_after_delivery + 1);
+
+        // A newly constructed client models automatic in-process runtime/tunnel
+        // recovery. The process-scoped delivered tombstone must suppress an exact
+        // copy already queued or redelivered after the successful response.
+        make_client()
+            .process_command(mcp, command, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"AB");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            posts_after_conflict,
+            "delivered tombstone must suppress both execution and a second terminal POST"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn capacity_error_redelivery_does_not_retire_original_shell_request_key() {
+        use crate::mcp::ShellArgs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let (base_url, posts) = fake_control_plane(|_| (StatusCode::OK, Duration::ZERO)).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let request_id = "capacity-redelivery";
+        let request_key = durable_request_key(&client.request_namespace, request_id);
+        let shell_args = ShellArgs {
+            command: "printf original".to_owned(),
+            dir: ".".to_owned(),
+            stdin: None,
+            timeout_secs: Some(5),
+            max_output_bytes: Some(4096),
+        };
+        let original = mcp
+            .machine
+            .start_shell_job(shell_args.clone(), false, Some(request_key.clone()))
+            .unwrap();
+        drop(original);
+        assert_eq!(
+            mcp.machine.job_request_delivery_state(&request_key),
+            Some(crate::jobs::RequestDeliveryState::Pending)
+        );
+
+        for _ in 0..crate::jobs::MAX_RETAINED_JOBS {
+            loop {
+                match mcp.machine.start_shell_job(
+                    ShellArgs {
+                        command: "true".to_owned(),
+                        dir: ".".to_owned(),
+                        stdin: None,
+                        timeout_secs: Some(2),
+                        max_output_bytes: Some(1024),
+                    },
+                    false,
+                    None,
+                ) {
+                    Ok(started) => {
+                        // An abandoned local response is deliberately exposed as
+                        // a compatibility job and therefore occupies one ordinary slot.
+                        drop(started);
+                        break;
+                    }
+                    Err(error) if error.to_string().contains("too many active shell jobs") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("could not fill retained-job capacity: {error}"),
+                }
+            }
+        }
+
+        let command = TunnelCommand {
+            request_id: request_id.to_owned(),
+            shard_token: "test-shard".to_owned(),
+            command_type: "jsonrpc".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: Some(json!("20s")),
+            headers: BTreeMap::new(),
+            jsonrpc: Some(json!({
+                "jsonrpc":"2.0", "id":77, "method":"tools/call",
+                "params": {
+                    "name": crate::mcp::shell_tool_name(),
+                    "arguments": {
+                        "command": shell_args.command,
+                        "dir": shell_args.dir,
+                        "timeout_secs": shell_args.timeout_secs,
+                        "max_output_bytes": shell_args.max_output_bytes
+                    }
+                }
+            })),
+        };
+        let fingerprint = replay_request_fingerprint(command.jsonrpc.as_ref().unwrap()).unwrap();
+        client
+            .process_command(mcp.clone(), command, Instant::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            posts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a pre-commit redelivery error must not be published as this durable request's terminal response"
+        );
+        assert!(
+            mcp.machine.has_job_request_delivery(&request_key),
+            "a capacity-blocked redelivery must not consume the original execution key"
+        );
+        assert_eq!(
+            mcp.machine.job_request_delivery_state(&request_key),
+            Some(crate::jobs::RequestDeliveryState::Pending)
+        );
+        assert!(matches!(
+            client
+                .replays
+                .claim(&request_key, client.request_namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::RecoverableShell
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lost_embedded_shell_response_recovers_from_inner_owner_and_finalizes_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let request_key = "lost-embedded-response";
+        let mut jsonrpc = json!({
+            "jsonrpc":"2.0", "id":91, "method":"tools/call",
+            "params": {"name":crate::mcp::shell_tool_name(), "arguments":{"command":"printf recovered"}}
+        });
+        annotate_response_context(
+            &mut jsonrpc,
+            Duration::from_secs(20),
+            Duration::from_secs(5),
+            request_key,
+            mcp.machine.transport_context_token(),
+        )
+        .unwrap();
+
+        // Execute normally but intentionally discard the first embedded response,
+        // modeling a post-execution response collection/streaming failure.
+        let first = mcp.dispatch(&BTreeMap::new(), &jsonrpc).await.unwrap();
+        assert_eq!(first.status, 200);
+        assert!(mcp.machine.has_job_request_delivery(request_key));
+
+        let (base_url, _) = fake_control_plane(|_| (StatusCode::OK, Duration::ZERO)).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let command = TunnelCommand {
+            request_id: "lost-embedded-response".to_owned(),
+            shard_token: "test-shard".to_owned(),
+            command_type: "jsonrpc".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: Some(json!("20s")),
+            headers: BTreeMap::new(),
+            jsonrpc: Some(jsonrpc.clone()),
+        };
+        let fingerprint = replay_request_fingerprint(&jsonrpc).unwrap();
+        let replay = ReplayRequestContext {
+            command: &command,
+            jsonrpc: &jsonrpc,
+            request_key,
+            namespace: client.request_namespace,
+            fingerprint,
+            dispatch_deadline: None,
+            deadline: None,
+        };
+        let recovered = client
+            .recovered_shell_terminal(&mcp, &replay)
+            .unwrap()
+            .expect("durable shell response should be recoverable");
+        assert!(recovered.finalize_job_delivery);
+        let body = serialize_tunnel_response(&recovered.response).unwrap();
+        assert!(
+            client
+                .post_terminal_bytes(
+                    &command,
+                    body,
+                    Some(Instant::now() + Duration::from_secs(1))
+                )
+                .await
+                .unwrap()
+        );
+        mcp.machine.acknowledge_job_request_delivery(request_key);
+        assert!(
+            !mcp.machine.has_job_request_delivery(request_key),
+            "positive delivery must retire the inner request key after recovered response delivery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recoverable_shell_without_its_inner_job_owner_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let effect = root.join("must-not-run.txt");
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let (base_url, _) = fake_control_plane(|_| (StatusCode::OK, Duration::ZERO)).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let command = TunnelCommand {
+            request_id: "lost-shell-owner".to_owned(),
+            shard_token: "test-shard".to_owned(),
+            command_type: "jsonrpc".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: Some(json!("20s")),
+            headers: BTreeMap::new(),
+            jsonrpc: Some(json!({
+                "jsonrpc": "2.0",
+                "id": 88,
+                "method": "tools/call",
+                "params": {
+                    "name": crate::mcp::shell_tool_name(),
+                    "arguments": {"command": format!("printf duplicate > '{}'", effect.display())}
+                }
+            })),
+        };
+        let key = durable_request_key(&client.request_namespace, &command.request_id);
+        let fingerprint =
+            replay_request_fingerprint(command.jsonrpc.as_ref().expect("jsonrpc")).unwrap();
+        assert!(matches!(
+            client
+                .replays
+                .claim(&key, client.request_namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        drop(ReplayLeaderGuard::new(
+            client.replays.clone(),
+            &key,
+            client.request_namespace,
+            fingerprint,
+            true,
+        ));
+        assert!(matches!(
+            client
+                .replays
+                .claim(&key, client.request_namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::RecoverableShell
+        ));
+
+        // This models Ctrl+R / authority replacement: the outer process replay
+        // state survived, but the old JobManager session and its request key did
+        // not. Re-dispatching the shell would repeat any side effects completed
+        // before cancellation, so the request must become fail-closed instead.
+        client
+            .process_command(mcp, command, Instant::now())
+            .await
+            .unwrap();
+        assert!(
+            !effect.exists(),
+            "shell was re-executed without its durable owner"
+        );
+        assert!(matches!(
+            client
+                .replays
+                .claim(&key, client.request_namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Delivered
+        ));
     }
 
     #[cfg(unix)]
@@ -2623,6 +4058,20 @@ mod tests {
         assert!(error.contains("16 bytes"), "{error}");
     }
 
+    #[test]
+    fn synthesized_jsonrpc_errors_bound_untrusted_ids() {
+        let huge = "x".repeat(super::super::MAX_STANDARD_ROUTING_VALUE_BYTES + 1);
+        for id in [Value::String(huge), json!({"bad": "id"}), json!(["bad-id"])] {
+            let request = json!({"jsonrpc":"2.0", "id":id, "method":"tools/list"});
+            let error = synthesized_jsonrpc_error(&request, "test");
+            assert_eq!(error["id"], Value::Null);
+            assert!(serde_json::to_vec(&error).unwrap().len() < 4096);
+        }
+
+        let request = json!({"jsonrpc":"2.0", "id":42, "method":"tools/list"});
+        assert_eq!(synthesized_jsonrpc_error(&request, "test")["id"], 42);
+    }
+
     #[tokio::test]
     async fn oversized_sep_routing_values_fail_compactly_before_rmcp_can_reflect_them() {
         const VERSION: &str = "2026-07-28";
@@ -2926,12 +4375,27 @@ mod tests {
     }
 
     #[test]
-    fn durable_request_keys_are_fixed_width_and_unambiguous() {
-        let a = durable_request_key("a", "b:c");
-        let b = durable_request_key("a:b", "c");
-        assert_ne!(a, b);
+    fn durable_request_keys_are_fixed_width_and_namespace_scoped() {
+        let namespace_a = tunnel_identity([Some("https://a"), Some("tunnel"), None, None]);
+        let namespace_b = tunnel_identity([Some("https://b"), Some("tunnel"), None, None]);
+        let a = durable_request_key(&namespace_a, "request");
+        let b = durable_request_key(&namespace_b, "request");
+        assert_ne!(a, b, "different tunnel namespaces must not deduplicate");
         assert_eq!(a.len(), 64);
-        assert_eq!(a, durable_request_key("a", "b:c"));
+        assert_eq!(a, durable_request_key(&namespace_a, "request"));
+
+        // Credential rotation intentionally does not participate in the request
+        // namespace; a late redelivery from the same endpoint/tunnel/org must
+        // still find the old exactly-once replay state after a key rotation.
+        let with_key_one =
+            tunnel_identity([Some("https://a"), Some("tunnel"), Some("key-one"), None]);
+        let with_key_two =
+            tunnel_identity([Some("https://a"), Some("tunnel"), Some("key-two"), None]);
+        assert_ne!(with_key_one, with_key_two);
+        assert_eq!(
+            namespace_a,
+            tunnel_identity([Some("https://a"), Some("tunnel"), None, None])
+        );
     }
 
     #[test]
@@ -2975,6 +4439,377 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_replay_leader_is_retryable_only_with_a_durable_inner_owner() {
+        let namespace = [1; 32];
+        let fingerprint = [2; 32];
+
+        let mutator = RequestReplayLedger::default();
+        mutator.activate_namespace(namespace);
+        assert!(matches!(
+            mutator.claim("mutator", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        drop(ReplayLeaderGuard::new(
+            mutator.clone(),
+            "mutator",
+            namespace,
+            fingerprint,
+            false,
+        ));
+        assert!(matches!(
+            mutator.claim("mutator", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Uncertain
+        ));
+        assert_eq!(mutator.slot().reserved_bytes, 0);
+
+        let shell = RequestReplayLedger::default();
+        shell.activate_namespace(namespace);
+        assert!(matches!(
+            shell.claim("shell", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        drop(ReplayLeaderGuard::new(
+            shell.clone(),
+            "shell",
+            namespace,
+            fingerprint,
+            true,
+        ));
+        assert!(matches!(
+            shell.claim("shell", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::RecoverableShell
+        ));
+        assert_eq!(shell.slot().reserved_bytes, 0);
+        assert!(matches!(
+            shell
+                .resume_recoverable_shell("shell", namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        assert_eq!(
+            shell.slot().reserved_bytes,
+            REQUEST_REPLAY_RESERVATION_BYTES
+        );
+    }
+
+    #[test]
+    fn replay_ledger_reserves_worst_case_before_execution_and_shrinks_on_completion() {
+        let ledger = RequestReplayLedger::default();
+        let namespace = [3; 32];
+        let fingerprint = [4; 32];
+        ledger.activate_namespace(namespace);
+        let worst_case_slots = MAX_REQUEST_REPLAY_BYTES / REQUEST_REPLAY_RESERVATION_BYTES;
+        assert!(worst_case_slots >= TunnelTuning::default().max_in_flight);
+        for index in 0..worst_case_slots {
+            assert!(matches!(
+                ledger
+                    .claim(&format!("request-{index}"), namespace, fingerprint)
+                    .unwrap(),
+                RequestReplayClaim::Leader
+            ));
+        }
+        let error = match ledger.claim("overflow", namespace, fingerprint) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("worst-case replay reservation admitted past the safety ceiling"),
+        };
+        assert!(error.contains("replay memory"), "{error}");
+
+        ledger
+            .complete(
+                "request-0",
+                namespace,
+                fingerprint,
+                ReplayTerminal {
+                    response: TunnelResponse {
+                        request_id: "request-0".to_owned(),
+                        channel: Some("main".to_owned()),
+                        resp_json: Some(json!({"jsonrpc":"2.0","id":1,"result":{}})),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: 200,
+                        resp_type: "jsonrpc_response".to_owned(),
+                    },
+                    finalize_job_delivery: false,
+                    requires_job_owner: false,
+                    recoverable_shell: false,
+                },
+            )
+            .unwrap();
+        {
+            let state = ledger.slot();
+            assert!(
+                state.reserved_bytes
+                    < worst_case_slots.saturating_mul(REQUEST_REPLAY_RESERVATION_BYTES),
+                "small terminal response must release unused worst-case reservation"
+            );
+        }
+        assert!(matches!(
+            ledger
+                .claim("after-small-response", namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+    }
+
+    #[test]
+    fn expired_ready_body_releases_memory_but_keeps_fail_closed_identity() {
+        let ledger = RequestReplayLedger::default();
+        let namespace = [8; 32];
+        let fingerprint = [9; 32];
+        ledger.activate_namespace(namespace);
+        assert!(matches!(
+            ledger.claim("stale-ready", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        ledger
+            .complete(
+                "stale-ready",
+                namespace,
+                fingerprint,
+                ReplayTerminal {
+                    response: TunnelResponse {
+                        request_id: "stale-ready".to_owned(),
+                        channel: Some("main".to_owned()),
+                        resp_json: Some(json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: 200,
+                        resp_type: "jsonrpc_response".to_owned(),
+                    },
+                    finalize_job_delivery: false,
+                    requires_job_owner: false,
+                    recoverable_shell: false,
+                },
+            )
+            .unwrap();
+        assert!(ledger.slot().reserved_bytes > 0);
+
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        {
+            let mut state = ledger.slot();
+            // Model enough undeliverable responses to consume the entire replay
+            // byte budget without actually allocating hundreds of MiB in this test.
+            state.reserved_bytes = MAX_REQUEST_REPLAY_BYTES;
+            let record = state.entries.get_mut("stale-ready").unwrap();
+            let RequestReplayEntry::Ready {
+                reserved_bytes,
+                body_until,
+                ..
+            } = &mut record.state
+            else {
+                panic!("completed replay did not become Ready");
+            };
+            *reserved_bytes = MAX_REQUEST_REPLAY_BYTES;
+            *body_until = past;
+            state.expirations.push_front(ReplayExpiration {
+                until: past,
+                key: "stale-ready".to_owned(),
+                kind: ReplayExpirationKind::DropReadyBody,
+            });
+        }
+
+        assert!(matches!(
+            ledger.claim("stale-ready", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Uncertain
+        ));
+        assert_eq!(ledger.slot().reserved_bytes, 0);
+        assert!(matches!(
+            ledger.claim("fresh", namespace, [10; 32]).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+    }
+
+    #[test]
+    fn expired_committed_shell_body_releases_memory_and_falls_back_to_inner_owner() {
+        let ledger = RequestReplayLedger::default();
+        let namespace = [18; 32];
+        let fingerprint = [19; 32];
+        ledger.activate_namespace(namespace);
+        assert!(matches!(
+            ledger.claim("shell-ready", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        ledger
+            .complete(
+                "shell-ready",
+                namespace,
+                fingerprint,
+                ReplayTerminal {
+                    response: TunnelResponse {
+                        request_id: "shell-ready".to_owned(),
+                        channel: Some("main".to_owned()),
+                        resp_json: Some(
+                            json!({"jsonrpc":"2.0","id":1,"result":{"job_id":"owned"}}),
+                        ),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: 200,
+                        resp_type: "jsonrpc_response".to_owned(),
+                    },
+                    finalize_job_delivery: true,
+                    requires_job_owner: true,
+                    recoverable_shell: false,
+                },
+            )
+            .unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        {
+            let mut state = ledger.slot();
+            let record = state.entries.get_mut("shell-ready").unwrap();
+            let RequestReplayEntry::Ready { body_until, .. } = &mut record.state else {
+                panic!("completed shell replay did not become Ready");
+            };
+            *body_until = past;
+            state.expirations.push_front(ReplayExpiration {
+                until: past,
+                key: "shell-ready".to_owned(),
+                kind: ReplayExpirationKind::DropReadyBody,
+            });
+        }
+        assert!(matches!(
+            ledger.claim("shell-ready", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::RecoverableShell
+        ));
+        assert_eq!(ledger.slot().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn replay_namespace_switch_releases_cached_bytes_and_keeps_fail_closed_tombstone() {
+        let ledger = RequestReplayLedger::default();
+        let namespace_a = [10; 32];
+        let namespace_b = [11; 32];
+        let fingerprint = [12; 32];
+        ledger.activate_namespace(namespace_a);
+        assert!(matches!(
+            ledger.claim("request", namespace_a, fingerprint).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        ledger
+            .complete(
+                "request",
+                namespace_a,
+                fingerprint,
+                ReplayTerminal {
+                    response: TunnelResponse {
+                        request_id: "request".to_owned(),
+                        channel: Some("main".to_owned()),
+                        resp_json: Some(json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: 200,
+                        resp_type: "jsonrpc_response".to_owned(),
+                    },
+                    finalize_job_delivery: false,
+                    requires_job_owner: false,
+                    recoverable_shell: false,
+                },
+            )
+            .unwrap();
+        assert!(ledger.slot().reserved_bytes > 0);
+
+        ledger.activate_namespace(namespace_b);
+        assert_eq!(ledger.slot().reserved_bytes, 0);
+        ledger.activate_namespace(namespace_a);
+        assert!(matches!(
+            ledger.claim("request", namespace_a, fingerprint).unwrap(),
+            RequestReplayClaim::Uncertain
+        ));
+    }
+
+    #[test]
+    fn cached_durable_handle_becomes_uncertain_when_its_job_owner_is_revoked() {
+        let ledger = RequestReplayLedger::default();
+        let namespace = [16; 32];
+        let fingerprint = [17; 32];
+        ledger.activate_namespace(namespace);
+        assert!(matches!(
+            ledger.claim("request", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        ledger
+            .complete(
+                "request",
+                namespace,
+                fingerprint,
+                ReplayTerminal {
+                    response: TunnelResponse {
+                        request_id: "request".to_owned(),
+                        channel: Some("main".to_owned()),
+                        resp_json: Some(json!({"jsonrpc":"2.0","id":1,"result":{"job_id":"gone"}})),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: 200,
+                        resp_type: "jsonrpc_response".to_owned(),
+                    },
+                    finalize_job_delivery: true,
+                    requires_job_owner: true,
+                    recoverable_shell: false,
+                },
+            )
+            .unwrap();
+        assert!(ledger.slot().reserved_bytes > 0);
+        ledger.invalidate_ready_dependency("request", namespace, fingerprint);
+        assert_eq!(ledger.slot().reserved_bytes, 0);
+        assert!(matches!(
+            ledger.claim("request", namespace, fingerprint).unwrap(),
+            RequestReplayClaim::Uncertain
+        ));
+    }
+
+    #[test]
+    fn replay_fingerprint_binds_jsonrpc_correlation_id() {
+        let first = json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"write","arguments":{"path":"x","content":"y"}}
+        });
+        let second = json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":"write","arguments":{"path":"x","content":"y"}}
+        });
+        assert_ne!(
+            replay_request_fingerprint(&first).unwrap(),
+            replay_request_fingerprint(&second).unwrap(),
+            "one hosted request id cannot replay a cached response under a different JSON-RPC id"
+        );
+        let mut different_version = first.clone();
+        different_version["jsonrpc"] = Value::String("1.0".to_owned());
+        assert_ne!(
+            replay_request_fingerprint(&first).unwrap(),
+            replay_request_fingerprint(&different_version).unwrap(),
+            "a different JSON-RPC envelope must not borrow a cached valid response"
+        );
+    }
+
+    #[test]
+    fn recoverable_shell_rejects_same_request_id_with_different_payload_fingerprint() {
+        let ledger = RequestReplayLedger::default();
+        let namespace = [13; 32];
+        let original = [14; 32];
+        let different = [15; 32];
+        ledger.activate_namespace(namespace);
+        assert!(matches!(
+            ledger.claim("request", namespace, original).unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        drop(ReplayLeaderGuard::new(
+            ledger.clone(),
+            "request",
+            namespace,
+            original,
+            true,
+        ));
+        assert!(matches!(
+            ledger.claim("request", namespace, different).unwrap(),
+            RequestReplayClaim::Conflict
+        ));
+        assert!(matches!(
+            ledger
+                .resume_recoverable_shell("request", namespace, different)
+                .unwrap(),
+            RequestReplayClaim::Conflict
+        ));
+    }
+
+    #[test]
     fn poll_failure_threshold_restarts_runtime_on_tenth_failure() {
         let restart_after = TunnelTuning::default().restart_after;
         assert!(!should_restart_runtime_after_poll_failures(
@@ -2995,14 +4830,18 @@ mod tests {
         ));
     }
 
-    async fn test_machine(base_dir: &std::path::Path) -> LocalMachine {
+    async fn test_machine_with_write(base_dir: &std::path::Path, write: bool) -> LocalMachine {
         use crate::mcp::{AccessSpec, MachineConfig};
 
         LocalMachine::new(MachineConfig {
             access: AccessSpec {
                 base_dir: base_dir.to_path_buf(),
                 read_roots: vec![base_dir.to_path_buf()],
-                write_roots: Vec::new(),
+                write_roots: if write {
+                    vec![base_dir.to_path_buf()]
+                } else {
+                    Vec::new()
+                },
                 deny_read_roots: Vec::new(),
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
@@ -3029,6 +4868,10 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn test_machine(base_dir: &std::path::Path) -> LocalMachine {
+        test_machine_with_write(base_dir, false).await
     }
 
     fn fast_retry_tuning() -> TunnelTuning {
@@ -3145,7 +4988,7 @@ mod tests {
         let outcome = client
             .post_once(
                 &command,
-                &response,
+                serialize_tunnel_response(&response).unwrap(),
                 Some(Instant::now() + Duration::from_millis(10)),
             )
             .await
@@ -3162,7 +5005,14 @@ mod tests {
             CancellationToken::new(),
         )
         .unwrap();
-        let outcome = client.post_once(&command, &response, None).await.unwrap();
+        let outcome = client
+            .post_once(
+                &command,
+                serialize_tunnel_response(&response).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
         assert!(matches!(outcome, PostOutcome::Undeliverable));
     }
 
@@ -3209,7 +5059,13 @@ mod tests {
             resp_type: "session_termination_response".to_owned(),
         };
         assert!(matches!(
-            post_client.post_once(&command, &response, None).await,
+            post_client
+                .post_once(
+                    &command,
+                    serialize_tunnel_response(&response).unwrap(),
+                    None
+                )
+                .await,
             Ok(PostOutcome::Cancelled)
         ));
 
@@ -3462,6 +5318,116 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replay_protected_dispatch_releases_tunnel_attempt_at_response_deadline() {
+        use crate::mcp::{AccessSpec, MachineConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("gate-held");
+        let target = root.join("must-not-write-yet");
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root.clone()],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: true,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 10,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: 60,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let background = json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params": {
+                "name":"job_start",
+                "arguments": {
+                    "command": format!("printf held > '{}'; sleep 1", marker.display()),
+                    "timeout_secs": 3
+                }
+            }
+        });
+        mcp.dispatch(&BTreeMap::new(), &background).await.unwrap();
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            marker.exists(),
+            "background shell never acquired the operation gate"
+        );
+
+        let (base_url, _) = fake_control_plane(|_| (StatusCode::OK, Duration::ZERO)).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning {
+                delivery_reserve: Duration::from_millis(20),
+                ..TunnelTuning::default()
+            },
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let command = TunnelCommand {
+            request_id: "deadline-write".to_owned(),
+            shard_token: "test-shard".to_owned(),
+            command_type: "jsonrpc".to_owned(),
+            channel: Some("main".to_owned()),
+            response_timeout: Some(json!("100ms")),
+            headers: BTreeMap::new(),
+            jsonrpc: Some(json!({
+                "jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params": {"name":"write", "arguments":{"path":"must-not-write-yet","content":"x"}}
+            })),
+        };
+        let key = durable_request_key(&client.request_namespace, &command.request_id);
+        let fingerprint = replay_request_fingerprint(command.jsonrpc.as_ref().unwrap()).unwrap();
+        let started = Instant::now();
+        client
+            .process_command(mcp, command, Instant::now())
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "replay-protected dispatch held the tunnel attempt past its response window"
+        );
+        assert!(
+            !target.exists(),
+            "blocked write unexpectedly crossed the operation gate"
+        );
+        assert!(matches!(
+            client
+                .replays
+                .claim(&key, client.request_namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Uncertain
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn serialized_background_job_control_remains_pollable_and_cancellable() {
         use crate::mcp::{AccessSpec, MachineConfig};
 
@@ -3645,6 +5611,58 @@ mod tests {
         assert_eq!(tuning.response_attempts, 6);
         assert_eq!(tuning.backoff.base, Duration::from_millis(250));
         assert_eq!(tuning.backoff.cap, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn failed_client_replacement_does_not_retire_the_live_replay_namespace() {
+        let process_state = ProcessState::default();
+        let first = TunnelClient::new(
+            Config {
+                process_state: process_state.clone(),
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let namespace = first.request_namespace;
+        let fingerprint = [31; 32];
+        assert!(matches!(
+            process_state
+                .replays
+                .claim("live", namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+
+        let error = match TunnelClient::new(
+            Config {
+                tunnel_id: "replacement-tunnel".to_owned(),
+                process_state: process_state.clone(),
+                ..test_config()
+            },
+            TunnelTuning {
+                response_attempts: 0,
+                ..TunnelTuning::default()
+            },
+            CancellationToken::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid replacement tuning unexpectedly constructed a client"),
+        };
+        assert!(error.to_string().contains("response_attempts"));
+        assert_eq!(
+            process_state.replays.slot().active_namespace,
+            Some(namespace),
+            "a replacement that failed validation must not retire live replay authority"
+        );
+        assert!(matches!(
+            process_state
+                .replays
+                .claim("live", namespace, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Wait(_)
+        ));
     }
 
     #[test]

@@ -12,7 +12,9 @@ use tokio::sync::RwLock;
 use crate::logging::LogConfig;
 use crate::mcp::tools::dot;
 use crate::mcp::tools::grep::{GrepArgs, GrepOutputMode};
-use crate::mcp::{AccessPolicy, AccessSpec, LocalMachine, RuntimeConfig, TransportContextToken};
+use crate::mcp::{
+    AccessPolicy, AccessSpec, LocalMachine, PreparedLaunchers, RuntimeConfig, TransportContextToken,
+};
 
 pub(crate) fn test_machine(root: PathBuf) -> LocalMachine {
     test_machine_with(root, |_| {})
@@ -44,8 +46,6 @@ pub(crate) fn test_machine_with(
         allow_shell: false,
         sandbox_shell: false,
         allow_network: false,
-        shell_program: None,
-        bwrap_program: None,
         max_shell_timeout_secs: 60,
         max_output_bytes: 65536,
         max_read_bytes: 65536,
@@ -57,6 +57,7 @@ pub(crate) fn test_machine_with(
     configure(&mut config);
     LocalMachine {
         config,
+        launchers: PreparedLaunchers::default(),
         jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
             crate::limits::DEFAULT_JOB_RETENTION_SECS,
         ))

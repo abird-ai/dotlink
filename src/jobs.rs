@@ -41,7 +41,7 @@ use crate::limits::DEFAULT_JOB_SPOOL_BYTES;
 use crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM;
 
 const MAX_ACTIVE_JOBS: usize = 32;
-const MAX_RETAINED_JOBS: usize = 256;
+pub(crate) const MAX_RETAINED_JOBS: usize = 256;
 /// Transport-owned hidden state is separate from ordinary user-visible job
 /// retention. Request-key replay mappings plus positive-delivery cleanup-only
 /// retries share this bound; the spool quota independently bounds their bytes.
@@ -211,12 +211,54 @@ impl JobCompletion {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetentionClass {
-    /// Active jobs and any state intentionally visible through the job/task API.
+    /// Active jobs and state intentionally visible through the job/task API.
     Ordinary,
-    /// Hidden terminal OpenAI request awaiting positive delivery acknowledgement.
-    ReplayOnly,
+    /// Hidden request-key state owned only by transport replay/deduplication.
+    /// This class does not consume an ordinary retained-job slot and may be
+    /// running or terminal; the request key and spool quotas bound it instead.
+    TransportOnly,
     /// Delivery is confirmed; only retryable spool cleanup remains.
     CleanupOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestDeliveryState {
+    /// The execution exists, but no successful wire representation has been committed yet.
+    Pending,
+    /// The exact synchronous shell result is the committed response.
+    Synchronous,
+    /// A compatibility receipt or native Task is committed and still depends on this job session.
+    Durable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JobDisposition {
+    /// No response representation has been committed yet. A redelivery may
+    /// still choose synchronous replay or one durable exposure form.
+    Pending,
+    /// The exact ordinary shell result is the committed response.
+    Synchronous,
+    /// The compatibility job receipt is the committed response.
+    Compatibility,
+    /// A native MCP Task is the committed response.
+    NativeTask,
+}
+
+impl JobDisposition {
+    fn exposed(self) -> bool {
+        matches!(self, Self::Compatibility | Self::NativeTask)
+    }
+
+    fn native_task(self) -> bool {
+        self == Self::NativeTask
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum JobHandoff {
+    Synchronous,
+    Compatibility(CallToolResult),
+    NativeTask(Task),
 }
 
 #[derive(Debug)]
@@ -241,10 +283,17 @@ struct JobEntry {
     output_cleanup_requested: bool,
     output_cleanup_pending: bool,
     expiration_pending: bool,
-    externally_exposed: bool,
-    native_task_exposed: bool,
+    disposition: JobDisposition,
+    /// Live callers currently deciding the response representation. This is
+    /// orthogonal to `disposition`: transport-only replay may remain Pending
+    /// after every active attempt has gone away.
+    response_attempts: usize,
     retention: RetentionClass,
     request_key: Option<String>,
+    /// When user-visible retention began. For request-key responses this is
+    /// rebased on positive delivery acknowledgement; execution completion stays
+    /// independently represented by `terminal_at`.
+    retention_anchor: Option<Instant>,
     notify: Arc<Notify>,
 }
 
@@ -404,10 +453,26 @@ impl JobStream {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+struct ResponseAttemptGuard {
+    inner: Weak<JobManagerInner>,
+    id: String,
+}
+
+impl Drop for ResponseAttemptGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        abandon_response_attempt(&inner, &self.id);
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct JobStart {
     pub(crate) id: String,
     pub(crate) is_new: bool,
+    _response_attempt: Option<ResponseAttemptGuard>,
 }
 
 #[derive(Debug)]
@@ -661,8 +726,32 @@ impl JobManager {
         if let Some(key) = request_key.as_ref()
             && let Some(id) = state.request_jobs.get(key).cloned()
         {
-            if state.jobs.contains_key(&id) {
-                return Ok(JobStart { id, is_new: false });
+            let needs_slot = state.jobs.get(&id).is_some_and(|entry| {
+                entry.disposition == JobDisposition::Pending
+                    && entry.response_attempts == 0
+                    && entry.retention == RetentionClass::TransportOnly
+            });
+            if needs_slot && !ensure_retained_capacity(&self.inner, &mut state, 1) {
+                bail!(
+                    "too many retained shell jobs ({MAX_RETAINED_JOBS}); wait for retained jobs to expire or acknowledge output before retrying this delivery"
+                );
+            }
+            if let Some(entry) = state.jobs.get_mut(&id) {
+                if needs_slot {
+                    entry.retention = RetentionClass::Ordinary;
+                }
+                let response_attempt = (entry.disposition == JobDisposition::Pending).then(|| {
+                    entry.response_attempts = entry.response_attempts.saturating_add(1);
+                    ResponseAttemptGuard {
+                        inner: Arc::downgrade(&self.inner),
+                        id: id.clone(),
+                    }
+                });
+                return Ok(JobStart {
+                    id,
+                    is_new: false,
+                    _response_attempt: response_attempt,
+                });
             }
             state.request_jobs.remove(key);
         }
@@ -714,10 +803,11 @@ impl JobManager {
                 output_cleanup_requested: false,
                 output_cleanup_pending: false,
                 expiration_pending: false,
-                externally_exposed: false,
-                native_task_exposed: false,
+                disposition: JobDisposition::Pending,
+                response_attempts: 1,
                 retention: RetentionClass::Ordinary,
                 request_key: request_key.clone(),
+                retention_anchor: None,
                 notify,
             },
         );
@@ -744,7 +834,14 @@ impl JobManager {
             .expect("job inserted before runner registration")
             .runner = Some(task);
         files.commit();
-        Ok(JobStart { id, is_new: true })
+        Ok(JobStart {
+            _response_attempt: Some(ResponseAttemptGuard {
+                inner: Arc::downgrade(&self.inner),
+                id: id.clone(),
+            }),
+            id,
+            is_new: true,
+        })
     }
 
     #[cfg(test)]
@@ -788,10 +885,11 @@ impl JobManager {
                 output_cleanup_requested: false,
                 output_cleanup_pending: false,
                 expiration_pending: false,
-                externally_exposed: false,
-                native_task_exposed: false,
+                disposition: JobDisposition::Pending,
+                response_attempts: 0,
                 retention: RetentionClass::Ordinary,
                 request_key: None,
+                retention_anchor: None,
                 notify: Arc::new(Notify::new()),
             },
         );
@@ -955,7 +1053,7 @@ impl JobManager {
         let mut jobs = state
             .jobs
             .values()
-            .filter(|entry| entry.externally_exposed)
+            .filter(|entry| entry.disposition.exposed())
             .collect::<Vec<_>>();
         jobs.sort_by_key(|entry| std::cmp::Reverse(entry.created));
         serde_json::json!({
@@ -974,33 +1072,54 @@ impl JobManager {
 
     pub(crate) fn expose_compatibility(&self, id: &str) -> JobResult<CallToolResult> {
         let mut state = self.inner.state.lock().expect("job manager lock");
-        reserve_exposure_slot(&self.inner, &mut state, id)?;
-        let entry = state
+        let disposition = state
             .jobs
-            .get_mut(id)
-            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        entry.externally_exposed = true;
-        entry.retention = RetentionClass::Ordinary;
-        Ok(compatibility_receipt(&self.inner, entry))
+            .get(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
+            .disposition;
+        match disposition {
+            JobDisposition::Pending => {
+                reserve_exposure_slot(&self.inner, &mut state, id)?;
+                let entry = state
+                    .jobs
+                    .get_mut(id)
+                    .expect("job validated before exposure capacity reservation");
+                commit_exposure(entry, JobDisposition::Compatibility);
+                Ok(compatibility_receipt(&self.inner, entry))
+            }
+            JobDisposition::Compatibility => Ok(compatibility_receipt(
+                &self.inner,
+                state.jobs.get(id).expect("job validated above"),
+            )),
+            JobDisposition::Synchronous | JobDisposition::NativeTask => Err(JobError::Internal(
+                anyhow!("job {id} already committed a different response representation"),
+            )),
+        }
     }
 
     /// Expose a job as a native MCP Task only when its exact eventual
     /// CallToolResult is guaranteed to fit the tightest task-result budget for the current request and every active transport sharing the runtime.
     /// An already-native task remains native on redelivery.
+    #[cfg(test)]
     pub(crate) fn expose_native_task(
         &self,
         id: &str,
         budget: Option<usize>,
     ) -> JobResult<Option<Task>> {
         let mut state = self.inner.state.lock().expect("job manager lock");
-        let eligible = state
+        let entry = state
             .jobs
             .get(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        if !eligible.native_task_exposed
-            && budget.is_some_and(|budget| {
-                !crate::mcp::shell_result_fits_budget(eligible.result_limit, budget)
-            })
+        match entry.disposition {
+            JobDisposition::NativeTask => {
+                return Ok(Some(task_from_entry(entry, self.retention())));
+            }
+            JobDisposition::Pending => {}
+            JobDisposition::Synchronous | JobDisposition::Compatibility => return Ok(None),
+        }
+        if budget
+            .is_some_and(|budget| !crate::mcp::shell_result_fits_budget(entry.result_limit, budget))
         {
             return Ok(None);
         }
@@ -1009,25 +1128,74 @@ impl JobManager {
             .jobs
             .get_mut(id)
             .expect("job validated before exposure capacity reservation");
-        entry.externally_exposed = true;
-        entry.native_task_exposed = true;
-        entry.retention = RetentionClass::Ordinary;
+        commit_exposure(entry, JobDisposition::NativeTask);
         Ok(Some(task_from_entry(entry, self.retention())))
     }
 
-    pub(crate) fn is_exposed(&self, id: &str) -> JobResult<(bool, bool)> {
+    /// Atomically choose a durable response representation, or replay the one
+    /// already committed by a concurrent/redelivered attempt. The first winner
+    /// owns the wire contract for this execution; later callers cannot switch
+    /// between synchronous, compatibility-job and native-task responses.
+    pub(crate) fn handoff(
+        &self,
+        id: &str,
+        native_tasks: bool,
+        budget: Option<usize>,
+    ) -> JobResult<JobHandoff> {
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let (disposition, result_limit) = {
+            let entry = state
+                .jobs
+                .get(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            (entry.disposition, entry.result_limit)
+        };
+        if disposition == JobDisposition::Pending {
+            let native = native_tasks
+                && !budget.is_some_and(|budget| {
+                    !crate::mcp::shell_result_fits_budget(result_limit, budget)
+                });
+            reserve_exposure_slot(&self.inner, &mut state, id)?;
+            let entry = state
+                .jobs
+                .get_mut(id)
+                .expect("job validated before exposure capacity reservation");
+            commit_exposure(
+                entry,
+                if native {
+                    JobDisposition::NativeTask
+                } else {
+                    JobDisposition::Compatibility
+                },
+            );
+        }
+        let entry = state
+            .jobs
+            .get(id)
+            .expect("job remains present after response disposition");
+        Ok(handoff_from_entry(&self.inner, entry, self.retention()))
+    }
+
+    pub(crate) fn replay_handoff(&self, id: &str) -> JobResult<Option<JobHandoff>> {
         let state = self.inner.state.lock().expect("job manager lock");
         let entry = state
             .jobs
             .get(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        Ok((entry.externally_exposed, entry.native_task_exposed))
+        if entry.disposition == JobDisposition::Pending {
+            return Ok(None);
+        }
+        Ok(Some(handoff_from_entry(
+            &self.inner,
+            entry,
+            self.retention(),
+        )))
     }
 
     pub(crate) fn ensure_native_task(&self, id: &str) -> JobResult<()> {
         let state = self.inner.state.lock().expect("job manager lock");
         match state.jobs.get(id) {
-            Some(entry) if entry.native_task_exposed => Ok(()),
+            Some(entry) if entry.disposition.native_task() => Ok(()),
             _ => Err(JobError::Unknown(format!("unknown task {id}"))),
         }
     }
@@ -1116,23 +1284,58 @@ impl JobManager {
     /// transports that have no durable redelivery identity. OpenAI request-key
     /// jobs retain the spools until terminal delivery is positively acknowledged;
     /// the ordinary result is reconstructed from those same bytes on redelivery.
-    pub(crate) fn mark_synchronous_result(&self, id: &str) -> JobResult<()> {
+    pub(crate) fn mark_synchronous_result(&self, id: &str) -> JobResult<JobDisposition> {
         let mut state = self.inner.state.lock().expect("job manager lock");
         let entry = state
             .jobs
             .get_mut(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        if entry.request_key.is_some() && !entry.externally_exposed && entry.status().terminal() {
-            entry.retention = RetentionClass::ReplayOnly;
-        } else if entry.request_key.is_none()
-            && let Some(completion) = entry.completion.as_mut()
-        {
+        if !entry.status().terminal() {
+            return Err(JobError::Internal(anyhow!("job {id} is still running")));
+        }
+        if entry.disposition != JobDisposition::Pending {
+            return Ok(entry.disposition);
+        }
+        entry.disposition = JobDisposition::Synchronous;
+        if entry.request_key.is_some() {
+            entry.retention = RetentionClass::TransportOnly;
+        } else if let Some(completion) = entry.completion.as_mut() {
             entry.stdout_consumed = completion.stdout.stored_bytes;
             entry.stderr_consumed = completion.stderr.stored_bytes;
             entry.output_cleanup_requested = true;
             maybe_release_output(&self.inner, entry);
         }
-        Ok(())
+        Ok(entry.disposition)
+    }
+
+    pub(crate) fn owns_request_key(&self, request_key: &str) -> bool {
+        self.request_job_id(request_key).is_some()
+    }
+
+    pub(crate) fn request_job_id(&self, request_key: &str) -> Option<String> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let id = state.request_jobs.get(request_key)?;
+        state
+            .jobs
+            .get(id)
+            .is_some_and(|entry| entry.request_key.as_deref() == Some(request_key))
+            .then(|| id.clone())
+    }
+
+    pub(crate) fn request_delivery_state(&self, request_key: &str) -> Option<RequestDeliveryState> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let id = state.request_jobs.get(request_key)?;
+        let entry = state.jobs.get(id)?;
+        if entry.request_key.as_deref() != Some(request_key) {
+            return None;
+        }
+        Some(match entry.disposition {
+            JobDisposition::Pending => RequestDeliveryState::Pending,
+            JobDisposition::Synchronous => RequestDeliveryState::Synchronous,
+            JobDisposition::Compatibility | JobDisposition::NativeTask => {
+                RequestDeliveryState::Durable
+            }
+        })
     }
 
     /// Confirm that the transport accepted the terminal response for a durable
@@ -1156,7 +1359,19 @@ impl JobManager {
         let mut remove_hidden = false;
         if let Some(entry) = state.jobs.get_mut(&id) {
             entry.request_key = None;
-            if !entry.externally_exposed && entry.status().terminal() {
+            if entry.disposition.exposed() {
+                // Transport replay may have kept this handle alive long past its
+                // ordinary TTL. Positive receipt delivery starts a fresh full
+                // user-visible retention window; execution completion remains
+                // independently anchored by `terminal_at`.
+                entry.retention_anchor = Some(Instant::now());
+                entry.expiration_pending = false;
+            } else if !entry.disposition.exposed() && entry.status().terminal() {
+                // Positive terminal delivery makes any still-hidden response
+                // final even if a caller was dropped before recording the local
+                // disposition. Retire the hidden execution rather than leaving
+                // an inaccessible job behind.
+                entry.disposition = JobDisposition::Synchronous;
                 entry.retention = RetentionClass::CleanupOnly;
                 if let Some(completion) = entry.completion.as_mut() {
                     entry.stdout_consumed = completion.stdout.stored_bytes;
@@ -1307,7 +1522,7 @@ impl JobManager {
             let entry = state
                 .jobs
                 .get_mut(id)
-                .filter(|entry| entry.native_task_exposed)
+                .filter(|entry| entry.disposition.native_task())
                 .ok_or_else(|| JobError::Unknown(format!("unknown task {id}")))?;
             let task = task_from_entry(entry, self.retention());
             let status = entry.status();
@@ -1684,6 +1899,78 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
     .to_string()
 }
 
+fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
+    let Ok(mut state) = inner.state.lock() else {
+        return;
+    };
+    let Some(entry) = state.jobs.get_mut(id) else {
+        return;
+    };
+    entry.response_attempts = entry.response_attempts.saturating_sub(1);
+    if entry.disposition != JobDisposition::Pending {
+        return;
+    }
+    if entry.request_key.is_some() && entry.response_attempts == 0 {
+        // The transport can redeliver this exact request later. Once the last
+        // undecided caller disappears, keep execution/replay state but release
+        // the scarce ordinary retained-job slot. A surviving concurrent attempt
+        // keeps the slot it is still actively deciding how to represent.
+        entry.retention = RetentionClass::TransportOnly;
+    } else if entry.request_key.is_none() && entry.response_attempts == 0 {
+        // Local transports have no durable request identity to replay. Make an
+        // abandoned execution discoverable through job_list instead of hiding a
+        // side effect behind an irrecoverable lost response.
+        commit_exposure(entry, JobDisposition::Compatibility);
+    }
+}
+
+fn commit_exposure(entry: &mut JobEntry, disposition: JobDisposition) {
+    debug_assert!(matches!(
+        disposition,
+        JobDisposition::Compatibility | JobDisposition::NativeTask
+    ));
+    entry.disposition = disposition;
+    entry.retention = RetentionClass::Ordinary;
+    entry.retention_anchor = Some(Instant::now());
+    entry.expiration_pending = false;
+}
+
+fn handoff_from_entry(
+    inner: &JobManagerInner,
+    entry: &JobEntry,
+    retention: Duration,
+) -> JobHandoff {
+    match entry.disposition {
+        JobDisposition::Synchronous => JobHandoff::Synchronous,
+        JobDisposition::Compatibility => {
+            JobHandoff::Compatibility(compatibility_receipt(inner, entry))
+        }
+        JobDisposition::NativeTask => JobHandoff::NativeTask(task_from_entry(entry, retention)),
+        JobDisposition::Pending => unreachable!("pending job has no committed response"),
+    }
+}
+
+fn terminal_retention_anchor(entry: &JobEntry) -> Option<Instant> {
+    let terminal = entry.terminal_at?;
+    Some(
+        entry
+            .retention_anchor
+            .map_or(terminal, |anchor| anchor.max(terminal)),
+    )
+}
+
+fn task_retention_anchor(entry: &JobEntry) -> Option<Instant> {
+    let anchor = terminal_retention_anchor(entry)?;
+    if entry.request_key.is_some() && entry.disposition.exposed() {
+        // A replayed receipt may be delivered long after the first attempt. Its
+        // advertised TTL must match the full window the server will start when
+        // positive delivery is acknowledged.
+        Some(anchor.max(Instant::now()))
+    } else {
+        Some(anchor)
+    }
+}
+
 fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
@@ -1783,7 +2070,7 @@ fn maybe_release_output(inner: &JobManagerInner, entry: &mut JobEntry) {
 }
 
 fn release_acknowledged_output(inner: &JobManagerInner, entry: &mut JobEntry) {
-    if entry.native_task_exposed {
+    if entry.disposition.native_task() {
         let _ = compact_native_task_output(inner, entry);
     } else {
         let _ = release_output_files(inner, entry);
@@ -2040,15 +2327,16 @@ fn reclaimable_terminal(entry: &JobEntry) -> bool {
     if entry.retention != RetentionClass::Ordinary
         || !entry.status().terminal()
         || entry.request_key.is_some()
+        || entry.response_attempts != 0
         || entry.readers != 0
-        || entry.native_task_exposed
+        || entry.disposition.native_task()
     {
         return false;
     }
     let empty = entry.completion.as_ref().is_some_and(|completion| {
         completion.stdout.stored_bytes == 0 && completion.stderr.stored_bytes == 0
     });
-    entry.output_released || (!entry.externally_exposed && empty)
+    entry.output_released || (!entry.disposition.exposed() && empty)
 }
 
 fn evict_one_reclaimable_terminal(inner: &JobManagerInner, state: &mut JobState) -> bool {
@@ -2056,7 +2344,12 @@ fn evict_one_reclaimable_terminal(inner: &JobManagerInner, state: &mut JobState)
         .jobs
         .iter()
         .filter(|(_, entry)| reclaimable_terminal(entry))
-        .map(|(id, entry)| (entry.terminal_at.unwrap_or(entry.created), id.clone()))
+        .map(|(id, entry)| {
+            (
+                terminal_retention_anchor(entry).unwrap_or(entry.created),
+                id.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(terminal_at, _)| *terminal_at);
     for (_, id) in candidates {
@@ -2142,9 +2435,16 @@ fn sweep_expired(inner: &JobManagerInner) {
             .jobs
             .iter()
             .filter_map(|(id, entry)| {
-                entry
-                    .terminal_at
-                    .filter(|terminal| terminal.elapsed() >= retention)
+                // An outstanding transport request key is the dedupe authority,
+                // not ordinary job TTL. Late tunnel redelivery must keep finding
+                // the same execution until positive response delivery clears the
+                // key; the separate transport-entry and spool quotas bound this
+                // state without weakening exactly-once side-effect semantics.
+                if entry.request_key.is_some() || entry.response_attempts != 0 {
+                    return None;
+                }
+                terminal_retention_anchor(entry)
+                    .filter(|anchor| anchor.elapsed() >= retention)
                     .map(|_| id.clone())
             })
             .collect::<Vec<_>>();
@@ -2191,9 +2491,9 @@ fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
         entry.created_at.clone(),
         entry.updated_at.clone(),
     );
-    if let Some(terminal_at) = entry.terminal_at {
-        let terminal_age = terminal_at.saturating_duration_since(entry.created);
-        let ttl = u64::try_from(terminal_age.as_millis())
+    if let Some(anchor) = task_retention_anchor(entry) {
+        let retention_age = anchor.saturating_duration_since(entry.created);
+        let ttl = u64::try_from(retention_age.as_millis())
             .unwrap_or(u64::MAX)
             .saturating_add(retention_ms);
         task = task.with_ttl_ms(ttl);
@@ -2988,6 +3288,514 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abandoned_keyed_response_releases_ordinary_capacity_but_preserves_replay() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("abandoned-request".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        let id = started.id.clone();
+        drop(started);
+        assert!(matches!(
+            manager.wait_until(&id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&id];
+            assert_eq!(entry.disposition, JobDisposition::Pending);
+            assert_eq!(entry.retention, RetentionClass::TransportOnly);
+            assert_eq!(retained_job_slots(&state), 0);
+            assert_eq!(state.request_jobs.get("abandoned-request"), Some(&id));
+        }
+
+        let replay = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("abandoned-request".to_owned()),
+                |_job| async { panic!("redelivery must reuse the abandoned execution") },
+            )
+            .unwrap();
+        assert!(!replay.is_new);
+        assert_eq!(replay.id, id);
+        let _ = manager.tool_result(&id, None).unwrap().unwrap();
+        assert_eq!(
+            manager.mark_synchronous_result(&id).unwrap(),
+            JobDisposition::Synchronous
+        );
+        assert!(matches!(
+            manager.replay_handoff(&id).unwrap(),
+            Some(JobHandoff::Synchronous)
+        ));
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_abandoned_redelivery_does_not_release_a_surviving_attempts_slot() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let first = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("concurrent-attempts".to_owned()),
+                |_job| async { std::future::pending::<JobCompletion>().await },
+            )
+            .unwrap();
+        let duplicate = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("concurrent-attempts".to_owned()),
+                |_job| async { panic!("duplicate runner must never launch") },
+            )
+            .unwrap();
+        assert_eq!(first.id, duplicate.id);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&first.id];
+            assert_eq!(entry.response_attempts, 2);
+            assert_eq!(entry.retention, RetentionClass::Ordinary);
+        }
+        let id = first.id.clone();
+        drop(first);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&id];
+            assert_eq!(entry.response_attempts, 1);
+            assert_eq!(entry.retention, RetentionClass::Ordinary);
+            assert_eq!(retained_job_slots(&state), 1);
+        }
+        drop(duplicate);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&id];
+            assert_eq!(entry.response_attempts, 0);
+            assert_eq!(entry.retention, RetentionClass::TransportOnly);
+            assert_eq!(retained_job_slots(&state), 0);
+        }
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn many_abandoned_keyed_responses_cannot_exhaust_ordinary_capacity() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let count = MAX_RETAINED_JOBS + 32;
+        for index in 0..count {
+            let started = manager
+                .spawn(
+                    30,
+                    crate::limits::DEFAULT_TRANSFER_BYTES,
+                    Some(format!("abandoned-{index}")),
+                    |_job| async {
+                        JobCompletion::completed(
+                            Some(0),
+                            true,
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        )
+                    },
+                )
+                .unwrap();
+            let id = started.id.clone();
+            drop(started);
+            assert!(matches!(
+                manager.wait_until(&id, None).await.unwrap(),
+                JobWait::Terminal
+            ));
+        }
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert_eq!(retained_job_slots(&state), 0);
+            assert_eq!(state.request_jobs.len(), count);
+            assert!(state.jobs.values().all(|entry| {
+                entry.disposition == JobDisposition::Pending
+                    && entry.retention == RetentionClass::TransportOnly
+                    && entry.response_attempts == 0
+            }));
+        }
+        let ordinary = manager.create_for_test(30).unwrap();
+        assert!(manager.status(&ordinary.id).is_ok());
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_local_response_becomes_recoverable_compatibility_job() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                None,
+                |_job| async { std::future::pending::<JobCompletion>().await },
+            )
+            .unwrap();
+        let id = started.id.clone();
+        drop(started);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&id];
+            assert_eq!(entry.disposition, JobDisposition::Compatibility);
+            assert_eq!(entry.retention, RetentionClass::Ordinary);
+            assert!(entry.retention_anchor.is_some());
+        }
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(64)).unwrap();
+        assert_eq!(listed["jobs"][0]["job_id"], id);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_committed_response_disposition_wins_concurrent_redelivery_races() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let exposed = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("exposure-wins".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&exposed.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        let _rendered = manager.tool_result(&exposed.id, None).unwrap().unwrap();
+        assert!(matches!(
+            manager.handoff(&exposed.id, false, None).unwrap(),
+            JobHandoff::Compatibility(_)
+        ));
+        assert_eq!(
+            manager.mark_synchronous_result(&exposed.id).unwrap(),
+            JobDisposition::Compatibility,
+            "a late synchronous contender must replay the already-committed receipt"
+        );
+        assert!(matches!(
+            manager.replay_handoff(&exposed.id).unwrap(),
+            Some(JobHandoff::Compatibility(_))
+        ));
+
+        let synchronous = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("sync-wins".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&synchronous.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        let _ = manager.tool_result(&synchronous.id, None).unwrap().unwrap();
+        assert_eq!(
+            manager.mark_synchronous_result(&synchronous.id).unwrap(),
+            JobDisposition::Synchronous
+        );
+        assert!(matches!(
+            manager.handoff(&synchronous.id, true, None).unwrap(),
+            JobHandoff::Synchronous
+        ));
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delivered_exposed_request_gets_a_fresh_user_visible_retention_window() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("delayed-receipt".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        assert!(matches!(
+            manager.handoff(&started.id, false, None).unwrap(),
+            JobHandoff::Compatibility(_)
+        ));
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            let entry = state.jobs.get_mut(&started.id).unwrap();
+            let old = Instant::now() - Duration::from_secs(61);
+            entry.terminal_at = Some(old);
+            entry.retention_anchor = Some(old);
+        }
+        sweep_expired(&manager.inner);
+        assert!(
+            manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&started.id)
+        );
+
+        manager.acknowledge_request_delivery("delayed-receipt");
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&started.id];
+            assert!(entry.request_key.is_none());
+            assert!(
+                entry
+                    .retention_anchor
+                    .is_some_and(|anchor| anchor.elapsed() < Duration::from_secs(1))
+            );
+        }
+        sweep_expired(&manager.inner);
+        assert!(manager.status(&started.id).is_ok());
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replayed_native_task_advertises_retention_from_the_delivery_attempt() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("delayed-task".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        assert!(matches!(
+            manager.handoff(&started.id, true, None).unwrap(),
+            JobHandoff::NativeTask(_)
+        ));
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            let entry = state.jobs.get_mut(&started.id).unwrap();
+            let now = Instant::now();
+            entry.created = now - Duration::from_secs(62);
+            entry.terminal_at = Some(now - Duration::from_secs(61));
+            entry.retention_anchor = Some(now - Duration::from_secs(61));
+        }
+        let Some(JobHandoff::NativeTask(task)) = manager.replay_handoff(&started.id).unwrap()
+        else {
+            panic!("native task disposition must replay identically")
+        };
+        assert!(
+            task.ttl_ms.is_some_and(|ttl| ttl >= 121_000),
+            "replayed task must promise a full retention window from this delivery attempt: {task:?}"
+        );
+        manager.acknowledge_request_delivery("delayed-task");
+        assert!(manager.detailed_task(&started.id).is_ok());
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_request_key_survives_generic_job_ttl() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("late-redelivery".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        let _ = manager.tool_result(&started.id, None).unwrap().unwrap();
+        manager.mark_synchronous_result(&started.id).unwrap();
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            let entry = state.jobs.get_mut(&started.id).unwrap();
+            entry.terminal_at = Some(Instant::now() - Duration::from_secs(61));
+            assert_eq!(entry.retention, RetentionClass::TransportOnly);
+        }
+
+        sweep_expired(&manager.inner);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert_eq!(
+                state.request_jobs.get("late-redelivery"),
+                Some(&started.id),
+                "ordinary job TTL must not retire transport dedupe authority"
+            );
+            assert!(state.jobs.contains_key(&started.id));
+        }
+
+        let duplicate = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("late-redelivery".to_owned()),
+                |_job| async { panic!("late redelivery must not launch another runner") },
+            )
+            .unwrap();
+        assert!(!duplicate.is_new);
+        assert_eq!(duplicate.id, started.id);
+        manager.acknowledge_request_delivery("late-redelivery");
+        assert!(
+            !manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&started.id)
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronous_disposition_rejects_a_running_job_without_releasing_it() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                None,
+                |_job| async { std::future::pending::<JobCompletion>().await },
+            )
+            .unwrap();
+
+        let error = manager.mark_synchronous_result(&started.id).unwrap_err();
+        assert!(error.to_string().contains("still running"));
+        assert!(
+            manager.inner.state.lock().unwrap().jobs[&started.id].disposition
+                == JobDisposition::Pending,
+            "an invalid early transition must not release the pressure-eviction guard"
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_response_disposition_is_not_capacity_evicted() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                None,
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        assert_eq!(
+            manager.inner.state.lock().unwrap().jobs[&started.id].disposition,
+            JobDisposition::Pending
+        );
+
+        for _ in 1..MAX_RETAINED_JOBS {
+            let job = manager.create_for_test(30).unwrap();
+            fs::write(&job.stdout_path, b"x").unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary {
+                        total_bytes: 1,
+                        stored_bytes: 1,
+                        truncated: false,
+                    },
+                    StreamSummary::default(),
+                ),
+            );
+            manager.expose_compatibility(&job.id).unwrap();
+        }
+        let error = manager.create_for_test(30).unwrap_err();
+        assert!(error.to_string().contains("too many retained shell jobs"));
+        assert!(
+            manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&started.id),
+            "capacity pressure must not evict an execution before its initiating response commits"
+        );
+
+        let _ = manager.tool_result(&started.id, None).unwrap().unwrap();
+        manager.mark_synchronous_result(&started.id).unwrap();
+        assert!(
+            manager.inner.state.lock().unwrap().jobs[&started.id].disposition
+                != JobDisposition::Pending
+        );
+        let started_id = started.id.clone();
+        drop(started);
+        let extra = manager.create_for_test(30).unwrap();
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert!(state.jobs.contains_key(&extra.id));
+            assert!(
+                !state.jobs.contains_key(&started_id),
+                "resolved empty synchronous metadata may be reclaimed after its response attempt ends"
+            );
+        }
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn ambiguous_hidden_replays_do_not_consume_ordinary_retained_job_capacity() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         for index in 0..(MAX_RETAINED_JOBS + 32) {
@@ -3096,7 +3904,7 @@ mod tests {
                 state
                     .jobs
                     .values()
-                    .all(|entry| entry.retention == RetentionClass::ReplayOnly)
+                    .all(|entry| entry.retention == RetentionClass::TransportOnly)
             );
         }
 
@@ -3174,7 +3982,7 @@ mod tests {
             .expect("the terminal request already owns its retained slot");
         {
             let state = manager.inner.state.lock().unwrap();
-            assert!(state.jobs[&started.id].externally_exposed);
+            assert!(state.jobs[&started.id].disposition.exposed());
             assert_eq!(state.jobs[&started.id].retention, RetentionClass::Ordinary);
             assert_eq!(retained_job_slots(&state), MAX_RETAINED_JOBS);
         }
@@ -3182,7 +3990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_to_exposed_transition_reserves_an_ordinary_slot() {
+    async fn transport_only_redelivery_reserves_ordinary_capacity_before_waiting() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let replay = manager
             .spawn(
@@ -3199,13 +4007,15 @@ mod tests {
                 },
             )
             .unwrap();
+        let replay_id = replay.id.clone();
+        drop(replay);
         assert!(matches!(
-            manager.wait_until(&replay.id, None).await.unwrap(),
+            manager.wait_until(&replay_id, None).await.unwrap(),
             JobWait::Terminal
         ));
-        manager.mark_synchronous_result(&replay.id).unwrap();
 
-        for _ in 0..MAX_RETAINED_JOBS {
+        let mut reclaimable = None;
+        for index in 0..MAX_RETAINED_JOBS {
             let job = manager.create_for_test(30).unwrap();
             fs::write(&job.stdout_path, b"x").unwrap();
             manager.finish(
@@ -3222,19 +4032,58 @@ mod tests {
                 ),
             );
             manager.expose_compatibility(&job.id).unwrap();
+            if index == 0 {
+                reclaimable = Some(job.id);
+            }
         }
+
         let error = manager
-            .expose_compatibility(&replay.id)
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("replay-transition".to_owned()),
+                |_job| async { panic!("redelivery must never launch a second runner") },
+            )
             .unwrap_err()
             .to_string();
         assert!(error.contains("too many retained shell jobs"), "{error}");
         {
             let state = manager.inner.state.lock().unwrap();
-            let replay_entry = &state.jobs[&replay.id];
-            assert_eq!(replay_entry.retention, RetentionClass::ReplayOnly);
-            assert!(!replay_entry.externally_exposed);
+            let replay_entry = &state.jobs[&replay_id];
+            assert_eq!(replay_entry.retention, RetentionClass::TransportOnly);
+            assert_eq!(replay_entry.response_attempts, 0);
             assert_eq!(retained_job_slots(&state), MAX_RETAINED_JOBS);
         }
+
+        let reclaimable = reclaimable.unwrap();
+        manager
+            .acknowledge_output(&reclaimable, JobStream::Stdout, 1)
+            .unwrap();
+        manager
+            .acknowledge_output(&reclaimable, JobStream::Stderr, 0)
+            .unwrap();
+        let duplicate = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("replay-transition".to_owned()),
+                |_job| async { panic!("redelivery must reuse the original execution") },
+            )
+            .unwrap();
+        assert!(!duplicate.is_new);
+        assert_eq!(duplicate.id, replay_id);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let replay_entry = &state.jobs[&replay_id];
+            assert_eq!(replay_entry.retention, RetentionClass::Ordinary);
+            assert_eq!(replay_entry.response_attempts, 1);
+            assert_eq!(retained_job_slots(&state), MAX_RETAINED_JOBS);
+        }
+        drop(duplicate);
+        assert_eq!(
+            manager.inner.state.lock().unwrap().jobs[&replay_id].retention,
+            RetentionClass::TransportOnly
+        );
         manager.shutdown().await.unwrap();
     }
 

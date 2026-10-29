@@ -981,10 +981,10 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
 
     supervisor.schedule_restart_reset();
 
-    // Both outlive any one runtime: a signal or an unresolved OpenAI
-    // rejection must survive an in-process restart.
+    // Both outlive any one runtime: a signal or unresolved OpenAI request
+    // replay/rejection state must survive an in-process restart.
     let mut shutdown = Shutdown::default();
-    let rejections = transports::openai::RejectionLedger::default();
+    let openai_state = transports::openai::ProcessState::default();
     // Long-running jobs belong to the dotlink process session, not one OpenAI
     // transport runtime. Automatic tunnel recovery therefore preserves them.
     let mut jobs: Option<jobs::JobManager> = None;
@@ -996,7 +996,7 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
             &log,
             setup_color,
             &mut shutdown,
-            &rejections,
+            &openai_state,
             &mut jobs,
         )
         .await
@@ -1196,7 +1196,6 @@ fn transport_authority_value(
             "base_url": config.base_url,
             "tunnel_id": config.tunnel_id,
             "organization_id": config.organization_id,
-            "runtime_key": hex::encode(crate::mcp::sha256(config.runtime_api_key.as_bytes())),
         })
     });
     let http = transports.http.as_ref().map(|config| {
@@ -1278,7 +1277,7 @@ async fn plan_runtime(
     launch_dir: &Path,
     log: &LogConfig,
     setup_color: bool,
-    rejections: &transports::openai::RejectionLedger,
+    openai_state: &transports::openai::ProcessState,
 ) -> Result<Option<RuntimePlan>> {
     let Some(mut setup) = load_or_setup(false, args.profile.as_deref(), setup_color).await? else {
         return Ok(None);
@@ -1336,7 +1335,7 @@ async fn plan_runtime(
             organization_id: setup.config.organization_id.clone(),
             new_tunnel: setup.new_tunnel,
             log: log.clone(),
-            rejections: rejections.clone(),
+            process_state: openai_state.clone(),
         })
     } else {
         None
@@ -1476,6 +1475,7 @@ async fn prepare_runtime(
             let prepared =
                 LocalMachine::prepare_with_job_root(machine_config, created.protected_path())
                     .await?;
+            prepared.validate_launchers().await?;
             let authority = job_authority_fingerprint(intent, &prepared)?;
             let bound_policy = created.bind_policy(authority);
             debug_assert!(bound_policy);
@@ -1488,6 +1488,7 @@ async fn prepare_runtime(
         debug_assert!(bound_intent);
         let prepared =
             LocalMachine::prepare_with_job_root(machine_config, created.protected_path()).await?;
+        prepared.validate_launchers().await?;
         let authority = job_authority_fingerprint(intent, &prepared)?;
         let bound_policy = created.bind_policy(authority);
         debug_assert!(bound_policy);
@@ -1505,7 +1506,7 @@ async fn run_runtime(
     log: &LogConfig,
     setup_color: bool,
     shutdown: &mut Shutdown,
-    rejections: &transports::openai::RejectionLedger,
+    openai_state: &transports::openai::ProcessState,
     jobs: &mut Option<jobs::JobManager>,
 ) -> Result<RuntimeOutcome> {
     // On the first pass this does not install a listener, preserving the OS's
@@ -1513,7 +1514,13 @@ async fn run_runtime(
     // pass is raced from its first planning operation because the listener is
     // sticky for the rest of the process.
     let planned = shutdown
-        .run_until_requested(plan_runtime(args, launch_dir, log, setup_color, rejections))
+        .run_until_requested(plan_runtime(
+            args,
+            launch_dir,
+            log,
+            setup_color,
+            openai_state,
+        ))
         .await;
     let Some(planned) = planned else {
         eprintln!("\ndotlink stopped.");
@@ -1955,6 +1962,49 @@ mod tests {
         assert_ne!(
             before, after,
             "execution-lifetime policy changes must revoke the old job session"
+        );
+    }
+
+    #[test]
+    fn runtime_api_key_rotation_does_not_revoke_job_execution_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let mut config: crate::setup::AppConfig =
+            serde_json::from_value(serde_json::json!({"version": 10})).unwrap();
+        config.permissions.default_allow = true;
+        let setup = SetupResult {
+            config,
+            new_tunnel: false,
+            protected_paths: Vec::new(),
+        };
+        let policy = Policy::from_args(&args, root, &setup.config.permissions).unwrap();
+        let openai = |key: &str| transports::openai::Config {
+            base_url: "https://api.openai.com".to_owned(),
+            tunnel_id: "tunnel".to_owned(),
+            runtime_api_key: key.to_owned(),
+            organization_id: Some("org".to_owned()),
+            new_tunnel: false,
+            log: LogConfig::default(),
+            process_state: transports::openai::ProcessState::default(),
+        };
+        let before_transports = ActiveTransports {
+            openai: Some(openai("key-one")),
+            stdio: false,
+            http: None,
+        };
+        let after_transports = ActiveTransports {
+            openai: Some(openai("key-two")),
+            stdio: false,
+            http: None,
+        };
+        let before =
+            job_authority_intent_fingerprint(&args, &setup, &policy, &before_transports).unwrap();
+        let after =
+            job_authority_intent_fingerprint(&args, &setup, &policy, &after_transports).unwrap();
+        assert_eq!(
+            before, after,
+            "transport credential rotation must not revoke execution-lifetime job authority"
         );
     }
 

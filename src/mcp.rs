@@ -6,6 +6,8 @@
 
 mod tools;
 #[cfg(test)]
+pub(crate) use tools::shell::ShellArgs;
+#[cfg(test)]
 pub(crate) use tools::test_support::test_machine;
 pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 
@@ -165,14 +167,30 @@ struct RuntimeConfig {
     allow_shell: bool,
     sandbox_shell: bool,
     allow_network: bool,
-    shell_program: Option<PathBuf>,
-    bwrap_program: Option<PathBuf>,
     max_shell_timeout_secs: u64,
     max_output_bytes: usize,
     max_read_bytes: usize,
     max_write_bytes: usize,
     task_result_budget: Option<usize>,
     protected_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreparedLaunchers {
+    shell: Option<tools::shell::PreparedExecutable>,
+    #[cfg(target_os = "linux")]
+    bwrap: Option<tools::shell::PreparedExecutable>,
+}
+
+#[cfg(test)]
+impl PreparedLaunchers {
+    fn for_test(shell: Option<PathBuf>, bwrap: Option<PathBuf>) -> Self {
+        Self {
+            shell: shell.map(tools::shell::PreparedExecutable::for_test),
+            #[cfg(target_os = "linux")]
+            bwrap: bwrap.map(tools::shell::PreparedExecutable::for_test),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -203,6 +221,7 @@ impl std::fmt::Debug for TransportContextToken {
 #[derive(Clone, Debug)]
 pub struct LocalMachine {
     config: RuntimeConfig,
+    launchers: PreparedLaunchers,
     jobs: crate::jobs::JobManager,
     operation_gate: Arc<RwLock<()>>,
     serialize: bool,
@@ -221,6 +240,7 @@ pub struct LocalMachine {
 #[derive(Debug)]
 pub(crate) struct PreparedMachine {
     config: RuntimeConfig,
+    launchers: PreparedLaunchers,
     authority: serde_json::Value,
     job_root: PathBuf,
     serialize: bool,
@@ -561,12 +581,17 @@ pub enum Capability {
     Job,
 }
 
-/// One row per advertised tool: the single place that records a tool's
-/// capability and whether it may run concurrently. Visibility, the concurrency
-/// gate, `--list-tools` and log labels all read this table.
+/// One row per advertised tool: the single place that records capability,
+/// transport replay sensitivity and whether it may run concurrently. Visibility,
+/// exactly-once tunnel admission, the concurrency gate, `--list-tools` and log
+/// labels all read this table.
 pub struct ToolSpec {
     pub name: &'static str,
     pub capability: Capability,
+    /// Whether one authenticated tunnel request identity must execute this tool
+    /// at most once. This belongs beside the tool definition so a future
+    /// side-effecting tool cannot silently miss transport replay protection.
+    pub request_replay: bool,
     /// Pure reads that may overlap each other without an operation gate. Read
     /// only on platforms that still serialize mutation.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -577,89 +602,117 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "ls",
         capability: Capability::Read,
+        request_replay: false,
         concurrent_read: true,
     },
     ToolSpec {
         name: "grep",
         capability: Capability::Read,
+        request_replay: false,
         concurrent_read: true,
     },
     ToolSpec {
         name: "read",
         capability: Capability::Read,
+        request_replay: false,
         concurrent_read: true,
     },
     ToolSpec {
         name: "bread",
         capability: Capability::Read,
+        request_replay: false,
         concurrent_read: true,
     },
     ToolSpec {
         name: "write",
         capability: Capability::Write,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "bwrite",
         capability: Capability::Write,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "edit",
         capability: Capability::ReadWrite,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "patch",
         capability: Capability::ReadWrite,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "bedit",
         capability: Capability::ReadWrite,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "bash",
         capability: Capability::ShellUnix,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "powershell",
         capability: Capability::ShellWindows,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "job_start",
         capability: Capability::Job,
+        request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
         name: "job_list",
         capability: Capability::Job,
+        request_replay: false,
         concurrent_read: true,
     },
     ToolSpec {
         name: "job_get",
         capability: Capability::Job,
+        request_replay: false,
         concurrent_read: true,
     },
     ToolSpec {
         name: "job_output",
         capability: Capability::Job,
+        request_replay: false,
         concurrent_read: true,
     },
     ToolSpec {
         name: "job_ack",
         capability: Capability::Job,
+        request_replay: false,
         concurrent_read: false,
     },
     ToolSpec {
         name: "job_cancel",
         capability: Capability::Job,
+        request_replay: false,
         concurrent_read: false,
     },
 ];
+
+/// Whether a `tools/call` must be executed at most once for one authenticated
+/// tunnel request identity. Keep this derived from the same capability table
+/// that owns the tool surface so transport replay policy cannot drift into a
+/// separate name list.
+pub(crate) fn tool_requires_request_replay(name: &str) -> bool {
+    TOOL_SPECS
+        .iter()
+        .find(|spec| spec.name == name)
+        .is_some_and(|spec| spec.request_replay)
+}
 
 impl Capabilities {
     pub fn allows(self, capability: Capability) -> bool {
@@ -1494,6 +1547,7 @@ pub(crate) fn authority_path_identity(path: &Path) -> serde_json::Value {
 
 fn prepared_authority_value(
     config: &RuntimeConfig,
+    launchers: &PreparedLaunchers,
     #[cfg(any(target_os = "linux", target_os = "macos"))] secure_fs: &crate::secure_fs::SecureFs,
 ) -> Result<serde_json::Value> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1561,6 +1615,31 @@ fn prepared_authority_value(
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    let executable_authority = |executable: &tools::shell::PreparedExecutable| {
+        #[cfg(unix)]
+        {
+            let identity = executable.identity();
+            serde_json::json!({
+                "path": executable.path(),
+                "dev": identity.dev,
+                "ino": identity.ino,
+                "rdev": identity.rdev,
+                "sha256": hex::encode(executable.digest()),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            serde_json::json!({
+                "path": authority_path_identity(executable.path()),
+                "sha256": hex::encode(executable.digest()),
+            })
+        }
+    };
+    let shell_program_authority = launchers.shell.as_ref().map(&executable_authority);
+    #[cfg(target_os = "linux")]
+    let bwrap_program_authority = launchers.bwrap.as_ref().map(&executable_authority);
+    #[cfg(not(target_os = "linux"))]
+    let bwrap_program_authority: Option<serde_json::Value> = None;
     let mut authority = serde_json::json!({
         "base_dir": authority_path_identity(&config.access.base_dir),
         "read_roots": read_roots,
@@ -1569,6 +1648,8 @@ fn prepared_authority_value(
         "deny_write_roots": config.access.deny_write_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
         "protected_paths": config.protected_paths.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
         "cache_mounts": caches,
+        "shell_program": shell_program_authority,
+        "bwrap_program": bwrap_program_authority,
     });
     #[cfg(target_os = "linux")]
     {
@@ -1610,6 +1691,18 @@ fn prepared_authority_value(
 impl PreparedMachine {
     pub(crate) fn authority_value(&self) -> &serde_json::Value {
         &self.authority
+    }
+
+    /// Execute launcher capability probes only after the caller has decided that
+    /// this prepared authority is safe to activate. Preparation itself is pure
+    /// with respect to host-side launcher execution, which lets automatic
+    /// recovery compare a candidate against the trusted live session first.
+    pub(crate) async fn validate_launchers(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(bwrap) = self.launchers.bwrap.as_ref() {
+            tools::shell::validate_bubblewrap(bwrap).await?;
+        }
+        Ok(())
     }
 }
 
@@ -1719,38 +1812,41 @@ impl LocalMachine {
         #[cfg(target_os = "linux")]
         validate_host_mount_policy(&access, &args.host_shell, &protected_paths)?;
 
-        let shell_program = if args.allow_shell {
+        let shell_launcher = if args.allow_shell {
             #[cfg(windows)]
-            {
-                Some(
-                    resolve_executable("pwsh.exe")
-                        .or_else(|| resolve_executable("powershell.exe"))
-                        .ok_or_else(|| anyhow!("PowerShell was not found in PATH"))?,
-                )
-            }
+            let program = resolve_executable("pwsh.exe")
+                .or_else(|| resolve_executable("powershell.exe"))
+                .ok_or_else(|| anyhow!("PowerShell was not found in PATH"))?;
             #[cfg(not(windows))]
-            {
-                Some(
-                    resolve_executable("bash")
-                        .ok_or_else(|| anyhow!("bash was not found in PATH"))?,
-                )
-            }
+            let program = resolve_executable("bash")
+                .ok_or_else(|| anyhow!("an executable bash was not found in PATH"))?;
+            Some(tools::shell::PreparedExecutable::prepare(program)?)
         } else {
             None
         };
 
         #[cfg(target_os = "linux")]
-        let bwrap_program = if args.allow_shell && args.sandbox_shell {
+        let bwrap_launcher = if args.allow_shell && args.sandbox_shell {
             let program = resolve_executable("bwrap").ok_or_else(|| {
-                anyhow!("Bubblewrap (bwrap) is required for sandboxed shell access")
+                crate::recovery::operator(anyhow!(
+                    "an executable Bubblewrap (bwrap) is required for sandboxed shell access"
+                ))
             })?;
-            tools::shell::validate_bubblewrap(&program).await?;
-            Some(program)
+            let launcher = tools::shell::PreparedExecutable::prepare_sandbox_launcher(program)
+                .map_err(crate::recovery::operator)?;
+            launcher
+                .validate_sandbox_source(&access, &cache_mounts)
+                .map_err(crate::recovery::operator)?;
+            Some(launcher)
         } else {
             None
         };
-        #[cfg(not(target_os = "linux"))]
-        let bwrap_program = None;
+
+        let launchers = PreparedLaunchers {
+            shell: shell_launcher,
+            #[cfg(target_os = "linux")]
+            bwrap: bwrap_launcher,
+        };
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let secure_fs = Arc::new(crate::secure_fs::SecureFs::new(
@@ -1768,8 +1864,6 @@ impl LocalMachine {
             allow_shell: args.allow_shell,
             sandbox_shell: args.sandbox_shell,
             allow_network: args.allow_network,
-            shell_program,
-            bwrap_program,
             max_shell_timeout_secs,
             max_output_bytes,
             max_read_bytes,
@@ -1779,11 +1873,13 @@ impl LocalMachine {
         };
         let authority = prepared_authority_value(
             &config,
+            &launchers,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             &secure_fs,
         )?;
         Ok(PreparedMachine {
             config,
+            launchers,
             authority,
             job_root: job_root.to_path_buf(),
             serialize: args.serialize,
@@ -1805,6 +1901,7 @@ impl LocalMachine {
         let operation_gate = jobs.operation_gate();
         Ok(Self {
             config: prepared.config,
+            launchers: prepared.launchers,
             jobs,
             operation_gate,
             serialize: prepared.serialize,
@@ -1820,6 +1917,7 @@ impl LocalMachine {
         jobs: crate::jobs::JobManager,
     ) -> Result<Self> {
         let prepared = Self::prepare_with_job_root(args, jobs.protected_path()).await?;
+        prepared.validate_launchers().await?;
         Self::from_prepared(prepared, jobs)
     }
 
@@ -2220,6 +2318,10 @@ impl LocalMachine {
             (Some(runtime), None) => Some(runtime),
             (None, request) => request,
         }
+    }
+
+    pub(crate) fn has_job_request_delivery(&self, request_key: &str) -> bool {
+        self.jobs.owns_request_key(request_key)
     }
 
     pub(crate) fn acknowledge_job_request_delivery(&self, request_key: &str) {
@@ -2668,12 +2770,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolve_executable_canonicalizes_symlink_paths() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let temp = tempfile::tempdir().unwrap();
         let real = temp.path().join("real-bash");
         let link = temp.path().join("bash");
         std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&real, &link).unwrap();
 
         assert_eq!(
@@ -3372,6 +3475,75 @@ mod tests {
         assert!(!rendered.contains("secret-test-capability"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prepared_authority_fingerprints_executable_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let launcher = root.join("launcher");
+        std::fs::copy(&bash, &launcher).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let access = AccessPolicy::from_spec(AccessSpec {
+            base_dir: root.clone(),
+            read_roots: vec![root.clone()],
+            write_roots: vec![root.clone()],
+            deny_read_roots: Vec::new(),
+            deny_write_roots: Vec::new(),
+            unrestricted_fs: false,
+        })
+        .unwrap();
+        let config = RuntimeConfig {
+            access,
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            protected_paths: Vec::new(),
+        };
+        let secure_fs = crate::secure_fs::SecureFs::new(
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let first = PreparedLaunchers {
+            shell: Some(tools::shell::PreparedExecutable::prepare(launcher.clone()).unwrap()),
+            #[cfg(target_os = "linux")]
+            bwrap: None,
+        };
+        let before = prepared_authority_value(&config, &first, &secure_fs).unwrap();
+
+        let replacement = root.join("replacement");
+        std::fs::copy(bash, &replacement).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(replacement, &launcher).unwrap();
+        let second = PreparedLaunchers {
+            shell: Some(tools::shell::PreparedExecutable::prepare(launcher).unwrap()),
+            #[cfg(target_os = "linux")]
+            bwrap: None,
+        };
+        let after = prepared_authority_value(&config, &second, &secure_fs).unwrap();
+
+        assert_ne!(before["shell_program"], after["shell_program"]);
+        assert_ne!(
+            before, after,
+            "launcher inode replacement must change authority"
+        );
+    }
+
     #[tokio::test]
     async fn configured_resource_ceilings_are_rejected_not_widened() {
         let temp = tempfile::tempdir().unwrap();
@@ -3442,6 +3614,37 @@ mod tests {
         assert_eq!(accepted, [platform_shell]);
         assert!(!is_shell_tool("read"));
         assert!(!is_shell_tool("future_tool"));
+    }
+
+    #[test]
+    fn request_replay_policy_is_explicit_in_the_tool_table() {
+        let protected = TOOL_SPECS
+            .iter()
+            .filter(|spec| spec.request_replay)
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            protected,
+            [
+                "write",
+                "bwrite",
+                "edit",
+                "patch",
+                "bedit",
+                "bash",
+                "powershell",
+                "job_start",
+            ]
+        );
+        for spec in TOOL_SPECS {
+            assert_eq!(
+                tool_requires_request_replay(spec.name),
+                spec.request_replay,
+                "{} replay policy drifted from ToolSpec",
+                spec.name
+            );
+        }
+        assert!(!tool_requires_request_replay("future_tool"));
     }
 
     #[tokio::test]
