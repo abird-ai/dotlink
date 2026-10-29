@@ -42,6 +42,10 @@ use crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM;
 
 const MAX_ACTIVE_JOBS: usize = 32;
 const MAX_RETAINED_JOBS: usize = 256;
+/// Transport-owned hidden state is separate from ordinary user-visible job
+/// retention. Request-key replay mappings plus positive-delivery cleanup-only
+/// retries share this bound; the spool quota independently bounds their bytes.
+const MAX_REQUEST_REPLAYS: usize = 4_096;
 const JOB_POLL_INTERVAL_MS: u64 = 1_000;
 const JOB_OUTPUT_RESPONSE_RESERVE: usize = 2 * 1024;
 const SESSION_PREFIX: &str = "session-";
@@ -205,6 +209,16 @@ impl JobCompletion {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetentionClass {
+    /// Active jobs and any state intentionally visible through the job/task API.
+    Ordinary,
+    /// Hidden terminal OpenAI request awaiting positive delivery acknowledgement.
+    ReplayOnly,
+    /// Delivery is confirmed; only retryable spool cleanup remains.
+    CleanupOnly,
+}
+
 #[derive(Debug)]
 struct JobEntry {
     id: String,
@@ -229,6 +243,7 @@ struct JobEntry {
     expiration_pending: bool,
     externally_exposed: bool,
     native_task_exposed: bool,
+    retention: RetentionClass,
     request_key: Option<String>,
     notify: Arc<Notify>,
 }
@@ -410,8 +425,10 @@ pub(crate) enum JobError {
 impl JobError {
     pub(crate) fn into_mcp(self) -> McpError {
         match self {
-            Self::Unknown(message) => McpError::invalid_params(message, None),
-            Self::Internal(error) => McpError::internal_error(error.to_string(), None),
+            Self::Unknown(message) => McpError::invalid_params(bounded_job_error(message), None),
+            Self::Internal(error) => {
+                McpError::internal_error(bounded_job_error(error.to_string()), None)
+            }
         }
     }
 }
@@ -657,10 +674,12 @@ impl JobManager {
         if active >= MAX_ACTIVE_JOBS {
             bail!("too many active shell jobs ({MAX_ACTIVE_JOBS}); wait for or cancel one");
         }
-        if state.jobs.len() >= MAX_RETAINED_JOBS {
-            evict_oldest_reclaimable_terminal(&self.inner, &mut state);
+        if request_key.is_some() && transport_retention_slots(&state) >= MAX_REQUEST_REPLAYS {
+            bail!(
+                "too many pending shell delivery replays/cleanups ({MAX_REQUEST_REPLAYS}); wait for delivery acknowledgement or retention cleanup"
+            );
         }
-        if state.jobs.len() >= MAX_RETAINED_JOBS {
+        if !ensure_retained_capacity(&self.inner, &mut state, 1) {
             bail!(
                 "too many retained shell jobs ({MAX_RETAINED_JOBS}); acknowledge output or wait for retention cleanup"
             );
@@ -697,6 +716,7 @@ impl JobManager {
                 expiration_pending: false,
                 externally_exposed: false,
                 native_task_exposed: false,
+                retention: RetentionClass::Ordinary,
                 request_key: request_key.clone(),
                 notify,
             },
@@ -735,10 +755,7 @@ impl JobManager {
         if state.closed {
             bail!("job session is shutting down");
         }
-        if state.jobs.len() >= MAX_RETAINED_JOBS {
-            evict_oldest_reclaimable_terminal(&self.inner, &mut state);
-        }
-        if state.jobs.len() >= MAX_RETAINED_JOBS {
+        if !ensure_retained_capacity(&self.inner, &mut state, 1) {
             bail!(
                 "too many retained shell jobs ({MAX_RETAINED_JOBS}); acknowledge output or wait for retention cleanup"
             );
@@ -773,6 +790,7 @@ impl JobManager {
                 expiration_pending: false,
                 externally_exposed: false,
                 native_task_exposed: false,
+                retention: RetentionClass::Ordinary,
                 request_key: None,
                 notify: Arc::new(Notify::new()),
             },
@@ -956,11 +974,13 @@ impl JobManager {
 
     pub(crate) fn expose_compatibility(&self, id: &str) -> JobResult<CallToolResult> {
         let mut state = self.inner.state.lock().expect("job manager lock");
+        reserve_exposure_slot(&self.inner, &mut state, id)?;
         let entry = state
             .jobs
             .get_mut(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
         entry.externally_exposed = true;
+        entry.retention = RetentionClass::Ordinary;
         Ok(compatibility_receipt(&self.inner, entry))
     }
 
@@ -973,19 +993,25 @@ impl JobManager {
         budget: Option<usize>,
     ) -> JobResult<Option<Task>> {
         let mut state = self.inner.state.lock().expect("job manager lock");
-        let entry = state
+        let eligible = state
             .jobs
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        if !entry.native_task_exposed
+        if !eligible.native_task_exposed
             && budget.is_some_and(|budget| {
-                !crate::mcp::shell_result_fits_budget(entry.result_limit, budget)
+                !crate::mcp::shell_result_fits_budget(eligible.result_limit, budget)
             })
         {
             return Ok(None);
         }
+        reserve_exposure_slot(&self.inner, &mut state, id)?;
+        let entry = state
+            .jobs
+            .get_mut(id)
+            .expect("job validated before exposure capacity reservation");
         entry.externally_exposed = true;
         entry.native_task_exposed = true;
+        entry.retention = RetentionClass::Ordinary;
         Ok(Some(task_from_entry(entry, self.retention())))
     }
 
@@ -1096,7 +1122,9 @@ impl JobManager {
             .jobs
             .get_mut(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        if entry.request_key.is_none()
+        if entry.request_key.is_some() && !entry.externally_exposed && entry.status().terminal() {
+            entry.retention = RetentionClass::ReplayOnly;
+        } else if entry.request_key.is_none()
             && let Some(completion) = entry.completion.as_mut()
         {
             entry.stdout_consumed = completion.stdout.stored_bytes;
@@ -1109,27 +1137,38 @@ impl JobManager {
 
     /// Confirm that the transport accepted the terminal response for a durable
     /// request identity. This is the only point where OpenAI redelivery state
-    /// becomes unnecessary. Hidden synchronous jobs are compacted; exposed jobs
-    /// keep their task/job state but no longer occupy the dedupe ledger.
+    /// becomes unnecessary. Hidden synchronous jobs release their spools and
+    /// metadata once cleanup succeeds; exposed jobs keep their task/job state
+    /// but no longer occupy the dedupe ledger.
     pub(crate) fn acknowledge_request_delivery(&self, request_key: &str) {
         let mut state = self.inner.state.lock().expect("job manager lock");
-        let Some(id) = state.request_jobs.remove(request_key) else {
+        let Some(id) = state.request_jobs.get(request_key).cloned() else {
             return;
         };
-        let Some(entry) = state.jobs.get_mut(&id) else {
-            return;
-        };
-        if entry.request_key.as_deref() == Some(request_key) {
-            entry.request_key = None;
-        }
-        if !entry.externally_exposed
-            && entry.status().terminal()
-            && let Some(completion) = entry.completion.as_mut()
+        if state
+            .jobs
+            .get(&id)
+            .is_none_or(|entry| entry.request_key.as_deref() != Some(request_key))
         {
-            entry.stdout_consumed = completion.stdout.stored_bytes;
-            entry.stderr_consumed = completion.stderr.stored_bytes;
-            entry.output_cleanup_requested = true;
-            maybe_release_output(&self.inner, entry);
+            return;
+        }
+        state.request_jobs.remove(request_key);
+        let mut remove_hidden = false;
+        if let Some(entry) = state.jobs.get_mut(&id) {
+            entry.request_key = None;
+            if !entry.externally_exposed && entry.status().terminal() {
+                entry.retention = RetentionClass::CleanupOnly;
+                if let Some(completion) = entry.completion.as_mut() {
+                    entry.stdout_consumed = completion.stdout.stored_bytes;
+                    entry.stderr_consumed = completion.stderr.stored_bytes;
+                    entry.output_cleanup_requested = true;
+                    maybe_release_output(&self.inner, entry);
+                    remove_hidden = entry.output_released && entry.readers == 0;
+                }
+            }
+        }
+        if remove_hidden {
+            let _ = remove_job_locked(&mut state, &id);
         }
     }
 
@@ -1826,7 +1865,7 @@ fn release_output_files(inner: &JobManagerInner, entry: &mut JobEntry) -> bool {
 }
 
 fn release_reader(inner: &Arc<JobManagerInner>, id: &str) {
-    let mut expired = None;
+    let mut removed = None;
     {
         let mut state = inner.state.lock().expect("job manager lock");
         let Some(entry) = state.jobs.get_mut(id) else {
@@ -1840,14 +1879,19 @@ fn release_reader(inner: &Arc<JobManagerInner>, id: &str) {
                     .get(id)
                     .is_some_and(|entry| cleanup_entry(inner, entry));
                 if cleanup_ok {
-                    expired = remove_job_locked(&mut state, id);
+                    removed = remove_job_locked(&mut state, id);
+                }
+            } else if entry.retention == RetentionClass::CleanupOnly {
+                release_acknowledged_output(inner, entry);
+                if entry.output_released {
+                    removed = remove_job_locked(&mut state, id);
                 }
             } else if entry.output_cleanup_pending {
                 release_acknowledged_output(inner, entry);
             }
         }
     }
-    drop(expired);
+    drop(removed);
 }
 
 fn cleanup_stale_sessions_coordinated(current: &Path) {
@@ -1974,8 +2018,27 @@ fn remove_job_locked(state: &mut JobState, id: &str) -> Option<JobEntry> {
     Some(entry)
 }
 
+fn retained_job_slots(state: &JobState) -> usize {
+    state
+        .jobs
+        .values()
+        .filter(|entry| entry.retention == RetentionClass::Ordinary)
+        .count()
+}
+
+fn transport_retention_slots(state: &JobState) -> usize {
+    state.request_jobs.len().saturating_add(
+        state
+            .jobs
+            .values()
+            .filter(|entry| entry.retention == RetentionClass::CleanupOnly)
+            .count(),
+    )
+}
+
 fn reclaimable_terminal(entry: &JobEntry) -> bool {
-    if !entry.status().terminal()
+    if entry.retention != RetentionClass::Ordinary
+        || !entry.status().terminal()
         || entry.request_key.is_some()
         || entry.readers != 0
         || entry.native_task_exposed
@@ -1988,21 +2051,57 @@ fn reclaimable_terminal(entry: &JobEntry) -> bool {
     entry.output_released || (!entry.externally_exposed && empty)
 }
 
-fn evict_oldest_reclaimable_terminal(inner: &JobManagerInner, state: &mut JobState) {
-    let candidate = state
+fn evict_one_reclaimable_terminal(inner: &JobManagerInner, state: &mut JobState) -> bool {
+    let mut candidates = state
         .jobs
         .iter()
         .filter(|(_, entry)| reclaimable_terminal(entry))
-        .min_by_key(|(_, entry)| entry.terminal_at.unwrap_or(entry.created))
-        .map(|(id, _)| id.clone());
-    if let Some(id) = candidate {
+        .map(|(id, entry)| (entry.terminal_at.unwrap_or(entry.created), id.clone()))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(terminal_at, _)| *terminal_at);
+    for (_, id) in candidates {
         let cleanup_ok = state
             .jobs
             .get(&id)
             .is_some_and(|entry| cleanup_entry(inner, entry));
         if cleanup_ok {
             let _ = remove_job_locked(state, &id);
+            return true;
         }
+    }
+    false
+}
+
+fn ensure_retained_capacity(
+    inner: &JobManagerInner,
+    state: &mut JobState,
+    additional: usize,
+) -> bool {
+    while retained_job_slots(state).saturating_add(additional) > MAX_RETAINED_JOBS {
+        if !evict_one_reclaimable_terminal(inner, state) {
+            return false;
+        }
+    }
+    true
+}
+
+fn reserve_exposure_slot(inner: &JobManagerInner, state: &mut JobState, id: &str) -> JobResult<()> {
+    let entry = state
+        .jobs
+        .get(id)
+        .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+    if entry.retention == RetentionClass::Ordinary {
+        return Ok(());
+    }
+    if entry.retention == RetentionClass::CleanupOnly {
+        return Err(JobError::Unknown(format!("unknown job {id}")));
+    }
+    if ensure_retained_capacity(inner, state, 1) {
+        Ok(())
+    } else {
+        Err(JobError::Internal(anyhow!(
+            "too many retained shell jobs ({MAX_RETAINED_JOBS}); acknowledge output or wait for retention cleanup"
+        )))
     }
 }
 
@@ -2012,8 +2111,30 @@ fn sweep_expired(inner: &JobManagerInner) {
         let Ok(mut state) = inner.state.lock() else {
             return;
         };
+        let cleanup_only = state
+            .jobs
+            .iter()
+            .filter(|(_, entry)| {
+                entry.retention == RetentionClass::CleanupOnly && entry.readers == 0
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in cleanup_only {
+            let released = if let Some(entry) = state.jobs.get_mut(&id) {
+                release_acknowledged_output(inner, entry);
+                entry.output_released
+            } else {
+                false
+            };
+            if released {
+                let _ = remove_job_locked(&mut state, &id);
+            }
+        }
         for entry in state.jobs.values_mut() {
-            if entry.output_cleanup_pending && entry.readers == 0 {
+            if entry.retention != RetentionClass::CleanupOnly
+                && entry.output_cleanup_pending
+                && entry.readers == 0
+            {
                 release_acknowledged_output(inner, entry);
             }
         }
@@ -2555,6 +2676,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capacity_skips_reclaimable_job_with_stuck_cleanup() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let stuck = manager.create_for_test(30).unwrap();
+        manager.finish(
+            &stuck.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        fs::remove_file(&stuck.stderr_path).unwrap();
+        fs::create_dir(&stuck.stderr_path).unwrap();
+
+        for _ in 1..MAX_RETAINED_JOBS {
+            let job = manager.create_for_test(30).unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                ),
+            );
+        }
+        let extra = manager.create_for_test(30).unwrap();
+        assert!(manager.status(&extra.id).is_ok());
+        assert!(
+            manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&stuck.id),
+            "failed cleanup stays retryable while a later safe candidate is reclaimed"
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn released_terminal_metadata_is_reclaimable_at_capacity() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         for _ in 0..MAX_RETAINED_JOBS {
@@ -2606,6 +2770,57 @@ mod tests {
         let extra = manager.create_for_test(30).unwrap();
         assert!(manager.status(&extra.id).is_ok());
         manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hidden_delivery_cleanup_failure_is_bounded_and_retries_to_removal() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("cleanup-only".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        let stderr = {
+            let state = manager.inner.state.lock().unwrap();
+            state.jobs[&started.id].stderr_path.clone()
+        };
+        fs::remove_file(&stderr).unwrap();
+        fs::create_dir(&stderr).unwrap();
+        manager.acknowledge_request_delivery("cleanup-only");
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&started.id];
+            assert_eq!(entry.retention, RetentionClass::CleanupOnly);
+            assert_eq!(retained_job_slots(&state), 0);
+            assert_eq!(transport_retention_slots(&state), 1);
+            assert!(entry.output_cleanup_pending);
+            assert!(!state.request_jobs.contains_key("cleanup-only"));
+        }
+        fs::remove_dir(&stderr).unwrap();
+        sweep_expired(&manager.inner);
+        assert!(
+            !manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&started.id)
+        );
     }
 
     #[test]
@@ -2678,7 +2893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synchronous_request_replays_from_spools_until_delivery_then_compacts() {
+    async fn synchronous_request_replays_from_spools_until_delivery_then_releases() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
             .spawn(
@@ -2749,11 +2964,278 @@ mod tests {
 
         manager.acknowledge_request_delivery("request-key");
         let state = manager.inner.state.lock().unwrap();
-        let entry = &state.jobs[&started.id];
-        assert!(entry.request_key.is_none());
-        assert!(entry.output_released);
         assert!(!state.request_jobs.contains_key("request-key"));
-        assert!(!entry.stdout_path.exists() && !entry.stderr_path.exists());
+        assert!(
+            !state.jobs.contains_key(&started.id),
+            "positively delivered hidden requests need no retained metadata"
+        );
+        assert!(!started.id.is_empty());
+        drop(state);
+        assert!(
+            !manager
+                .inner
+                .root
+                .join(format!("{}.stdout", started.id))
+                .exists()
+        );
+        assert!(
+            !manager
+                .inner
+                .root
+                .join(format!("{}.stderr", started.id))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_hidden_replays_do_not_consume_ordinary_retained_job_capacity() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        for index in 0..(MAX_RETAINED_JOBS + 32) {
+            let key = format!("ambiguous-{index}");
+            let started = manager
+                .spawn(
+                    30,
+                    crate::limits::DEFAULT_TRANSFER_BYTES,
+                    Some(key),
+                    |_job| async {
+                        JobCompletion::completed(
+                            Some(0),
+                            true,
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        )
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.wait_until(&started.id, None).await.unwrap(),
+                JobWait::Terminal
+            ));
+            manager.mark_synchronous_result(&started.id).unwrap();
+        }
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert!(state.jobs.len() > MAX_RETAINED_JOBS);
+            assert_eq!(retained_job_slots(&state), 0);
+            assert_eq!(state.request_jobs.len(), MAX_RETAINED_JOBS + 32);
+        }
+
+        let ordinary = manager.create_for_test(30).unwrap();
+        assert!(manager.status(&ordinary.id).is_ok());
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delivery_acknowledgement_requires_a_consistent_request_mapping() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("original-key".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            state.jobs.get_mut(&started.id).unwrap().request_key = Some("other-key".to_owned());
+        }
+        manager.acknowledge_request_delivery("original-key");
+        let state = manager.inner.state.lock().unwrap();
+        assert_eq!(
+            state.request_jobs.get("original-key"),
+            Some(&started.id),
+            "an inconsistent mapping must not be destructively half-acknowledged"
+        );
+        assert_eq!(
+            state.jobs[&started.id].request_key.as_deref(),
+            Some("other-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledging_replay_backlog_removes_hidden_metadata_without_slot_burst() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let count = MAX_RETAINED_JOBS + 32;
+        for index in 0..count {
+            let key = format!("recover-{index}");
+            let started = manager
+                .spawn(
+                    30,
+                    crate::limits::DEFAULT_TRANSFER_BYTES,
+                    Some(key),
+                    |_job| async {
+                        JobCompletion::completed(
+                            Some(0),
+                            true,
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        )
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                manager.wait_until(&started.id, None).await.unwrap(),
+                JobWait::Terminal
+            ));
+            manager.mark_synchronous_result(&started.id).unwrap();
+        }
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert_eq!(retained_job_slots(&state), 0);
+            assert_eq!(state.request_jobs.len(), count);
+            assert_eq!(transport_retention_slots(&state), count);
+            assert!(
+                state
+                    .jobs
+                    .values()
+                    .all(|entry| entry.retention == RetentionClass::ReplayOnly)
+            );
+        }
+
+        for index in 0..count {
+            manager.acknowledge_request_delivery(&format!("recover-{index}"));
+        }
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert!(
+                state.jobs.is_empty(),
+                "hidden delivered jobs need no retained metadata"
+            );
+            assert!(state.request_jobs.is_empty());
+            assert_eq!(retained_job_slots(&state), 0);
+            assert_eq!(transport_retention_slots(&state), 0);
+        }
+        let ordinary = manager.create_for_test(30).unwrap();
+        assert!(manager.status(&ordinary.id).is_ok());
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_request_keeps_its_reserved_slot_until_response_representation_is_chosen() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("handoff-slot".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&started.id];
+            assert_eq!(entry.retention, RetentionClass::Ordinary);
+            assert_eq!(retained_job_slots(&state), 1);
+        }
+
+        for _ in 1..MAX_RETAINED_JOBS {
+            let job = manager.create_for_test(30).unwrap();
+            fs::write(&job.stdout_path, b"x").unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary {
+                        total_bytes: 1,
+                        stored_bytes: 1,
+                        truncated: false,
+                    },
+                    StreamSummary::default(),
+                ),
+            );
+            manager.expose_compatibility(&job.id).unwrap();
+        }
+        assert_eq!(
+            retained_job_slots(&manager.inner.state.lock().unwrap()),
+            MAX_RETAINED_JOBS
+        );
+        manager
+            .expose_compatibility(&started.id)
+            .expect("the terminal request already owns its retained slot");
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert!(state.jobs[&started.id].externally_exposed);
+            assert_eq!(state.jobs[&started.id].retention, RetentionClass::Ordinary);
+            assert_eq!(retained_job_slots(&state), MAX_RETAINED_JOBS);
+        }
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_to_exposed_transition_reserves_an_ordinary_slot() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let replay = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("replay-transition".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&replay.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        manager.mark_synchronous_result(&replay.id).unwrap();
+
+        for _ in 0..MAX_RETAINED_JOBS {
+            let job = manager.create_for_test(30).unwrap();
+            fs::write(&job.stdout_path, b"x").unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary {
+                        total_bytes: 1,
+                        stored_bytes: 1,
+                        truncated: false,
+                    },
+                    StreamSummary::default(),
+                ),
+            );
+            manager.expose_compatibility(&job.id).unwrap();
+        }
+        let error = manager
+            .expose_compatibility(&replay.id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too many retained shell jobs"), "{error}");
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let replay_entry = &state.jobs[&replay.id];
+            assert_eq!(replay_entry.retention, RetentionClass::ReplayOnly);
+            assert!(!replay_entry.externally_exposed);
+            assert_eq!(retained_job_slots(&state), MAX_RETAINED_JOBS);
+        }
+        manager.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3015,6 +3497,16 @@ mod tests {
         );
         release_reader(&manager.inner, &started.id);
         assert!(!stdout_path.exists());
+        assert!(
+            !manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&started.id),
+            "cleanup-only metadata must disappear with the last reader"
+        );
     }
 
     #[test]
@@ -3073,6 +3565,14 @@ mod tests {
             conflict.exists(),
             "pre-existing conflicting file is not ours to remove"
         );
+    }
+
+    #[test]
+    fn unknown_job_errors_bound_caller_controlled_identifiers() {
+        let huge = "x".repeat(MAX_JOB_ERROR_BYTES * 4);
+        let error = JobError::Unknown(format!("unknown task {huge}")).into_mcp();
+        assert!(error.message.len() <= MAX_JOB_ERROR_BYTES);
+        assert!(error.message.ends_with('…'));
     }
 
     #[test]

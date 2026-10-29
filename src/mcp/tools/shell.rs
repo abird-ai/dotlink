@@ -1,6 +1,7 @@
 //! `bash` / `powershell`: the sandboxed shell, its mounts and its heartbeat.
 
 use std::{
+    collections::BTreeMap,
     env,
     path::{Path, PathBuf},
     process::Stdio,
@@ -312,12 +313,128 @@ fn sandbox_visible_path(access: &AccessPolicy) -> std::ffi::OsString {
         .unwrap_or_else(|_| std::ffi::OsString::from("/run/current-system/sw/bin:/usr/bin:/bin"))
 }
 
+/// Check the actual mount primitives used by the shell backend at runtime
+/// preparation. The probe has both a time bound and a byte bound; a broken
+/// executable cannot consume unbounded memory while advertising capabilities.
+#[cfg(target_os = "linux")]
+const MAX_BUBBLEWRAP_HELP_BYTES: u64 = 64 * 1024;
+
+#[cfg(target_os = "linux")]
+async fn read_bubblewrap_help(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_BUBBLEWRAP_HELP_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_BUBBLEWRAP_HELP_BYTES {
+        return Err(crate::recovery::operator(anyhow::anyhow!(
+            "Bubblewrap --help exceeded {MAX_BUBBLEWRAP_HELP_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn validate_bubblewrap(program: &Path) -> Result<()> {
+    const REQUIRED: &[&str] = &["--bind-fd", "--ro-bind-fd", "--dev-bind"];
+    let mut child = Command::new(program)
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("cannot inspect Bubblewrap {}", program.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Bubblewrap help stdout was not piped")?;
+    let help = tokio::time::timeout(Duration::from_secs(5), async {
+        let bytes = read_bubblewrap_help(stdout).await?;
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(crate::recovery::operator(anyhow::anyhow!(
+                "Bubblewrap {} could not report its supported options ({status})",
+                program.display()
+            )));
+        }
+        Ok::<_, anyhow::Error>(bytes)
+    })
+    .await
+    .with_context(|| format!("timed out inspecting Bubblewrap {}", program.display()))??;
+    let missing = missing_bubblewrap_options(&String::from_utf8_lossy(&help), REQUIRED);
+    if !missing.is_empty() {
+        return Err(crate::recovery::operator(anyhow::anyhow!(
+            "Bubblewrap {} is missing required options: {}; install a newer Bubblewrap with descriptor-backed mount support",
+            program.display(),
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn missing_bubblewrap_options<'a>(help: &str, required: &'a [&str]) -> Vec<&'a str> {
+    required
+        .iter()
+        .copied()
+        .filter(|option| {
+            !help
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(*option))
+        })
+        .collect()
+}
+
 /// Read-only host paths the shell needs without a grant: loader, libraries and
 /// Nix profiles; resolver and CA files with network; account lookup files with
 /// the SSH agent (`ssh-keygen -Y sign` calls getpwuid, and `/etc` stays
 /// private otherwise).
 #[cfg(target_os = "linux")]
-fn sandbox_runtime_paths(network: bool, accounts: bool) -> Vec<PathBuf> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeTargetPolicy {
+    Any,
+    Beneath(PathBuf),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeSource {
+    path: PathBuf,
+    target: RuntimeTargetPolicy,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeSource {
+    fn system(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            target: RuntimeTargetPolicy::Any,
+        }
+    }
+
+    fn constrained(path: impl Into<PathBuf>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            target: RuntimeTargetPolicy::Beneath(root.into()),
+        }
+    }
+
+    fn validate_target(&self, canonical: &Path) -> Result<()> {
+        match &self.target {
+            RuntimeTargetPolicy::Any => Ok(()),
+            RuntimeTargetPolicy::Beneath(root) if canonical.starts_with(root) => Ok(()),
+            RuntimeTargetPolicy::Beneath(root) => anyhow::bail!(
+                "refusing implicit runtime alias {} -> {} because it escapes trusted root {}",
+                self.path.display(),
+                canonical.display(),
+                root.display()
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_runtime_sources(network: bool, accounts: bool) -> Vec<RuntimeSource> {
     let mut paths = [
         "/nix/store",
         "/run/current-system",
@@ -329,10 +446,13 @@ fn sandbox_runtime_paths(network: bool, accounts: bool) -> Vec<PathBuf> {
         "/lib",
         "/lib64",
     ]
-    .map(PathBuf::from)
+    .map(RuntimeSource::system)
     .to_vec();
     if let Some(home) = env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".nix-profile"));
+        paths.push(RuntimeSource::constrained(
+            PathBuf::from(home).join(".nix-profile"),
+            PathBuf::from("/nix/store"),
+        ));
     }
     if network {
         paths.extend(
@@ -344,13 +464,14 @@ fn sandbox_runtime_paths(network: bool, accounts: bool) -> Vec<PathBuf> {
                 "/etc/ca-certificates",
                 "/etc/pki",
             ]
-            .map(PathBuf::from),
+            .map(RuntimeSource::system),
         );
     }
     if accounts {
-        paths.extend(["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"].map(PathBuf::from));
+        paths
+            .extend(["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"].map(RuntimeSource::system));
     }
-    paths.retain(|path| path.exists());
+    paths.retain(|source| source.path.exists());
     paths
 }
 
@@ -371,13 +492,14 @@ pub(crate) struct RuntimeLayout {
 #[cfg(target_os = "linux")]
 impl RuntimeLayout {
     pub(crate) fn for_shell(network: bool, accounts: bool) -> Result<Self> {
-        Self::resolve(&sandbox_runtime_paths(network, accounts))
+        Self::resolve_sources(&sandbox_runtime_sources(network, accounts))
     }
 
-    fn resolve(paths: &[PathBuf]) -> Result<Self> {
+    fn resolve_sources(sources: &[RuntimeSource]) -> Result<Self> {
         let mut canonical_paths = BTreeSet::new();
         let mut aliases = Vec::new();
-        for path in paths {
+        for source in sources {
+            let path = &source.path;
             let canonical = match std::fs::canonicalize(path) {
                 Ok(canonical) => canonical,
                 // Optional; it disappeared after discovery.
@@ -389,6 +511,7 @@ impl RuntimeLayout {
                     )));
                 }
             };
+            source.validate_target(&canonical)?;
             if canonical != *path {
                 aliases.push((path.clone(), canonical.clone()));
             }
@@ -411,6 +534,16 @@ impl RuntimeLayout {
             }
         }
         Ok(layout)
+    }
+
+    #[cfg(test)]
+    fn resolve(paths: &[PathBuf]) -> Result<Self> {
+        let sources = paths
+            .iter()
+            .cloned()
+            .map(RuntimeSource::system)
+            .collect::<Vec<_>>();
+        Self::resolve_sources(&sources)
     }
 }
 
@@ -463,12 +596,14 @@ impl ShellRuntime {
         let protected = guard_identities(&access.base_dir, &self.config.protected_paths)?;
         let runtime =
             RuntimeLayout::for_shell(self.config.allow_network, self.config.host_shell.ssh_agent)?;
-        validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
+        let anchors =
+            validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
         validate_host_mount_policy(&access, &self.config.host_shell, &protected)?;
         Ok(ShellGuards {
             access,
             protected,
             runtime,
+            anchors,
         })
     }
 
@@ -558,17 +693,35 @@ impl ShellRuntime {
                 prepare_parent_dirs(&mut command, alias);
                 command.arg("--symlink").arg(canonical).arg(alias);
             }
+        }
 
+        // User grants and namespace anchors are one ordered mount layer. A
+        // deeper explicit grant must remain able to override a broader grant's
+        // access mode even when an anchored protected directory shares an
+        // ancestor with it, so sort the union shallow -> deep and bind each
+        // path exactly once.
+        let mut policy_mounts = BTreeMap::<PathBuf, bool>::new();
+        if !access.unrestricted_fs {
             for (path, writable) in access.sandbox_mounts() {
-                prepare_mount_target_dirs(&mut command, &path);
-                let source = self.secure_fs.open_directory(&path)?;
-                bind_fd(&mut command, source, &path, writable, false);
+                policy_mounts.insert(path, writable);
             }
+        }
+        for anchor in &guards.anchors {
+            policy_mounts
+                .entry(anchor.path.clone())
+                .or_insert(anchor.writable);
+        }
+        let mut policy_mounts = policy_mounts.into_iter().collect::<Vec<_>>();
+        policy_mounts.sort_by_key(|(path, _)| path.components().count());
+        for (path, writable) in policy_mounts {
+            prepare_mount_target_dirs(&mut command, &path);
+            let source = self.secure_fs.open_directory(&path)?;
+            bind_fd(&mut command, source, &path, writable, false);
         }
 
         for cache in &self.config.cache_mounts {
             prepare_directory_mount_target(&mut command, &cache.target);
-            let source = crate::secure_fs::SecureFs::open_canonical_directory(&cache.source)?;
+            let source = cache.pinned.try_clone()?;
             bind_fd(&mut command, source, &cache.target, cache.writable, false);
         }
 
@@ -928,7 +1081,6 @@ impl LocalMachine {
         let runtime = self.shell_runtime();
         let operation_gate = (self.serialize || cfg!(windows)).then(|| self.operation_gate.clone());
         let output_limit = runtime.output_limit(args.max_output_bytes);
-        let runner_args = args.clone();
         crate::blocking::run(|| {
             self.jobs.spawn(
                 timeout_secs,
@@ -959,16 +1111,14 @@ impl LocalMachine {
                         );
                     }
 
-                    let (mut command, working_dir) = match runtime
-                        .prepare_shell_command(&runner_args, powershell)
-                        .await
-                    {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            let message = error.to_string();
-                            return JobCompletion::failed(message);
-                        }
-                    };
+                    let (mut command, working_dir) =
+                        match runtime.prepare_shell_command(&args, powershell).await {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                let message = error.to_string();
+                                return JobCompletion::failed(message);
+                            }
+                        };
                     if job.cancel.is_cancelled() {
                         return JobCompletion::cancelled(
                             StreamSummary::default(),
@@ -977,7 +1127,7 @@ impl LocalMachine {
                     }
                     crate::shell_process::configure(&mut command);
                     crate::credentials::hide_from_child(&mut command)
-                        .stdin(if runner_args.stdin.is_some() {
+                        .stdin(if args.stdin.is_some() {
                             Stdio::piped()
                         } else {
                             Stdio::null()
@@ -1006,7 +1156,7 @@ impl LocalMachine {
                     };
                     let completion = LocalMachine::run_shell_job(
                         command,
-                        runner_args.stdin,
+                        args.stdin,
                         deadline,
                         job,
                         result_context,
@@ -1425,8 +1575,8 @@ mod tests {
 
     use crate::logging::LogConfig;
     use crate::mcp::{
-        AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, RuntimeConfig,
-        SandboxCacheMount, TransportContextToken,
+        AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, PreparedCacheMount,
+        RuntimeConfig, SandboxCacheMount, TransportContextToken,
     };
 
     #[cfg(unix)]
@@ -2465,9 +2615,73 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_help_read_is_bounded_even_without_eof() {
+        let exact = std::io::Cursor::new(vec![b'x'; MAX_BUBBLEWRAP_HELP_BYTES as usize]);
+        assert_eq!(
+            read_bubblewrap_help(exact).await.unwrap().len(),
+            MAX_BUBBLEWRAP_HELP_BYTES as usize
+        );
+        let oversized = std::io::Cursor::new(vec![b'x'; MAX_BUBBLEWRAP_HELP_BYTES as usize + 1]);
+        let error = read_bubblewrap_help(oversized).await.unwrap_err();
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+        assert!(error.to_string().contains("exceeded"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_feature_probe_matches_exact_option_tokens() {
+        let help = "  --bind-fd FD DEST  Bind descriptor\n  --ro-bind-fd FD DEST  Read only\n  --dev-bind SRC DEST  Device\n";
+        assert!(
+            missing_bubblewrap_options(help, &["--bind-fd", "--ro-bind-fd", "--dev-bind"])
+                .is_empty()
+        );
+        assert_eq!(
+            missing_bubblewrap_options("  --bind-fd-extra FD DEST\n", &["--bind-fd"]),
+            vec!["--bind-fd"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn constrained_runtime_alias_cannot_escape_its_trusted_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let trusted = root.join("trusted");
+        let outside = root.join("outside");
+        let alias = root.join("profile");
+        std::fs::create_dir(&trusted).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &alias).unwrap();
+        let source = RuntimeSource::constrained(alias.clone(), trusted.clone());
+        let error = RuntimeLayout::resolve_sources(std::slice::from_ref(&source)).unwrap_err();
+        assert!(
+            error.to_string().contains("escapes trusted root"),
+            "{error}"
+        );
+
+        std::fs::remove_file(&alias).unwrap();
+        let profile = trusted.join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        symlink(&profile, &alias).unwrap();
+        let layout =
+            RuntimeLayout::resolve_sources(&[RuntimeSource::constrained(alias.clone(), trusted)])
+                .unwrap();
+        assert!(layout.links.contains(&(alias, profile)));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_runtime_paths_include_available_nix_profiles_without_home_root() {
-        let mounts = sandbox_runtime_paths(false, false);
+        let mounts = sandbox_runtime_sources(false, false)
+            .into_iter()
+            .map(|source| source.path)
+            .collect::<Vec<_>>();
 
         for expected in [
             PathBuf::from("/nix/store"),
@@ -2489,6 +2703,14 @@ mod tests {
             let profile = home.join(".nix-profile");
             if profile.exists() {
                 assert!(mounts.contains(&profile));
+                let source = sandbox_runtime_sources(false, false)
+                    .into_iter()
+                    .find(|source| source.path == profile)
+                    .unwrap();
+                assert_eq!(
+                    source.target,
+                    RuntimeTargetPolicy::Beneath(PathBuf::from("/nix/store"))
+                );
             }
             assert!(
                 !mounts.contains(&home),
@@ -2589,7 +2811,9 @@ mod tests {
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
             .expect_err("a writable protected symlink must stop sandbox startup");
         assert!(
-            error.to_string().contains("writable shell mount"),
+            error
+                .to_string()
+                .contains("not an existing canonical object"),
             "{error}"
         );
         assert!(alias.is_symlink());
@@ -2598,7 +2822,105 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bubblewrap_rejects_a_writable_ancestor_of_a_protected_path() {
+    fn broad_writable_home_uses_namespace_anchors_for_private_directory() {
+        use std::ffi::OsStr;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let config = home.join(".config");
+        let abird = config.join("abird");
+        let protected = abird.join("dotlink");
+        let runtime_key = protected.join("runtime.key");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(&runtime_key, b"secret").unwrap();
+
+        let mut machine = sandbox_machine(&home, Vec::new());
+        // Mirror normal setup: the stable private directory plus a redundant
+        // active credential file beneath it are both protected.
+        machine.config.protected_paths = vec![protected.clone(), runtime_key];
+        let command = machine
+            .bubblewrap_command(Path::new("/bin/bash"), &home, "true")
+            .expect("a broad writable home should be anchorable");
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+
+        for anchor in [&config, &abird] {
+            assert!(
+                args.windows(3).any(|window| {
+                    window[0] == OsStr::new("--bind-fd") && window[2] == anchor.as_os_str()
+                }),
+                "missing writable namespace anchor for {}: {args:?}",
+                anchor.display()
+            );
+        }
+        assert!(
+            args.windows(2).any(|window| {
+                window[0] == OsStr::new("--tmpfs") && window[1] == protected.as_os_str()
+            }),
+            "protected directory must remain masked: {args:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn anchored_private_directory_stays_hidden_while_broad_home_remains_writable() {
+        if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
+            return;
+        }
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let Some(bwrap) = resolve_executable("bwrap") else {
+            return;
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let config = home.join(".config");
+        let abird = config.join("abird");
+        let protected = abird.join("dotlink");
+        let runtime_key = protected.join("runtime.key");
+        let safe = abird.join("safe.txt");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(&runtime_key, b"TOP-SECRET\n").unwrap();
+
+        let mut machine = sandbox_machine(&home, Vec::new());
+        machine.config.bwrap_program = Some(bwrap);
+        machine.config.shell_program = Some(bash.clone());
+        machine.config.protected_paths = vec![protected.clone(), runtime_key.clone()];
+        let script = format!(
+            "set +e; printf safe > '{}'; \
+             mv '{}' '{}-moved' >/dev/null 2>&1; echo abird_rc=$?; \
+             mv '{}' '{}-moved' >/dev/null 2>&1; echo config_rc=$?; \
+             cat '{}' 2>/dev/null; echo secret_rc=$?",
+            safe.display(),
+            abird.display(),
+            abird.display(),
+            config.display(),
+            config.display(),
+            runtime_key.display(),
+        );
+        let mut command = machine
+            .bubblewrap_command(&bash, &home, &script)
+            .expect("anchored broad-home sandbox should build");
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("abird_rc=1"), "{stdout}");
+        assert!(stdout.contains("config_rc=1"), "{stdout}");
+        assert!(stdout.contains("secret_rc=1"), "{stdout}");
+        assert!(!stdout.contains("TOP-SECRET"), "{stdout}");
+        assert_eq!(std::fs::read(&safe).unwrap(), b"safe");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_anchors_writable_ancestor_of_protected_file() {
+        use std::ffi::OsStr;
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let container = root.join("container");
@@ -2607,19 +2929,26 @@ mod tests {
         std::fs::write(&protected, b"secret").unwrap();
 
         let mut machine = sandbox_machine(&root, Vec::new());
-        machine.config.protected_paths = vec![protected];
-        let error = machine
+        machine.config.protected_paths = vec![protected.clone()];
+        let command = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .expect_err("a writable ancestor could be renamed around the path mask");
-        assert!(
-            error.to_string().contains("writable shell mount"),
-            "{error}"
-        );
+            .expect("an existing protected file can be stabilized by its parent anchor");
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--bind-fd") && window[2] == container.as_os_str()
+        }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--ro-bind")
+                && window[1] == OsStr::new("/dev/null")
+                && window[2] == protected.as_os_str()
+        }));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bubblewrap_rejects_a_nested_boundary_below_a_writable_ancestor() {
+    fn bubblewrap_anchors_nested_boundary_below_writable_ancestor() {
+        use std::ffi::OsStr;
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let container = root.join("container");
@@ -2628,15 +2957,23 @@ mod tests {
         std::fs::create_dir_all(&locked).unwrap();
         std::fs::write(&protected, b"secret").unwrap();
 
-        let mut machine = sandbox_machine(&root, vec![locked]);
-        machine.config.protected_paths = vec![protected];
-        let error = machine
+        let mut machine = sandbox_machine(&root, vec![locked.clone()]);
+        machine.config.protected_paths = vec![protected.clone()];
+        let command = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .expect_err("the writable intermediate directory can move the nested boundary");
-        assert!(
-            error.to_string().contains("writable shell mount"),
-            "{error}"
-        );
+            .expect("nested canonical guards should be lifetime-anchorable");
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--bind-fd") && window[2] == container.as_os_str()
+        }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--ro-bind-fd") && window[2] == locked.as_os_str()
+        }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--ro-bind")
+                && window[1] == OsStr::new("/dev/null")
+                && window[2] == protected.as_os_str()
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -2654,7 +2991,7 @@ mod tests {
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
             .expect_err("a host process can populate a missing guard while a shell runs");
         assert!(
-            error.to_string().contains("host process can replace"),
+            error.to_string().contains("cannot be lifetime-anchored"),
             "{error}"
         );
     }
@@ -2679,7 +3016,9 @@ mod tests {
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
             .expect_err("read-only mounts remain mutable by external host processes");
         assert!(
-            error.to_string().contains("host process can replace"),
+            error
+                .to_string()
+                .contains("not an existing canonical object"),
             "{error}"
         );
     }
@@ -2701,11 +3040,11 @@ mod tests {
 
         let mut machine = sandbox_machine(&root, Vec::new());
         machine.config.access.write_roots.clear();
-        machine.config.cache_mounts = vec![SandboxCacheMount {
-            source: cache.clone(),
-            target: PathBuf::from("/tmp/home/.cache/shared"),
-            writable: true,
-        }];
+        machine.config.cache_mounts = vec![PreparedCacheMount::for_test(
+            cache.clone(),
+            PathBuf::from("/tmp/home/.cache/shared"),
+            true,
+        )];
         machine.config.protected_paths = vec![alias.clone(), safe];
         let initial = machine
             .shell_guards()
@@ -2735,7 +3074,10 @@ mod tests {
     fn runtime_mount_rejects_protected_content_even_without_a_user_grant() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let protected = sandbox_runtime_paths(false, false)
+        let protected = sandbox_runtime_sources(false, false)
+            .into_iter()
+            .map(|source| source.path)
+            .collect::<Vec<_>>()
             .into_iter()
             .find(|path| {
                 path.canonicalize()
@@ -2786,12 +3128,13 @@ mod tests {
         crate::mcp::validate_shell_guards(&machine.config.access, &[], &[guard], &safe).unwrap();
     }
 
-    /// A deny-write root may name a file as well as a directory. A writable
-    /// ancestor grant cannot safely rely on a per-path rebind for the full
-    /// command lifetime; the policy rejects such conflicts before invocation.
+    /// Existing canonical deny-write files/directories become stable read-only
+    /// mountpoints beneath broad writable grants; missing/symlink names still fail.
     #[cfg(target_os = "linux")]
     #[test]
-    fn deny_write_files_and_directories_conflict_with_writable_grants() {
+    fn deny_write_files_and_directories_are_anchored_read_only() {
+        use std::ffi::OsStr;
+
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let locked_dir = root.join("locked-dir");
@@ -2800,16 +3143,19 @@ mod tests {
         std::fs::write(&locked_file, b"secret").unwrap();
 
         let machine = sandbox_machine(&root, vec![locked_dir.clone(), locked_file.clone()]);
-        let error = machine
+        let command = machine
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
-            .expect_err(
-                "a writable host ancestor could replace either denied object during the command",
+            .expect("existing deny-write objects should be safely re-bound read-only");
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        for guarded in [&locked_dir, &locked_file] {
+            assert!(
+                args.windows(3).any(|window| {
+                    window[0] == OsStr::new("--ro-bind-fd") && window[2] == guarded.as_os_str()
+                }),
+                "missing read-only guard bind for {}: {args:?}",
+                guarded.display()
             );
-        assert!(
-            error.to_string().contains("overlaps writable shell mount"),
-            "{error}"
-        );
-        assert!(error.to_string().contains("narrow the grant"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -3037,6 +3383,79 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prepared_cache_mount_keeps_the_original_directory_after_path_replacement() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let cache = root.join("cache");
+        let old = root.join("cache-old");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("original"), b"old").unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: vec![SandboxCacheMount {
+                source: cache.clone(),
+                target: PathBuf::from("/tmp/home/.cache/test"),
+                writable: true,
+            }],
+            shell_env: Vec::new(),
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 5,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let pinned_before = machine.config.cache_mounts[0].pinned.metadata().unwrap();
+        std::fs::rename(&cache, &old).unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("replacement"), b"new").unwrap();
+        let replacement = std::fs::metadata(&cache).unwrap();
+        let pinned_after = machine.config.cache_mounts[0].pinned.metadata().unwrap();
+        assert_eq!(pinned_before.dev(), pinned_after.dev());
+        assert_eq!(pinned_before.ino(), pinned_after.ino());
+        assert_ne!(pinned_after.ino(), replacement.ino());
+        let error = machine
+            .shell_guards()
+            .err()
+            .expect("replaced cache source must fail closed");
+        assert!(
+            error.to_string().contains("cache source changed"),
+            "{error}"
+        );
+
+        std::fs::remove_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink(&old, &cache).unwrap();
+        let error = machine
+            .shell_guards()
+            .err()
+            .expect("symlink-back cache source must also fail closed");
+        assert!(
+            error.to_string().contains("cache source changed"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn bubblewrap_cache_mounts_preserve_ro_rw_and_cache_env() {
         use std::ffi::OsStr;
@@ -3060,16 +3479,16 @@ mod tests {
                 })
                 .unwrap(),
                 cache_mounts: vec![
-                    SandboxCacheMount {
-                        source: read_only.clone(),
-                        target: PathBuf::from("/tmp/home/.cargo/registry"),
-                        writable: false,
-                    },
-                    SandboxCacheMount {
-                        source: read_write.clone(),
-                        target: PathBuf::from("/tmp/home/.cargo/git"),
-                        writable: true,
-                    },
+                    PreparedCacheMount::for_test(
+                        read_only.clone(),
+                        PathBuf::from("/tmp/home/.cargo/registry"),
+                        false,
+                    ),
+                    PreparedCacheMount::for_test(
+                        read_write.clone(),
+                        PathBuf::from("/tmp/home/.cargo/git"),
+                        true,
+                    ),
                 ],
                 shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
                 #[cfg(target_os = "linux")]

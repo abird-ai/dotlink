@@ -309,7 +309,7 @@ public HTTP ingress      OFF
 unsandboxed host mode    OFF
 ~~~
 
-Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--allow-shell`, and `--allow-network`. A saved profile may have no filesystem grants: one-run CLI permissions are merged before checking whether a usable capability remains. No effective grant still fails closed, and the shell still requires a readable directory. Denies always win. `--allow-rw=/` grants filesystem RW only; full unsandboxed host authority requires `--allow-all --no-sandbox`.
+Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--allow-shell`, and `--allow-network`. A saved profile may have no filesystem grants: one-run CLI permissions are merged before checking whether a usable capability remains. No effective grant still fails closed, and the shell still requires a readable directory. Denies always win. `--allow-rw=/` grants filesystem RW only. `--unrestricted` is the one-flag full unsandboxed host mode; the legacy `--allow-all --no-sandbox` pair remains equivalent.
 
 ### Filesystem policy
 
@@ -376,7 +376,7 @@ skipped to reach `offset` are scanned rather than buffered, so a long first line
 never blocks a later window; a single returned line larger than the ceiling is
 an error naming it, since cutting it silently would hide content. `read.max_read_bytes` is a per-call page budget exposed in the tool schema, defaulting to the profile `max_read_bytes` ceiling and clamped to it. New profiles default `max_read_bytes`, `max_write_bytes`, and `max_output_bytes` to 1 MiB; configured raw/tool transfer ceilings may be raised to 8 MiB. The OpenAI adapter allows a complete embedded MCP message up to 9 MiB and reserves the final 1 MiB below the hosted 10 MiB tunnel-envelope limit for tunnel framing. `bread` derives encoding-safe raw windows automatically (base64/MCP about 3/4 of the MCP payload room, hex about 1/2); an explicit binary window that cannot fit returns an actionable smaller limit before encoding.
 
-OpenAI Secure MCP Tunnel requests have a fixed 120-second hosted lifetime. dotlink reserves 5 seconds for terminal delivery, but that window limits only how long the request waits — it never shortens command execution. Every `bash`/`powershell` call starts exactly one durable execution. If it finishes in the remaining response window and the complete ordinary result fits the transport result budget, dotlink returns that result; otherwise the same execution is exposed through either a native MCP Task or the compatibility job id—even if execution already finished. Active transports derive one shared constraint set; OpenAI's private sync/result/replay metadata is authenticated with a redacted per-runtime opaque capability, and the adapter clears dotlink's reserved `_meta` namespace before installing trusted values, so client-supplied metadata cannot spoof transport deadlines, budgets, deduplication keys, or future private fields. Native MCP Tasks are created only when their exact eventual `CallToolResult` is safe for the tightest active transport sharing the runtime; `tasks/get` reconstructs it from the same retained stdout/stderr spools, otherwise dotlink uses the compatibility job surface. `job_output` remains available for the full retained streams. `job_start` is the explicit return-immediately form. OpenAI request ids are scoped to the tunnel and deduplicated, so a redelivered shell call cannot launch the side effect twice; request-key + spool replay state is retained across failed/expired/ambiguous delivery and compacted only after OpenAI positively accepts the terminal response, and `job_list` recovers exposed ids if a creation receipt was lost. Output streams directly to private files below dotlink's protected XDG state tree. Each stdout/stderr stream retains at most 64 MiB while excess output is drained and marked truncated, and the whole live/retained session has a configurable aggregate `job_spool_bytes` quota (512 MiB by default). `job_output` is a pure replayable read; only explicit `job_ack` advances cleanup watermarks. After both streams are acknowledged, compatibility-job spools disappear immediately and their metadata may be reclaimed under capacity pressure; native MCP Tasks compact each stream to only the ordinary-result prefix needed to reproduce exact `tasks/get` results, then remove that prefix when task retention expires. Transient deletion/truncation failures remain pending and are retried rather than falsely marking output released. Unacknowledged terminal state expires after `job_retention_secs` (1 hour by default). Automatic transport recovery reuses jobs only after a single prepared runtime snapshot proves the effective filesystem/shell/network/cache/host authority is unchanged. Grants are fingerprinted from the same pinned native capabilities the replacement machine consumes; guards/caches/host resources are resolved once into that frozen snapshot, Windows path identities include volume/file index, and construction performs no second authority resolution. If preparation cannot prove equality, or any policy/object identity changes, the old session is cancelled before recovery continues. `Ctrl+R` and normal exit likewise cancel and await the old session before removing its spool directory.
+OpenAI Secure MCP Tunnel requests have a fixed 120-second hosted lifetime. dotlink reserves 5 seconds for terminal delivery, but that window limits only how long the request waits — it never shortens command execution. Every `bash`/`powershell` call starts exactly one durable execution. If it finishes in the remaining response window and the complete ordinary result fits the transport result budget, dotlink returns that result; otherwise the same execution is exposed through either a native MCP Task or the compatibility job id—even if execution already finished. Active transports derive one shared constraint set; OpenAI's private sync/result/replay metadata is authenticated with a redacted per-runtime opaque capability, and the adapter clears dotlink's reserved `_meta` namespace before installing trusted values, so client-supplied metadata cannot spoof transport deadlines, budgets, deduplication keys, or future private fields. The same authenticated result ceiling is attached to native Task RPCs (`tasks/get`, `tasks/update`, `tasks/cancel`), so their protocol errors and completed task payloads cannot overflow the hosted response envelope. Before rmcp sees an embedded OpenAI request, reflected/routing body strings (`id`, method, protocol version, name/URI/taskId and schema-routed tool parameters) are limited to 4 KiB; oversized body selectors are rejected with a compact error, and oversized/malformed routing header groups are suppressed so rmcp can only emit bounded missing-header diagnostics. Native MCP Tasks are created only when their exact eventual `CallToolResult` is safe for the tightest active transport sharing the runtime; `tasks/get` reconstructs it from the same retained stdout/stderr spools, otherwise dotlink uses the compatibility job surface. `job_output` remains available for the full retained streams. `job_start` is the explicit return-immediately form. OpenAI request ids are scoped to the tunnel and deduplicated, so a redelivered shell call cannot launch the side effect twice. A request-key job keeps its ordinary retained slot until the response representation is chosen, so a completed side effect can always hand off a durable handle without reacquiring capacity. Once a normal synchronous result is selected, an ambiguously delivered hidden request becomes `ReplayOnly`: it keeps the same request key/spools but no longer consumes one of the 256 ordinary retained-job slots. Positive delivery removes hidden spools+metadata as soon as cleanup succeeds; transient cleanup failure becomes `CleanupOnly`. Request-key state plus cleanup-only retries share one 4096-entry transport-retention ceiling, while retained bytes still share the session spool quota. Exposed compatibility/native jobs remain ordinary retained jobs, and `job_list` recovers their ids if a creation receipt was lost. Output streams directly to private files below dotlink's protected XDG state tree. Each stdout/stderr stream retains at most 64 MiB while excess output is drained and marked truncated, and the whole live/retained session has a configurable aggregate `job_spool_bytes` quota (512 MiB by default). `job_output` is a pure replayable read; only explicit `job_ack` advances cleanup watermarks. After both streams are acknowledged, compatibility-job spools disappear immediately and their metadata may be reclaimed under capacity pressure; native MCP Tasks compact each stream to only the ordinary-result prefix needed to reproduce exact `tasks/get` results, then remove that prefix when task retention expires. Transient deletion/truncation failures remain pending and are retried rather than falsely marking output released. Unacknowledged terminal state expires after `job_retention_secs` (1 hour by default). Automatic transport recovery reuses jobs only after a single prepared runtime snapshot proves the effective filesystem/shell/network/cache/host authority is unchanged. Explicit developer caches are converted from path specs into pinned directory capabilities during preparation; the fingerprint reads those exact descriptors and each shell clones the same descriptors rather than reopening host paths. Before every command, the configured cache pathname must still canonicalize to that pinned inode, otherwise shell preparation fails closed and requires a runtime restart. Grants are fingerprinted from the same pinned native capabilities the replacement machine consumes; cache/host descriptor identities are read through one fail-closed native `fstat` helper and preparation aborts if an already-pinned capability cannot be identified. Guards/caches/host resources are resolved once into that frozen snapshot, Windows path identities include volume/file index, and construction performs no second authority resolution. If preparation cannot prove equality, or any policy/object identity changes, the old session is cancelled before recovery continues. `Ctrl+R` and normal exit likewise cancel and await the old session before removing its spool directory.
 
 Text tools (`grep`, `read`, `write`, `edit`, `patch`) accept UTF-8
 without binary control bytes. Use `bread`, `bwrite`, or `bedit` for
@@ -427,10 +427,10 @@ With `--allow-shell`, Bash runs inside Bubblewrap by default. Read grants mount 
 Unsandboxed shell execution inherently has the OS user's filesystem and network authority, so dotlink exposes one explicit full-host escape hatch rather than several partial "dangerous" flags:
 
 ~~~bash
-dotlink --allow-all --no-sandbox
+dotlink --unrestricted
 ~~~
 
-The two flags require each other. This grants:
+This is exactly equivalent to the legacy `--allow-all --no-sandbox` pair. It grants:
 
 ~~~text
 filesystem   read+write /
@@ -445,7 +445,7 @@ For unrestricted filesystem access **without** removing the Linux sandbox, use t
 dotlink --allow-rw=/
 ~~~
 
-Then add `--allow-shell` and/or `--allow-network` separately if needed. On Linux, those capabilities remain Bubblewrap-sandboxed unless `--allow-all --no-sandbox` is explicitly selected.
+Then add `--allow-shell` and/or `--allow-network` separately if needed. On Linux, those capabilities remain Bubblewrap-sandboxed unless `--unrestricted` (or the legacy `--allow-all --no-sandbox` pair) is explicitly selected. In full-host mode, saved or CLI `--allow-cache-*`, SSH/Nix/Git, KVM, and GPU sandbox integrations are redundant: they do not perform separate mounts or discovery, and the shell inherits normal host access.
 
 ## OpenAI Secure MCP Tunnel
 
@@ -531,14 +531,7 @@ engine preserves strict all-stage-before-commit and
 `patch` best-effort behavior. Individual file replacements remain atomic;
 a multi-file commit is not a cross-file transaction.
 
-On Linux, normal fine-grained shell grants reject readable mounts overlapping
-protected/read-denied paths (even read-only binds). For an intentional
-unrestricted filesystem grant, **`--allow-rw=/ --allow-shell` works with
-Bubblewrap still enabled**; this explicitly opts out of guaranteed private-file
-isolation in the sandboxed shell. Dotlink-private paths are accessible to that shell by design; its native MCP
-tools still protect them. Explicit deny rules that cannot be enforced are not silently discarded. Shell
-network, PID namespace and host integrations retain independent controls.
-Native filesystem tools continue enforcing Dotlink's protected paths.
+On Linux, ordinary broad grants such as `$HOME` are compatible with dotlink's own private state. Native MCP tools always reject dotlink-protected paths. For the Bubblewrap shell, dotlink masks/rebinds existing canonical protected objects and internally self-binds the writable ancestor chain as namespace anchors, so the sandboxed child can keep writing ordinary files under `$HOME` but cannot rename the path components that keep the guarded name stable. A protected directory such as `~/.config/abird/dotlink` covers nested protected files such as `runtime.key`; a standalone protected regular file becomes its own masked mountpoint. Only missing guard names and symlink spellings still fail closed when a broad live bind would make their name lifetime-unstable. For an intentional unrestricted filesystem grant, **`--allow-rw=/ --allow-shell` works with Bubblewrap still enabled** and remains the explicit private-path isolation opt-out for that shell. Shell network, PID namespace and host integrations retain independent controls, and native filesystem tools continue enforcing dotlink's protected paths.
 
 ## Logging
 
@@ -655,7 +648,8 @@ SHELL & NETWORK
 --allow-network                 network inside the Linux shell sandbox
 --deny-network                  deny shell network; deny always wins
 --allow-rw=/                    filesystem rw / while keeping Linux sandboxing
---allow-all --no-sandbox        explicit full-host filesystem + shell + network
+--unrestricted                  full-host rw / + shell + network + no sandbox
+--allow-all --no-sandbox        legacy equivalent of --unrestricted
 
 SHELL INTEGRATIONS (Linux Bubblewrap only; separately opted in)
 --allow-nix-daemon              share only the Nix daemon Unix socket
@@ -934,7 +928,7 @@ The filesystem MCP tools (`read`, `write`, `edit`, `ls`, binary tools) still enf
 The shell is different: Bubblewrap is Linux-specific, so native macOS and Windows do not currently have an equivalent dotlink shell sandbox. To enable shell execution natively on those platforms, use the explicit full-host mode:
 
 ~~~bash
-dotlink --allow-all --no-sandbox
+dotlink --unrestricted
 ~~~
 
 That intentionally removes dotlink's shell isolation and gives the child shell the OS user's filesystem/network authority. Use it only when that is what you want.
@@ -954,7 +948,7 @@ Native Windows can still use the Rust filesystem tools with allow/deny enforceme
 
 ### macOS
 
-macOS can use the Rust filesystem tools with the same allow/deny policy, plus stdio/HTTP/OpenAI transports. Because Bubblewrap is unavailable, shell execution requires `--allow-all --no-sandbox` until a macOS-native sandbox backend is added.
+macOS can use the Rust filesystem tools with the same allow/deny policy, plus stdio/HTTP/OpenAI transports. Because Bubblewrap is unavailable, shell execution requires `--unrestricted` (or the legacy `--allow-all --no-sandbox` pair) until a macOS-native sandbox backend is added.
 
 Apple Silicon release binaries are cross-built reproducibly from the same x86_64 Linux Nix release graph using a pinned Apple SDK and LLVM's Mach-O linker. Intel macOS is not currently published; build it from source with Cargo if needed.
 

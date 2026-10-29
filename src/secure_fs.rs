@@ -551,6 +551,23 @@ struct Root {
     resolve: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) rdev: u64,
+}
+
+pub(crate) fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        rdev: metadata.rdev(),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RootIdentity {
     pub(crate) path: PathBuf,
@@ -634,18 +651,16 @@ impl SecureFs {
     }
 
     pub(crate) fn authority_roots(&self) -> Result<(Vec<RootIdentity>, Vec<RootIdentity>)> {
-        use std::os::unix::fs::MetadataExt as _;
-
         let identities = |roots: &[Root]| -> Result<Vec<RootIdentity>> {
             let mut values = Vec::with_capacity(roots.len());
             for root in roots {
                 let file = File::from(root.fd.try_clone()?);
-                let metadata = file.metadata()?;
+                let identity = file_identity(&file)?;
                 values.push(RootIdentity {
                     path: root.path.clone(),
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                    rdev: metadata.rdev(),
+                    dev: identity.dev,
+                    ino: identity.ino,
+                    rdev: identity.rdev,
                 });
             }
             values.sort_by(|left, right| left.path.cmp(&right.path));

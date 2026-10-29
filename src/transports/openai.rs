@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use http::{Request, header::HeaderName};
+use http::{
+    Request,
+    header::{HeaderName, HeaderValue},
+};
 use http_body_util::Full;
 use reqwest::{Client, StatusCode};
 use rmcp::transport::streamable_http_server::{
@@ -38,6 +41,7 @@ const REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_secs(10);
 /// The control plane rejects larger poll batches with HTTP 400.
 const CONTROL_PLANE_MAX_POLL_LIMIT: usize = 25;
 const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
+const INVALID_TRANSPORT_META: &str = "params._meta must be an object or null";
 const SERVER_INFO: &str =
     r#"{"version":2,"channels":[{"name":"main","stateless":true,"proc_affinity":true}]}"#;
 // The hosted tunnel imposes one serialized-message ceiling on poll commands
@@ -298,6 +302,47 @@ struct LocalResponse {
     messages: Vec<Value>,
 }
 
+/// Never reflect a caller-supplied oversized or malformed JSON-RPC id into
+/// synthesized transport errors.
+fn bounded_jsonrpc_id(id: &Value) -> Value {
+    match id {
+        Value::String(value) if value.len() > super::MAX_STANDARD_ROUTING_VALUE_BYTES => {
+            Value::Null
+        }
+        Value::String(_) | Value::Number(_) | Value::Null => id.clone(),
+        _ => Value::Null,
+    }
+}
+
+fn oversized_routing_response(request: &Value) -> LocalResponse {
+    let Some(raw_id) = request.get("id") else {
+        return LocalResponse {
+            status: StatusCode::ACCEPTED.as_u16(),
+            headers: BTreeMap::new(),
+            messages: Vec::new(),
+        };
+    };
+    let id = bounded_jsonrpc_id(raw_id);
+    LocalResponse {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        headers: BTreeMap::from([(
+            "Content-Type".to_owned(),
+            vec!["application/json".to_owned()],
+        )]),
+        messages: vec![json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32602,
+                "message": format!(
+                    "MCP routing value exceeds the {} byte limit",
+                    super::MAX_STANDARD_ROUTING_VALUE_BYTES
+                )
+            }
+        })],
+    }
+}
+
 impl EmbeddedMcp {
     pub(crate) fn new(machine: LocalMachine, cancellation: CancellationToken) -> Self {
         let max_request_bytes = machine
@@ -354,7 +399,10 @@ impl EmbeddedMcp {
         jsonrpc: &Value,
         notifications: mpsc::Sender<Value>,
     ) -> Result<LocalResponse> {
-        let body = serde_json::to_vec(jsonrpc).context("failed to serialize MCP command")?;
+        let routing = super::RoutingPreflight::for_request(jsonrpc, &self.machine);
+        if routing.rejects_request() {
+            return Ok(oversized_routing_response(jsonrpc));
+        }
         let mut request = Request::builder()
             .method("POST")
             .uri("http://localhost/mcp")
@@ -363,28 +411,40 @@ impl EmbeddedMcp {
             .header("Accept", "application/json, text/event-stream");
 
         for (name, values) in command_headers {
+            if name.len() > 256 {
+                continue;
+            }
             let lower = name.to_ascii_lowercase();
-            if !request_header_allowed(&lower) {
+            if !request_header_allowed(&lower)
+                || values.iter().any(|value| {
+                    value.len() > super::MAX_STANDARD_ROUTING_VALUE_BYTES
+                        || HeaderValue::from_str(value).is_err()
+                })
+            {
                 continue;
             }
             let Ok(header_name) = HeaderName::from_bytes(lower.as_bytes()) else {
                 continue;
             };
             for value in values {
-                request = request.header(header_name.clone(), value.as_str());
+                let header_value = HeaderValue::from_str(value)
+                    .expect("routing header values were validated above");
+                request = request.header(header_name.clone(), header_value);
             }
         }
 
+        let body_source = jsonrpc;
+        let body = serde_json::to_vec(body_source).context("failed to serialize MCP command")?;
         let body_len = body.len();
         let mut request = request
             .body(Full::new(Bytes::from(body)))
             .context("failed to build in-process MCP request")?;
         if body_len <= self.max_request_bytes
-            && super::unknown_standard_tool_value(request.headers(), jsonrpc, &self.machine)
+            && super::unknown_standard_tool_value(request.headers(), body_source, &self.machine)
         {
-            // Only an unknown tool needs a second owned JSON tree. Known tools
-            // keep their original body and avoid cloning huge payload strings.
-            let mut message = jsonrpc.clone();
+            // Only a bounded unknown tool needs a second owned JSON tree. Known
+            // tools and oversized routing values stay zero-copy at this layer.
+            let mut message = body_source.clone();
             if super::canonicalize_unknown_standard_tool(
                 request.headers_mut(),
                 &mut message,
@@ -1159,13 +1219,43 @@ impl TunnelClient {
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
             && let Some(jsonrpc) = command.jsonrpc.as_mut()
         {
-            let sync_secs = annotate_response_context(
+            let sync_secs = match annotate_response_context(
                 jsonrpc,
                 remaining,
                 self.tuning.delivery_reserve,
                 &durable_request_key,
                 mcp.machine.transport_context_token(),
-            );
+            ) {
+                Ok(budget) => budget,
+                Err(message) => {
+                    // Invalid metadata must never turn off the transport-owned
+                    // replay key, result ceiling or synchronous handoff window.
+                    let response = TunnelResponse {
+                        request_id: command.request_id.clone(),
+                        channel: command.channel.clone(),
+                        resp_json: jsonrpc.get("id").map(|id| {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": bounded_jsonrpc_id(id),
+                                "error": {
+                                    "code": -32602,
+                                    "message": message
+                                }
+                            })
+                        }),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: StatusCode::BAD_REQUEST.as_u16(),
+                        resp_type: if jsonrpc.get("id").is_some() {
+                            "jsonrpc_response"
+                        } else {
+                            "notify_ack"
+                        }
+                        .to_owned(),
+                    };
+                    let _ = self.post_terminal(&command, response, deadline).await?;
+                    return Ok(());
+                }
+            };
             if let Some(secs) = sync_secs {
                 debug!(
                     request_id = %request_id_label,
@@ -1528,18 +1618,32 @@ fn annotate_response_context(
     reserve: Duration,
     request_key: &str,
     transport_context_token: &str,
-) -> Option<u64> {
-    if jsonrpc.get("method").and_then(Value::as_str) != Some("tools/call") {
-        return None;
+) -> std::result::Result<Option<u64>, &'static str> {
+    let Some(method) = jsonrpc.get("method").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let tools_call = method == "tools/call";
+    let bounded_response = tools_call || method.starts_with("tasks/");
+    if !bounded_response {
+        return Ok(None);
     }
-    let name = jsonrpc.pointer("/params/name").and_then(Value::as_str)?;
-    let shell = crate::mcp::is_shell_tool(name);
-    let durable_shell = shell || name == "job_start";
-    let params = jsonrpc.get_mut("params")?.as_object_mut()?;
+    let name = jsonrpc.pointer("/params/name").and_then(Value::as_str);
+    let shell = tools_call && name.is_some_and(crate::mcp::is_shell_tool);
+    let durable_shell = shell || (tools_call && name == Some("job_start"));
+    // Missing and null metadata are both valid MCP representations. Normalize
+    // either to an object before adding authenticated transport constraints.
+    let Some(params) = jsonrpc.get_mut("params").and_then(Value::as_object_mut) else {
+        return Ok(None); // Invalid tool params will be rejected by rmcp.
+    };
     let meta = params
         .entry("_meta")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-        .as_object_mut()?;
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if meta.is_null() {
+        *meta = Value::Object(serde_json::Map::new());
+    }
+    let Some(meta) = meta.as_object_mut() else {
+        return Err(INVALID_TRANSPORT_META); // Before any side effects.
+    };
     meta.retain(|key, _| !key.starts_with(crate::mcp::TRANSPORT_META_PREFIX));
     meta.insert(
         crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY.to_owned(),
@@ -1549,6 +1653,9 @@ fn annotate_response_context(
         crate::mcp::RESULT_BUDGET_META_KEY.to_owned(),
         Value::from(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES as u64),
     );
+    if !tools_call {
+        return Ok(None);
+    }
     if durable_shell {
         meta.insert(
             crate::mcp::REQUEST_KEY_META_KEY.to_owned(),
@@ -1556,7 +1663,7 @@ fn annotate_response_context(
         );
     }
     if !shell {
-        return None;
+        return Ok(None);
     }
     let budget = window.saturating_sub(reserve);
     let millis = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
@@ -1564,7 +1671,7 @@ fn annotate_response_context(
         crate::mcp::SYNC_BUDGET_META_KEY.to_owned(),
         Value::from(millis),
     );
-    Some(shell_timeout_within(window, reserve))
+    Ok(Some(shell_timeout_within(window, reserve)))
 }
 
 fn verbose_request_label(jsonrpc: &Value) -> String {
@@ -1741,6 +1848,309 @@ mod tests {
             let result: Value = serde_json::from_str(text).unwrap();
             assert_eq!(result["stdout"], expected, "{message}");
         }
+    }
+
+    #[test]
+    fn valid_null_or_missing_meta_never_loses_trusted_shell_constraints() {
+        let name = crate::mcp::shell_tool_name();
+        for original in [
+            None,
+            Some(Value::Null),
+            Some(json!({"client": "untouched"})),
+        ] {
+            let mut call = json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": name, "arguments": {"command": "true"}}
+            });
+            if let Some(meta) = original {
+                call["params"]["_meta"] = meta;
+            }
+            assert_eq!(
+                annotate_response_context(
+                    &mut call,
+                    Duration::from_secs(20),
+                    Duration::from_secs(5),
+                    "durable-key",
+                    "trusted-token"
+                ),
+                Ok(Some(15))
+            );
+            let meta = call["params"]["_meta"].as_object().unwrap();
+            assert_eq!(meta[crate::mcp::REQUEST_KEY_META_KEY], "durable-key");
+            assert_eq!(
+                meta[crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY],
+                "trusted-token"
+            );
+            assert_eq!(meta[crate::mcp::SYNC_BUDGET_META_KEY], 15_000);
+            assert_eq!(
+                meta[crate::mcp::RESULT_BUDGET_META_KEY],
+                crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES as u64
+            );
+        }
+
+        let mut task = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tasks/get",
+            "params": {"taskId": "unknown", "_meta": null}
+        });
+        assert_eq!(
+            annotate_response_context(
+                &mut task,
+                Duration::from_secs(20),
+                Duration::from_secs(5),
+                "unused",
+                "trusted-token"
+            ),
+            Ok(None)
+        );
+        let meta = task["params"]["_meta"].as_object().unwrap();
+        assert_eq!(
+            meta[crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY],
+            "trusted-token"
+        );
+        assert_eq!(
+            meta[crate::mcp::RESULT_BUDGET_META_KEY],
+            crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES as u64
+        );
+        assert!(!meta.contains_key(crate::mcp::REQUEST_KEY_META_KEY));
+
+        for meta in [json!([]), json!("bad"), json!(true), json!(7)] {
+            let mut call = json!({
+                "jsonrpc":"2.0", "id": 8, "method":"tools/call",
+                "params": {"name": name, "arguments": {"command": "true"}, "_meta": meta}
+            });
+            assert_eq!(
+                annotate_response_context(
+                    &mut call,
+                    Duration::from_secs(20),
+                    Duration::from_secs(5),
+                    "durable-key",
+                    "trusted-token"
+                ),
+                Err(INVALID_TRANSPORT_META)
+            );
+            assert!(
+                call.pointer("/params/_meta/io.abird.dotlink~1requestKey")
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn shell_enabled_test_machine(root: &std::path::Path) -> LocalMachine {
+        use crate::mcp::{AccessSpec, MachineConfig};
+        LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.to_path_buf(),
+                read_roots: vec![root.to_path_buf()],
+                write_roots: vec![root.to_path_buf()],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 20,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn null_meta_request_replays_original_side_effect_not_a_second_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let effect = root.join("effect.txt");
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let mut call = json!({
+            "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+            "params": {
+                "name": crate::mcp::shell_tool_name(),
+                "arguments": {"command": format!("printf x >> '{}'", effect.display())},
+                "_meta": null
+            }
+        });
+        assert_eq!(
+            annotate_response_context(
+                &mut call,
+                Duration::from_secs(20),
+                Duration::from_secs(5),
+                "same-delivery-key",
+                mcp.machine.transport_context_token()
+            ),
+            Ok(Some(15))
+        );
+        let headers = BTreeMap::new();
+        for _ in 0..2 {
+            let response = mcp.dispatch(&headers, &call).await.unwrap();
+            assert_eq!(response.status, 200, "{response:?}");
+            let text = response.messages[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap();
+            let result: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(result["success"], true, "{result}");
+        }
+        assert_eq!(
+            std::fs::read(&effect).unwrap(),
+            b"x",
+            "redelivery ran a second shell"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_tunnel_metadata_never_dispatches_a_side_effecting_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mcp = EmbeddedMcp::new(
+            shell_enabled_test_machine(&root).await,
+            CancellationToken::new(),
+        );
+        let (base_url, posts) = fake_control_plane(|_| (StatusCode::OK, Duration::ZERO)).await;
+        let client = TunnelClient::new(
+            Config {
+                base_url,
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        for (index, meta) in [json!([]), json!(false), json!("invalid"), json!(3)]
+            .into_iter()
+            .enumerate()
+        {
+            let effect = root.join(format!("invalid-meta-{index}"));
+            let command = TunnelCommand {
+                request_id: format!("bad-meta-{index}"),
+                shard_token: "test-shard".to_owned(),
+                command_type: "jsonrpc".to_owned(),
+                channel: Some("main".to_owned()),
+                response_timeout: Some(json!("20s")),
+                headers: BTreeMap::new(),
+                jsonrpc: Some(json!({
+                    "jsonrpc": "2.0", "id": index + 1, "method": "tools/call",
+                    "params": {
+                        "name": crate::mcp::shell_tool_name(),
+                        "arguments": {"command": format!("printf x > '{}'", effect.display())},
+                        "_meta": meta
+                    }
+                })),
+            };
+            client
+                .process_command(mcp.clone(), command, Instant::now())
+                .await
+                .unwrap();
+            assert!(
+                !effect.exists(),
+                "malformed _meta dispatched a shell command"
+            );
+        }
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn task_rpc_receives_authenticated_result_budget() {
+        let mut call = json!({
+            "jsonrpc":"2.0", "id":7, "method":"tasks/get",
+            "params": {
+                "taskId":"unknown",
+                "_meta": {
+                    "io.abird.dotlink/futureField":"attacker",
+                    "client":"preserved"
+                }
+            }
+        });
+        assert_eq!(
+            annotate_response_context(
+                &mut call,
+                Duration::from_secs(120),
+                TunnelTuning::default().delivery_reserve,
+                "unused-request-key",
+                "task-token",
+            ),
+            Ok(None)
+        );
+        let meta = call["params"]["_meta"].as_object().unwrap();
+        assert_eq!(
+            meta.get(crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY),
+            Some(&json!("task-token"))
+        );
+        assert_eq!(
+            meta.get(crate::mcp::RESULT_BUDGET_META_KEY),
+            Some(&json!(
+                crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES as u64
+            ))
+        );
+        assert!(!meta.contains_key("io.abird.dotlink/futureField"));
+        assert_eq!(meta.get("client"), Some(&json!("preserved")));
+    }
+
+    #[tokio::test]
+    async fn task_rpc_budget_reaches_the_real_handler_and_bounds_unknown_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = crate::mcp::test_machine(root);
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let token = mcp.machine.transport_context_token().to_owned();
+        let task_id = "x".repeat(1024);
+        let call = json!({
+            "jsonrpc":"2.0", "id":77, "method":"tasks/get",
+            "params": {
+                "taskId": task_id.clone(),
+                "_meta": {
+                    crate::mcp::TRANSPORT_CONTEXT_TOKEN_META_KEY: token,
+                    crate::mcp::RESULT_BUDGET_META_KEY: 512,
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {"name":"task-budget-test","version":"1"},
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {"io.modelcontextprotocol/tasks": {}}
+                    }
+                }
+            }
+        });
+        let headers = BTreeMap::from([
+            (
+                "mcp-protocol-version".to_owned(),
+                vec!["2026-07-28".to_owned()],
+            ),
+            ("mcp-method".to_owned(), vec!["tasks/get".to_owned()]),
+            ("mcp-name".to_owned(), vec![task_id]),
+        ]);
+        let response = mcp.dispatch(&headers, &call).await.unwrap();
+        let message = response
+            .messages
+            .iter()
+            .find(|message| message.get("id") == Some(&json!(77)))
+            .unwrap();
+        assert_eq!(message["error"]["code"], -32602, "{message}");
+        assert!(
+            serde_json::to_vec(&message["error"]).unwrap().len() <= 512,
+            "{}",
+            serde_json::to_vec(&message["error"]).unwrap().len()
+        );
+        assert!(
+            message["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("transport response budget"),
+            "{message}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2068,9 +2478,23 @@ mod tests {
                     mcp.dispatch(&headers, &req_a),
                     mcp.dispatch(&headers, &req_b)
                 );
-                assert_eq!(a.unwrap().status, 200);
-                assert_eq!(b.unwrap().status, 200);
-                let log = fs::read_to_string(events).unwrap();
+                for response in [a.unwrap(), b.unwrap()] {
+                    assert_eq!(response.status, 200, "{response:?}");
+                    let terminal = response.messages.iter().find(|message| {
+                        message.get("result").is_some() || message.get("error").is_some()
+                    });
+                    let result = terminal.expect("shell call must produce a terminal response");
+                    assert!(result.get("error").is_none(), "shell RPC failed: {result}");
+                    let text = result
+                        .pointer("/result/content/0/text")
+                        .and_then(Value::as_str)
+                        .expect("shell result must contain its JSON summary");
+                    let shell: Value = serde_json::from_str(text).expect("valid shell summary");
+                    assert_eq!(shell["success"], true, "shell failed: {shell}");
+                }
+                let log = fs::read_to_string(&events).unwrap_or_else(|error| {
+                    panic!("missing shell events {}: {error}", events.display())
+                });
                 let entries: Vec<_> = log.lines().collect();
                 assert_eq!(entries.len(), 4, "unexpected events: {log}");
                 if serialize {
@@ -2197,6 +2621,162 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("16 bytes"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn oversized_sep_routing_values_fail_compactly_before_rmcp_can_reflect_them() {
+        const VERSION: &str = "2026-07-28";
+        let temp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::test_machine(temp.path().canonicalize().unwrap());
+        let embedded = EmbeddedMcp::new(machine, CancellationToken::new());
+        let huge = "x".repeat(super::super::MAX_STANDARD_ROUTING_VALUE_BYTES + 1024);
+
+        let task = json!({
+            "jsonrpc":"2.0", "id":41, "method":"tasks/get",
+            "params": {
+                "taskId": huge,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": VERSION,
+                    "io.modelcontextprotocol/clientInfo": {"name":"routing-test","version":"1"},
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {"io.modelcontextprotocol/tasks": {}}
+                    }
+                }
+            }
+        });
+        let task_headers = BTreeMap::from([
+            ("mcp-protocol-version".to_owned(), vec![VERSION.to_owned()]),
+            ("mcp-method".to_owned(), vec!["tasks/get".to_owned()]),
+            ("mcp-name".to_owned(), vec!["small-mismatch".to_owned()]),
+        ]);
+        let response = embedded.dispatch(&task_headers, &task).await.unwrap();
+        let encoded = serde_json::to_vec(&response.messages).unwrap();
+        assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(response.messages[0]["error"]["code"], -32602);
+        assert!(
+            encoded.len() < 4096,
+            "oversized task routing leaked into response"
+        );
+        assert!(String::from_utf8_lossy(&encoded).contains("routing value exceeds"));
+        assert!(!String::from_utf8_lossy(&encoded).contains(&"x".repeat(1024)));
+
+        let oversized_method_call = json!({
+            "jsonrpc":"2.0", "id":44, "method": huge.clone(),
+            "params": {}
+        });
+        let response = embedded
+            .dispatch(&BTreeMap::new(), &oversized_method_call)
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(response.messages[0]["error"]["code"], -32602);
+        assert!(
+            response.messages[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("routing value exceeds")
+        );
+
+        let oversized_meta = json!({
+            "jsonrpc":"2.0", "id":45, "method":"tools/list",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": huge.clone(),
+                "io.modelcontextprotocol/clientInfo": {"name":"routing-test","version":"1"},
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}
+        });
+        let response = embedded
+            .dispatch(&BTreeMap::new(), &oversized_meta)
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(response.messages[0]["error"]["code"], -32602);
+
+        let oversized_id = json!({
+            "jsonrpc":"2.0", "id": huge.clone(), "method":"tools/list",
+            "params": {}
+        });
+        let response = embedded
+            .dispatch(&BTreeMap::new(), &oversized_id)
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(response.messages[0]["id"], Value::Null);
+        assert_eq!(response.messages[0]["error"]["code"], -32602);
+        let encoded_id = serde_json::to_vec(&response.messages).unwrap();
+        assert!(encoded_id.len() < 4096);
+        assert!(!String::from_utf8_lossy(&encoded_id).contains(&"x".repeat(1024)));
+
+        let method_headers = BTreeMap::from([
+            ("mcp-protocol-version".to_owned(), vec![VERSION.to_owned()]),
+            ("mcp-method".to_owned(), vec![huge.clone()]),
+        ]);
+        let method_call = json!({
+            "jsonrpc":"2.0", "id":42, "method":"tools/list",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": VERSION,
+                "io.modelcontextprotocol/clientInfo": {"name":"routing-test","version":"1"},
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}
+        });
+        let response = embedded
+            .dispatch(&method_headers, &method_call)
+            .await
+            .unwrap();
+        let encoded = serde_json::to_vec(&response.messages).unwrap();
+        assert!(encoded.len() < 4096);
+        assert!(String::from_utf8_lossy(&encoded).contains("missing required Mcp-Method"));
+
+        let protocol_headers = BTreeMap::from([
+            ("mcp-protocol-version".to_owned(), vec![huge.clone()]),
+            ("mcp-method".to_owned(), vec!["tools/list".to_owned()]),
+        ]);
+        let response = embedded
+            .dispatch(&protocol_headers, &method_call)
+            .await
+            .unwrap();
+        let encoded = serde_json::to_vec(&response.messages).unwrap();
+        assert!(encoded.len() < 4096);
+        assert!(String::from_utf8_lossy(&encoded).contains("requires MCP-Protocol-Version header"));
+
+        let invalid_headers = BTreeMap::from([
+            ("mcp-protocol-version".to_owned(), vec![VERSION.to_owned()]),
+            (
+                "mcp-method".to_owned(),
+                vec!["tools/list\nforged".to_owned()],
+            ),
+        ]);
+        let response = embedded
+            .dispatch(&invalid_headers, &method_call)
+            .await
+            .unwrap();
+        let encoded = serde_json::to_vec(&response.messages).unwrap();
+        assert!(encoded.len() < 4096);
+        assert!(String::from_utf8_lossy(&encoded).contains("missing required Mcp-Method"));
+    }
+
+    #[tokio::test]
+    async fn oversized_initialize_protocol_version_is_rejected_compactly_before_rmcp() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::test_machine(temp.path().canonicalize().unwrap());
+        let embedded = EmbeddedMcp::new(machine, CancellationToken::new());
+        let huge = "v".repeat(super::super::MAX_STANDARD_ROUTING_VALUE_BYTES + 1024);
+        let request = json!({
+            "jsonrpc":"2.0", "id":43, "method":"initialize",
+            "params": {
+                "protocolVersion": huge,
+                "capabilities": {},
+                "clientInfo": {"name":"routing-test","version":"1"}
+            }
+        });
+        let headers = BTreeMap::from([("mcp-protocol-version".to_owned(), vec![huge])]);
+        let response = embedded.dispatch(&headers, &request).await.unwrap();
+        let encoded = serde_json::to_vec(&response.messages).unwrap();
+        assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(response.messages[0]["error"]["code"], -32602);
+        assert!(encoded.len() < 16 * 1024, "{response:?}");
+        assert!(String::from_utf8_lossy(&encoded).contains("routing value exceeds"));
+        assert!(!String::from_utf8_lossy(&encoded).contains(&"v".repeat(1024)));
     }
 
     #[tokio::test]
@@ -3288,7 +3868,7 @@ mod tests {
                 "request",
                 "token",
             ),
-            Some(0)
+            Ok(Some(0))
         );
         assert_eq!(
             subsecond.pointer("/params/_meta/io.abird.dotlink~1syncBudgetMs"),
@@ -3318,7 +3898,7 @@ mod tests {
         });
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Some(115)
+            Ok(Some(115))
         );
         assert_eq!(call.pointer("/params/arguments/timeout_secs"), None);
         assert_eq!(sync_meta(&call), Some(115_000));
@@ -3346,7 +3926,7 @@ mod tests {
             let mut call = shell(json!({"command":"true","timeout_secs":value}));
             assert_eq!(
                 annotate_response_context(&mut call, window, reserve, "request", "token"),
-                Some(115)
+                Ok(Some(115))
             );
             assert_eq!(
                 call.pointer("/params/arguments/timeout_secs"),
@@ -3360,7 +3940,7 @@ mod tests {
         let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Some(115)
+            Ok(Some(115))
         );
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
@@ -3374,7 +3954,7 @@ mod tests {
         let mut job_start = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"job_start","arguments":{"command":"true"}}});
         assert_eq!(
             annotate_response_context(&mut job_start, window, reserve, "job-request", "token"),
-            None
+            Ok(None)
         );
         assert_eq!(request_meta(&job_start), Some("job-request".to_owned()));
         assert_eq!(sync_meta(&job_start), None);
@@ -3384,7 +3964,7 @@ mod tests {
         let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"a"}}});
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            None
+            Ok(None)
         );
         assert_eq!(sync_meta(&call), None);
         assert_eq!(request_meta(&call), None);
@@ -3399,7 +3979,7 @@ mod tests {
         let original = call.clone();
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            None
+            Ok(None)
         );
         assert_eq!(call, original);
     }
@@ -3560,7 +4140,7 @@ mod tests {
                 "request",
                 &transport_token
             ),
-            Some(0)
+            Ok(Some(0))
         );
 
         let started = Instant::now();

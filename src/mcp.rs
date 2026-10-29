@@ -10,7 +10,7 @@ pub(crate) use tools::test_support::test_machine;
 pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -81,6 +81,67 @@ pub struct SandboxCacheMount {
 }
 
 #[derive(Clone, Debug)]
+struct PreparedCacheMount {
+    source: PathBuf,
+    target: PathBuf,
+    writable: bool,
+    #[cfg(target_os = "linux")]
+    pinned: Arc<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedCacheMount {
+    fn verify_source_identity(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let pinned = self.pinned.metadata().with_context(|| {
+            format!(
+                "cannot inspect prepared cache source {}",
+                self.source.display()
+            )
+        })?;
+        let current_path = std::fs::canonicalize(&self.source).with_context(|| {
+            format!(
+                "shell cache source changed or disappeared since preparation: {}",
+                self.source.display()
+            )
+        })?;
+        let current = std::fs::metadata(&current_path).with_context(|| {
+            format!(
+                "cannot inspect shell cache source {}",
+                current_path.display()
+            )
+        })?;
+        if current_path != self.source
+            || pinned.dev() != current.dev()
+            || pinned.ino() != current.ino()
+        {
+            bail!(
+                "shell cache source changed since preparation: {}; restart dotlink to re-authorize the new directory",
+                self.source.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl PreparedCacheMount {
+    fn for_test(source: PathBuf, target: PathBuf, writable: bool) -> Self {
+        let source = std::fs::canonicalize(source).expect("test cache source canonicalizes");
+        let pinned = Arc::new(
+            crate::secure_fs::SecureFs::open_canonical_directory(&source)
+                .expect("test cache source pins"),
+        );
+        Self {
+            source,
+            target,
+            writable,
+            pinned,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct AccessPolicy {
     base_dir: PathBuf,
     read_roots: Vec<PathBuf>,
@@ -96,7 +157,7 @@ struct AccessPolicy {
 #[derive(Clone, Debug)]
 struct RuntimeConfig {
     access: AccessPolicy,
-    cache_mounts: Vec<SandboxCacheMount>,
+    cache_mounts: Vec<PreparedCacheMount>,
     shell_env: Vec<(String, String)>,
     #[cfg(target_os = "linux")]
     host_shell: crate::host_services::HostShell,
@@ -1170,10 +1231,18 @@ impl AccessPolicy {
 /// command is built: deny aliases and protected paths may have been retargeted
 /// since startup, so both their startup and current identities apply.
 #[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GuardAnchor {
+    path: PathBuf,
+    writable: bool,
+}
+
+#[cfg(target_os = "linux")]
 struct ShellGuards {
     access: AccessPolicy,
     protected: Vec<PathBuf>,
     runtime: tools::shell::RuntimeLayout,
+    anchors: Vec<GuardAnchor>,
 }
 
 /// A sandbox policy the shell cannot enforce as configured. Retrying with the
@@ -1183,23 +1252,28 @@ fn shell_policy_conflict(message: String) -> anyhow::Error {
     crate::recovery::operator(anyhow!(message))
 }
 
-/// An exposed bind directory shares its *live* host inode tree with the
-/// sandbox, even when the bind is read-only. Path-mounted masks can lose their
-/// target when another host process renames/recreates that entry during an
-/// already-running command. No sequence of pre-launch pathname checks closes
-/// this lifetime race. Reject overlapping exposure instead of constructing a
-/// mask that is only temporarily authoritative.
+/// A path mask is lifetime-safe beneath a broad user bind when every mutable
+/// directory entry between the bind root and the guarded directory is itself a
+/// mountpoint in the sandbox. The shell may still write *inside* those anchored
+/// directories, but cannot rename/unlink the namespace chain (`EBUSY`) and make
+/// a later host-side recreation of the guarded name appear outside the mask.
 ///
-/// Read denies/protected paths conflict with any readable bind; write denies
-/// conflict only with writable binds. Cache/host integrations are checked by
-/// the same overlap rules at their existing authority boundaries.
+/// Any existing canonical object can use this mechanism: its eventual mask or
+/// read-only rebind makes the leaf itself a mountpoint, while ancestor anchors
+/// stabilize the namespace above it. Missing names and symlink spellings remain
+/// fail-closed because there is no stable leaf mountpoint at the configured name.
+/// Cache/host/runtime integrations keep their stricter overlap rules because
+/// they are independent remappings rather than the user's ordinary grant tree.
 #[cfg(target_os = "linux")]
 fn validate_shell_guards(
     access: &AccessPolicy,
-    cache_mounts: &[SandboxCacheMount],
+    cache_mounts: &[PreparedCacheMount],
     protected_paths: &[PathBuf],
     runtime: &tools::shell::RuntimeLayout,
-) -> Result<()> {
+) -> Result<Vec<GuardAnchor>> {
+    for cache in cache_mounts {
+        cache.verify_source_identity()?;
+    }
     let guards = protected_paths
         .iter()
         // An explicit root rw grant is a deliberate opt-out of private-file
@@ -1219,7 +1293,31 @@ fn validate_shell_guards(
                 .map(|path| ("deny-write path", path, false)),
         );
     let mounts = access.sandbox_mounts();
+    // One hidden canonical directory makes every guarded descendant invisible
+    // as well. Standard dotlink state deliberately uses this shape (private
+    // directory plus sometimes a redundant active credential file beneath it),
+    // so do not reject a child file that is already covered by the parent mask.
+    let hidden_directory_ancestors = protected_paths
+        .iter()
+        .filter(|_| !access.explicit_root_rw_grant())
+        .chain(access.deny_read_roots.iter())
+        .filter_map(|path| {
+            let metadata = std::fs::symlink_metadata(path).ok()?;
+            if !metadata.is_dir() {
+                return None;
+            }
+            let canonical = std::fs::canonicalize(path).ok()?;
+            (canonical == *path).then_some(canonical)
+        })
+        .collect::<Vec<_>>();
+    let mut anchors = BTreeMap::<PathBuf, bool>::new();
     for (label, guarded, hide) in guards {
+        if hidden_directory_ancestors
+            .iter()
+            .any(|ancestor| ancestor != guarded && guarded.starts_with(ancestor))
+        {
+            continue;
+        }
         for cache in cache_mounts.iter().filter(|cache| hide || cache.writable) {
             if paths_overlap(guarded, &cache.source) || paths_overlap(guarded, &cache.target) {
                 return Err(shell_policy_conflict(format!(
@@ -1231,18 +1329,61 @@ fn validate_shell_guards(
             }
         }
         for (mount, writable) in &mounts {
-            if (hide || *writable) && paths_overlap(guarded, mount) {
+            if !(hide || *writable) || !paths_overlap(guarded, mount) {
+                continue;
+            }
+            if !guarded.starts_with(mount) || guarded == mount {
                 return Err(shell_policy_conflict(format!(
-                    "{label} {} overlaps {} shell mount {}. A host process can replace a masked name while the shell runs, even when its mount is read-only; narrow the grant to exclude this path, or disable shell for this profile",
+                    "{label} {} contains or equals exposed shell mount {}; narrow the grant to exclude this guarded path",
+                    guarded.display(),
+                    mount.display()
+                )));
+            }
+            let metadata = std::fs::symlink_metadata(guarded).map_err(|error| {
+                shell_policy_conflict(format!(
+                    "{label} {} overlaps {} shell mount {} but cannot be lifetime-anchored: {error}",
+                    guarded.display(),
+                    if *writable { "writable" } else { "readable" },
+                    mount.display()
+                ))
+            })?;
+            let canonical = std::fs::canonicalize(guarded).map_err(|error| {
+                shell_policy_conflict(format!(
+                    "{label} {} overlaps shell mount {} but cannot be resolved for lifetime anchoring: {error}",
+                    guarded.display(),
+                    mount.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink() || canonical != *guarded {
+                return Err(shell_policy_conflict(format!(
+                    "{label} {} overlaps {} shell mount {} but is not an existing canonical object; missing paths and symlink spellings cannot be safely guarded beneath a live broad bind",
                     guarded.display(),
                     if *writable { "writable" } else { "readable" },
                     mount.display()
                 )));
             }
+
+            let mut ancestor = guarded.parent();
+            while let Some(path) = ancestor {
+                if path == mount {
+                    break;
+                }
+                if !path.starts_with(mount) {
+                    return Err(shell_policy_conflict(format!(
+                        "internal error: guard anchor {} escaped shell mount {}",
+                        path.display(),
+                        mount.display()
+                    )));
+                }
+                anchors
+                    .entry(path.to_path_buf())
+                    .or_insert_with(|| access.can_write(path));
+                ancestor = path.parent();
+            }
         }
-        // Runtime directories are live host-backed binds too. In particular,
-        // ~/.nix-profile can contain an explicitly selected config or secret.
-        // A read-only bind does not prevent host-side recreation after masks.
+        // Runtime directories are live host-backed binds too. Keep their
+        // overlap policy strict: they are implicit remappings, not user grant
+        // ancestors for which we can preserve the original write semantics.
         if hide {
             for bind in &runtime.binds {
                 if paths_overlap(guarded, bind) {
@@ -1266,7 +1407,7 @@ fn validate_shell_guards(
         }
         // Procfs and devtmpfs are separately exposed by Bubblewrap even when
         // no user grant mentions them. Their dynamic objects cannot be
-        // protected by pathname masks either.
+        // protected by namespace anchors or pathname masks.
         if hide
             && ["/proc", "/dev"]
                 .iter()
@@ -1278,7 +1419,12 @@ fn validate_shell_guards(
             )));
         }
     }
-    Ok(())
+    let mut anchors = anchors
+        .into_iter()
+        .map(|(path, writable)| GuardAnchor { path, writable })
+        .collect::<Vec<_>>();
+    anchors.sort_by_key(|anchor| path_depth(&anchor.path));
+    Ok(anchors)
 }
 
 #[cfg(target_os = "linux")]
@@ -1386,14 +1532,35 @@ fn prepared_authority_value(
     let caches = config
         .cache_mounts
         .iter()
-        .map(|cache| {
-            serde_json::json!({
-                "source": authority_path_identity(&cache.source),
-                "target": cache.target,
-                "writable": cache.writable,
-            })
+        .map(|cache| -> Result<serde_json::Value> {
+            #[cfg(target_os = "linux")]
+            {
+                let identity =
+                    crate::secure_fs::file_identity(&cache.pinned).with_context(|| {
+                        format!(
+                            "cannot fingerprint prepared cache source {}",
+                            cache.source.display()
+                        )
+                    })?;
+                Ok(serde_json::json!({
+                    "source": cache.source,
+                    "target": cache.target,
+                    "writable": cache.writable,
+                    "dev": identity.dev,
+                    "ino": identity.ino,
+                    "rdev": identity.rdev,
+                }))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Ok(serde_json::json!({
+                    "source": authority_path_identity(&cache.source),
+                    "target": cache.target,
+                    "writable": cache.writable,
+                }))
+            }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let mut authority = serde_json::json!({
         "base_dir": authority_path_identity(&config.access.base_dir),
         "read_roots": read_roots,
@@ -1405,24 +1572,29 @@ fn prepared_authority_value(
     });
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::MetadataExt as _;
         let mounts = config
             .host_shell
             .mounts
             .iter()
-            .map(|mount| {
-                let metadata = mount.pinned.metadata().ok();
-                serde_json::json!({
+            .map(|mount| -> Result<serde_json::Value> {
+                let identity =
+                    crate::secure_fs::file_identity(&mount.pinned).with_context(|| {
+                        format!(
+                            "cannot fingerprint pinned host integration {}",
+                            mount.source.display()
+                        )
+                    })?;
+                Ok(serde_json::json!({
                     "source": mount.source,
                     "resolved": mount.resolved,
                     "target": mount.target,
                     "kind": format!("{:?}", mount.kind),
-                    "dev": metadata.as_ref().map(|value| value.dev()),
-                    "ino": metadata.as_ref().map(|value| value.ino()),
-                    "rdev": metadata.as_ref().map(|value| value.rdev()),
-                })
+                    "dev": identity.dev,
+                    "ino": identity.ino,
+                    "rdev": identity.rdev,
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         authority["host_shell"] = serde_json::json!({
             "mounts": mounts,
             "environment": config.host_shell.environment,
@@ -1466,6 +1638,20 @@ impl LocalMachine {
         let access = AccessPolicy::resolve(args.access).await?;
         let mut configured_protected = args.protected_paths.clone();
         configured_protected.push(job_root.to_path_buf());
+        #[cfg(target_os = "linux")]
+        if args.allow_shell && args.sandbox_shell {
+            for private_root in [
+                crate::setup::dotlink_config_dir()?,
+                crate::oauth::state_dir()?,
+            ] {
+                if configured_protected
+                    .iter()
+                    .any(|path| path == &private_root)
+                {
+                    crate::private_state::prepare_owned_dir(&private_root)?;
+                }
+            }
+        }
         let protected_paths = resolve_guards(&access.base_dir, &configured_protected).await?;
 
         let mut cache_mounts = Vec::with_capacity(args.cache_mounts.len());
@@ -1509,10 +1695,16 @@ impl LocalMachine {
                     target.display()
                 );
             }
-            cache_mounts.push(SandboxCacheMount {
+            #[cfg(target_os = "linux")]
+            let pinned = Arc::new(crate::secure_fs::SecureFs::open_canonical_directory(
+                &source,
+            )?);
+            cache_mounts.push(PreparedCacheMount {
                 source,
                 target,
                 writable,
+                #[cfg(target_os = "linux")]
+                pinned,
             });
         }
 
@@ -1522,7 +1714,7 @@ impl LocalMachine {
                 args.allow_network,
                 args.host_shell.ssh_agent,
             )?;
-            validate_shell_guards(&access, &cache_mounts, &protected_paths, &runtime)?;
+            let _ = validate_shell_guards(&access, &cache_mounts, &protected_paths, &runtime)?;
         }
         #[cfg(target_os = "linux")]
         validate_host_mount_policy(&access, &args.host_shell, &protected_paths)?;
@@ -1549,9 +1741,11 @@ impl LocalMachine {
 
         #[cfg(target_os = "linux")]
         let bwrap_program = if args.allow_shell && args.sandbox_shell {
-            Some(resolve_executable("bwrap").ok_or_else(|| {
+            let program = resolve_executable("bwrap").ok_or_else(|| {
                 anyhow!("Bubblewrap (bwrap) is required for sandboxed shell access")
-            })?)
+            })?;
+            tools::shell::validate_bubblewrap(&program).await?;
+            Some(program)
         } else {
             None
         };
@@ -1639,12 +1833,14 @@ impl LocalMachine {
             self.config.allow_network,
             self.config.host_shell.ssh_agent,
         )?;
-        validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
+        let anchors =
+            validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
         validate_host_mount_policy(&access, &self.config.host_shell, &protected)?;
         Ok(ShellGuards {
             access,
             protected,
             runtime,
+            anchors,
         })
     }
 
@@ -2041,6 +2237,34 @@ impl LocalMachine {
         self.policy_tool_router().get(name).is_some()
     }
 
+    /// Whether a SEP-2243 schema-routed argument could be reflected by rmcp
+    /// into a pre-handler mismatch diagnostic above the routing ceiling.
+    pub(crate) fn has_oversized_routing_param(
+        &self,
+        name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+        limit: usize,
+    ) -> bool {
+        let Some(arguments) = arguments else {
+            return false;
+        };
+        let Some(properties) = self
+            .policy_tool_router()
+            .get(name)
+            .and_then(|tool| tool.input_schema.get("properties"))
+            .and_then(Value::as_object)
+        else {
+            return false;
+        };
+        properties.iter().any(|(property, schema)| {
+            schema.get("x-mcp-header").and_then(Value::as_str).is_some()
+                && arguments
+                    .get(property)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.len() > limit)
+        })
+    }
+
     /// Pure reads may overlap each other; everything else takes the operation
     /// gate on platforms without descriptor-rooted IO.
     #[cfg(any(test, windows))]
@@ -2195,43 +2419,59 @@ impl rmcp::ServerHandler for LocalMachine {
     async fn get_task(
         &self,
         request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        self.jobs
+        let budget = self.request_result_budget(&context);
+        let result = self
+            .jobs
             .detailed_task(&request.task_id)
             .map(GetTaskResult::new)
-            .map_err(crate::jobs::JobError::into_mcp)
+            .map_err(|error| fit_mcp_error_to_budget(error.into_mcp(), budget))?;
+        if budget.is_some_and(|limit| serialized_json_len(&result).is_none_or(|size| size > limit))
+        {
+            return Err(fit_mcp_error_to_budget(
+                McpError::internal_error(
+                    "native task result exceeded its transport response budget",
+                    None,
+                ),
+                budget,
+            ));
+        }
+        Ok(result)
     }
 
     async fn update_task(
         &self,
         request: UpdateTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         // Shell jobs never enter input_required. Validate the shared task id so
         // unknown-task behavior stays precise, then reject an update that has no
         // outstanding server request instead of silently accepting unused input.
         self.jobs
             .ensure_native_task(&request.task_id)
-            .map_err(crate::jobs::JobError::into_mcp)?;
-        Err(McpError::invalid_params(
-            "shell tasks do not request mid-task input",
-            None,
+            .map_err(|error| {
+                fit_mcp_error_to_budget(error.into_mcp(), self.request_result_budget(&context))
+            })?;
+        Err(fit_mcp_error_to_budget(
+            McpError::invalid_params("shell tasks do not request mid-task input", None),
+            self.request_result_budget(&context),
         ))
     }
 
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
+        let budget = self.request_result_budget(&context);
         self.jobs
             .ensure_native_task(&request.task_id)
-            .map_err(crate::jobs::JobError::into_mcp)?;
+            .map_err(|error| fit_mcp_error_to_budget(error.into_mcp(), budget))?;
         self.jobs
             .cancel(&request.task_id)
             .map(|_| ())
-            .map_err(crate::jobs::JobError::into_mcp)
+            .map_err(|error| fit_mcp_error_to_budget(error.into_mcp(), budget))
     }
 
     async fn call_tool(
@@ -3376,12 +3616,86 @@ mod tests {
         }
     }
 
-    /// A deny mask deep inside a writable bind moves with a renamed
-    /// intermediate directory, and the denied pathname can then be recreated.
-    /// Startup refuses it before any tool runs, as an operator error.
+    /// Existing canonical file/directory guards can be made lifetime-stable
+    /// beneath a broad live bind: the leaf mask/read-only rebind is its own
+    /// mountpoint and mutable ancestors become namespace anchors. Missing names
+    /// and symlink spellings remain fail-closed.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn sandbox_guards_cannot_be_lifetime_safe_with_exposed_ancestors() {
+    async fn broad_writable_home_accepts_standard_dotlink_private_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let dotlink = home.join(".config/abird/dotlink");
+        std::fs::create_dir_all(&dotlink).unwrap();
+        std::fs::write(dotlink.join("runtime.key"), b"secret").unwrap();
+
+        let mut config = sandboxed_config(&home, Vec::new());
+        config.protected_paths = vec![dotlink.clone(), dotlink.join("runtime.key")];
+        let machine = LocalMachine::new(config)
+            .await
+            .expect("a broad writable home must coexist with dotlink's private directory");
+        let guards = machine.shell_guards().unwrap();
+        assert_eq!(
+            guards
+                .anchors
+                .iter()
+                .map(|anchor| anchor.path.clone())
+                .collect::<Vec<_>>(),
+            [home.join(".config"), home.join(".config/abird")]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn broad_writable_home_accepts_control_plane_and_job_spool_private_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let config_dir = home.join(".config/abird/dotlink");
+        let job_root = home.join(".local/state/abird/dotlink/jobs/session-test");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&job_root).unwrap();
+        std::fs::write(config_dir.join("runtime.key"), b"secret").unwrap();
+
+        let mut config = sandboxed_config(&home, Vec::new());
+        config.protected_paths = vec![config_dir.clone()];
+        let prepared = LocalMachine::prepare_with_job_root(config, &job_root)
+            .await
+            .expect("broad writable home must coexist with both private trees");
+        let runtime = tools::shell::RuntimeLayout::for_shell(false, false).unwrap();
+        let anchors = validate_shell_guards(
+            &prepared.config.access,
+            &prepared.config.cache_mounts,
+            &prepared.config.protected_paths,
+            &runtime,
+        )
+        .unwrap();
+        let anchors = anchors
+            .into_iter()
+            .map(|anchor| anchor.path)
+            .collect::<BTreeSet<_>>();
+
+        for expected in [
+            home.join(".config"),
+            home.join(".config/abird"),
+            home.join(".local"),
+            home.join(".local/state"),
+            home.join(".local/state/abird"),
+            home.join(".local/state/abird/dotlink"),
+            home.join(".local/state/abird/dotlink/jobs"),
+        ] {
+            assert!(
+                anchors.contains(&expected),
+                "missing anchor {}",
+                expected.display()
+            );
+        }
+        assert!(prepared.config.protected_paths.contains(&config_dir));
+        assert!(prepared.config.protected_paths.contains(&job_root));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn canonical_file_and_directory_guards_are_anchorable_but_symlinks_fail_closed() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -3390,39 +3704,45 @@ mod tests {
         let nested = project.join(".env");
         std::fs::create_dir(&project).unwrap();
         std::fs::write(&nested, b"secret").unwrap();
+
+        let file_machine = LocalMachine::new(sandboxed_config(&root, vec![nested.clone()]))
+            .await
+            .expect("an existing canonical file guard is lifetime-anchorable");
+        let file_guards = file_machine.shell_guards().unwrap();
+        assert_eq!(
+            file_guards
+                .anchors
+                .iter()
+                .map(|anchor| anchor.path.as_path())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&project.as_path())
+        );
+
         let alias = root.join("alias");
         symlink(&project, &alias).unwrap();
-
-        for (deny, reason) in [
-            (nested.clone(), "two levels below the writable root"),
-            (alias, "a symlink cannot become a mount point"),
-        ] {
-            let error = match LocalMachine::new(sandboxed_config(&root, vec![deny])).await {
-                Ok(_) => panic!("{reason}: sandbox policy was accepted"),
-                Err(error) => error,
-            };
-            assert!(
-                error.to_string().contains("overlaps writable shell mount"),
-                "{reason}: {error}"
-            );
-            assert_eq!(
-                crate::recovery::Recovery::of(&error),
-                crate::recovery::Recovery::Operator,
-                "{reason}"
-            );
-        }
-
-        // A direct-child mask is not stable under an external host rename,
-        // even though an in-sandbox rename of that mount point would fail.
-        let access = AccessPolicy::resolve(sandboxed_config(&root, vec![project, nested]).access)
+        let error = LocalMachine::new(sandboxed_config(&root, vec![alias]))
             .await
-            .unwrap();
-        let error =
-            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
-                .unwrap_err();
+            .expect_err("a symlink spelling cannot become a stable namespace anchor");
         assert_eq!(
             crate::recovery::Recovery::of(&error),
             crate::recovery::Recovery::Operator
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("not an existing canonical object"),
+            "{error}"
+        );
+
+        let access = AccessPolicy::resolve(sandboxed_config(&root, vec![project, nested]).access)
+            .await
+            .unwrap();
+        let anchors =
+            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                .unwrap();
+        assert!(
+            anchors.is_empty(),
+            "a directly-mounted guarded directory is itself the stable mask mountpoint"
         );
     }
 
@@ -3434,7 +3754,7 @@ mod tests {
         let protected = base.join("config.jsonc");
         std::fs::write(&protected, b"private").unwrap();
         let mut spec = AccessSpec {
-            base_dir: base,
+            base_dir: base.clone(),
             read_roots: vec![PathBuf::from("/")],
             write_roots: vec![PathBuf::from("/")],
             deny_read_roots: Vec::new(),
@@ -3445,21 +3765,18 @@ mod tests {
         let policy = AccessPolicy::resolve(spec.clone()).await.unwrap();
         assert!(policy.explicit_root_rw_grant());
         validate_shell_guards(&policy, &[], std::slice::from_ref(&protected), &runtime).unwrap();
-        // Explicit denies are not opted out. A root bind with a descendant
-        // deny cannot truthfully enforce it across external host mutations.
+        // Explicit denies are not opted out. Existing canonical objects can
+        // still be enforced under the root bind by anchoring their ancestor
+        // namespace and masking the leaf.
         spec.deny_read_roots.push(protected);
         let denied = AccessPolicy::resolve(spec).await.unwrap();
-        let error = validate_shell_guards(&denied, &[], &[], &runtime).unwrap_err();
-        assert_eq!(
-            crate::recovery::Recovery::of(&error),
-            crate::recovery::Recovery::Operator
-        );
-        assert!(error.to_string().contains("deny-read"), "{error}");
+        let anchors = validate_shell_guards(&denied, &[], &[], &runtime).unwrap();
+        assert!(anchors.iter().any(|anchor| anchor.path == base));
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn guard_visibility_remains_forbidden_before_and_after_host_mutations() {
+    async fn regular_file_guard_is_anchorable_but_missing_name_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let guard = root.join(".env");
@@ -3467,52 +3784,63 @@ mod tests {
         let access = AccessPolicy::resolve(sandboxed_config(&root, vec![guard.clone()]).access)
             .await
             .unwrap();
-        for state in 0..3 {
-            if state == 1 {
-                std::fs::remove_file(&guard).unwrap();
-            }
-            if state == 2 {
-                std::fs::write(&guard, b"restored").unwrap();
-            }
-            let error =
-                validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
-                    .unwrap_err();
-            assert!(
-                error.to_string().contains("host process can replace"),
-                "{error}"
-            );
-            assert_eq!(
-                crate::recovery::Recovery::of(&error),
-                crate::recovery::Recovery::Operator
-            );
-        }
+
+        assert!(
+            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_file(&guard).unwrap();
+        let error =
+            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                .unwrap_err();
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+        assert!(
+            error.to_string().contains("cannot be lifetime-anchored"),
+            "{error}"
+        );
+
+        std::fs::write(&guard, b"restored").unwrap();
+        assert!(
+            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn readable_mounts_also_cannot_expose_guarded_objects() {
+    async fn readable_mount_masks_existing_guard_but_missing_name_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let secret = root.join(".secret");
         let mut config = sandboxed_config(&root, vec![secret.clone()]);
         config.access.write_roots.clear();
         let access = AccessPolicy::resolve(config.access).await.unwrap();
-        for present in [false, true] {
-            if present {
-                std::fs::write(&secret, b"secret").unwrap();
-            }
-            let error =
-                validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
-                    .unwrap_err();
-            assert!(
-                error.to_string().contains("overlaps readable shell mount"),
-                "{error}"
-            );
-            assert_eq!(
-                crate::recovery::Recovery::of(&error),
-                crate::recovery::Recovery::Operator
-            );
-        }
+
+        let error =
+            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                .unwrap_err();
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+        assert!(
+            error.to_string().contains("cannot be lifetime-anchored"),
+            "{error}"
+        );
+
+        std::fs::write(&secret, b"secret").unwrap();
+        assert!(
+            validate_shell_guards(&access, &[], &[], &tools::shell::RuntimeLayout::default())
+                .unwrap()
+                .is_empty(),
+            "a direct-child existing file is stabilized by its own mask mountpoint"
+        );
     }
 
     #[cfg(target_os = "linux")]

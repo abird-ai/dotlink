@@ -348,18 +348,77 @@ fn unrelated_profile_edits_do_not_retire_running_process_credentials() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn writable_sandbox_parent_cannot_contain_control_plane_paths() {
+fn standard_config_inside_broad_writable_home_starts_with_private_state_anchored() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let config_home = home.join(".config");
+    let state_home = home.join(".local/state");
+    let private = config_home.join("abird/dotlink");
+    fs::create_dir_all(&private).unwrap();
+    fs::write(
+        private.join("config.jsonc"),
+        format!(
+            r#"{{"version":10,"transports":{{"openai":false,"stdio":true}},"permissions":{{"allow_rw":["{}"],"allow_shell":true}}}}"#,
+            home.display()
+        ),
+    )
+    .unwrap();
+
+    let runtime = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--stdio")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_API_KEY")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&runtime.stderr);
+    assert_ne!(
+        runtime.status.code(),
+        Some(78),
+        "standard private config beneath writable HOME was still rejected as CONFIG: {stderr}"
+    );
+    assert!(
+        !stderr.contains("overlaps writable shell mount")
+            && !stderr.contains("cannot be lifetime-anchored"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("connection closed: initialize request") || runtime.status.success(),
+        "unexpected post-startup failure: {stderr}"
+    );
+    for path in [private, state_home.join("abird/dotlink")] {
+        let metadata = fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("private root {} missing: {error}", path.display()));
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_sandbox_parent_anchors_control_plane_paths() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let config_home = root.join("cfg");
     let state_home = root.join("state");
     let custom_config = root.join("custom.jsonc");
-    fs::write(&custom_config, format!(
-        r#"{{"version":10,"transports":{{"openai":false,"stdio":true}},"permissions":{{"allow_rw":["{}"],"allow_shell":true}}}}"#,
-        root.display()
-    )).unwrap();
+    fs::write(
+        &custom_config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":false,"stdio":true}},"permissions":{{"allow_rw":["{}"],"allow_shell":true}}}}"#,
+            root.display()
+        ),
+    )
+    .unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+    let inspection = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--list-tools")
         .env("DOTLINK_CONFIG", &custom_config)
         .env("XDG_CONFIG_HOME", &config_home)
@@ -369,15 +428,15 @@ fn writable_sandbox_parent_cannot_contain_control_plane_paths() {
         .output()
         .unwrap();
     assert!(
-        result.status.success(),
+        inspection.status.success(),
         "{}",
-        String::from_utf8_lossy(&result.stderr)
+        String::from_utf8_lossy(&inspection.stderr)
     );
     let owned = [
         config_home.join("abird/dotlink"),
         state_home.join("abird/dotlink"),
     ];
-    // Inspection is pure: it must not create private state or mount targets.
+    // Configuration-only inspection stays pure.
     for private in &owned {
         assert!(
             !private.exists(),
@@ -385,9 +444,10 @@ fn writable_sandbox_parent_cannot_contain_control_plane_paths() {
             private.display()
         );
     }
-    // A path mask follows a renamed ancestor, so exposing any control-plane
-    // path through a broader writable bind must fail before Bubblewrap starts.
-    // The conflict is deterministic: a supervisor must not restart it forever.
+
+    // Runtime preparation may create the stable private roots so the shell can
+    // anchor/mask them beneath the broad writable grant. EOF on stdio then lets
+    // this one-shot integration process exit normally.
     let runtime = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--stdio")
         .env("DOTLINK_CONFIG", &custom_config)
@@ -399,15 +459,31 @@ fn writable_sandbox_parent_cannot_contain_control_plane_paths() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&runtime.stderr);
-    assert_eq!(runtime.status.code(), Some(78), "{stderr}");
-    assert!(stderr.contains("overlaps writable shell mount"), "{stderr}");
-    for private in owned {
-        assert!(
-            !private.exists(),
-            "failed startup created {}",
-            private.display()
-        );
+    assert_ne!(
+        runtime.status.code(),
+        Some(78),
+        "broad writable control-plane parent was still rejected as CONFIG: {stderr}"
+    );
+    assert!(
+        !stderr.contains("overlaps writable shell mount")
+            && !stderr.contains("cannot be lifetime-anchored"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("connection closed: initialize request") || runtime.status.success(),
+        "unexpected post-startup failure: {stderr}"
+    );
+    for private in &owned {
+        let metadata = fs::metadata(private)
+            .unwrap_or_else(|error| panic!("private root {} missing: {error}", private.display()));
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
+    assert!(custom_config.exists());
+    assert!(
+        !state_home.join("abird/dotlink/jobs").exists(),
+        "idle runtime must keep the per-job spool hierarchy lazy"
+    );
 }
 
 #[test]

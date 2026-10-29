@@ -73,6 +73,77 @@ pub(crate) fn known_standard_tool_body(bytes: &[u8], machine: &LocalMachine) -> 
     })
 }
 
+/// Keep attacker-controlled SEP routing values small enough that rmcp's
+/// pre-handler header mismatch diagnostics can never exceed dotlink's bounded
+/// response envelope. Ordinary requests allocate nothing here.
+pub(crate) const MAX_STANDARD_ROUTING_VALUE_BYTES: usize = 4 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RoutingPreflight {
+    reject_oversized_body: bool,
+}
+
+impl RoutingPreflight {
+    pub(crate) fn for_request(message: &Value, machine: &LocalMachine) -> Self {
+        let method = message.get("method").and_then(Value::as_str);
+        let oversized_id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() > MAX_STANDARD_ROUTING_VALUE_BYTES);
+        let oversized_method =
+            method.is_some_and(|value| value.len() > MAX_STANDARD_ROUTING_VALUE_BYTES);
+        let oversized_meta_version = message
+            .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() > MAX_STANDARD_ROUTING_VALUE_BYTES);
+        let oversized_initialize_version = method == Some("initialize")
+            && message
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.len() > MAX_STANDARD_ROUTING_VALUE_BYTES);
+        let routed_name = match method {
+            Some("tools/call" | "prompts/get") => message.pointer("/params/name"),
+            Some("resources/read" | "resources/subscribe" | "resources/unsubscribe") => {
+                message.pointer("/params/uri")
+            }
+            Some("tasks/get" | "tasks/update" | "tasks/cancel") => {
+                message.pointer("/params/taskId")
+            }
+            _ => None,
+        }
+        .and_then(Value::as_str);
+        let oversized_name =
+            routed_name.is_some_and(|value| value.len() > MAX_STANDARD_ROUTING_VALUE_BYTES);
+        let oversized_param = method == Some("tools/call")
+            && message
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    name.len() <= MAX_STANDARD_ROUTING_VALUE_BYTES
+                        && machine.has_oversized_routing_param(
+                            name,
+                            message
+                                .pointer("/params/arguments")
+                                .and_then(Value::as_object),
+                            MAX_STANDARD_ROUTING_VALUE_BYTES,
+                        )
+                });
+
+        Self {
+            reject_oversized_body: oversized_id
+                || oversized_method
+                || oversized_meta_version
+                || oversized_initialize_version
+                || oversized_name
+                || oversized_param,
+        }
+    }
+
+    pub(crate) fn rejects_request(self) -> bool {
+        self.reject_oversized_body
+    }
+}
+
 /// Whether the *structured* request needs unknown-tool rewriting. Use before
 /// cloning the OpenAI tunnel's already-parsed Value; common known-tool calls
 /// should not clone every embedded binary or text payload.

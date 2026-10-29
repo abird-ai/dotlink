@@ -81,7 +81,7 @@ const HELP_STYLES: Styles = Styles::styled()
     about = "Connect ChatGPT and other MCP clients to permission-scoped files and tools on this machine",
     args_conflicts_with_subcommands = true,
     subcommand_help_heading = "Management commands",
-    after_help = "Quick start:\n  dotlink --setup\n  dotlink --allow-rw --allow-shell\n  dotlink profile --help\n  dotlink oauth --help",
+    after_help = "Quick start:\n  dotlink --setup\n  dotlink --allow-rw --allow-shell\n  dotlink --unrestricted\n  dotlink profile --help\n  dotlink oauth --help",
     styles = HELP_STYLES
 )]
 struct Args {
@@ -338,15 +338,20 @@ struct Args {
     #[command(flatten)]
     cache_flags: CacheFlags,
 
-    /// Disable the shell sandbox. Requires --allow-all.
-    #[arg(long, requires = "allow_all")]
+    /// Disable the shell sandbox. Requires --allow-all or --unrestricted.
+    #[arg(long)]
     #[arg(help_heading = "Shell & network")]
     no_sandbox: bool,
 
-    /// Grant unrestricted filesystem, shell, and network access. Requires --no-sandbox.
-    #[arg(long, requires = "no_sandbox")]
+    /// Legacy two-flag full-host mode; pair with --no-sandbox.
+    #[arg(long)]
     #[arg(help_heading = "Shell & network")]
     allow_all: bool,
+
+    /// Full unrestricted host access: root RW filesystem, shell, network, and no sandbox.
+    #[arg(long)]
+    #[arg(help_heading = "Shell & network")]
+    unrestricted: bool,
 
     /// Print the configured OpenAI Tunnel ID and exit.
     #[arg(long)]
@@ -644,12 +649,21 @@ impl Policy {
             || !args.deny_write.is_empty()
             || !args.deny_rw.is_empty()
             || !args.deny.is_empty();
+        let unrestricted = args.unrestricted || args.allow_all;
+        let no_sandbox = args.unrestricted || args.no_sandbox;
 
-        if args.allow_all && has_filesystem_denies {
-            bail!("--allow-all cannot be combined with filesystem deny rules");
+        if args.allow_all != args.no_sandbox && !args.unrestricted {
+            bail!(
+                "--allow-all and --no-sandbox must be used together; use --unrestricted for the one-flag full-host mode"
+            );
         }
-        if args.allow_all && (args.deny_shell || args.deny_network) {
-            bail!("--allow-all cannot be combined with --deny-shell or --deny-network");
+        if unrestricted && has_filesystem_denies {
+            bail!("--unrestricted/--allow-all cannot be combined with filesystem deny rules");
+        }
+        if unrestricted && (args.deny_shell || args.deny_network) {
+            bail!(
+                "--unrestricted/--allow-all cannot be combined with --deny-shell or --deny-network"
+            );
         }
 
         let mut read_roots = Vec::new();
@@ -684,7 +698,7 @@ impl Policy {
             write_roots.push(path);
         }
 
-        if args.allow_all {
+        if unrestricted {
             read_roots.push(PathBuf::from("/"));
             write_roots.push(PathBuf::from("/"));
         }
@@ -714,17 +728,17 @@ impl Policy {
         let unrestricted_fs = read_roots.iter().any(|path| path == Path::new("/"))
             && write_roots.iter().any(|path| path == Path::new("/"));
 
-        let requested_shell = defaults.allow_shell || args.allow_shell || args.allow_all;
+        let requested_shell = defaults.allow_shell || args.allow_shell || unrestricted;
         if args.allow_network && !requested_shell && !args.deny_shell {
             bail!("--allow-network requires shell permission");
         }
         let allow_shell = requested_shell && !args.deny_shell;
-        let sandbox_shell = cfg!(target_os = "linux") && allow_shell && !args.no_sandbox;
+        let sandbox_shell = cfg!(target_os = "linux") && allow_shell && !no_sandbox;
 
         #[cfg(not(target_os = "linux"))]
-        if allow_shell && !args.no_sandbox {
+        if allow_shell && !no_sandbox {
             bail!(
-                "sandboxed shell execution is unavailable on this OS; use --no-sandbox --allow-all, or use Linux/WSL2 with Bubblewrap"
+                "sandboxed shell execution is unavailable on this OS; use --unrestricted, or use Linux/WSL2 with Bubblewrap"
             );
         }
 
@@ -742,6 +756,7 @@ impl Policy {
             || !defaults.allow_gpu.is_empty();
         if (host_integration_requested || !args.cache_flags.requested().is_empty())
             && !sandbox_shell
+            && !unrestricted
         {
             bail!(
                 "host integrations and --allow-cache-* require a Linux Bubblewrap shell; enable --allow-shell without --no-sandbox"
@@ -749,31 +764,42 @@ impl Policy {
         }
 
         #[cfg(target_os = "linux")]
-        let host_access = host_services::HostAccess {
-            nix_daemon: args.allow_nix_daemon || defaults.allow_nix_daemon,
-            nix_config: args.allow_nix_config || defaults.allow_nix_config,
-            ssh_agent: args.allow_ssh_agent || defaults.allow_ssh_agent,
-            git_config: args.allow_git_config || defaults.allow_git_config,
+        // Full-host mode already uses the process's host environment/devices.
+        // Sandbox-specific mounts and discovery are redundant, including saved
+        // profile defaults; do not try to initialize them without Bubblewrap.
+        let host_access = if sandbox_shell {
+            host_services::HostAccess {
+                nix_daemon: args.allow_nix_daemon || defaults.allow_nix_daemon,
+                nix_config: args.allow_nix_config || defaults.allow_nix_config,
+                ssh_agent: args.allow_ssh_agent || defaults.allow_ssh_agent,
+                git_config: args.allow_git_config || defaults.allow_git_config,
+            }
+        } else {
+            host_services::HostAccess::default()
         };
         #[cfg(target_os = "linux")]
-        let allow_kvm = args.allow_kvm || defaults.allow_kvm;
+        let allow_kvm = sandbox_shell && (args.allow_kvm || defaults.allow_kvm);
         #[cfg(target_os = "linux")]
-        let allow_gpu = args
-            .allow_gpu
-            .iter()
-            .copied()
-            .chain(defaults.allow_gpu.iter().copied())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let requested_sandbox_network = defaults.allow_network || args.allow_network;
+        let allow_gpu = if sandbox_shell {
+            args.allow_gpu
+                .iter()
+                .copied()
+                .chain(defaults.allow_gpu.iter().copied())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let requested_sandbox_network =
+            defaults.allow_network || args.allow_network || unrestricted;
 
         let allow_network = if !allow_shell || args.deny_network {
             false
         } else if sandbox_shell {
             requested_sandbox_network
         } else {
-            // --no-sandbox requires --allow-all at the CLI layer.
+            // Unsandboxed mode is reached through --unrestricted or the legacy --allow-all --no-sandbox pair.
             true
         };
 
@@ -1999,6 +2025,56 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn prepared_cache_authority_uses_concrete_pinned_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let prepared = LocalMachine::prepare_with_job_root(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                cache_mounts: vec![SandboxCacheMount {
+                    source: cache,
+                    target: PathBuf::from("/tmp/home/.cache/test"),
+                    writable: false,
+                }],
+                shell_env: Vec::new(),
+                host_shell: host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                job_retention_secs: 60,
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            manager.protected_path(),
+        )
+        .await
+        .unwrap();
+        let cache = &prepared.authority_value()["cache_mounts"][0];
+        assert!(cache["dev"].as_u64().is_some(), "{cache}");
+        assert!(cache["ino"].as_u64().is_some(), "{cache}");
+        assert!(cache["rdev"].as_u64().is_some(), "{cache}");
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn prepared_grant_fingerprint_uses_the_pinned_root_capability() {
         use std::os::unix::fs::symlink;
 
@@ -2412,23 +2488,101 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_and_no_sandbox_require_each_other() {
-        assert!(Args::try_parse_from(["dotlink", "--allow-all"]).is_err());
-        assert!(Args::try_parse_from(["dotlink", "--no-sandbox"]).is_err());
-        assert!(Args::try_parse_from(["dotlink", "--allow-all", "--no-sandbox"]).is_ok());
+    fn legacy_allow_all_and_no_sandbox_still_require_each_other() {
+        for argv in [
+            ["dotlink", "--allow-all"].as_slice(),
+            ["dotlink", "--no-sandbox"].as_slice(),
+        ] {
+            let args = Args::try_parse_from(argv).unwrap();
+            let error =
+                Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap_err();
+            assert!(
+                error.to_string().contains("must be used together"),
+                "{error}"
+            );
+        }
+        let args = Args::try_parse_from(["dotlink", "--allow-all", "--no-sandbox"]).unwrap();
+        assert!(Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).is_ok());
     }
 
     #[test]
-    fn allow_all_no_sandbox_is_full_authority() {
-        let (_, policy) = parse(&["dotlink", "--allow-all", "--no-sandbox"], no_defaults());
+    fn unrestricted_is_the_one_flag_full_host_mode() {
+        let args = Args::try_parse_from(["dotlink", "--unrestricted"]).unwrap();
+        let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).unwrap();
         assert!(policy.unrestricted_fs);
+        assert!(policy.read_roots.contains(&PathBuf::from("/")));
+        assert!(policy.write_roots.contains(&PathBuf::from("/")));
         assert!(policy.allow_shell);
         assert!(!policy.sandbox_shell);
         assert!(policy.allow_network);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn allow_all_rejects_deny_rules() {
+    fn unrestricted_supersedes_saved_and_cli_sandbox_integrations() {
+        let defaults = PermissionConfig {
+            allow_shell: true,
+            allow_nix_daemon: true,
+            allow_nix_config: true,
+            allow_ssh_agent: true,
+            allow_git_config: true,
+            allow_kvm: true,
+            allow_gpu: vec![GpuVendor::Amd],
+            ..no_defaults()
+        };
+        for argv in [
+            ["dotlink", "--unrestricted"].as_slice(),
+            ["dotlink", "--allow-all", "--no-sandbox"].as_slice(),
+            [
+                "dotlink",
+                "--unrestricted",
+                "--allow-ssh-agent",
+                "--allow-kvm",
+                "--allow-gpu=amd",
+                "--allow-cache-npm",
+            ]
+            .as_slice(),
+        ] {
+            let args = Args::try_parse_from(argv).unwrap();
+            let policy = Policy::from_args(&args, PathBuf::from("/workspace"), &defaults).unwrap();
+            assert!(policy.unrestricted_fs);
+            assert!(policy.allow_shell);
+            assert!(policy.allow_network);
+            assert!(!policy.sandbox_shell);
+            assert_eq!(policy.host_access, host_services::HostAccess::default());
+            assert!(!policy.allow_kvm);
+            assert!(policy.allow_gpu.is_empty());
+        }
+
+        // Normal sandboxed mode must retain precisely the saved integrations.
+        let (_, sandboxed) = parse(&["dotlink"], defaults);
+        assert!(sandboxed.sandbox_shell);
+        assert!(sandboxed.host_access.nix_daemon);
+        assert!(sandboxed.host_access.nix_config);
+        assert!(sandboxed.host_access.ssh_agent);
+        assert!(sandboxed.host_access.git_config);
+        assert!(sandboxed.allow_kvm);
+        assert_eq!(sandboxed.allow_gpu, vec![GpuVendor::Amd]);
+    }
+
+    #[test]
+    fn unrestricted_matches_legacy_allow_all_no_sandbox_policy() {
+        let unrestricted = Args::try_parse_from(["dotlink", "--unrestricted"]).unwrap();
+        let legacy = Args::try_parse_from(["dotlink", "--allow-all", "--no-sandbox"]).unwrap();
+        let left =
+            Policy::from_args(&unrestricted, PathBuf::from("/workspace"), &no_defaults()).unwrap();
+        let right =
+            Policy::from_args(&legacy, PathBuf::from("/workspace"), &no_defaults()).unwrap();
+        assert_eq!(left.read_roots, right.read_roots);
+        assert_eq!(left.write_roots, right.write_roots);
+        assert_eq!(left.unrestricted_fs, right.unrestricted_fs);
+        assert_eq!(left.allow_shell, right.allow_shell);
+        assert_eq!(left.sandbox_shell, right.sandbox_shell);
+        assert_eq!(left.allow_network, right.allow_network);
+    }
+
+    #[test]
+    fn unrestricted_and_allow_all_reject_deny_rules() {
         let args = Args::try_parse_from([
             "dotlink",
             "--allow-all",
@@ -2437,6 +2591,12 @@ mod tests {
         ])
         .unwrap();
         assert!(Policy::from_args(&args, PathBuf::from("/workspace"), &no_defaults()).is_err());
+
+        let unrestricted =
+            Args::try_parse_from(["dotlink", "--unrestricted", "--deny-rw=/secret"]).unwrap();
+        assert!(
+            Policy::from_args(&unrestricted, PathBuf::from("/workspace"), &no_defaults()).is_err()
+        );
     }
 
     #[test]
