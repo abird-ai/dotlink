@@ -25,7 +25,7 @@ jobs:
         uses: cachix/install-nix-action@v31
 
       - name: Run tests and lint checks
-        run: nix flake check
+        run: nix flake check -L
 
       - name: Build every release binary
         run: nix build .#release-all --out-link result-release

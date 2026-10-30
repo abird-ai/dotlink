@@ -62,6 +62,17 @@
     commonArgs
     // {
       inherit cargoArtifacts;
+      # Nix builders intentionally do not provide a normal writable HOME.
+      # Runtime/job tests exercise XDG-backed private state, so give the test
+      # process an explicit hermetic home rather than weakening production
+      # ownership/permission checks for /homeless-shelter.
+      preCheck = ''
+        export HOME="$TMPDIR/home"
+        export XDG_CONFIG_HOME="$HOME/.config"
+        export XDG_STATE_HOME="$HOME/.local/state"
+        export XDG_CACHE_HOME="$HOME/.cache"
+        mkdir -p "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+      '';
     }
   );
 
