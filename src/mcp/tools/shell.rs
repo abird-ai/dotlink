@@ -1,8 +1,8 @@
 //! `bash` / `powershell`: the sandboxed shell, its mounts and its heartbeat.
 
 use std::{
-    collections::BTreeMap,
     env,
+    io::Write as _,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -43,15 +43,15 @@ use crate::mcp::{
 use crate::{
     jobs::{
         JobCompletion, JobDisposition, JobHandle, JobHandoff, JobResultContext, JobStatus, JobWait,
-        StreamSummary,
+        SpoolWriterGuard, StreamSummary,
     },
     mcp::RuntimeConfig,
 };
 #[cfg(target_os = "linux")]
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
+    io::{Read as _, Seek as _, SeekFrom},
     os::fd::{AsRawFd as _, FromRawFd as _},
     path::Component,
 };
@@ -196,20 +196,40 @@ pub(crate) fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usiz
 /// Drain a long-running job stream directly into its private spool file. The
 /// stored prefix is bounded independently of response paging, while the pipe is
 /// always fully drained so a noisy child can never deadlock on a full pipe.
+type SpoolTask = AbortOnDropHandle<std::io::Result<StreamSummary>>;
+
+async fn abort_and_quiesce_spool_tasks(job: &JobHandle, stdout: &SpoolTask, stderr: &SpoolTask) {
+    // Seal registration before requesting cancellation. This makes the transition
+    // one-way even if a future drain implementation grows detached helper tasks.
+    job.seal_spool_writers();
+    stdout.abort();
+    stderr.abort();
+    // A collection timeout may already have consumed one JoinHandle result while
+    // waiting for the other, so task handles are not a reusable completion barrier.
+    // Writer lifetime is registered before spawn and remains authoritative even
+    // after a JoinHandle result was consumed or its owner was dropped.
+    job.wait_spool_writers_idle().await;
+}
+
 async fn spool_job_output<R>(
     mut reader: R,
     path: PathBuf,
-    job: JobHandle,
+    writer_guard: SpoolWriterGuard,
 ) -> std::io::Result<StreamSummary>
 where
     R: AsyncRead + Unpin,
 {
     let cap = crate::jobs::spool_limit();
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await?;
+    // Tokio's async file writer may detach a blocking write when its owning task
+    // is aborted. Job terminal metadata must never race bytes that can still land
+    // afterward, so spool-file mutations use the shared cancellation-safe
+    // synchronous OS-operation boundary while child-pipe reads stay async.
+    let mut file = crate::blocking::run(|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+    })?;
     let mut buffer = [0_u8; 16 * 1024];
     let mut total = 0_u64;
     let mut stored = 0_u64;
@@ -228,43 +248,47 @@ where
         }
         let remaining = cap.saturating_sub(stored);
         let wanted = remaining.min(read as u64);
-        let reserved = job.reserve_spool(wanted);
+        let reserved = writer_guard.reserve(wanted);
         let keep = usize::try_from(reserved).unwrap_or(read);
         if keep > 0 {
-            let mut written = 0_usize;
-            while written < keep {
-                match file.write(&buffer[written..keep]).await {
-                    Ok(0) => {
-                        job.release_spool(reserved.saturating_sub(written as u64));
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "job spool write made no progress",
-                        ));
-                    }
-                    Ok(count) => written += count,
-                    Err(error) => {
-                        // Successful prefix writes remain charged; release only
-                        // the bytes that never reached the spool file.
-                        job.release_spool(reserved.saturating_sub(written as u64));
-                        return Err(error);
+            let (written, error) = crate::blocking::run(|| {
+                let mut written = 0_usize;
+                while written < keep {
+                    match file.write(&buffer[written..keep]) {
+                        Ok(0) => {
+                            return (
+                                written,
+                                Some(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "job spool write made no progress",
+                                )),
+                            );
+                        }
+                        Ok(count) => written += count,
+                        Err(error) => return (written, Some(error)),
                     }
                 }
+                (written, None)
+            });
+            if let Some(error) = error {
+                // Successful prefix writes remain charged; release only the
+                // reservation that never reached the spool file.
+                writer_guard.release(reserved.saturating_sub(written as u64));
+                return Err(error);
             }
-            // Flush each received chunk: a failed tunnel request may lose its
-            // response, but never bytes already accepted from the child.
-            file.flush().await?;
             stored = stored.saturating_add(written as u64);
         }
         if reserved < read as u64 {
             truncated = true;
         }
     }
-    file.flush().await?;
-    Ok(StreamSummary {
+    let summary = StreamSummary {
         total_bytes: total,
         stored_bytes: stored,
         truncated,
-    })
+    };
+    drop(writer_guard);
+    Ok(summary)
 }
 
 fn stream_summary_from_file(path: &Path, truncated: bool) -> StreamSummary {
@@ -293,12 +317,295 @@ fn effectively_executable(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn sandbox_launcher_unprivileged_source_mutable(
-    source_uid: libc::uid_t,
-    euid: libc::uid_t,
-    effectively_writable: bool,
+fn descriptor_filesystem_read_only(file: &File) -> Result<bool> {
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `stats` points to valid writable storage and `file` owns a live FD.
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot inspect launcher filesystem");
+    }
+    // SAFETY: successful `fstatvfs` initialized the complete structure.
+    let stats = unsafe { stats.assume_init() };
+    Ok((stats.f_flag & libc::ST_RDONLY as libc::c_ulong) != 0)
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_filesystem_type(file: &File) -> Result<u64> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `stats` points to valid writable storage and `file` owns a live FD.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot inspect launcher filesystem type");
+    }
+    // SAFETY: successful `fstatfs` initialized the complete structure.
+    Ok(unsafe { stats.assume_init() }.f_type as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_mount_id(file: &File) -> Result<u64> {
+    // `/proc/self/fdinfo` exposes the kernel mount id for this exact live
+    // descriptor. Using the proc ABI directly avoids libc/statx target-surface
+    // differences (notably musl) while keeping the check descriptor-bound and
+    // fail-closed when proc metadata is unavailable.
+    let path = format!("/proc/self/fdinfo/{}", file.as_raw_fd());
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read launcher descriptor metadata {path}"))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .map(str::trim)
+        .ok_or_else(|| anyhow::anyhow!("launcher descriptor metadata has no mount id"))?
+        .parse::<u64>()
+        .context("launcher descriptor mount id is invalid")
+}
+
+#[cfg(target_os = "linux")]
+fn nix_store_item_root(path: &Path) -> Option<PathBuf> {
+    const NIX_BASE32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    let relative = path.strip_prefix("/nix/store").ok()?;
+    let Component::Normal(item) = relative.components().next()? else {
+        return None;
+    };
+    let bytes = item.as_bytes();
+    if bytes.len() <= 33
+        || bytes[32] != b'-'
+        || !bytes[..32].iter().all(|byte| NIX_BASE32.contains(byte))
+    {
+        return None;
+    }
+    Some(Path::new("/nix/store").join(item))
+}
+
+#[cfg(target_os = "linux")]
+fn root_owned_launcher_path(path: &Path, source: &std::fs::Metadata) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if source.uid() != 0 || source.mode() & 0o022 != 0 {
+        return Ok(false);
+    }
+    let mut ancestor = path.parent();
+    while let Some(path) = ancestor {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("cannot inspect launcher ancestor {}", path.display()))?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Ok(false);
+        }
+        ancestor = path.parent();
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn traditional_nix_store_trusted(
+    store_uid: libc::uid_t,
+    store_mode: libc::mode_t,
+    all_item_objects_root_owned: bool,
 ) -> bool {
-    euid != 0 && (source_uid == euid || effectively_writable)
+    store_uid == 0
+        && all_item_objects_root_owned
+        && (store_mode & 0o022 == 0 || store_mode & 0o1000 != 0)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NixStoreTrust {
+    RootOwned,
+    ReadOnlyMapped,
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_nix_store_launcher(
+    path: &Path,
+    source: &File,
+    source_metadata: &std::fs::Metadata,
+) -> Result<Option<NixStoreTrust>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some(item_root) = nix_store_item_root(path) else {
+        return Ok(None);
+    };
+    if source_metadata.mode() & 0o022 != 0 {
+        return Ok(None);
+    }
+
+    let mut all_item_objects_root_owned = source_metadata.uid() == 0;
+    let mut ancestor = path.parent();
+    let mut reached_item_root = false;
+    while let Some(path) = ancestor {
+        if !path.starts_with(&item_root) {
+            break;
+        }
+        let metadata = std::fs::symlink_metadata(path).with_context(|| {
+            format!(
+                "cannot inspect Nix store launcher ancestor {}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.mode() & 0o022 != 0 {
+            return Ok(None);
+        }
+        all_item_objects_root_owned &= metadata.uid() == 0;
+        if path == item_root {
+            reached_item_root = true;
+            break;
+        }
+        ancestor = path.parent();
+    }
+    if !reached_item_root {
+        return Ok(None);
+    }
+
+    let store = crate::secure_fs::SecureFs::pin_canonical(Path::new("/nix/store"))?;
+    let store_metadata = store.metadata()?;
+    if !store_metadata.is_dir()
+        || descriptor_filesystem_type(&store)? == libc::FUSE_SUPER_MAGIC as u64
+        || descriptor_mount_id(&store)? != descriptor_mount_id(source)?
+    {
+        return Ok(None);
+    }
+
+    // Traditional daemon-managed stores may have a writable sticky store root,
+    // while the immutable item itself and every descendant are root-owned.
+    if traditional_nix_store_trusted(
+        store_metadata.uid(),
+        store_metadata.mode(),
+        all_item_objects_root_owned,
+    ) {
+        return Ok(Some(NixStoreTrust::RootOwned));
+    }
+
+    // UID-remapped/rootless stores have no usable ownership provenance from this
+    // namespace. A read-only same-mount view is sufficient only for unprivileged
+    // same-UID execution; root rejects this trust mode entirely because the
+    // launcher snapshot cannot authenticate its loader/shared-library closure.
+    if descriptor_filesystem_read_only(&store)? {
+        return Ok(Some(NixStoreTrust::ReadOnlyMapped));
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn build_pinned_bubblewrap(path: &Path) -> bool {
+    option_env!("DOTLINK_BUILD_BWRAP")
+        .and_then(|value| std::fs::canonicalize(value).ok())
+        .is_some_and(|trusted| trusted == path)
+}
+
+#[cfg(target_os = "linux")]
+fn nix_store_selection_authorized(build_pinned: bool, root_managed_selector: bool) -> bool {
+    build_pinned || root_managed_selector
+}
+
+#[cfg(target_os = "linux")]
+fn read_only_mapped_nix_allowed_for_effective_uid(
+    euid: libc::uid_t,
+    selection_authorized: bool,
+) -> bool {
+    selection_authorized && euid != 0
+}
+
+#[cfg(target_os = "linux")]
+fn managed_selector_applies(candidate: &Path) -> bool {
+    !candidate.starts_with("/nix/store")
+}
+
+#[cfg(target_os = "linux")]
+fn root_managed_launcher_selector(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !path.is_absolute() {
+        return Ok(false);
+    }
+
+    // Selection authority belongs to the final PATH entry, not to any ancestor
+    // symlink that happened to participate in path traversal. Requiring the final
+    // candidate itself to be root-owned means only the host administrator can
+    // choose which immutable Nix object dotlink may execute host-side.
+    let selector = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect launcher selector {}", path.display()))?;
+    if !selector.file_type().is_symlink() || selector.uid() != 0 {
+        return Ok(false);
+    }
+
+    // Follow each parent as the kernel would during candidate lookup. An ancestor
+    // symlink into a user-controlled tree therefore resolves to a non-root-owned
+    // or writable directory and cannot become a shortcut to trusted selection.
+    let mut parent = path.parent();
+    while let Some(path) = parent {
+        let metadata = std::fs::metadata(path).with_context(|| {
+            format!("cannot inspect launcher selector parent {}", path.display())
+        })?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Ok(false);
+        }
+        parent = path.parent();
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct UntrustedSandboxLauncher {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for UntrustedSandboxLauncher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Bubblewrap launcher {} is not from a trusted host-managed source; use a root-owned native executable under a root-owned non-writable path, a root-managed selector such as the system profile, or dotlink's Nix package so the exact Bubblewrap derivation is build-pinned (Nix-store immutability alone is not selection authority)",
+            self.path.display()
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for UntrustedSandboxLauncher {}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SandboxLauncherTrust {
+    RootOwnedPath,
+    NixStoreRootOwned,
+    NixStoreReadOnlyMapped,
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_launcher_source_trust(
+    path: &Path,
+    source: &File,
+    source_metadata: &std::fs::Metadata,
+    allow_nix_store: bool,
+    allow_read_only_mapped_nix: bool,
+) -> Result<Option<SandboxLauncherTrust>> {
+    if descriptor_filesystem_type(source)? == libc::FUSE_SUPER_MAGIC as u64 {
+        return Ok(None);
+    }
+
+    // Nix store objects are root-owned even when an unprivileged user asked the
+    // daemon to build them. Never let a canonical store path fall through the
+    // generic root-owned-file rule: every runtime uid must additionally prove
+    // that selection came from the build pin or a root-owned final PATH symlink.
+    if path.starts_with("/nix/store") {
+        if !allow_nix_store {
+            return Ok(None);
+        }
+        return Ok(
+            match trusted_nix_store_launcher(path, source, source_metadata)? {
+                Some(NixStoreTrust::RootOwned) => Some(SandboxLauncherTrust::NixStoreRootOwned),
+                Some(NixStoreTrust::ReadOnlyMapped) if allow_read_only_mapped_nix => {
+                    Some(SandboxLauncherTrust::NixStoreReadOnlyMapped)
+                }
+                Some(NixStoreTrust::ReadOnlyMapped) => None,
+                None => None,
+            },
+        );
+    }
+
+    if root_owned_launcher_path(path, source_metadata)? {
+        return Ok(Some(SandboxLauncherTrust::RootOwnedPath));
+    }
+    Ok(None)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -335,7 +642,30 @@ pub(crate) struct PreparedExecutable {
     #[cfg(target_os = "linux")]
     privileged_source: bool,
     #[cfg(target_os = "linux")]
-    unprivileged_source_mutable: bool,
+    sandbox_trust: Option<SandboxLauncherTrust>,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_sandbox_launcher(prepared: &PreparedExecutable) -> Result<()> {
+    if prepared.privileged_source {
+        anyhow::bail!(
+            "Bubblewrap launcher {} uses setuid/setgid bits or Linux file capabilities; sealed launcher snapshots intentionally drop kernel-granted executable privileges, so install an unprivileged modern Bubblewrap (0.12+) in a system-managed path",
+            prepared.path.display()
+        );
+    }
+    if prepared.script {
+        anyhow::bail!(
+            "Bubblewrap launcher {} is a #! wrapper; sandbox launchers must be native executables so the host-side interpreter is part of the sealed trust boundary",
+            prepared.path.display()
+        );
+    }
+    if prepared.sandbox_trust.is_none() {
+        anyhow::bail!(
+            "Bubblewrap launcher {} is not from a trusted host-managed source; use a root-owned native executable under a root-owned non-writable path, a root-managed selector such as the system profile, or dotlink's Nix package so the exact Bubblewrap derivation is build-pinned (Nix-store immutability alone is not selection authority)",
+            prepared.path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -500,12 +830,25 @@ fn executable_digest(path: &Path) -> Result<[u8; 32]> {
 
 impl PreparedExecutable {
     pub(crate) fn prepare(path: PathBuf) -> Result<Self> {
+        Self::prepare_inner(path, false, false, false)
+    }
+
+    fn prepare_inner(
+        path: PathBuf,
+        require_sandbox_trust: bool,
+        allow_nix_store: bool,
+        allow_read_only_mapped_nix: bool,
+    ) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = (
+            require_sandbox_trust,
+            allow_nix_store,
+            allow_read_only_mapped_nix,
+        );
         let path = std::fs::canonicalize(&path)
             .with_context(|| format!("cannot resolve executable {}", path.display()))?;
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::fs::MetadataExt as _;
-
             let pinned = crate::secure_fs::SecureFs::pin_canonical(&path)?;
             let source_metadata = pinned.metadata()?;
             if !source_metadata.is_file() {
@@ -518,16 +861,23 @@ impl PreparedExecutable {
                     path.display()
                 );
             }
-            let euid = unsafe { libc::geteuid() };
-            // For an unprivileged process, ownership itself grants chmod authority,
-            // so even a 0555 user-owned launcher is mutable by a same-uid peer. For
-            // euid 0 ownership is not a useful discriminator (system launchers are
-            // normally root-owned); execution consumes the sealed pinned snapshot.
-            let unprivileged_source_mutable = sandbox_launcher_unprivileged_source_mutable(
-                source_metadata.uid(),
-                euid,
-                effective_access(&pinned_path, libc::W_OK),
-            );
+            let sandbox_trust = if require_sandbox_trust {
+                let trust = sandbox_launcher_source_trust(
+                    &path,
+                    &pinned,
+                    &source_metadata,
+                    allow_nix_store,
+                    allow_read_only_mapped_nix,
+                )?;
+                if trust.is_none() {
+                    return Err(anyhow::Error::new(UntrustedSandboxLauncher {
+                        path: path.clone(),
+                    }));
+                }
+                trust
+            } else {
+                None
+            };
             let identity = crate::secure_fs::file_identity(&pinned)?;
             let (snapshot, digest, script, privileged_source) =
                 sealed_executable_snapshot(&pinned, &path)?;
@@ -551,7 +901,7 @@ impl PreparedExecutable {
                 exec_path,
                 script,
                 privileged_source,
-                unprivileged_source_mutable,
+                sandbox_trust,
             })
         }
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -582,27 +932,34 @@ impl PreparedExecutable {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     pub(crate) fn prepare_sandbox_launcher(path: PathBuf) -> Result<Self> {
-        let prepared = Self::prepare(path)?;
-        if prepared.privileged_source {
-            anyhow::bail!(
-                "Bubblewrap launcher {} uses setuid/setgid bits or Linux file capabilities; sealed launcher snapshots intentionally drop kernel-granted executable privileges, so install an unprivileged modern Bubblewrap (0.12+) in a system-managed path",
-                prepared.path.display()
-            );
-        }
-        if prepared.script {
-            anyhow::bail!(
-                "Bubblewrap launcher {} is a #! wrapper; sandbox launchers must be native executables so the host-side interpreter is part of the sealed trust boundary",
-                prepared.path.display()
-            );
-        }
-        if prepared.unprivileged_source_mutable {
-            anyhow::bail!(
-                "Bubblewrap launcher {} is owned or writable by the unprivileged dotlink uid; install Bubblewrap as a system-managed native executable",
-                prepared.path.display()
-            );
-        }
+        Self::prepare_sandbox_launcher_selected(path, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_sandbox_launcher_selected(
+        path: PathBuf,
+        root_managed_selector: bool,
+    ) -> Result<Self> {
+        let canonical = std::fs::canonicalize(&path)
+            .with_context(|| format!("cannot resolve executable {}", path.display()))?;
+        let build_pinned = build_pinned_bubblewrap(&canonical);
+        let euid = unsafe { libc::geteuid() };
+        // Nix-store immutability proves only that the selected bytes cannot
+        // change; it does not prove who selected them. Unprivileged users can
+        // ask the daemon to build arbitrary root-owned derivations, so direct
+        // store paths are trusted only when this exact Bubblewrap was compiled
+        // into Dotlink or a root-managed host selector chose it.
+        let selection_authorized =
+            nix_store_selection_authorized(build_pinned, root_managed_selector);
+        let prepared = Self::prepare_inner(
+            canonical,
+            true,
+            selection_authorized,
+            read_only_mapped_nix_allowed_for_effective_uid(euid, selection_authorized),
+        )?;
+        validate_sandbox_launcher(&prepared)?;
         Ok(prepared)
     }
 
@@ -682,7 +1039,12 @@ impl PreparedExecutable {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn sandbox_host_command(&self) -> Result<Command> {
+    fn sandbox_host_command(&self) -> Result<Command> {
+        if self.sandbox_trust.is_none() {
+            anyhow::bail!(
+                "internal error: host-side sandbox launcher execution requires trusted provenance"
+            );
+        }
         let mut command = self.command()?;
         // Bubblewrap is itself host-side code. Start it with no inherited
         // environment so dynamic-loader controls (LD_PRELOAD, LD_LIBRARY_PATH,
@@ -720,13 +1082,76 @@ impl PreparedExecutable {
         prepared.path = path;
         prepared
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn for_test_sandbox_launcher(path: PathBuf) -> Self {
+        let mut prepared = Self::for_test(path);
+        prepared.sandbox_trust = Some(SandboxLauncherTrust::RootOwnedPath);
+        prepared
+    }
 }
 
-fn resolve_executable_in_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+fn executable_candidate_in_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     env::split_paths(path)
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable_file(candidate))
+}
+
+fn resolve_executable_in_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    executable_candidate_in_path(name, path)
         .map(|found| std::fs::canonicalize(&found).unwrap_or(found))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_bubblewrap_in_path(path: &std::ffi::OsStr) -> Result<Option<PreparedExecutable>> {
+    let mut first_preparation_error = None;
+    let mut first_selector_error = None;
+    let mut first_rejection = None;
+    for dir in env::split_paths(path) {
+        let candidate = dir.join("bwrap");
+        if !is_executable_file(&candidate) {
+            continue;
+        }
+        let selector = if managed_selector_applies(&candidate) {
+            match root_managed_launcher_selector(&candidate) {
+                Ok(selector) => selector,
+                Err(error) => {
+                    first_selector_error.get_or_insert(error);
+                    continue;
+                }
+            }
+        } else {
+            false
+        };
+        match PreparedExecutable::prepare_sandbox_launcher_selected(candidate, selector) {
+            Ok(prepared) => return Ok(Some(prepared)),
+            Err(error) => {
+                if crate::recovery::Recovery::of(&error) == crate::recovery::Recovery::Operator {
+                    return Err(error);
+                }
+                if error.downcast_ref::<UntrustedSandboxLauncher>().is_some() {
+                    first_rejection.get_or_insert(error);
+                } else {
+                    first_preparation_error.get_or_insert(error);
+                }
+            }
+        }
+    }
+    match first_preparation_error
+        .or(first_selector_error)
+        .or(first_rejection)
+    {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_bubblewrap_from_path() -> Result<Option<PreparedExecutable>> {
+    let Some(path) = env::var_os("PATH") else {
+        return Ok(None);
+    };
+    prepare_bubblewrap_in_path(&path)
 }
 
 pub(crate) fn resolve_executable(name: &str) -> Option<PathBuf> {
@@ -1940,15 +2365,21 @@ impl LocalMachine {
                     .with_context(result_context);
             }
         };
+        let Some([stdout_writer, stderr_writer]) = job.begin_spool_writers() else {
+            process_tree.terminate();
+            Self::terminate_child(&mut child).await;
+            return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_context(result_context);
+        };
         let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
             stdout,
             job.stdout_path.clone(),
-            job.clone(),
+            stdout_writer,
         )));
         let mut stderr_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
             stderr,
             job.stderr_path.clone(),
-            job.clone(),
+            stderr_writer,
         )));
 
         let (mut stdin_task, mut stdin_rx) = match stdin_text {
@@ -1964,8 +2395,7 @@ impl LocalMachine {
                 None => {
                     process_tree.terminate();
                     Self::terminate_child(&mut child).await;
-                    stdout_task.abort();
-                    stderr_task.abort();
+                    abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
                     return JobCompletion::failed("failed to capture child stdin")
                         .with_context(result_context);
                 }
@@ -2105,8 +2535,7 @@ impl LocalMachine {
                 (stdout, stderr)
             }
             Err(_) if terminal == JobStatus::Completed => {
-                stdout_task.abort();
-                stderr_task.abort();
+                abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
                 process_tree.terminate();
                 return JobCompletion::internal_failed(
                     format!(
@@ -2119,8 +2548,7 @@ impl LocalMachine {
                 .with_context(result_context);
             }
             Err(_) => {
-                stdout_task.abort();
-                stderr_task.abort();
+                abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
                 (
                     stream_summary_from_file(&job.stdout_path, true),
                     stream_summary_from_file(&job.stderr_path, true),
@@ -2412,7 +2840,8 @@ mod tests {
                         job: job.clone(),
                     },
                     job.stdout_path.clone(),
-                    job.clone(),
+                    job.begin_spool_writer()
+                        .expect("test spool writer registration is open"),
                 )
                 .await
                 .unwrap();
@@ -2439,6 +2868,53 @@ mod tests {
             "retained output must stay a contiguous prefix after the first dropped byte"
         );
         drop(started);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_spool_tasks_uses_writer_lifetime_after_one_join_result_was_consumed() {
+        let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let [stdout_writer, stderr_writer] = job
+            .begin_spool_writers()
+            .expect("test spool writer registration is open");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut stdout = AbortOnDropHandle::new(tokio::spawn(async move {
+            drop(stdout_writer);
+            Ok(StreamSummary::default())
+        }));
+        let stderr = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _writer = stderr_writer;
+            crate::blocking::run(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            Ok(StreamSummary::default())
+        }));
+        (&mut stdout)
+            .await
+            .expect("stdout task joins")
+            .expect("stdout task succeeds");
+        crate::blocking::run(|| entered_rx.recv_timeout(Duration::from_secs(2))).unwrap();
+
+        {
+            let quiesce = abort_and_quiesce_spool_tasks(&job, &stdout, &stderr);
+            tokio::pin!(quiesce);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut quiesce)
+                    .await
+                    .is_err(),
+                "abort must not report quiescence while blocking spool I/O is still running"
+            );
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), &mut quiesce)
+                .await
+                .expect("quiescence must complete once the blocking write returns");
+        }
+        drop(stderr);
+        drop(stdout);
+        drop(job);
         manager.shutdown().await.unwrap();
     }
 
@@ -2601,7 +3077,8 @@ mod tests {
         let wrapper = temp.path().join("bwrap");
         std::fs::write(&wrapper, b"#!/bin/sh\nexec /bin/false \"$@\"\n").unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = PreparedExecutable::prepare_sandbox_launcher(wrapper)
+        let prepared = PreparedExecutable::prepare(wrapper).unwrap();
+        let error = validate_sandbox_launcher(&prepared)
             .unwrap_err()
             .to_string();
         assert!(error.contains("#! wrapper"), "{error}");
@@ -2620,7 +3097,8 @@ mod tests {
         let launcher = temp.path().join("bwrap");
         std::fs::copy(bash, &launcher).unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o4755)).unwrap();
-        let error = PreparedExecutable::prepare_sandbox_launcher(launcher)
+        let prepared = PreparedExecutable::prepare(launcher).unwrap();
+        let error = validate_sandbox_launcher(&prepared)
             .unwrap_err()
             .to_string();
         assert!(error.contains("setuid/setgid"), "{error}");
@@ -2629,12 +3107,77 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn root_launcher_trust_does_not_reject_system_root_ownership() {
-        assert!(!sandbox_launcher_unprivileged_source_mutable(0, 0, true));
-        assert!(sandbox_launcher_unprivileged_source_mutable(
-            1000, 1000, false
-        ));
-        assert!(sandbox_launcher_unprivileged_source_mutable(0, 1000, true));
+    fn nix_launcher_requires_trusted_selection_and_root_owned_store_bytes() {
+        assert!(!nix_store_selection_authorized(false, false));
+        assert!(nix_store_selection_authorized(true, false));
+        assert!(nix_store_selection_authorized(false, true));
+        assert!(!read_only_mapped_nix_allowed_for_effective_uid(1000, false));
+        assert!(read_only_mapped_nix_allowed_for_effective_uid(1000, true));
+        assert!(!read_only_mapped_nix_allowed_for_effective_uid(0, true));
+        assert!(managed_selector_applies(Path::new(
+            "/run/current-system/sw/bin/bwrap"
+        )));
+        assert!(!managed_selector_applies(Path::new(
+            "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-bubblewrap/bin/bwrap"
+        )));
+        assert!(managed_selector_applies(Path::new("/usr/bin/bwrap")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nix_store_trust_accepts_traditional_root_owned_items_only() {
+        assert!(traditional_nix_store_trusted(0, 0o755, true));
+        assert!(traditional_nix_store_trusted(0, 0o1775, true));
+        assert!(!traditional_nix_store_trusted(0, 0o775, true));
+        assert!(!traditional_nix_store_trusted(1000, 0o755, true));
+        assert!(!traditional_nix_store_trusted(0, 0o755, false));
+        assert!(
+            nix_store_item_root(Path::new(
+                "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-bubblewrap/bin/bwrap"
+            ))
+            .is_some()
+        );
+        assert!(nix_store_item_root(Path::new("/nix/store/not-a-store-item/bin/bwrap")).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_discovery_skips_untrusted_executable_shadow() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let Some(path_env) = env::var_os("PATH") else {
+            return;
+        };
+        let trusted = env::split_paths(&path_env)
+            .map(|dir| dir.join("bwrap"))
+            .find(|candidate| {
+                if !is_executable_file(candidate) {
+                    return false;
+                }
+                let selector = managed_selector_applies(candidate)
+                    && root_managed_launcher_selector(candidate).unwrap_or(false);
+                PreparedExecutable::prepare_sandbox_launcher_selected(candidate.clone(), selector)
+                    .is_ok()
+            });
+        let Some(trusted) = trusted else {
+            return;
+        };
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let shadow = temp.path().join("bwrap");
+        std::fs::copy(bash, &shadow).unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = env::join_paths([temp.path(), trusted.parent().unwrap()]).unwrap();
+
+        let prepared = prepare_bubblewrap_in_path(&path)
+            .unwrap()
+            .expect("later trusted Bubblewrap should not be shadowed by an untrusted executable");
+        assert_eq!(prepared.path(), trusted.canonicalize().unwrap());
     }
 
     #[cfg(target_os = "linux")]
@@ -2649,17 +3192,49 @@ mod tests {
         let launcher = launcher_root.path().join("bwrap");
         std::fs::copy(bash, &launcher).unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let error = PreparedExecutable::prepare_sandbox_launcher(launcher)
-            .unwrap_err()
-            .to_string();
+        let error = PreparedExecutable::prepare_sandbox_launcher(launcher).unwrap_err();
         assert!(
-            error.contains("owned or writable by the unprivileged dotlink uid"),
+            error.downcast_ref::<UntrustedSandboxLauncher>().is_some(),
+            "provenance rejection must remain typed for PATH-discovery error priority"
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains("not from a trusted host-managed source"),
             "{error}"
         );
-        assert!(
-            error.contains("system-managed native executable"),
-            "{error}"
-        );
+        assert!(error.contains("root-owned non-writable path"), "{error}");
+        assert!(error.contains("dotlink's Nix package"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_nix_store_launcher_requires_explicit_selection_authority() {
+        let Some(bwrap) = resolve_executable("bwrap") else {
+            return;
+        };
+        let Ok(canonical) = std::fs::canonicalize(&bwrap) else {
+            return;
+        };
+        if nix_store_item_root(&canonical).is_none() {
+            return;
+        }
+        let build_pinned = build_pinned_bubblewrap(&canonical);
+        let prepared = PreparedExecutable::prepare_sandbox_launcher(canonical);
+        if build_pinned {
+            let prepared = prepared.expect("the build-pinned Nix launcher must be trusted");
+            assert!(matches!(
+                prepared.sandbox_trust,
+                Some(
+                    SandboxLauncherTrust::NixStoreRootOwned
+                        | SandboxLauncherTrust::NixStoreReadOnlyMapped
+                )
+            ));
+        } else {
+            let error = prepared.expect_err(
+                "a directly selected Nix store item must not gain trust from immutability alone",
+            );
+            assert!(error.downcast_ref::<UntrustedSandboxLauncher>().is_some());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2671,7 +3246,14 @@ mod tests {
         if std::env::var_os("HOME").is_none() {
             return;
         }
-        let prepared = PreparedExecutable::prepare_sandbox_launcher(bash).unwrap();
+        let ordinary = PreparedExecutable::prepare(bash.clone()).unwrap();
+        let error = ordinary.sandbox_host_command().unwrap_err().to_string();
+        assert!(error.contains("requires trusted provenance"), "{error}");
+
+        // The environment-clearing behavior is tested with an explicit test-only
+        // trusted marker; production can obtain that marker only through the
+        // provenance-aware Bubblewrap preparation path.
+        let prepared = PreparedExecutable::for_test_sandbox_launcher(bash);
         let status = prepared
             .sandbox_host_command()
             .unwrap()
@@ -2690,11 +3272,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn sandbox_launcher_preparation_does_not_run_capability_probe() {
+    async fn sealed_host_executable_probes_only_when_validation_is_requested() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
-        let prepared = PreparedExecutable::prepare_sandbox_launcher(bash).unwrap();
+        let prepared = PreparedExecutable::for_test_sandbox_launcher(bash);
         let error = validate_bubblewrap(&prepared)
             .await
             .unwrap_err()
@@ -5691,7 +6273,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sandboxed_root_rw_preparation_accepts_system_managed_bubblewrap() {
-        if resolve_executable("bash").is_none() || resolve_executable("bwrap").is_none() {
+        if resolve_executable("bash").is_none() || !crate::mcp::trusted_bubblewrap_available() {
             return;
         }
         let temp = tempfile::tempdir().unwrap();

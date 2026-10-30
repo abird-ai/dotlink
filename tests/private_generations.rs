@@ -1,5 +1,44 @@
 use std::{fs, process::Command};
 
+#[cfg(target_os = "linux")]
+fn trusted_bubblewrap_available() -> bool {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let config = temp.path().join("probe.jsonc");
+    fs::write(
+        &config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":false,"stdio":true}},"permissions":{{"allow_read":["{}"],"allow_shell":true}}}}"#,
+            root.display()
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .arg("--stdio")
+        .env("DOTLINK_CONFIG", &config)
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("cfg"))
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("DOTLINK_API_KEY_FILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(78)
+        && stderr.contains("Bubblewrap launcher")
+        && stderr.contains("not from a trusted host-managed source")
+    {
+        return false;
+    }
+    assert!(
+        output.status.success() || stderr.contains("connection closed: initialize request"),
+        "trusted Bubblewrap probe failed for an unrelated reason: {stderr}"
+    );
+    true
+}
+
 fn run_with_profile(
     config_dir: &std::path::Path,
     profile: &std::path::Path,
@@ -351,6 +390,9 @@ fn unrelated_profile_edits_do_not_retire_running_process_credentials() {
 fn standard_config_inside_broad_writable_home_starts_with_private_state_anchored() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if !trusted_bubblewrap_available() {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let config_home = home.join(".config");
@@ -404,6 +446,9 @@ fn standard_config_inside_broad_writable_home_starts_with_private_state_anchored
 fn writable_sandbox_parent_anchors_control_plane_paths() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if !trusted_bubblewrap_available() {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let config_home = root.join("cfg");

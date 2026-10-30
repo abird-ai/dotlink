@@ -16,6 +16,7 @@ in {
       ];
 
     RUST_BACKTRACE = "1";
+    DOTLINK_BUILD_BWRAP = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "${pkgs.bubblewrap}/bin/bwrap";
   };
   formatter = pkgs.writeShellApplication {
     name = "dotlink-fmt";

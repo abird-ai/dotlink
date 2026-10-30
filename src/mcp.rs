@@ -9,6 +9,8 @@ mod tools;
 pub(crate) use tools::shell::ShellArgs;
 #[cfg(test)]
 pub(crate) use tools::test_support::test_machine;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tools::test_support::trusted_bubblewrap_available;
 pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 
 use std::{
@@ -188,7 +190,7 @@ impl PreparedLaunchers {
         Self {
             shell: shell.map(tools::shell::PreparedExecutable::for_test),
             #[cfg(target_os = "linux")]
-            bwrap: bwrap.map(tools::shell::PreparedExecutable::for_test),
+            bwrap: bwrap.map(tools::shell::PreparedExecutable::for_test_sandbox_launcher),
         }
     }
 }
@@ -1851,14 +1853,14 @@ impl LocalMachine {
 
         #[cfg(target_os = "linux")]
         let bwrap_launcher = if args.allow_shell && args.sandbox_shell {
-            let program = resolve_executable("bwrap").ok_or_else(|| {
-                crate::recovery::operator(anyhow!(
-                    "an executable Bubblewrap (bwrap) is required for sandboxed shell access"
-                ))
-            })?;
             Some(
-                tools::shell::PreparedExecutable::prepare_sandbox_launcher(program)
-                    .map_err(crate::recovery::operator)?,
+                tools::shell::prepare_bubblewrap_from_path()
+                    .map_err(crate::recovery::operator)?
+                    .ok_or_else(|| {
+                        crate::recovery::operator(anyhow!(
+                            "an executable Bubblewrap (bwrap) is required for sandboxed shell access"
+                        ))
+                    })?,
             )
         } else {
             None
@@ -3896,6 +3898,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn broad_writable_home_accepts_standard_dotlink_private_directory() {
+        if !trusted_bubblewrap_available() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
         let dotlink = home.join(".config/abird/dotlink");
@@ -3921,6 +3926,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn broad_writable_home_accepts_control_plane_and_job_spool_private_trees() {
+        if !trusted_bubblewrap_available() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
         let config_dir = home.join(".config/abird/dotlink");
@@ -3971,6 +3979,9 @@ mod tests {
     async fn canonical_file_and_directory_guards_are_anchorable_but_symlinks_fail_closed() {
         use std::os::unix::fs::symlink;
 
+        if !trusted_bubblewrap_available() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let project = root.join("project");

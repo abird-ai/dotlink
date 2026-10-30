@@ -15,12 +15,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::FutureExt as _;
 use rmcp::{
     ErrorData as McpError,
     model::{
@@ -291,9 +292,15 @@ struct JobEntry {
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     spool_account: Arc<SpoolAccount>,
+    stdout_retained: u64,
+    stderr_retained: u64,
     stdout_consumed: u64,
     stderr_consumed: u64,
-    output_released: bool,
+    /// The full durable stream is no longer pageable. Compatibility cleanup
+    /// deletes it; native Task compaction may still retain the exact Task-result
+    /// prefix for `tasks/get` while marking the original stream released.
+    stdout_released: bool,
+    stderr_released: bool,
     readers: usize,
     output_cleanup_requested: bool,
     output_cleanup_pending: bool,
@@ -321,6 +328,21 @@ impl JobEntry {
             .as_ref()
             .map_or(JobStatus::Working, |completion| completion.status)
     }
+
+    fn stream_released(&self, stream: JobStream) -> bool {
+        match stream {
+            JobStream::Stdout => self.stdout_released,
+            JobStream::Stderr => self.stderr_released,
+        }
+    }
+
+    fn any_output_released(&self) -> bool {
+        self.stdout_released || self.stderr_released
+    }
+
+    fn all_output_released(&self) -> bool {
+        self.stdout_released && self.stderr_released
+    }
 }
 
 #[derive(Default)]
@@ -328,6 +350,18 @@ struct JobState {
     closed: bool,
     jobs: HashMap<String, JobEntry>,
     request_jobs: HashMap<String, String>,
+}
+
+impl JobState {
+    fn available(&self, id: &str) -> Option<&JobEntry> {
+        self.jobs.get(id).filter(|entry| !entry.expiration_pending)
+    }
+
+    fn available_mut(&mut self, id: &str) -> Option<&mut JobEntry> {
+        self.jobs
+            .get_mut(id)
+            .filter(|entry| !entry.expiration_pending)
+    }
 }
 
 struct JobManagerInner {
@@ -344,10 +378,20 @@ struct JobManagerInner {
     policy_fingerprint: Mutex<Option<[u8; 32]>>,
 }
 
+const SPOOL_WRITERS_SEALED: usize = 1usize << (usize::BITS - 1);
+const SPOOL_WRITER_COUNT_MASK: usize = !SPOOL_WRITERS_SEALED;
+
 #[derive(Debug)]
 struct SpoolAccount {
     inner: Weak<JobManagerInner>,
     charged: AtomicU64,
+    writers: AtomicUsize,
+    writers_idle: Notify,
+}
+
+#[derive(Debug)]
+pub(crate) struct SpoolWriterGuard {
+    account: Arc<SpoolAccount>,
 }
 
 impl SpoolAccount {
@@ -355,6 +399,8 @@ impl SpoolAccount {
         Arc::new(Self {
             inner: Arc::downgrade(inner),
             charged: AtomicU64::new(0),
+            writers: AtomicUsize::new(0),
+            writers_idle: Notify::new(),
         })
     }
 
@@ -402,9 +448,90 @@ impl SpoolAccount {
         }
     }
 
+    fn begin_writers<const N: usize>(self: &Arc<Self>) -> Option<[SpoolWriterGuard; N]> {
+        if N == 0 {
+            return Some(std::array::from_fn(|_| unreachable!()));
+        }
+        let mut state = self.writers.load(Ordering::Acquire);
+        loop {
+            if state & SPOOL_WRITERS_SEALED != 0 {
+                return None;
+            }
+            let count = state & SPOOL_WRITER_COUNT_MASK;
+            let next_count = count.checked_add(N)?;
+            if next_count > SPOOL_WRITER_COUNT_MASK {
+                return None;
+            }
+            match self.writers.compare_exchange_weak(
+                state,
+                next_count,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(std::array::from_fn(|_| SpoolWriterGuard {
+                        account: self.clone(),
+                    }));
+                }
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn begin_writer(self: &Arc<Self>) -> Option<SpoolWriterGuard> {
+        self.begin_writers::<1>().map(|[writer]| writer)
+    }
+
+    fn seal_writers(&self) {
+        self.writers
+            .fetch_or(SPOOL_WRITERS_SEALED, Ordering::AcqRel);
+    }
+
+    async fn wait_writers_idle(&self) {
+        loop {
+            let notified = self.writers_idle.notified();
+            tokio::pin!(notified);
+            // Register before observing the count: `notify_waiters` does not store
+            // a permit for a future waiter, so checking first could miss the final
+            // writer transition and sleep forever.
+            notified.as_mut().enable();
+            if self.writers.load(Ordering::Acquire) & SPOOL_WRITER_COUNT_MASK == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn seal_and_wait_writers_idle(&self) {
+        self.seal_writers();
+        self.wait_writers_idle().await;
+    }
+
     #[cfg(test)]
     fn charged(&self) -> u64 {
         self.charged.load(Ordering::Relaxed)
+    }
+}
+
+impl SpoolWriterGuard {
+    pub(crate) fn reserve(&self, requested: u64) -> u64 {
+        self.account.reserve(requested)
+    }
+
+    pub(crate) fn release(&self, bytes: u64) {
+        self.account.release(bytes);
+    }
+}
+
+impl Drop for SpoolWriterGuard {
+    fn drop(&mut self) {
+        let previous = self.account.writers.fetch_sub(1, Ordering::AcqRel);
+        let previous_count = previous & SPOOL_WRITER_COUNT_MASK;
+        debug_assert!(previous_count != 0, "spool writer count underflow");
+        if previous_count == 1 {
+            self.account.writers_idle.notify_waiters();
+        }
     }
 }
 
@@ -448,6 +575,7 @@ impl Drop for JobManagerInner {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
             for entry in state.jobs.values_mut() {
+                entry.spool_account.seal_writers();
                 entry.cancel.cancel();
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
@@ -482,7 +610,7 @@ pub(crate) struct JobManager {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct JobFinisher {
+struct JobFinisher {
     inner: Weak<JobManagerInner>,
 }
 
@@ -521,12 +649,31 @@ impl JobHandle {
     /// Reserve up to `requested` bytes from the process-session spool budget.
     /// The caller may persist only the returned prefix and must keep draining
     /// the producer after the budget is exhausted.
+    #[cfg(test)]
     pub(crate) fn reserve_spool(&self, requested: u64) -> u64 {
         self.spool_account.reserve(requested)
     }
 
+    #[cfg(test)]
     pub(crate) fn release_spool(&self, bytes: u64) {
         self.spool_account.release(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_spool_writer(&self) -> Option<SpoolWriterGuard> {
+        self.spool_account.begin_writer()
+    }
+
+    pub(crate) fn begin_spool_writers(&self) -> Option<[SpoolWriterGuard; 2]> {
+        self.spool_account.begin_writers::<2>()
+    }
+
+    pub(crate) fn seal_spool_writers(&self) {
+        self.spool_account.seal_writers();
+    }
+
+    pub(crate) async fn wait_spool_writers_idle(&self) {
+        self.spool_account.wait_writers_idle().await;
     }
 }
 
@@ -682,10 +829,18 @@ impl Drop for JobReadLease {
 }
 
 impl JobFinisher {
-    pub(crate) fn finish(&self, id: &str, completion: JobCompletion) {
-        if let Some(inner) = self.inner.upgrade() {
-            finish_inner(&inner, id, completion);
+    async fn finish(&self, id: &str, completion: JobCompletion) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let spool_account = {
+            let state = inner.state.lock().expect("job manager lock");
+            state.jobs.get(id).map(|entry| entry.spool_account.clone())
+        };
+        if let Some(account) = spool_account {
+            account.seal_and_wait_writers_idle().await;
         }
+        finish_inner(&inner, id, completion);
     }
 }
 
@@ -890,9 +1045,12 @@ impl JobManager {
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
                 spool_account: spool_account.clone(),
+                stdout_retained: 0,
+                stderr_retained: 0,
                 stdout_consumed: 0,
                 stderr_consumed: 0,
-                output_released: false,
+                stdout_released: false,
+                stderr_released: false,
                 readers: 0,
                 output_cleanup_requested: false,
                 output_cleanup_pending: false,
@@ -917,12 +1075,29 @@ impl JobManager {
             spool_account,
             inner: Arc::downgrade(&self.inner),
         };
+        let panic_stdout = handle.stdout_path.clone();
+        let panic_stderr = handle.stderr_path.clone();
+        let panic_account = handle.spool_account.clone();
         let finisher = self.finisher();
         let id_for_task = id.clone();
         let future = runner(handle);
         let task = tokio::spawn(async move {
-            let completion = future.await;
-            finisher.finish(&id_for_task, completion);
+            let completion = match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                Ok(completion) => completion,
+                Err(_) => {
+                    // A panic drops the runner future (and therefore its task
+                    // handles), but blocking spool writes may still be finishing.
+                    // Seal/quiesce before freezing the retained prefixes so a
+                    // programmer bug cannot strand a permanently-working job.
+                    panic_account.seal_and_wait_writers_idle().await;
+                    JobCompletion::internal_failed(
+                        "shell job runner panicked",
+                        incomplete_stream_summary(&panic_stdout),
+                        incomplete_stream_summary(&panic_stderr),
+                    )
+                }
+            };
+            finisher.finish(&id_for_task, completion).await;
         });
         state
             .jobs
@@ -941,7 +1116,7 @@ impl JobManager {
     }
 
     #[cfg(test)]
-    fn create_for_test(&self, timeout_secs: u64) -> Result<JobHandle> {
+    pub(crate) fn create_for_test(&self, timeout_secs: u64) -> Result<JobHandle> {
         self.ensure_session_initialized()?;
         sweep_expired(&self.inner);
         let mut state = self.inner.state.lock().expect("job manager lock");
@@ -976,9 +1151,12 @@ impl JobManager {
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
                 spool_account: spool_account.clone(),
+                stdout_retained: 0,
+                stderr_retained: 0,
                 stdout_consumed: 0,
                 stderr_consumed: 0,
-                output_released: false,
+                stdout_released: false,
+                stderr_released: false,
                 readers: 0,
                 output_cleanup_requested: false,
                 output_cleanup_pending: false,
@@ -1008,7 +1186,7 @@ impl JobManager {
         finish_inner(&self.inner, id, completion);
     }
 
-    pub(crate) fn finisher(&self) -> JobFinisher {
+    fn finisher(&self) -> JobFinisher {
         JobFinisher {
             inner: Arc::downgrade(&self.inner),
         }
@@ -1070,25 +1248,38 @@ impl JobManager {
             let _ = sweeper.await;
         }
 
-        let runners = {
+        let (runners, spool_accounts) = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             state.closed = true;
             state.request_jobs.clear();
             let mut runners = Vec::new();
+            let mut spool_accounts = Vec::with_capacity(state.jobs.len());
             for entry in state.jobs.values_mut() {
+                // Seal before cancellation so a detached runner subtask cannot
+                // register a new writer after shutdown has observed an idle count.
+                entry.spool_account.seal_writers();
+                spool_accounts.push(entry.spool_account.clone());
                 entry.cancel.cancel();
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
                     runners.push(handle);
                 }
             }
-            runners
+            (runners, spool_accounts)
         };
         for runner in runners {
             let _ = runner.await;
         }
 
-        let entries = {
+        // Runner abort drops its AbortOnDrop spool handles, but Tokio abort is a
+        // request: a writer already inside cancellation-safe blocking I/O may
+        // still be running. Registrations are already sealed; now wait until all
+        // existing writers have actually stopped before unlinking spool state.
+        for account in &spool_accounts {
+            account.wait_writers_idle().await;
+        }
+
+        let mut entries = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             state
                 .jobs
@@ -1096,7 +1287,7 @@ impl JobManager {
                 .map(|(_, entry)| entry)
                 .collect::<Vec<_>>()
         };
-        for entry in &entries {
+        for entry in &mut entries {
             cleanup_entry(entry);
         }
         self.inner
@@ -1127,8 +1318,7 @@ impl JobManager {
         sweep_expired(&self.inner);
         let mut state = self.inner.state.lock().expect("job manager lock");
         let entry = state
-            .jobs
-            .get_mut(id)
+            .available_mut(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
         if !entry.status().terminal() {
             entry.cancel.cancel();
@@ -1141,8 +1331,7 @@ impl JobManager {
         sweep_expired(&self.inner);
         let state = self.inner.state.lock().expect("job manager lock");
         let entry = state
-            .jobs
-            .get(id)
+            .available(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
         Ok(render_status_locked(&self.inner, entry))
     }
@@ -1153,7 +1342,7 @@ impl JobManager {
         let mut jobs = state
             .jobs
             .values()
-            .filter(|entry| entry.disposition.exposed())
+            .filter(|entry| entry.disposition.exposed() && !entry.expiration_pending)
             .collect::<Vec<_>>();
         jobs.sort_by_key(|entry| std::cmp::Reverse(entry.created));
         serde_json::json!({
@@ -1293,8 +1482,9 @@ impl JobManager {
     }
 
     pub(crate) fn ensure_native_task(&self, id: &str) -> JobResult<()> {
+        sweep_expired(&self.inner);
         let state = self.inner.state.lock().expect("job manager lock");
-        match state.jobs.get(id) {
+        match state.available(id) {
             Some(entry) if entry.disposition.native_task() => Ok(()),
             _ => Err(JobError::Unknown(format!("unknown task {id}"))),
         }
@@ -1347,13 +1537,12 @@ impl JobManager {
         let snapshot = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             let entry = state
-                .jobs
-                .get_mut(id)
+                .available_mut(id)
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
             if !entry.status().terminal() {
                 return Err(JobError::Internal(anyhow!("job {id} is still running")));
             }
-            if entry.output_released {
+            if entry.any_output_released() {
                 return Ok(None);
             }
             entry.readers += 1;
@@ -1487,7 +1676,7 @@ impl JobManager {
                     entry.stderr_consumed = completion.stderr.stored_bytes;
                     entry.output_cleanup_requested = true;
                     maybe_release_output(entry);
-                    remove_hidden = entry.output_released && entry.readers == 0;
+                    remove_hidden = entry.all_output_released() && entry.readers == 0;
                 }
             }
         }
@@ -1533,7 +1722,7 @@ impl JobManager {
             entry.output_cleanup_requested = true;
             maybe_release_output(entry);
         }
-        let remove_hidden = entry.output_released && entry.readers == 0;
+        let remove_hidden = entry.all_output_released() && entry.readers == 0;
         if remove_hidden {
             let _ = remove_job_locked(&mut state, &id);
         }
@@ -1612,8 +1801,7 @@ impl JobManager {
         let (snapshot, _lease) = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             let entry = state
-                .jobs
-                .get_mut(id)
+                .available_mut(id)
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
             let summary = entry.completion.as_ref().map(|completion| match stream {
                 JobStream::Stdout => completion.stdout,
@@ -1621,7 +1809,10 @@ impl JobManager {
             });
             let stored = summary.map_or_else(
                 || stored_len(stream_path(entry, stream), None),
-                |summary| summary.stored_bytes,
+                |_| match stream {
+                    JobStream::Stdout => entry.stdout_retained,
+                    JobStream::Stderr => entry.stderr_retained,
+                },
             );
             if offset > stored {
                 return Err(JobError::Internal(anyhow!(
@@ -1629,7 +1820,7 @@ impl JobManager {
                     stream.label()
                 )));
             }
-            if entry.output_released {
+            if entry.stream_released(stream) {
                 if offset == stored {
                     return OutputPageRender {
                         id,
@@ -1698,10 +1889,10 @@ impl JobManager {
         stream: JobStream,
         offset: u64,
     ) -> JobResult<String> {
+        sweep_expired(&self.inner);
         let mut state = self.inner.state.lock().expect("job manager lock");
         let entry = state
-            .jobs
-            .get_mut(id)
+            .available_mut(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
         let stored = entry.completion.as_ref().map_or_else(
             || stored_len(stream_path(entry, stream), None),
@@ -1730,8 +1921,7 @@ impl JobManager {
         let (task, status, internal_error, snapshot) = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             let entry = state
-                .jobs
-                .get_mut(id)
+                .available_mut(id)
                 .filter(|entry| entry.disposition.native_task())
                 .ok_or_else(|| JobError::Unknown(format!("unknown task {id}")))?;
             let task = task_from_entry(entry, self.retention());
@@ -1826,8 +2016,14 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             message.to_owned(),
         )]));
     }
-    let stdout = read_prefix(&snapshot.stdout_path, snapshot.result_limit)?;
-    let stderr = read_prefix(&snapshot.stderr_path, snapshot.result_limit)?;
+    let stdout_limit = usize::try_from(completion.stdout.stored_bytes)
+        .unwrap_or(usize::MAX)
+        .min(snapshot.result_limit);
+    let stderr_limit = usize::try_from(completion.stderr.stored_bytes)
+        .unwrap_or(usize::MAX)
+        .min(snapshot.result_limit);
+    let stdout = read_prefix(&snapshot.stdout_path, stdout_limit)?;
+    let stderr = read_prefix(&snapshot.stderr_path, stderr_limit)?;
     let stdout_truncated =
         completion.stdout.truncated || completion.stdout.total_bytes > snapshot.result_limit as u64;
     let stderr_truncated =
@@ -2072,9 +2268,15 @@ impl OutputPageRender<'_> {
 }
 
 fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
-    let stdout_stored = stored_len(&entry.stdout_path, None);
-    let stderr_stored = stored_len(&entry.stderr_path, None);
     let completion = entry.completion.as_ref();
+    let stdout_stored = completion.map_or_else(
+        || stored_len(&entry.stdout_path, None),
+        |_| entry.stdout_retained,
+    );
+    let stderr_stored = completion.map_or_else(
+        || stored_len(&entry.stderr_path, None),
+        |_| entry.stderr_retained,
+    );
     serde_json::json!({
         "job_id": entry.id,
         "task_id": entry.id,
@@ -2094,14 +2296,14 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
             "acknowledged_bytes": entry.stdout_consumed,
             "total_bytes": completion.map(|value| value.stdout.total_bytes),
             "truncated": completion.is_some_and(|value| value.stdout.truncated),
-            "released": entry.output_released,
+            "released": entry.stdout_released,
         },
         "stderr": {
             "stored_bytes": stderr_stored,
             "acknowledged_bytes": entry.stderr_consumed,
             "total_bytes": completion.map(|value| value.stderr.total_bytes),
             "truncated": completion.is_some_and(|value| value.stderr.truncated),
-            "released": entry.output_released,
+            "released": entry.stderr_released,
         },
         "output": "use job_output to read; job_ack explicitly advances cleanup watermarks",
         "cancel": "use job_cancel while status=working",
@@ -2208,6 +2410,8 @@ fn finish_inner(inner: &JobManagerInner, id: &str, completion: JobCompletion) {
         entry.phase = JobPhase::Terminal;
         entry.updated_at = chrono::Utc::now().to_rfc3339();
         entry.terminal_at = Some(Instant::now());
+        entry.stdout_retained = completion.stdout.stored_bytes;
+        entry.stderr_retained = completion.stderr.stored_bytes;
         entry.completion = Some(completion);
         if entry.output_cleanup_requested {
             maybe_release_output(entry);
@@ -2266,7 +2470,7 @@ fn maybe_release_output(entry: &mut JobEntry) {
     let Some(completion) = entry.completion.as_ref() else {
         return;
     };
-    if entry.output_released
+    if entry.all_output_released()
         || entry.stdout_consumed < completion.stdout.stored_bytes
         || entry.stderr_consumed < completion.stderr.stored_bytes
     {
@@ -2287,18 +2491,20 @@ fn release_acknowledged_output(entry: &mut JobEntry) {
     }
 }
 
-fn truncate_file_releasing(account: &SpoolAccount, path: &Path, keep: u64) -> bool {
+fn truncate_file_releasing(account: &SpoolAccount, path: &Path, keep: u64) -> Option<u64> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return keep == 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (keep == 0).then_some(0);
+        }
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "could not inspect native task spool for compaction");
-            return false;
+            return None;
         }
     };
     let len = metadata.len();
     if len <= keep {
-        return true;
+        return Some(len);
     }
     match OpenOptions::new()
         .write(true)
@@ -2307,17 +2513,17 @@ fn truncate_file_releasing(account: &SpoolAccount, path: &Path, keep: u64) -> bo
     {
         Ok(()) => {
             account.release(len - keep);
-            true
+            Some(keep)
         }
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "could not compact native task spool");
-            false
+            None
         }
     }
 }
 
 fn compact_native_task_output(entry: &mut JobEntry) -> bool {
-    if entry.output_released {
+    if entry.all_output_released() {
         return true;
     }
     let Some(completion) = entry.completion.as_ref() else {
@@ -2336,30 +2542,54 @@ fn compact_native_task_output(entry: &mut JobEntry) -> bool {
         .stderr
         .stored_bytes
         .min(entry.result_limit as u64);
-    let stdout_ok = truncate_file_releasing(&entry.spool_account, &entry.stdout_path, stdout_keep);
-    let stderr_ok = truncate_file_releasing(&entry.spool_account, &entry.stderr_path, stderr_keep);
-    let success = stdout_ok && stderr_ok;
-    if success {
-        let retained = stored_len(&entry.stdout_path, None)
-            .saturating_add(stored_len(&entry.stderr_path, None));
-        entry.spool_account.reconcile_to(retained);
+    let stdout_retained = if entry.stdout_released {
+        Some(entry.stdout_retained)
+    } else {
+        truncate_file_releasing(&entry.spool_account, &entry.stdout_path, stdout_keep)
+    };
+    let stderr_retained = if entry.stderr_released {
+        Some(entry.stderr_retained)
+    } else {
+        truncate_file_releasing(&entry.spool_account, &entry.stderr_path, stderr_keep)
+    };
+    if let Some(retained) = stdout_retained {
+        entry.stdout_retained = retained;
+        entry.stdout_released = true;
     }
-    entry.output_released = success;
+    if let Some(retained) = stderr_retained {
+        entry.stderr_retained = retained;
+        entry.stderr_released = true;
+    }
+    let success = entry.all_output_released();
+    if success {
+        entry
+            .spool_account
+            .reconcile_to(entry.stdout_retained.saturating_add(entry.stderr_retained));
+    }
     entry.output_cleanup_pending = !success;
     success
 }
 
 fn release_output_files(entry: &mut JobEntry) -> bool {
-    if entry.output_released {
+    if entry.all_output_released() {
         return true;
     }
-    let stdout_ok = remove_file_releasing(&entry.spool_account, &entry.stdout_path);
-    let stderr_ok = remove_file_releasing(&entry.spool_account, &entry.stderr_path);
-    let success = stdout_ok && stderr_ok;
+    let stdout_ok =
+        entry.stdout_released || remove_file_releasing(&entry.spool_account, &entry.stdout_path);
+    if stdout_ok {
+        entry.stdout_retained = 0;
+        entry.stdout_released = true;
+    }
+    let stderr_ok =
+        entry.stderr_released || remove_file_releasing(&entry.spool_account, &entry.stderr_path);
+    if stderr_ok {
+        entry.stderr_retained = 0;
+        entry.stderr_released = true;
+    }
+    let success = entry.all_output_released();
     if success {
         entry.spool_account.reconcile_to(0);
     }
-    entry.output_released = success;
     entry.output_cleanup_pending = !success;
     success
 }
@@ -2374,13 +2604,13 @@ fn release_reader(inner: &Arc<JobManagerInner>, id: &str) {
         entry.readers = entry.readers.saturating_sub(1);
         if entry.readers == 0 {
             if entry.expiration_pending {
-                let cleanup_ok = state.jobs.get(id).is_some_and(cleanup_entry);
+                let cleanup_ok = state.jobs.get_mut(id).is_some_and(cleanup_entry);
                 if cleanup_ok {
                     removed = remove_job_locked(&mut state, id);
                 }
             } else if entry.retention == RetentionClass::CleanupOnly {
                 release_acknowledged_output(entry);
-                if entry.output_released {
+                if entry.all_output_released() {
                     removed = remove_job_locked(&mut state, id);
                 }
             } else if entry.output_cleanup_pending {
@@ -2474,6 +2704,15 @@ fn create_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn incomplete_stream_summary(path: &Path) -> StreamSummary {
+    let stored = fs::metadata(path).map_or(0, |metadata| metadata.len());
+    StreamSummary {
+        total_bytes: stored,
+        stored_bytes: stored,
+        truncated: true,
+    }
+}
+
 fn stored_len(path: &Path, hint: Option<u64>) -> u64 {
     hint.unwrap_or_else(|| fs::metadata(path).map_or(0, |metadata| metadata.len()))
 }
@@ -2496,9 +2735,17 @@ fn remove_file_releasing(account: &SpoolAccount, path: &Path) -> bool {
     }
 }
 
-fn cleanup_entry(entry: &JobEntry) -> bool {
+fn cleanup_entry(entry: &mut JobEntry) -> bool {
     let stdout_ok = remove_file_releasing(&entry.spool_account, &entry.stdout_path);
+    if stdout_ok {
+        entry.stdout_retained = 0;
+        entry.stdout_released = true;
+    }
     let stderr_ok = remove_file_releasing(&entry.spool_account, &entry.stderr_path);
+    if stderr_ok {
+        entry.stderr_retained = 0;
+        entry.stderr_released = true;
+    }
     let success = stdout_ok && stderr_ok;
     if success {
         entry.spool_account.reconcile_to(0);
@@ -2550,7 +2797,7 @@ fn reclaimable_terminal(entry: &JobEntry) -> bool {
     let empty = entry.completion.as_ref().is_some_and(|completion| {
         completion.stdout.stored_bytes == 0 && completion.stderr.stored_bytes == 0
     });
-    entry.output_released || (!entry.disposition.exposed() && empty)
+    entry.all_output_released() || (!entry.disposition.exposed() && empty)
 }
 
 fn evict_one_reclaimable_terminal(state: &mut JobState) -> bool {
@@ -2567,7 +2814,7 @@ fn evict_one_reclaimable_terminal(state: &mut JobState) -> bool {
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(terminal_at, _)| *terminal_at);
     for (_, id) in candidates {
-        let cleanup_ok = state.jobs.get(&id).is_some_and(cleanup_entry);
+        let cleanup_ok = state.jobs.get_mut(&id).is_some_and(cleanup_entry);
         if cleanup_ok {
             let _ = remove_job_locked(state, &id);
             return true;
@@ -2622,7 +2869,7 @@ fn sweep_expired(inner: &JobManagerInner) {
         for id in cleanup_only {
             let released = if let Some(entry) = state.jobs.get_mut(&id) {
                 release_acknowledged_output(entry);
-                entry.output_released
+                entry.all_output_released()
             } else {
                 false
             };
@@ -2662,7 +2909,7 @@ fn sweep_expired(inner: &JobManagerInner) {
                 }
                 continue;
             }
-            let cleanup_ok = state.jobs.get(&id).is_some_and(cleanup_entry);
+            let cleanup_ok = state.jobs.get_mut(&id).is_some_and(cleanup_entry);
             if cleanup_ok {
                 let _ = remove_job_locked(&mut state, &id);
             } else if let Some(entry) = state.jobs.get_mut(&id) {
@@ -2822,6 +3069,138 @@ mod tests {
             manager.create_for_test(30).is_err(),
             "a closed process job session must never be resurrected"
         );
+    }
+
+    #[tokio::test]
+    async fn panicking_runner_becomes_terminal_internal_failure() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                None,
+                |_job| async move { panic!("runner bug") },
+            )
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.wait_until(&started.id, None),
+        )
+        .await
+        .expect("panicking runner must still reach a terminal job state")
+        .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(&manager.status(&started.id).unwrap()).unwrap();
+        assert_eq!(status["status"], "failed");
+        assert!(
+            status["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("runner panicked"))
+        );
+        drop(started);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runner_cannot_publish_terminal_state_before_spool_writers_are_idle() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let (writer_tx, writer_rx) = tokio::sync::oneshot::channel();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                None,
+                move |job| async move {
+                    writer_tx
+                        .send(
+                            job.begin_spool_writer()
+                                .expect("runner writer registration is open"),
+                        )
+                        .unwrap();
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        let writer = writer_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !manager.inner.state.lock().unwrap().jobs[&started.id]
+                .status()
+                .terminal(),
+            "JobManager must enforce writer quiescence before terminal publication"
+        );
+        drop(writer);
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        drop(started);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sealing_spool_writers_blocks_late_registration() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let account = SpoolAccount::new(&manager.inner);
+        let writer = account.begin_writer().expect("writer registration is open");
+        account.seal_writers();
+        assert!(
+            account.begin_writer().is_none(),
+            "sealed terminal/shutdown state must reject every later writer registration"
+        );
+        drop(writer);
+        account.wait_writers_idle().await;
+        drop(account);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_idle_wait_cannot_miss_the_final_drop() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let account = SpoolAccount::new(&manager.inner);
+        for _ in 0..256 {
+            let writer = account.begin_writer().expect("writer registration is open");
+            let waiter_account = account.clone();
+            let waiter = tokio::spawn(async move { waiter_account.wait_writers_idle().await });
+            tokio::task::yield_now().await;
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("final writer notification must never be lost")
+                .unwrap();
+        }
+        drop(account);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_registered_spool_writers_to_quiesce() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let root = manager.protected_path().to_path_buf();
+        let writer = job
+            .begin_spool_writer()
+            .expect("writer registration is open before shutdown");
+        let shutdown_manager = manager.clone();
+        let shutdown = tokio::spawn(async move { shutdown_manager.shutdown().await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must not unlink spool state while a registered writer is live"
+        );
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("shutdown should complete after the writer becomes idle")
+            .unwrap()
+            .unwrap();
+        assert!(!root.exists());
     }
 
     #[test]
@@ -3362,12 +3741,37 @@ mod tests {
             .acknowledge_output(&job.id, JobStream::Stderr, 0)
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
-        assert_eq!(status["stdout"]["released"], false);
+        assert_eq!(status["stdout"]["released"], true);
+        assert_eq!(status["stderr"]["released"], false);
+        assert_eq!(
+            status["stdout"]["stored_bytes"], 0,
+            "a successfully deleted stream must report zero retained bytes even while sibling cleanup is retryable"
+        );
+        let released_page: serde_json::Value = serde_json::from_str(
+            &manager
+                .output_page(&job.id, JobStream::Stdout, 0, 64, 4096, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(released_page["stored_bytes"], 0);
+        assert_eq!(released_page["complete"], true);
+        assert_eq!(released_page["released"], true);
+        assert_eq!(released_page["data"], "");
+        let page_error = manager
+            .output_page(&job.id, JobStream::Stdout, 1, 64, 4096, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            page_error.contains("beyond stored output (0 bytes)"),
+            "job_output must validate against current retained bytes after partial cleanup: {page_error}"
+        );
         {
             let state = manager.inner.state.lock().unwrap();
             let entry = &state.jobs[&job.id];
             assert!(entry.output_cleanup_pending);
-            assert!(!entry.output_released);
+            assert!(entry.stdout_released);
+            assert!(!entry.stderr_released);
+            assert!(!entry.all_output_released());
         }
 
         fs::remove_dir(&job.stderr_path).unwrap();
@@ -3388,7 +3792,7 @@ mod tests {
         // contract without relying on platform-specific sharing violations.
         let bad = tempfile::tempdir().unwrap();
         assert!(!remove_file_releasing(&job.spool_account, bad.path()));
-        assert!(!truncate_file_releasing(&job.spool_account, bad.path(), 0));
+        assert!(truncate_file_releasing(&job.spool_account, bad.path(), 0).is_none());
         manager.finish(
             &job.id,
             JobCompletion::completed(
@@ -4751,6 +5155,214 @@ mod tests {
         );
         assert!(internal.error.as_ref().unwrap().len() <= MAX_JOB_ERROR_BYTES);
         assert!(internal.internal_error.as_ref().unwrap().len() <= MAX_JOB_ERROR_BYTES);
+    }
+
+    #[test]
+    fn terminal_surfaces_never_read_past_frozen_output_prefix() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        fs::write(&job.stdout_path, b"stableEXTRA").unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: 6,
+                    stored_bytes: 6,
+                    truncated: false,
+                },
+                StreamSummary::default(),
+            ),
+        );
+
+        let status: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert_eq!(status["stdout"]["stored_bytes"], 6);
+
+        let page: serde_json::Value = serde_json::from_str(
+            &manager
+                .output_page(&job.id, JobStream::Stdout, 0, 100, 4096, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["stored_bytes"], 6);
+        assert_eq!(page["next_offset"], 6);
+        assert_eq!(page["data"], "stable");
+        assert_eq!(page["complete"], true);
+
+        manager.expose_native_task(&job.id, None).unwrap().unwrap();
+        let task = manager.detailed_task(&job.id).unwrap();
+        let TaskPayload::Completed { result } = task.payload else {
+            panic!("terminal native task must return a completed payload")
+        };
+        let rendered = serde_json::Value::Object(result).to_string();
+        assert!(rendered.contains("stable"), "{rendered}");
+        assert!(!rendered.contains("EXTRA"), "{rendered}");
+    }
+
+    #[test]
+    fn native_task_compaction_tracks_retained_bytes_without_rewriting_ack_history() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        fs::write(&job.stdout_path, b"abcdefgh").unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: 8,
+                    stored_bytes: 8,
+                    truncated: false,
+                },
+                StreamSummary::default(),
+            ),
+        );
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            state.jobs.get_mut(&job.id).unwrap().result_limit = 4;
+        }
+        manager.expose_native_task(&job.id, None).unwrap().unwrap();
+
+        let first: serde_json::Value = serde_json::from_str(
+            &manager
+                .acknowledge_output(&job.id, JobStream::Stdout, 8)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["stdout"]["stored_bytes"], 4);
+        assert_eq!(first["stdout"]["acknowledged_bytes"], 8);
+        assert_eq!(first["stdout"]["released"], true);
+        assert_eq!(fs::metadata(&job.stdout_path).unwrap().len(), 4);
+        let released_page: serde_json::Value = serde_json::from_str(
+            &manager
+                .output_page(&job.id, JobStream::Stdout, 4, 64, 4096, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(released_page["stored_bytes"], 4);
+        assert_eq!(released_page["complete"], true);
+        assert_eq!(released_page["released"], true);
+        assert_eq!(released_page["data"], "");
+        let released_error = manager
+            .output_page(&job.id, JobStream::Stdout, 0, 64, 4096, false)
+            .unwrap_err()
+            .to_string();
+        assert!(released_error.contains("already acknowledged and released"));
+
+        // The historical terminal length remains the acknowledgement ceiling, so
+        // a lost ACK response can be retried after compaction without becoming an
+        // invalid offset. Current retained bytes remain the compacted Task prefix.
+        let replay: serde_json::Value = serde_json::from_str(
+            &manager
+                .acknowledge_output(&job.id, JobStream::Stdout, 8)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay["stdout"]["stored_bytes"], 4);
+        assert_eq!(replay["stdout"]["acknowledged_bytes"], 8);
+        let tail: serde_json::Value = serde_json::from_str(
+            &manager
+                .output_page(&job.id, JobStream::Stdout, 4, 64, 4096, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tail["stored_bytes"], 4);
+        assert_eq!(tail["next_offset"], 4);
+        assert_eq!(tail["complete"], true);
+        assert_eq!(tail["released"], true);
+        let page_error = manager
+            .output_page(&job.id, JobStream::Stdout, 8, 64, 4096, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            page_error.contains("beyond stored output (4 bytes)"),
+            "job_output must not expose the pre-compaction terminal length: {page_error}"
+        );
+
+        let detailed = manager.detailed_task(&job.id).unwrap();
+        let TaskPayload::Completed { result } = detailed.payload else {
+            panic!("compacted native task must remain complete")
+        };
+        let rendered = serde_json::Value::Object(result).to_string();
+        assert!(rendered.contains("abcd"), "{rendered}");
+        assert!(!rendered.contains("efgh"), "{rendered}");
+    }
+
+    #[test]
+    fn expired_task_is_unavailable_while_cleanup_retry_remains_internal() {
+        let manager = JobManager::new(Duration::ZERO).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        fs::write(&job.stdout_path, b"x").unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: 1,
+                    stored_bytes: 1,
+                    truncated: false,
+                },
+                StreamSummary::default(),
+            ),
+        );
+        manager.expose_native_task(&job.id, None).unwrap().unwrap();
+
+        // Force TTL cleanup to succeed for stdout but remain retryable for stderr.
+        fs::remove_file(&job.stderr_path).unwrap();
+        fs::create_dir(&job.stderr_path).unwrap();
+
+        assert!(matches!(manager.status(&job.id), Err(JobError::Unknown(_))));
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(64)).unwrap();
+        assert!(
+            listed["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["job_id"] != job.id),
+            "expired cleanup-retry state must not remain user-discoverable"
+        );
+        assert!(matches!(
+            manager.detailed_task(&job.id),
+            Err(JobError::Unknown(_))
+        ));
+        assert!(matches!(
+            manager.ensure_native_task(&job.id),
+            Err(JobError::Unknown(_))
+        ));
+        assert!(matches!(
+            manager.output_page(&job.id, JobStream::Stdout, 0, 64, 4096, false),
+            Err(JobError::Unknown(_))
+        ));
+        assert!(matches!(
+            manager.acknowledge_output(&job.id, JobStream::Stdout, 1),
+            Err(JobError::Unknown(_))
+        ));
+        assert!(matches!(manager.cancel(&job.id), Err(JobError::Unknown(_))));
+
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&job.id];
+            assert!(entry.expiration_pending);
+            assert!(entry.stdout_released);
+            assert!(!entry.stderr_released);
+            assert!(!entry.all_output_released());
+        }
+
+        fs::remove_dir(&job.stderr_path).unwrap();
+        sweep_expired(&manager.inner);
+        assert!(
+            !manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&job.id),
+            "cleanup retry should remove internal metadata once physical cleanup succeeds"
+        );
     }
 
     #[test]

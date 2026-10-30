@@ -1441,14 +1441,30 @@ impl RequestReplayLedger {
                     continue;
                 }
 
+                if matches!(record.state, RequestReplayEntry::Retired { .. }) {
+                    // This logical namespace was inactive and is active again.
+                    // Its response bytes/inner ownership were deliberately
+                    // discarded when it was retired, so it can only re-enter
+                    // through the normal fail-closed uncertainty lifecycle.
+                    // Promoting here keeps the strong invariant that an active
+                    // scope never exposes a Retired entry to claim/delivery.
+                    record.authority = authority;
+                    record.state = RequestReplayEntry::Uncertain { until };
+                    record.delivery_leases = 0;
+                    record.deferred_expiry = None;
+                    expirations.push(ReplayExpiration {
+                        until,
+                        key: key.clone(),
+                        kind: ReplayExpirationKind::ExpireIdentity,
+                    });
+                    continue;
+                }
+
                 if record.authority == authority {
                     continue;
                 }
                 record.authority = authority;
-                if matches!(
-                    record.state,
-                    RequestReplayEntry::Delivered { .. } | RequestReplayEntry::Retired { .. }
-                ) {
+                if matches!(record.state, RequestReplayEntry::Delivered { .. }) {
                     continue;
                 }
 
@@ -5581,13 +5597,43 @@ mod tests {
 
         ledger.activate_scope(namespace_b, [0; 32]);
         assert_eq!(ledger.slot().reserved_bytes, 0);
+        let retired_until = {
+            let state = ledger.slot();
+            let RequestReplayEntry::Retired { until } = state.entries["request"].state else {
+                panic!("inactive namespace did not retain a fail-closed tombstone");
+            };
+            until
+        };
+
         ledger.activate_scope(namespace_a, [0; 32]);
-        assert!(matches!(
-            ledger
-                .claim("request", namespace_a, [0; 32], fingerprint)
-                .unwrap(),
-            RequestReplayClaim::Uncertain(_)
-        ));
+        let delivery = match ledger
+            .claim("request", namespace_a, [0; 32], fingerprint)
+            .unwrap()
+        {
+            RequestReplayClaim::Uncertain(Some(delivery)) => delivery,
+            _ => panic!("reactivated namespace did not promote Retired to leased Uncertain"),
+        };
+        assert!(ledger.commit_uncertain_delivery("request", namespace_a, [0; 32], fingerprint));
+        drop(delivery);
+
+        // The stale retirement expiration from namespace A's inactive period
+        // must not remove the newer Delivered generation.
+        {
+            let mut state = ledger.slot();
+            RequestReplayLedger::apply_expiration(
+                &mut state,
+                ReplayExpiration {
+                    until: retired_until,
+                    key: "request".to_owned(),
+                    kind: ReplayExpirationKind::RemoveTombstone,
+                },
+                Instant::now(),
+            );
+            assert!(matches!(
+                state.entries["request"].state,
+                RequestReplayEntry::Delivered { .. }
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5596,7 +5642,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         if crate::mcp::resolve_executable("bash").is_none()
-            || crate::mcp::resolve_executable("bwrap").is_none()
+            || !crate::mcp::trusted_bubblewrap_available()
         {
             return;
         }

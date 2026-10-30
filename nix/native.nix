@@ -8,12 +8,19 @@
   craneLib = mkCraneLib pkgs null;
   src = craneLib.cleanCargoSource sourceRoot;
 
-  commonArgs = {
-    inherit src version;
-    pname = "dotlink";
-    strictDeps = true;
-    cargoExtraArgs = "--locked --all-features";
-  };
+  commonArgs =
+    {
+      inherit src version;
+      pname = "dotlink";
+      strictDeps = true;
+      cargoExtraArgs = "--locked --all-features";
+    }
+    // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+      # Compile the exact package dependency into launcher trust. Runtime PATH
+      # remains discovery only and cannot substitute another Nix store object
+      # for the build-authorized launcher under any runtime uid.
+      DOTLINK_BUILD_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
+    };
 
   # Build dependency artifacts separately so source-only changes do not
   # invalidate the dependency graph.

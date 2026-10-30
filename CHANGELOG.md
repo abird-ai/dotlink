@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-10-31
+
+### Fixed
+
+- Tunnel replay namespace reactivation now promotes inactive `Retired` identities into a fresh fail-closed `Uncertain` generation instead of exposing retired state in an active scope. Delivery leasing/commit semantics apply normally after reactivation, and stale prior-generation expirations cannot remove a newer delivered tombstone or reopen the request for execution.
+- Bubblewrap discovery now evaluates complete host-managed provenance per executable PATH candidate and skips rejected shadows in favor of later trusted candidates. Ordinary launchers need a root-owned non-writable canonical path chain. Nix launchers must be real immutable store items on the exact non-FUSE store mount, but immutability alone is not selection authority: every runtime uid requires either the build-pinned derivation or a root-owned final PATH symlink beneath a root-owned non-writable resolved parent chain. Direct user-selected store derivations are rejected; UID-remapped/read-only Nix stores remain unprivileged-only after trusted selection because a read-only launcher view cannot authenticate the dynamic loader/shared-library closure for root.
+- Durable shell spooling now uses sealed job-owned writer capabilities that combine lifetime and quota authority. Stdout/stderr slots are reserved atomically before spawn; terminal publication and shutdown seal future registration, await true writer quiescence after cancellation, and only then expose or clean spool state. Immutable terminal capture lengths remain the replay/idempotent-ack history, while per-stream retained-byte/release state follows Task compaction and partial cleanup so `job_get` and `job_output` agree on what is still pageable; native Task rendering stays bounded to the frozen terminal result prefix, and retention expiry hides the handle immediately even when physical cleanup must retry internally.
+
 ## [0.14.1] - 2026-10-30
 
 ### Fixed

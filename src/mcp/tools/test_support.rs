@@ -16,6 +16,14 @@ use crate::mcp::{
     AccessPolicy, AccessSpec, LocalMachine, PreparedLaunchers, RuntimeConfig, TransportContextToken,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) fn trusted_bubblewrap_available() -> bool {
+    super::shell::prepare_bubblewrap_from_path()
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 pub(crate) fn test_machine(root: PathBuf) -> LocalMachine {
     test_machine_with(root, |_| {})
 }
