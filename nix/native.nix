@@ -8,17 +8,20 @@
   craneLib = mkCraneLib pkgs null;
   src = craneLib.cleanCargoSource sourceRoot;
 
-  commonArgs =
-    {
-      inherit src version;
-      pname = "dotlink";
-      strictDeps = true;
-      cargoExtraArgs = "--locked --all-features";
-    }
+  commonArgs = {
+    inherit src version;
+    pname = "dotlink";
+    strictDeps = true;
+    cargoExtraArgs = "--locked --all-features";
+  };
+
+  # Production packages compile the exact Bubblewrap dependency into launcher
+  # trust. Keep that runtime authority out of hermetic test/clippy derivations:
+  # a Nix builder is itself sandboxed and cannot promise nested Bubblewrap
+  # execution merely because the package's trusted launcher exists in the store.
+  packageArgs =
+    commonArgs
     // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-      # Compile the exact package dependency into launcher trust. Runtime PATH
-      # remains discovery only and cannot substitute another Nix store object
-      # for the build-authorized launcher under any runtime uid.
       DOTLINK_BUILD_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
     };
 
@@ -27,7 +30,7 @@
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
   package = craneLib.buildPackage (
-    commonArgs
+    packageArgs
     // {
       inherit cargoArtifacts;
       doCheck = false;
