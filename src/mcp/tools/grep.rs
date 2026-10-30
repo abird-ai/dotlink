@@ -1974,13 +1974,15 @@ mod walk_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn grep_content_escapes_ambiguous_and_invalid_utf8_path_labels() {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
-
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("line\nbreak:part.txt"), "hit\n").unwrap();
-        let invalid = OsString::from_vec(b"bad\xff.txt".to_vec());
-        std::fs::write(root.join(invalid), "hit\n").unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+            let invalid = OsString::from_vec(b"bad\xff.txt".to_vec());
+            std::fs::write(root.join(invalid), "hit\n").unwrap();
+        }
         let machine = crate::mcp::tools::test_support::test_machine(root);
         let content = machine.grep_impl(grep_args("hit")).await.unwrap();
 
@@ -1989,6 +1991,7 @@ mod walk_tests {
             "{content:?}"
         );
         assert!(!content.contains("line\nbreak:part.txt:1:"), "{content:?}");
+        #[cfg(target_os = "linux")]
         assert!(content.contains("b\"bad\\xFF.txt\":1: hit"), "{content:?}");
     }
 

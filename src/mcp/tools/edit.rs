@@ -141,8 +141,7 @@ impl LocalMachine {
         }
 
         let mut combined_bytes = 0_usize;
-        let mut resolved_paths = Vec::with_capacity(total);
-        let mut distinct = HashSet::<PathBuf>::new();
+        let mut lexical_paths = Vec::with_capacity(total);
         for (index, op) in args.edits.iter().enumerate() {
             let position = index + 1;
             super::require_text_bytes(op.old_text.as_bytes(), "bedit")?;
@@ -156,12 +155,22 @@ impl LocalMachine {
                     self.config.max_write_bytes
                 );
             }
-
             if op.path.is_empty() {
                 anyhow::bail!("edit {position}/{total}: edits[].path is required");
             }
-            let target = &op.path;
-            let resolved = self.resolve_existing(target, AccessNeed::ReadWrite).await?;
+            lexical_paths.push(self.config.access.lexical_target(&op.path)?);
+        }
+        let _name_admission = self
+            .reserve_mutation_names(lexical_paths.iter().map(|path| path.as_path()))
+            .await?;
+
+        let mut resolved_paths = Vec::with_capacity(total);
+        let mut distinct = HashSet::<PathBuf>::new();
+        for (index, op) in args.edits.iter().enumerate() {
+            let position = index + 1;
+            let resolved = self
+                .resolve_existing(&op.path, AccessNeed::ReadWrite)
+                .await?;
             if distinct.insert(resolved.clone()) && distinct.len() > MAX_EDIT_FILES {
                 anyhow::bail!(
                     "edit {position}/{total}: {} files, above the {MAX_EDIT_FILES} file limit",

@@ -80,6 +80,15 @@ pub(crate) struct MutationGuard {
     _windows: Vec<WindowsMutationLock>,
 }
 
+/// Windows-only pre-resolution admission for mutating pathnames. This uses a
+/// distinct kernel-mutex namespace from the resolved-target lock, so a caller
+/// may hold name admission while acquiring the canonical mutation guard without
+/// self-deadlocking. Non-Windows builds erase this to a zero-sized guard.
+pub(crate) struct MutationNameGuard {
+    #[cfg(windows)]
+    _windows: Vec<WindowsMutationLock>,
+}
+
 #[cfg(unix)]
 type DirectoryRegistry = std::sync::Mutex<HashMap<(u64, u64, LockMode), Weak<DirectoryLock>>>;
 #[cfg(unix)]
@@ -329,7 +338,7 @@ impl Drop for WindowsMutationLock {
 }
 
 #[cfg(windows)]
-fn windows_mutex_name(path: &Path) -> Result<String> {
+fn windows_mutex_name_with_scope(path: &Path, scope: &str) -> Result<String> {
     use std::{os::windows::ffi::OsStrExt as _, ptr};
 
     use anyhow::Context as _;
@@ -384,9 +393,19 @@ fn windows_mutex_name(path: &Path) -> Result<String> {
         digest.update(code_unit.to_le_bytes());
     }
     Ok(format!(
-        "Global\\abird-dotlink-path-{}",
+        "Global\\abird-dotlink-{scope}-{}",
         hex::encode(digest.finalize())
     ))
+}
+
+#[cfg(windows)]
+fn windows_mutex_name(path: &Path) -> Result<String> {
+    windows_mutex_name_with_scope(path, "path")
+}
+
+#[cfg(windows)]
+fn windows_admission_mutex_name(path: &Path) -> Result<String> {
+    windows_mutex_name_with_scope(path, "admission")
 }
 
 #[cfg(windows)]
@@ -458,6 +477,33 @@ impl WindowsMutationLock {
         Ok(Self {
             done: Some(wait.await??),
         })
+    }
+}
+
+pub(crate) async fn reserve_names<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<MutationNameGuard> {
+    #[cfg(windows)]
+    {
+        let deadline = Instant::now()
+            .checked_add(LOCK_TIMEOUT)
+            .expect("30-second lock deadline fits monotonic clock");
+        let mut planned = std::collections::BTreeMap::new();
+        for path in paths {
+            planned
+                .entry(windows_admission_mutex_name(path)?)
+                .or_insert_with(|| path.to_path_buf());
+        }
+        let mut windows = Vec::with_capacity(planned.len());
+        for (identity, path) in planned {
+            windows.push(WindowsMutationLock::acquire(&path, identity, deadline).await?);
+        }
+        Ok(MutationNameGuard { _windows: windows })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = paths;
+        Ok(MutationNameGuard {})
     }
 }
 
@@ -571,8 +617,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_mutation_wait_respects_the_shared_deadline() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().canonicalize().unwrap().join("held.txt");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("held.txt");
         let guard = lock([path.as_path()]).await.unwrap();
         let deadline = Instant::now() + Duration::from_millis(40);
         let now = Instant::now();
@@ -585,8 +632,8 @@ mod tests {
         assert!(now.elapsed() < Duration::from_secs(2));
         drop(guard);
         // A failed multi-path acquisition releases previously acquired keys.
-        let a = root.path().join("a.txt");
-        let b = root.path().join("b.txt");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
         let held_b = lock([b.as_path()]).await.unwrap();
         assert!(
             lock_until(

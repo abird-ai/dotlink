@@ -2082,7 +2082,19 @@ impl LocalMachine {
         Ok(())
     }
 
-    /// One guard spans planning through commit, shared by every mutating tool.
+    /// Windows replacement can briefly make an existing target unavailable
+    /// to pathname resolution. Reserve the lexical names before canonicalizing
+    /// them, then keep this guard through commit. The admission namespace is
+    /// distinct from the canonical mutation locks acquired after resolution.
+    pub(crate) async fn reserve_mutation_names<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<crate::mutation::MutationNameGuard> {
+        crate::mutation::reserve_names(paths).await
+    }
+
+    /// One resolved-target guard spans planning through commit, shared by every
+    /// mutating tool.
     pub(crate) async fn lock_mutations<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,

@@ -399,6 +399,8 @@ impl LocalMachine {
             format!("wrote {} bytes (path omitted)", args.content.len()),
             self.config.max_output_bytes,
         )?;
+        let lexical = self.config.access.lexical_target(&args.path)?;
+        let _name_admission = self.reserve_mutation_names([lexical.as_path()]).await?;
         let path = self
             .resolve_for_create(&args.path, AccessNeed::Write)
             .await?;

@@ -1129,6 +1129,7 @@ mod tests {
         let outside = temp.path().join("outside");
         std::fs::create_dir(&cwd).unwrap();
         std::fs::create_dir(&outside).unwrap();
+        let outside = std::fs::canonicalize(&outside).unwrap();
         std::fs::write(outside.join("secret.txt"), b"sensitive").unwrap();
         symlink(&outside, cwd.join("alias")).unwrap();
         for request in ["alias/secret.txt", "alias/new-file.txt"] {

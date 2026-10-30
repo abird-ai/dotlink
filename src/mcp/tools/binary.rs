@@ -336,6 +336,8 @@ impl LocalMachine {
             format!("wrote {} bytes (path omitted)", bytes.len()),
             self.config.max_output_bytes,
         )?;
+        let lexical = self.config.access.lexical_target(&args.path)?;
+        let _name_admission = self.reserve_mutation_names([lexical.as_path()]).await?;
         let path = self
             .resolve_for_create(&args.path, AccessNeed::Write)
             .await?;
@@ -356,6 +358,8 @@ impl LocalMachine {
         if total > MAX_BEDIT_RANGES {
             anyhow::bail!("bedit: {total} ranges, above the {MAX_BEDIT_RANGES} range limit");
         }
+        let lexical = self.config.access.lexical_target(&args.path)?;
+        let _name_admission = self.reserve_mutation_names([lexical.as_path()]).await?;
         let path = self
             .resolve_existing(&args.path, AccessNeed::ReadWrite)
             .await?;

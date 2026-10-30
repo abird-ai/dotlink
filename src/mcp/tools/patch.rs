@@ -1088,6 +1088,16 @@ impl LocalMachine {
             }
         };
 
+        let claimed_paths = ops
+            .iter()
+            .map(|op| match op {
+                PatchOp::Update { path, .. } | PatchOp::Add { path, .. } => claim(path),
+            })
+            .collect::<Vec<_>>();
+        let _name_admission = self
+            .reserve_mutation_names(claimed_paths.iter().map(|path| path.as_path()))
+            .await?;
+
         struct ResolvedSection<'a, 'b> {
             op: &'a PatchOp<'b>,
             path: PathBuf,
