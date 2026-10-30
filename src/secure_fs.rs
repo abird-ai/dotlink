@@ -234,8 +234,8 @@ pub(crate) fn child_metadata(
             libc::S_IFLNK => "symlink",
             _ => "other",
         };
-        let seconds = info.st_mtimespec.tv_sec;
-        let nanos = info.st_mtimespec.tv_nsec;
+        let seconds = info.st_mtime;
+        let nanos = info.st_mtime_nsec;
         let modified = u32::try_from(nanos)
             .ok()
             .filter(|nanos| *nanos < 1_000_000_000)

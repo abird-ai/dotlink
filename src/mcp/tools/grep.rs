@@ -1999,7 +1999,7 @@ mod walk_tests {
         let quoted = format!("hit {}\n", "\"\\".repeat(700));
         for index in 0..20 {
             std::fs::write(
-                root.join(format!("{index:02}-{}", "\"".repeat(20))),
+                root.join(format!("{index:02}-{}", "x".repeat(120))),
                 &quoted,
             )
             .unwrap();

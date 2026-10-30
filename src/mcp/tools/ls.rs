@@ -569,7 +569,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         for index in 0..80 {
-            std::fs::write(root.join(format!("{index:03}-{}", "\"\\".repeat(24))), "x").unwrap();
+            std::fs::write(root.join(format!("{index:03}-{}", "x".repeat(96))), "x").unwrap();
         }
         let machine = crate::mcp::tools::test_support::test_machine_with(root, |config| {
             config.max_output_bytes = 64 * 1024;

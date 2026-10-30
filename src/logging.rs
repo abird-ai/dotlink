@@ -424,7 +424,8 @@ fn display_path(input: &str, cwd: Option<&Path>) -> String {
             cwd.join(request)
         })
     });
-    let cwd = crate::mcp::lexical_normalize(cwd);
+    let cwd = crate::mcp::resolve_policy_path(cwd, Path::new("."))
+        .unwrap_or_else(|_| crate::mcp::lexical_normalize(cwd));
     let value = match absolute.strip_prefix(&cwd) {
         Ok(relative) if relative.as_os_str().is_empty() => "./".to_owned(),
         Ok(relative) => format!("./{}", relative.display()),
@@ -1055,27 +1056,37 @@ mod tests {
 
     #[test]
     fn log_paths_are_cwd_relative_only_when_inside_after_parent_folding() {
-        let cwd = Path::new("/home/pvl/src/dotlink");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let cwd = root.join("dotlink");
+        let inside = cwd.join("src/main.rs");
+        let outside = root.join("another/file");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, "fn main() {}\n").unwrap();
+        std::fs::write(&outside, "outside\n").unwrap();
+
+        let outside_display = std::fs::canonicalize(&outside)
+            .unwrap()
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let folded = cwd.join("../another/file");
         for (input, expected) in [
-            (".", "./"),
-            ("src/main.rs", "./src/main.rs"),
-            ("/home/pvl/src/dotlink/src/main.rs", "./src/main.rs"),
+            (".".to_owned(), "./".to_owned()),
+            ("src/main.rs".to_owned(), "./src/main.rs".to_owned()),
             (
-                "/home/pvl/src/dotlink/../another/file",
-                "/home/pvl/src/another/file",
+                inside.to_string_lossy().into_owned(),
+                "./src/main.rs".to_owned(),
             ),
-            ("../../secrets", "/home/pvl/secrets"),
+            (folded.to_string_lossy().into_owned(), outside_display),
         ] {
-            assert_eq!(display_path(input, Some(cwd)), expected, "input={input}");
+            assert_eq!(display_path(&input, Some(&cwd)), expected, "input={input}");
         }
-        let expected = std::fs::canonicalize("/etc/hosts").unwrap();
-        assert_eq!(
-            display_path("/etc/hosts", Some(cwd)),
-            expected.to_string_lossy()
-        );
+
         let args = serde_json::json!({
-            "path":"/home/pvl/src/dotlink/src/main.rs",
-            "dir":"/home/pvl/src/dotlink",
+            "path":inside,
+            "dir":cwd,
             "command":"echo one\necho two",
             "stdin":"\u{2603}",
             "timeout_secs":60,
@@ -1094,7 +1105,7 @@ mod tests {
                 "stdin",
                 "path",
             ],
-            Some(cwd),
+            Some(&cwd),
         );
         assert!(
             summary.starts_with("p=\"./src/main.rs\" d=\"./\" c=\"echo one\\necho two\""),

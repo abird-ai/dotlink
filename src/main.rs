@@ -1213,7 +1213,7 @@ fn runtime_authority_intent(
     transports: &ActiveTransports,
 ) -> Result<RuntimeAuthorityIntent> {
     let constraints = transports.constraints();
-    let mut execution = serde_json::json!({
+    let execution = serde_json::json!({
         "base_dir": policy.base_dir,
         "read_roots": policy.read_roots,
         "write_roots": policy.write_roots,
@@ -1235,7 +1235,8 @@ fn runtime_authority_intent(
         },
     });
     #[cfg(target_os = "linux")]
-    {
+    let execution = {
+        let mut execution = execution;
         execution["host_access"] = serde_json::json!({
             "nix_daemon": policy.host_access.nix_daemon,
             "nix_config": policy.host_access.nix_config,
@@ -1244,7 +1245,8 @@ fn runtime_authority_intent(
             "kvm": policy.allow_kvm,
             "gpu": policy.allow_gpu,
         });
-    }
+        execution
+    };
     let execution = crate::mcp::sha256(&serde_json::to_vec(&execution)?);
     let job_session = crate::mcp::sha256(&serde_json::to_vec(&serde_json::json!({
         "execution": hex::encode(execution),
@@ -2651,7 +2653,14 @@ mod tests {
 
         defaults.allow_shell = true;
         let error = Policy::from_args(&plain, base.clone(), &defaults).unwrap_err();
+        #[cfg(target_os = "linux")]
         assert!(error.to_string().contains("shell access requires"));
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            error
+                .to_string()
+                .contains("sandboxed shell execution is unavailable on this OS")
+        );
         #[cfg(target_os = "linux")]
         assert!(
             Policy::from_args(&read, base.clone(), &defaults)

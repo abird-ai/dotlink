@@ -14,7 +14,7 @@ pub(crate) use tools::test_support::trusted_bubblewrap_available;
 pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     path::{Component, Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -39,6 +39,9 @@ use tokio::{fs, io::AsyncReadExt, sync::RwLock};
 use uuid::Uuid;
 
 use crate::logging::{LogConfig, LogOutcome};
+
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 
 pub(crate) use tools::shell::{resolve_executable, with_profile_limits};
 
@@ -187,6 +190,8 @@ struct PreparedLaunchers {
 #[cfg(test)]
 impl PreparedLaunchers {
     fn for_test(shell: Option<PathBuf>, bwrap: Option<PathBuf>) -> Self {
+        #[cfg(not(target_os = "linux"))]
+        let _ = &bwrap;
         Self {
             shell: shell.map(tools::shell::PreparedExecutable::for_test),
             #[cfg(target_os = "linux")]
@@ -1666,7 +1671,7 @@ fn prepared_authority_value(
             }
         })
         .collect::<Vec<_>>();
-    let mut authority = serde_json::json!({
+    let authority = serde_json::json!({
         "base_dir": authority_path_identity(&config.access.base_dir),
         "read_roots": read_roots,
         "write_roots": write_roots,
@@ -1678,7 +1683,8 @@ fn prepared_authority_value(
         "bwrap_program": bwrap_program_authority,
     });
     #[cfg(target_os = "linux")]
-    {
+    let authority = {
+        let mut authority = authority;
         let mounts = config
             .host_shell
             .mounts
@@ -1710,7 +1716,8 @@ fn prepared_authority_value(
             "kvm": config.host_shell.kvm,
             "gpu": config.host_shell.gpu,
         });
-    }
+        authority
+    };
     Ok(authority)
 }
 

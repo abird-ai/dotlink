@@ -2502,6 +2502,13 @@ fn truncate_file_releasing(account: &SpoolAccount, path: &Path, keep: u64) -> Op
             return None;
         }
     };
+    if !metadata.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "could not compact native task spool because it is not a regular file"
+        );
+        return None;
+    }
     let len = metadata.len();
     if len <= keep {
         return Some(len);

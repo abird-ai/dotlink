@@ -2738,9 +2738,11 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::logging::LogConfig;
+    #[cfg(target_os = "linux")]
+    use crate::mcp::PreparedCacheMount;
     use crate::mcp::{
-        AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, PreparedCacheMount,
-        PreparedLaunchers, RuntimeConfig, SandboxCacheMount, TransportContextToken,
+        AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, PreparedLaunchers,
+        RuntimeConfig, SandboxCacheMount, TransportContextToken,
     };
 
     #[cfg(unix)]
