@@ -1193,17 +1193,17 @@ struct RuntimeAuthorityIntent {
     job_session: [u8; 32],
 }
 
-fn openai_job_namespace_value(transports: &ActiveTransports) -> serde_json::Value {
-    transports
-        .openai
-        .as_ref()
-        .map_or(serde_json::Value::Null, |config| {
-            serde_json::json!({
-                "base_url": transports::openai::canonical_base_url(&config.base_url),
+fn openai_job_namespace_value(transports: &ActiveTransports) -> Result<serde_json::Value> {
+    transports.openai.as_ref().map_or_else(
+        || Ok(serde_json::Value::Null),
+        |config| {
+            Ok(serde_json::json!({
+                "base_url": transports::openai::canonical_base_url(&config.base_url)?,
                 "tunnel_id": config.tunnel_id,
                 "organization_id": config.organization_id,
-            })
-        })
+            }))
+        },
+    )
 }
 
 fn runtime_authority_intent(
@@ -1251,7 +1251,7 @@ fn runtime_authority_intent(
         // Hidden OpenAI request keys are namespace-scoped. A logical tunnel
         // change must retire the old JobManager even when machine authority is
         // otherwise identical.
-        "openai_job_namespace": openai_job_namespace_value(transports),
+        "openai_job_namespace": openai_job_namespace_value(transports)?,
     }))?);
     Ok(RuntimeAuthorityIntent {
         execution,
@@ -1329,7 +1329,7 @@ async fn plan_runtime(
             anyhow::anyhow!("OpenAI transport is enabled but tunnel_id is missing")
         })?;
         Some(transports::openai::Config {
-            base_url: transports::openai::canonical_base_url(&setup.config.base_url).to_owned(),
+            base_url: transports::openai::canonical_base_url(&setup.config.base_url)?,
             tunnel_id,
             runtime_api_key: setup.config.runtime_api_key.clone(),
             organization_id: setup.config.organization_id.clone(),
@@ -2205,7 +2205,7 @@ mod tests {
             &args,
             &setup,
             &policy,
-            &transports("https://api.openai.com///"),
+            &transports("https://API.OpenAI.com:443///"),
         )
         .unwrap();
         assert_eq!(
@@ -2213,7 +2213,7 @@ mod tests {
             "equivalent control-plane endpoint spellings must not revoke durable job authority"
         );
         assert_eq!(
-            transports::openai::canonical_base_url("https://api.openai.com///"),
+            transports::openai::canonical_base_url("https://API.OpenAI.com:443///").unwrap(),
             "https://api.openai.com"
         );
     }

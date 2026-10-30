@@ -2499,6 +2499,21 @@ impl LocalMachine {
     }
 }
 
+fn tool_call_log_outcome(
+    result: &std::result::Result<CallToolResponse, McpError>,
+) -> LogOutcome<'static> {
+    match result {
+        Ok(CallToolResponse::Complete(result)) if result.is_error.unwrap_or(false) => {
+            LogOutcome::error("error")
+        }
+        Ok(CallToolResponse::Complete(_)) => LogOutcome::success("ok"),
+        Ok(CallToolResponse::InputRequired(_)) => LogOutcome::neutral("input-required"),
+        Ok(CallToolResponse::Task(_)) => LogOutcome::neutral("task"),
+        Ok(_) => LogOutcome::neutral("response"),
+        Err(_) => LogOutcome::error("protocol-error"),
+    }
+}
+
 #[tool_handler(
     router = self.policy_tool_router(),
     name = "dotlink",
@@ -2644,21 +2659,20 @@ impl rmcp::ServerHandler for LocalMachine {
         };
         let started = self.config.log.activity_start(&name, detail);
 
-        let shell_result = self
-            .handle_shell_call(&request, &context)
-            .await
-            .map_err(|error| fit_mcp_error_to_budget(error, result_budget))?;
+        let shell_result = match self.handle_shell_call(&request, &context).await {
+            Ok(Some(response)) => Some(Ok(fit_call_tool_response_to_budget(
+                &name,
+                response,
+                result_budget,
+            ))),
+            Ok(None) => None,
+            Err(error) => Some(Err(fit_mcp_error_to_budget(error, result_budget))),
+        };
         if let Some(result) = shell_result {
-            let result = fit_call_tool_response_to_budget(&name, result, result_budget);
-            let outcome = match &result {
-                CallToolResponse::Complete(result) if result.is_error.unwrap_or(false) => {
-                    LogOutcome::error("error")
-                }
-                CallToolResponse::Task(_) => LogOutcome::neutral("task"),
-                _ => LogOutcome::success("ok"),
-            };
-            self.config.log.activity_done(&name, started, outcome);
-            return Ok(result);
+            self.config
+                .log
+                .activity_done(&name, started, tool_call_log_outcome(&result));
+            return result;
         }
 
         let context = ToolCallContext::new(self, request, context);
@@ -2697,17 +2711,9 @@ impl rmcp::ServerHandler for LocalMachine {
         let result = result
             .map(|response| fit_call_tool_response_to_budget(&name, response, result_budget))
             .map_err(|error| fit_mcp_error_to_budget(error, result_budget));
-        let outcome = match &result {
-            Ok(CallToolResponse::Complete(result)) if result.is_error.unwrap_or(false) => {
-                LogOutcome::error("error")
-            }
-            Ok(CallToolResponse::Complete(_)) => LogOutcome::success("ok"),
-            Ok(CallToolResponse::InputRequired(_)) => LogOutcome::neutral("input-required"),
-            Ok(CallToolResponse::Task(_)) => LogOutcome::neutral("task"),
-            Ok(_) => LogOutcome::success("ok"),
-            Err(_) => LogOutcome::error("protocol-error"),
-        };
-        self.config.log.activity_done(&name, started, outcome);
+        self.config
+            .log
+            .activity_done(&name, started, tool_call_log_outcome(&result));
         result
     }
 }
@@ -3669,6 +3675,15 @@ mod tests {
         assert_eq!(accepted, [platform_shell]);
         assert!(!is_shell_tool("read"));
         assert!(!is_shell_tool("future_tool"));
+    }
+
+    #[test]
+    fn tool_log_outcome_marks_protocol_failures() {
+        let error = Err(McpError::invalid_params("bad shell arguments", None));
+        assert_eq!(
+            tool_call_log_outcome(&error),
+            LogOutcome::error("protocol-error")
+        );
     }
 
     #[test]

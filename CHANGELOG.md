@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-30
+
+### Fixed
+
+- Control-plane base URLs now use one parsed canonical identity across setup, runtime URLs, job-session fingerprints and tunnel replay namespaces, so equivalent host casing/default-port/path spellings cannot split exactly-once request dedupe.
+- Durable spool quota accounting is now owned per job and cancellation-safe: cleanup/Task compaction reconcile retained bytes and residual reservations are released even when an async spool writer is dropped mid-I/O.
+- Linux Bubblewrap launcher trust no longer rejects every root-owned system launcher when dotlink runs as root; unprivileged same-uid mutability checks remain, while root execution relies on the pinned sealed snapshot and still rejects privilege-bearing or shebang launchers.
+- Shell validation/admission/handoff protocol errors now always emit the matching TOOL completion outcome instead of leaving a start-only log line.
+
 ## [0.14.0] - 2026-10-30
 
 ### Added

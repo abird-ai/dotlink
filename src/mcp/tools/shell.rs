@@ -292,6 +292,15 @@ fn effectively_executable(path: &Path) -> bool {
     effective_access(path, libc::X_OK)
 }
 
+#[cfg(target_os = "linux")]
+fn sandbox_launcher_unprivileged_source_mutable(
+    source_uid: libc::uid_t,
+    euid: libc::uid_t,
+    effectively_writable: bool,
+) -> bool {
+    euid != 0 && (source_uid == euid || effectively_writable)
+}
+
 fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -326,7 +335,7 @@ pub(crate) struct PreparedExecutable {
     #[cfg(target_os = "linux")]
     privileged_source: bool,
     #[cfg(target_os = "linux")]
-    source_uid_mutable: bool,
+    unprivileged_source_mutable: bool,
 }
 
 #[cfg(unix)]
@@ -510,8 +519,15 @@ impl PreparedExecutable {
                 );
             }
             let euid = unsafe { libc::geteuid() };
-            let source_uid_mutable =
-                source_metadata.uid() == euid || effective_access(&pinned_path, libc::W_OK);
+            // For an unprivileged process, ownership itself grants chmod authority,
+            // so even a 0555 user-owned launcher is mutable by a same-uid peer. For
+            // euid 0 ownership is not a useful discriminator (system launchers are
+            // normally root-owned); execution consumes the sealed pinned snapshot.
+            let unprivileged_source_mutable = sandbox_launcher_unprivileged_source_mutable(
+                source_metadata.uid(),
+                euid,
+                effective_access(&pinned_path, libc::W_OK),
+            );
             let identity = crate::secure_fs::file_identity(&pinned)?;
             let (snapshot, digest, script, privileged_source) =
                 sealed_executable_snapshot(&pinned, &path)?;
@@ -535,7 +551,7 @@ impl PreparedExecutable {
                 exec_path,
                 script,
                 privileged_source,
-                source_uid_mutable,
+                unprivileged_source_mutable,
             })
         }
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -581,9 +597,9 @@ impl PreparedExecutable {
                 prepared.path.display()
             );
         }
-        if prepared.source_uid_mutable {
+        if prepared.unprivileged_source_mutable {
             anyhow::bail!(
-                "Bubblewrap launcher {} is owned or writable by the dotlink uid; install Bubblewrap as a system-managed native executable",
+                "Bubblewrap launcher {} is owned or writable by the unprivileged dotlink uid; install Bubblewrap as a system-managed native executable",
                 prepared.path.display()
             );
         }
@@ -2613,6 +2629,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn root_launcher_trust_does_not_reject_system_root_ownership() {
+        assert!(!sandbox_launcher_unprivileged_source_mutable(0, 0, true));
+        assert!(sandbox_launcher_unprivileged_source_mutable(
+            1000, 1000, false
+        ));
+        assert!(sandbox_launcher_unprivileged_source_mutable(0, 1000, true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sandbox_launcher_rejects_user_owned_source_even_outside_sandbox_write_authority() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -2627,7 +2653,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("owned or writable by the dotlink uid"),
+            error.contains("owned or writable by the unprivileged dotlink uid"),
             "{error}"
         );
         assert!(

@@ -290,6 +290,7 @@ struct JobEntry {
     terminal_at: Option<Instant>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    spool_account: Arc<SpoolAccount>,
     stdout_consumed: u64,
     stderr_consumed: u64,
     output_released: bool,
@@ -341,6 +342,82 @@ struct JobManagerInner {
     sweeper: Mutex<Option<JoinHandle<()>>>,
     intent_fingerprint: Mutex<Option<[u8; 32]>>,
     policy_fingerprint: Mutex<Option<[u8; 32]>>,
+}
+
+#[derive(Debug)]
+struct SpoolAccount {
+    inner: Weak<JobManagerInner>,
+    charged: AtomicU64,
+}
+
+impl SpoolAccount {
+    fn new(inner: &Arc<JobManagerInner>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::downgrade(inner),
+            charged: AtomicU64::new(0),
+        })
+    }
+
+    fn reserve(&self, requested: u64) -> u64 {
+        let Some(inner) = self.inner.upgrade() else {
+            return 0;
+        };
+        let reserved = reserve_spool_bytes(&inner, requested);
+        self.charged.fetch_add(reserved, Ordering::AcqRel);
+        reserved
+    }
+
+    fn release(&self, requested: u64) {
+        if requested == 0 {
+            return;
+        }
+        let mut current = self.charged.load(Ordering::Acquire);
+        loop {
+            let released = requested.min(current);
+            let next = current - released;
+            match self.charged.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if let Some(inner) = self.inner.upgrade() {
+                        release_spool_bytes(&inner, released);
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn reconcile_to(&self, retained: u64) {
+        loop {
+            let charged = self.charged.load(Ordering::Acquire);
+            if charged <= retained {
+                return;
+            }
+            self.release(charged - retained);
+        }
+    }
+
+    #[cfg(test)]
+    fn charged(&self) -> u64 {
+        self.charged.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SpoolAccount {
+    fn drop(&mut self) {
+        let residual = self.charged.swap(0, Ordering::AcqRel);
+        if residual == 0 {
+            return;
+        }
+        if let Some(inner) = self.inner.upgrade() {
+            release_spool_bytes(&inner, residual);
+        }
+    }
 }
 
 impl fmt::Debug for JobManagerInner {
@@ -415,6 +492,7 @@ pub(crate) struct JobHandle {
     pub(crate) cancel: CancellationToken,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
+    spool_account: Arc<SpoolAccount>,
     inner: Weak<JobManagerInner>,
 }
 
@@ -444,15 +522,11 @@ impl JobHandle {
     /// The caller may persist only the returned prefix and must keep draining
     /// the producer after the budget is exhausted.
     pub(crate) fn reserve_spool(&self, requested: u64) -> u64 {
-        self.inner
-            .upgrade()
-            .map_or(0, |inner| reserve_spool_bytes(&inner, requested))
+        self.spool_account.reserve(requested)
     }
 
     pub(crate) fn release_spool(&self, bytes: u64) {
-        if let Some(inner) = self.inner.upgrade() {
-            release_spool_bytes(&inner, bytes);
-        }
+        self.spool_account.release(bytes);
     }
 }
 
@@ -749,7 +823,7 @@ impl JobManager {
                     && entry.response_attempts == 0
                     && entry.retention == RetentionClass::TransportOnly
             });
-            if needs_slot && !ensure_retained_capacity(&self.inner, &mut state, 1) {
+            if needs_slot && !ensure_retained_capacity(&mut state, 1) {
                 bail!(
                     "too many retained shell jobs ({MAX_RETAINED_JOBS}); wait for retained jobs to expire or acknowledge output before retrying this delivery"
                 );
@@ -786,7 +860,7 @@ impl JobManager {
                 "too many pending shell delivery replays/cleanups ({MAX_REQUEST_REPLAYS}); wait for delivery acknowledgement or retention cleanup"
             );
         }
-        if !ensure_retained_capacity(&self.inner, &mut state, 1) {
+        if !ensure_retained_capacity(&mut state, 1) {
             bail!(
                 "too many retained shell jobs ({MAX_RETAINED_JOBS}); acknowledge output or wait for retention cleanup"
             );
@@ -797,6 +871,7 @@ impl JobManager {
         let [stdout_path, stderr_path] = files.paths.clone();
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
+        let spool_account = SpoolAccount::new(&self.inner);
         let now = chrono::Utc::now().to_rfc3339();
         state.jobs.insert(
             id.clone(),
@@ -814,6 +889,7 @@ impl JobManager {
                 terminal_at: None,
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
+                spool_account: spool_account.clone(),
                 stdout_consumed: 0,
                 stderr_consumed: 0,
                 output_released: false,
@@ -838,6 +914,7 @@ impl JobManager {
             cancel,
             stdout_path,
             stderr_path,
+            spool_account,
             inner: Arc::downgrade(&self.inner),
         };
         let finisher = self.finisher();
@@ -871,7 +948,7 @@ impl JobManager {
         if state.closed {
             bail!("job session is shutting down");
         }
-        if !ensure_retained_capacity(&self.inner, &mut state, 1) {
+        if !ensure_retained_capacity(&mut state, 1) {
             bail!(
                 "too many retained shell jobs ({MAX_RETAINED_JOBS}); acknowledge output or wait for retention cleanup"
             );
@@ -880,6 +957,7 @@ impl JobManager {
         let files = PendingJobFiles::create(&self.inner.root, &id)?;
         let [stdout_path, stderr_path] = files.paths.clone();
         let cancel = CancellationToken::new();
+        let spool_account = SpoolAccount::new(&self.inner);
         let now = chrono::Utc::now().to_rfc3339();
         state.jobs.insert(
             id.clone(),
@@ -897,6 +975,7 @@ impl JobManager {
                 terminal_at: None,
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
+                spool_account: spool_account.clone(),
                 stdout_consumed: 0,
                 stderr_consumed: 0,
                 output_released: false,
@@ -919,6 +998,7 @@ impl JobManager {
             cancel,
             stdout_path,
             stderr_path,
+            spool_account,
             inner: Arc::downgrade(&self.inner),
         })
     }
@@ -1017,7 +1097,7 @@ impl JobManager {
                 .collect::<Vec<_>>()
         };
         for entry in &entries {
-            cleanup_entry(&self.inner, entry);
+            cleanup_entry(entry);
         }
         self.inner
             .session_lock
@@ -1099,7 +1179,7 @@ impl JobManager {
             .disposition;
         match disposition {
             JobDisposition::Pending => {
-                reserve_exposure_slot(&self.inner, &mut state, id)?;
+                reserve_exposure_slot(&mut state, id)?;
                 let entry = state
                     .jobs
                     .get_mut(id)
@@ -1143,7 +1223,7 @@ impl JobManager {
         {
             return Ok(None);
         }
-        reserve_exposure_slot(&self.inner, &mut state, id)?;
+        reserve_exposure_slot(&mut state, id)?;
         let entry = state
             .jobs
             .get_mut(id)
@@ -1175,7 +1255,7 @@ impl JobManager {
                 && !budget.is_some_and(|budget| {
                     !crate::mcp::shell_result_fits_budget(result_limit, budget)
                 });
-            reserve_exposure_slot(&self.inner, &mut state, id)?;
+            reserve_exposure_slot(&mut state, id)?;
             let entry = state
                 .jobs
                 .get_mut(id)
@@ -1323,7 +1403,7 @@ impl JobManager {
             entry.stdout_consumed = completion.stdout.stored_bytes;
             entry.stderr_consumed = completion.stderr.stored_bytes;
             entry.output_cleanup_requested = true;
-            maybe_release_output(&self.inner, entry);
+            maybe_release_output(entry);
         }
         Ok(entry.disposition)
     }
@@ -1406,7 +1486,7 @@ impl JobManager {
                     entry.stdout_consumed = completion.stdout.stored_bytes;
                     entry.stderr_consumed = completion.stderr.stored_bytes;
                     entry.output_cleanup_requested = true;
-                    maybe_release_output(&self.inner, entry);
+                    maybe_release_output(entry);
                     remove_hidden = entry.output_released && entry.readers == 0;
                 }
             }
@@ -1451,7 +1531,7 @@ impl JobManager {
             entry.stdout_consumed = completion.stdout.stored_bytes;
             entry.stderr_consumed = completion.stderr.stored_bytes;
             entry.output_cleanup_requested = true;
-            maybe_release_output(&self.inner, entry);
+            maybe_release_output(entry);
         }
         let remove_hidden = entry.output_released && entry.readers == 0;
         if remove_hidden {
@@ -1484,7 +1564,7 @@ impl JobManager {
                 JobDisposition::Pending | JobDisposition::Synchronous
             ) && entry.retention != RetentionClass::Ordinary
         });
-        if needs_ordinary_slot && !ensure_retained_capacity(&self.inner, &mut state, 1) {
+        if needs_ordinary_slot && !ensure_retained_capacity(&mut state, 1) {
             return RequestRetirement::Busy;
         }
 
@@ -1641,7 +1721,7 @@ impl JobManager {
             JobStream::Stderr => entry.stderr_consumed = entry.stderr_consumed.max(offset),
         }
         entry.output_cleanup_requested = true;
-        maybe_release_output(&self.inner, entry);
+        maybe_release_output(entry);
         Ok(render_status_locked(&self.inner, entry))
     }
 
@@ -2130,7 +2210,7 @@ fn finish_inner(inner: &JobManagerInner, id: &str, completion: JobCompletion) {
         entry.terminal_at = Some(Instant::now());
         entry.completion = Some(completion);
         if entry.output_cleanup_requested {
-            maybe_release_output(inner, entry);
+            maybe_release_output(entry);
         }
         entry.notify.notify_waiters();
     }
@@ -2179,7 +2259,7 @@ fn release_spool_bytes(inner: &JobManagerInner, bytes: u64) {
     }
 }
 
-fn maybe_release_output(inner: &JobManagerInner, entry: &mut JobEntry) {
+fn maybe_release_output(entry: &mut JobEntry) {
     if !entry.output_cleanup_requested {
         return;
     }
@@ -2196,18 +2276,18 @@ fn maybe_release_output(inner: &JobManagerInner, entry: &mut JobEntry) {
         entry.output_cleanup_pending = true;
         return;
     }
-    release_acknowledged_output(inner, entry);
+    release_acknowledged_output(entry);
 }
 
-fn release_acknowledged_output(inner: &JobManagerInner, entry: &mut JobEntry) {
+fn release_acknowledged_output(entry: &mut JobEntry) {
     if entry.disposition.native_task() {
-        let _ = compact_native_task_output(inner, entry);
+        let _ = compact_native_task_output(entry);
     } else {
-        let _ = release_output_files(inner, entry);
+        let _ = release_output_files(entry);
     }
 }
 
-fn truncate_file_releasing(inner: &JobManagerInner, path: &Path, keep: u64) -> bool {
+fn truncate_file_releasing(account: &SpoolAccount, path: &Path, keep: u64) -> bool {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return keep == 0,
@@ -2226,7 +2306,7 @@ fn truncate_file_releasing(inner: &JobManagerInner, path: &Path, keep: u64) -> b
         .and_then(|file| file.set_len(keep))
     {
         Ok(()) => {
-            release_spool_bytes(inner, len - keep);
+            account.release(len - keep);
             true
         }
         Err(error) => {
@@ -2236,7 +2316,7 @@ fn truncate_file_releasing(inner: &JobManagerInner, path: &Path, keep: u64) -> b
     }
 }
 
-fn compact_native_task_output(inner: &JobManagerInner, entry: &mut JobEntry) -> bool {
+fn compact_native_task_output(entry: &mut JobEntry) -> bool {
     if entry.output_released {
         return true;
     }
@@ -2245,37 +2325,40 @@ fn compact_native_task_output(inner: &JobManagerInner, entry: &mut JobEntry) -> 
     };
     let keep_result =
         completion.internal_error.is_none() && completion.status != JobStatus::Cancelled;
-    let stdout_keep = if keep_result {
-        completion
-            .stdout
-            .stored_bytes
-            .min(entry.result_limit as u64)
-    } else {
-        0
-    };
-    let stderr_keep = if keep_result {
-        completion
-            .stderr
-            .stored_bytes
-            .min(entry.result_limit as u64)
-    } else {
-        0
-    };
-    let stdout_ok = truncate_file_releasing(inner, &entry.stdout_path, stdout_keep);
-    let stderr_ok = truncate_file_releasing(inner, &entry.stderr_path, stderr_keep);
+    if !keep_result {
+        return release_output_files(entry);
+    }
+    let stdout_keep = completion
+        .stdout
+        .stored_bytes
+        .min(entry.result_limit as u64);
+    let stderr_keep = completion
+        .stderr
+        .stored_bytes
+        .min(entry.result_limit as u64);
+    let stdout_ok = truncate_file_releasing(&entry.spool_account, &entry.stdout_path, stdout_keep);
+    let stderr_ok = truncate_file_releasing(&entry.spool_account, &entry.stderr_path, stderr_keep);
     let success = stdout_ok && stderr_ok;
+    if success {
+        let retained = stored_len(&entry.stdout_path, None)
+            .saturating_add(stored_len(&entry.stderr_path, None));
+        entry.spool_account.reconcile_to(retained);
+    }
     entry.output_released = success;
     entry.output_cleanup_pending = !success;
     success
 }
 
-fn release_output_files(inner: &JobManagerInner, entry: &mut JobEntry) -> bool {
+fn release_output_files(entry: &mut JobEntry) -> bool {
     if entry.output_released {
         return true;
     }
-    let stdout_ok = remove_file_releasing(inner, &entry.stdout_path);
-    let stderr_ok = remove_file_releasing(inner, &entry.stderr_path);
+    let stdout_ok = remove_file_releasing(&entry.spool_account, &entry.stdout_path);
+    let stderr_ok = remove_file_releasing(&entry.spool_account, &entry.stderr_path);
     let success = stdout_ok && stderr_ok;
+    if success {
+        entry.spool_account.reconcile_to(0);
+    }
     entry.output_released = success;
     entry.output_cleanup_pending = !success;
     success
@@ -2291,20 +2374,17 @@ fn release_reader(inner: &Arc<JobManagerInner>, id: &str) {
         entry.readers = entry.readers.saturating_sub(1);
         if entry.readers == 0 {
             if entry.expiration_pending {
-                let cleanup_ok = state
-                    .jobs
-                    .get(id)
-                    .is_some_and(|entry| cleanup_entry(inner, entry));
+                let cleanup_ok = state.jobs.get(id).is_some_and(cleanup_entry);
                 if cleanup_ok {
                     removed = remove_job_locked(&mut state, id);
                 }
             } else if entry.retention == RetentionClass::CleanupOnly {
-                release_acknowledged_output(inner, entry);
+                release_acknowledged_output(entry);
                 if entry.output_released {
                     removed = remove_job_locked(&mut state, id);
                 }
             } else if entry.output_cleanup_pending {
-                release_acknowledged_output(inner, entry);
+                release_acknowledged_output(entry);
             }
         }
     }
@@ -2398,15 +2478,15 @@ fn stored_len(path: &Path, hint: Option<u64>) -> u64 {
     hint.unwrap_or_else(|| fs::metadata(path).map_or(0, |metadata| metadata.len()))
 }
 
-fn remove_file_releasing(inner: &JobManagerInner, path: &Path) -> bool {
+fn remove_file_releasing(account: &SpoolAccount, path: &Path) -> bool {
     let bytes = fs::metadata(path).map_or(0, |metadata| metadata.len());
     match fs::remove_file(path) {
         Ok(()) => {
-            release_spool_bytes(inner, bytes);
+            account.release(bytes);
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            release_spool_bytes(inner, bytes);
+            account.release(bytes);
             true
         }
         Err(error) => {
@@ -2416,10 +2496,14 @@ fn remove_file_releasing(inner: &JobManagerInner, path: &Path) -> bool {
     }
 }
 
-fn cleanup_entry(inner: &JobManagerInner, entry: &JobEntry) -> bool {
-    let stdout_ok = remove_file_releasing(inner, &entry.stdout_path);
-    let stderr_ok = remove_file_releasing(inner, &entry.stderr_path);
-    stdout_ok && stderr_ok
+fn cleanup_entry(entry: &JobEntry) -> bool {
+    let stdout_ok = remove_file_releasing(&entry.spool_account, &entry.stdout_path);
+    let stderr_ok = remove_file_releasing(&entry.spool_account, &entry.stderr_path);
+    let success = stdout_ok && stderr_ok;
+    if success {
+        entry.spool_account.reconcile_to(0);
+    }
+    success
 }
 
 fn remove_job_locked(state: &mut JobState, id: &str) -> Option<JobEntry> {
@@ -2469,7 +2553,7 @@ fn reclaimable_terminal(entry: &JobEntry) -> bool {
     entry.output_released || (!entry.disposition.exposed() && empty)
 }
 
-fn evict_one_reclaimable_terminal(inner: &JobManagerInner, state: &mut JobState) -> bool {
+fn evict_one_reclaimable_terminal(state: &mut JobState) -> bool {
     let mut candidates = state
         .jobs
         .iter()
@@ -2483,10 +2567,7 @@ fn evict_one_reclaimable_terminal(inner: &JobManagerInner, state: &mut JobState)
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(terminal_at, _)| *terminal_at);
     for (_, id) in candidates {
-        let cleanup_ok = state
-            .jobs
-            .get(&id)
-            .is_some_and(|entry| cleanup_entry(inner, entry));
+        let cleanup_ok = state.jobs.get(&id).is_some_and(cleanup_entry);
         if cleanup_ok {
             let _ = remove_job_locked(state, &id);
             return true;
@@ -2495,20 +2576,16 @@ fn evict_one_reclaimable_terminal(inner: &JobManagerInner, state: &mut JobState)
     false
 }
 
-fn ensure_retained_capacity(
-    inner: &JobManagerInner,
-    state: &mut JobState,
-    additional: usize,
-) -> bool {
+fn ensure_retained_capacity(state: &mut JobState, additional: usize) -> bool {
     while retained_job_slots(state).saturating_add(additional) > MAX_RETAINED_JOBS {
-        if !evict_one_reclaimable_terminal(inner, state) {
+        if !evict_one_reclaimable_terminal(state) {
             return false;
         }
     }
     true
 }
 
-fn reserve_exposure_slot(inner: &JobManagerInner, state: &mut JobState, id: &str) -> JobResult<()> {
+fn reserve_exposure_slot(state: &mut JobState, id: &str) -> JobResult<()> {
     let entry = state
         .jobs
         .get(id)
@@ -2519,7 +2596,7 @@ fn reserve_exposure_slot(inner: &JobManagerInner, state: &mut JobState, id: &str
     if entry.retention == RetentionClass::CleanupOnly {
         return Err(JobError::Unknown(format!("unknown job {id}")));
     }
-    if ensure_retained_capacity(inner, state, 1) {
+    if ensure_retained_capacity(state, 1) {
         Ok(())
     } else {
         Err(JobError::Internal(anyhow!(
@@ -2544,7 +2621,7 @@ fn sweep_expired(inner: &JobManagerInner) {
             .collect::<Vec<_>>();
         for id in cleanup_only {
             let released = if let Some(entry) = state.jobs.get_mut(&id) {
-                release_acknowledged_output(inner, entry);
+                release_acknowledged_output(entry);
                 entry.output_released
             } else {
                 false
@@ -2558,7 +2635,7 @@ fn sweep_expired(inner: &JobManagerInner) {
                 && entry.output_cleanup_pending
                 && entry.readers == 0
             {
-                release_acknowledged_output(inner, entry);
+                release_acknowledged_output(entry);
             }
         }
         let expired = state
@@ -2585,10 +2662,7 @@ fn sweep_expired(inner: &JobManagerInner) {
                 }
                 continue;
             }
-            let cleanup_ok = state
-                .jobs
-                .get(&id)
-                .is_some_and(|entry| cleanup_entry(inner, entry));
+            let cleanup_ok = state.jobs.get(&id).is_some_and(cleanup_entry);
             if cleanup_ok {
                 let _ = remove_job_locked(&mut state, &id);
             } else if let Some(entry) = state.jobs.get_mut(&id) {
@@ -3313,8 +3387,8 @@ mod tests {
         // regular spool. This deterministically exercises the retryable-failure
         // contract without relying on platform-specific sharing violations.
         let bad = tempfile::tempdir().unwrap();
-        assert!(!remove_file_releasing(&manager.inner, bad.path()));
-        assert!(!truncate_file_releasing(&manager.inner, bad.path(), 0));
+        assert!(!remove_file_releasing(&job.spool_account, bad.path()));
+        assert!(!truncate_file_releasing(&job.spool_account, bad.path(), 0));
         manager.finish(
             &job.id,
             JobCompletion::completed(
@@ -4552,6 +4626,32 @@ mod tests {
         release_spool_bytes(&manager.inner, 6);
         assert_eq!(reserve_spool_bytes(&manager.inner, 5), 5);
         assert_eq!(manager.inner.spool_used_bytes.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn cleanup_reconciles_phantom_spool_reservations() {
+        let manager = JobManager::with_spool_limit(Duration::from_secs(60), 64).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        assert_eq!(job.reserve_spool(16), 16);
+        assert_eq!(job.spool_account.charged(), 16);
+        assert_eq!(manager.inner.spool_used_bytes.load(Ordering::Relaxed), 16);
+
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        manager.expose_compatibility(&job.id).unwrap();
+        manager
+            .acknowledge_output(&job.id, JobStream::Stdout, 0)
+            .unwrap();
+
+        assert_eq!(job.spool_account.charged(), 0);
+        assert_eq!(manager.inner.spool_used_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]

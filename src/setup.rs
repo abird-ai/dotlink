@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -2049,7 +2049,7 @@ async fn create_tunnel(
         .build()?;
     let url = format!(
         "{}/v1/tunnels",
-        crate::transports::openai::canonical_base_url(base_url)
+        crate::transports::openai::canonical_base_url(base_url)?
     );
     let response = client
         .post(url)
@@ -3221,29 +3221,7 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
 }
 
 fn validate_control_plane_base_url(value: &str) -> Result<()> {
-    let url = Url::parse(value).context("control-plane base URL is invalid")?;
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("control-plane base URL must not contain credentials, query, or fragment");
-    }
-
-    let https = url.scheme() == "https" && url.host_str().is_some();
-    let loopback_http = url.scheme() == "http"
-        && match url.host() {
-            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-            Some(url::Host::Ipv4(ip)) => ip == Ipv4Addr::LOCALHOST,
-            Some(url::Host::Ipv6(ip)) => {
-                crate::transports::http::normalize_ip(ip.into()).is_loopback()
-            }
-            None => false,
-        };
-    if !https && !loopback_http {
-        bail!("control-plane base URL must use HTTPS (loopback HTTP is allowed for testing)");
-    }
-    Ok(())
+    crate::transports::openai::canonical_base_url(value).map(|_| ())
 }
 
 fn validate_config(config: &AppConfig) -> Result<()> {

@@ -53,8 +53,34 @@ fn poll_response_ceiling() -> usize {
     MAX_POLL_RESPONSE_BYTES
 }
 
-pub(crate) fn canonical_base_url(value: &str) -> &str {
-    value.trim_end_matches('/')
+pub(crate) fn canonical_base_url(value: &str) -> Result<String> {
+    let mut url = url::Url::parse(value).context("control-plane base URL is invalid")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("control-plane base URL must not contain credentials, query, or fragment");
+    }
+
+    let https = url.scheme() == "https" && url.host_str().is_some();
+    let loopback_http = url.scheme() == "http"
+        && match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => super::http::normalize_ip(ip.into()).is_loopback(),
+            None => false,
+        };
+    if !https && !loopback_http {
+        bail!("control-plane base URL must use HTTPS (loopback HTTP is allowed for testing)");
+    }
+
+    // URL parsing canonicalizes scheme/host spelling, default ports and dot
+    // segments. Preserve an intentional base path, but make trailing slash
+    // variants one runtime/replay identity and one URL-construction form.
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
 fn durable_request_key(namespace: &[u8; 32], request_id: &str) -> String {
@@ -1864,7 +1890,7 @@ impl TunnelClient {
         if tunnel_id.trim().is_empty() || api_key.trim().is_empty() {
             bail!("tunnel id and runtime API key are required");
         }
-        let base_url = canonical_base_url(&base_url).to_owned();
+        let base_url = canonical_base_url(&base_url)?;
         let identity = tunnel_identity([
             Some(&base_url),
             Some(&tunnel_id),
@@ -5026,6 +5052,20 @@ mod tests {
         ] {
             assert!(!retryable_response_status(status), "{status}");
         }
+    }
+
+    #[test]
+    fn equivalent_control_plane_urls_share_durable_request_namespace() {
+        let first = canonical_base_url("https://API.OpenAI.com:443/v1/../control///").unwrap();
+        let second = canonical_base_url("https://api.openai.com/control").unwrap();
+        assert_eq!(first, second);
+        let first = tunnel_identity([Some(&first), Some("tunnel"), None, Some("org")]);
+        let second = tunnel_identity([Some(&second), Some("tunnel"), None, Some("org")]);
+        assert_eq!(first, second);
+        assert_eq!(
+            durable_request_key(&first, "request"),
+            durable_request_key(&second, "request")
+        );
     }
 
     #[test]
