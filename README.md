@@ -85,7 +85,7 @@ Default runs are quiet. Add `-v` to see tool activity:
 ~~~text
 $ dotlink -v -p aw
 
-dotlink v0.14.0
+dotlink v0.14.2
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
@@ -104,7 +104,7 @@ Keys        Ctrl-C: exit · Ctrl-R: restart · v: verbosity · V: full commands
 [10:59:19.194] TOOL read       ← ok  9ms
 ~~~
 
-`-v` starts with TOOL activity; `-vv` starts with TOOL + REQ diagnostics. During an interactive run, press `v` to cycle `quiet → TOOL → TOOL + REQ → quiet` and **`V` (Shift+V)** to toggle full versus 256-character `c=` command logging, **only while TOOL logging is enabled**. In quiet/REQ-only mode, the `V` hint is hidden and the key is ignored. Leaving TOOL logging or restarting resets full mode; noninteractive and stdio runs always cap commands. `Ctrl+R` reloads profile/policy/transports; `Ctrl+C` exits. Runtime controls are disabled during stdio MCP so protocol stdin is never intercepted. TOOL commands are quoted and escaped onto one line, with `…` inside the closing quote when truncated. File contents, binary payloads, explicit Runtime keys, and raw request bodies are not intentionally logged.
+`-v` starts with TOOL activity; `-vv` adds REQ diagnostics. Interactive runs support `v` to cycle verbosity, `V` to toggle full command logging while TOOL logging is active, `Ctrl+R` to reload the runtime, and `Ctrl+C` to exit. stdio keeps stdin protocol-clean. File contents, binary payloads, Runtime keys, and raw request bodies are not intentionally logged.
 
 ## Connect dotlink to ChatGPT
 
@@ -147,7 +147,7 @@ The tools ChatGPT discovers follow dotlink's local permissions:
 read-only      ls, grep, read, bread
 write          + write, bwrite
 read + write   + edit, patch, bedit
-shell          + bash/powershell + job_start, job_list, job_get, job_output, job_ack, job_cancel
+shell          + bash/powershell + durable job controls
 ~~~
 
 Never paste a Runtime or Admin API key into ChatGPT. ChatGPT only needs the `tunnel_...` ID.
@@ -168,7 +168,7 @@ Run setup, select **HTTP**, then enable the public ngrok endpoint:
 dotlink --setup
 ~~~
 
-Setup asks for one **owner password** the first time OAuth is needed. The password itself is never stored; dotlink persists only an Argon2id hash in its private state directory. Changing the owner password is effective for new authorizations on a running HTTP server without restarting it; previously issued short-lived access tokens still require restart for immediate invalidation.
+Setup asks for one **owner password** the first time OAuth is needed. The password itself is never stored; dotlink persists only an Argon2id hash in its private state directory.
 
 Set your ngrok account token and start dotlink:
 
@@ -226,17 +226,17 @@ dotlink --http --oauth --http-bind=127.0.0.1:3000 \
   --public-url=https://mcp.example.com
 ~~~
 
-Never derive the OAuth issuer from proxy/Host headers; `--public-url` is the explicit trust boundary. Anonymous OAuth work is also bounded by a trusted network requester identity: direct HTTP uses the TCP peer, while built-in ngrok uses authenticated tunnel connection metadata. Forwarded client-IP headers are ignored. A generic reverse proxy therefore shares one requester allowance unless it applies its own edge admission controls.
+Never derive the OAuth issuer from proxy/Host headers; `--public-url` is the explicit trust boundary.
 
 Public ngrok ingress is OAuth-protected by default. Direct non-loopback HTTP binds are also refused unless OAuth is enabled with an explicit HTTPS public origin. The only way to intentionally expose either form of public ingress without application-layer authentication is the explicit one-run escape hatch:
 
 ~~~bash
 dotlink --http --ngrok --allow-public-no-auth
-# Or use this machine's concrete LAN interface address (replace as needed):
+# or, for an intentionally unauthenticated LAN listener:
 dotlink --http --http-bind=192.168.1.50:3000 --allow-public-no-auth
 ~~~
 
-For LAN use, replace the example address with the machine's actual interface address; wildcard binds such as `0.0.0.0`, `::`, and their IPv4-mapped IPv6 forms do not identify that address for Host allowlisting. Conflicting HTTP `Host` and URI/HTTP2 authorities are rejected. This mode exposes every MCP capability granted to the process to anyone who can reach the endpoint and is not recommended.
+For LAN use, replace the example address with the machine's actual interface address; wildcard binds do not identify a concrete public Host authority. This mode exposes every MCP capability granted to the process to anyone who can reach the endpoint and is not recommended.
 
 ## Use dotlink as a local sandboxed MCP server
 
@@ -309,7 +309,7 @@ public HTTP ingress      OFF
 unsandboxed host mode    OFF
 ~~~
 
-Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--allow-shell`, and `--allow-network`. A saved profile may have no filesystem grants: one-run CLI permissions are merged before checking whether a usable capability remains. No effective grant still fails closed, and the shell still requires a readable directory. Denies always win. `--allow-rw=/` grants filesystem RW only. `--unrestricted` is the one-flag full unsandboxed host mode; the legacy `--allow-all --no-sandbox` pair remains equivalent.
+Capabilities are independent: `--allow-read`, `--allow-write`, `--allow-rw`, `--allow-shell`, and `--allow-network`. CLI grants compose with the selected profile; denies always win. `--allow-rw=/` grants filesystem RW only. Full unsandboxed host authority is the explicit `--unrestricted` mode; the legacy `--allow-all --no-sandbox` pair remains equivalent.
 
 ### Filesystem policy
 
@@ -319,106 +319,7 @@ write / bwrite                require write
 edit / patch / bedit          require read + write
 ~~~
 
-Targets are canonicalized before checks; create targets canonicalize their nearest existing ancestor, preventing symlink escapes. The advertised MCP tool list is permission-aware, so unavailable write/shell tools are omitted rather than merely rejected later.
-
-### Tools
-
-| Tool | Needs | What it does |
-| --- | --- | --- |
-| `ls` | read | List entries with `pattern` (glob), `depth`, `kind`, `sort`, `limit` |
-| `grep` | read | Regex search with `content`/`files`/`count` output, context, glob and `.gitignore` filters |
-| `read` | read | Read numbered lines from a UTF-8 file |
-| `write` | write | Create or replace a text file |
-| `edit` | read+write | Apply an ordered `edits[]` array with preflight and per-file atomic commits |
-| `patch` | read+write | Apply a Codex-format patch with strict preflight and per-file atomic commits |
-| `bread` | read | Read binary content as MCP typed content, base64, or hex |
-| `bwrite` | write | Create or replace a binary file |
-| `bedit` | read+write | Apply byte ranges against original-file offsets |
-
-| `bash` / `powershell` | shell | Start one durable execution, return its ordinary result if it finishes in the response window, otherwise return the same job/task handle while it keeps running |
-| `job_start` | shell | Explicitly start a durable background shell job and return immediately |
-| `job_list` | shell | Recover recent exposed job ids/status after a lost response |
-| `job_get` | shell | Poll job/task status and output byte counts |
-| `job_output` | shell | Pure, replayable page read of durable stdout/stderr by raw byte offset |
-| `job_ack` | shell | Idempotently acknowledge safely received stdout/stderr bytes so terminal spools may be released or, for native Tasks, compacted to the exact-result prefix |
-| `job_cancel` | shell | Cancel a running durable job and its contained process tree |
-
-Shell startup chooses a runnable executable, not merely the first matching file: Unix lookup uses the process's effective execution permission (`X_OK`), so ownership classes, ACLs, mount policy, or a non-runnable earlier PATH entry cannot shadow a later usable `bash`/`bwrap`. On Linux preparation pins the exact source object before validating `X_OK`, snapshots those bytes into a sealed executable `memfd` (requesting `MFD_EXEC` explicitly on modern kernels, with a pre-`MFD_EXEC` compatibility fallback; hardened kernels that prohibit executable memfds fail with an operator-facing startup error), executes Bubblewrap from that immutable snapshot with the inherited host environment cleared before its dynamic loader runs, and materializes the sealed shell inside the sandbox with `--perms 0500 --ro-bind-data`. Bubblewrap's exact pinned launcher source must have host-managed provenance before its sealed snapshot can execute. Ordinary launchers require a root-owned source with no group/other write bits beneath a canonical ancestor chain that is entirely root-owned and non-group/world-writable; FUSE sources are rejected. Nix store launchers are the explicit package-store exception: the canonical path must be a real `/nix/store/<hash>-...` item with a non-writable item/file chain on the exact same non-FUSE kernel mount as `/nix/store`. Traditional daemon-managed stores may be writable at the root only when that root is root-owned and non-writable or sticky and the complete selected item chain is root-owned; UID-remapped/rootless stores instead require the whole `/nix/store` view to be read-only. Nix-store immutability establishes eligible bytes, not selection authority: both root and unprivileged dotlink accept a Nix launcher only when the exact derivation is compiled into the dotlink build (`DOTLINK_BUILD_BWRAP`) or a root-owned final PATH symlink with root-owned non-group/world-writable resolved parent directories (for example a system-profile `bwrap` symlink) selected it. A direct user-selected `/nix/store/.../bwrap` is rejected unless it is the build-pinned derivation. UID-remapped/read-only Nix-store provenance remains unprivileged-only even after trusted selection; root requires traditional root-owned store provenance because a read-only mapped launcher view cannot establish provenance for the dynamic loader and shared-library closure. Bubblewrap discovery evaluates the complete provenance gate per executable PATH candidate and skips rejected shadows in favor of a later trusted candidate; user-controlled PATH entries cannot authorize arbitrary store code for host-side root execution. Linux execution consumes the pinned sealed snapshot rather than reopening that pathname. The system-managed native launcher's host loader/package closure is trusted host configuration, so sandboxed root-RW grants remain compatible with immutable package-store launchers. Privilege-bearing setuid/setgid/file-capability binaries and `#!` wrappers are also rejected, and modern unprivileged Bubblewrap is required. Automatic recovery compares prepared authority before probing a newly discovered launcher, so incompatible old jobs are revoked before replacement Bubblewrap bytes are executed. Shell stdin is streamed concurrently with output draining; if a child deliberately closes stdin early, dotlink treats the resulting broken pipe as end-of-input and lets the child's exit status decide the command result.
-
-One glob grammar everywhere (`globset`, `literal_separator`): `*`, `?`, `[...]`,
-`{a,b}` stay within one path segment and `**` recurses without a level cap.
-Every list/search tool has a documented `limit` and reports `truncated`. Walks
-stop after 100,000 visited entries; `scan_incomplete` explicitly marks partial
-results, which are sorted only among the visited entries. `grep` also limits
-file-content work to 32 MiB across at most 4096 candidates per request. When
-`gitignore` is enabled, inaccessible/denied ignore files include
-`ignore_rules` in `incomplete_reasons` (or a neutral text warning), not silently
-interpreted as absent. The singular `incomplete_reason` remains for compatible
-clients; the array preserves simultaneous directory, content, traversal,
-ignore-rule, and unreadable-file causes. Ignore processing is separately bounded to 256 non-absent
-file reads/4 MiB, including partial failed reads, and rejects any file beyond 64 KiB
-or 1024 lines. Narrow `path` or `glob`/`pattern` for large trees. `read` errors
-rather than emitting a misleading line-zero marker if the first complete line
-plus marker cannot fit. Skipping to a distant line offset is separately limited
-to exactly 32 MiB of source I/O per call, including buffered prefetch. Otherwise,
-`read` ends a capped result with a single marker. On bounded transports, every tool result and protocol error has a final serialized-size postcondition; pageable success paths still preflight their exact shape, while unexpectedly large error text is shortened with an explicit marker instead of becoming a transport failure. `read`, `grep`, and `ls` also fit the **serialized MCP tool result**, so quote/backslash-heavy content may page earlier than the raw profile ceiling while local transports retain the full raw window. `ls` and `grep`
-retain the best sorted candidates within the scanned entries in bounded memory.
-Both bound their JSON replies at `max_output_bytes`, keeping the longest prefix
-that fits. `ls` derives its default depth from the pattern (one level per segment,
-unbounded for `**`) so a deep pattern never silently returns nothing, and
-`grep` pages only ever contain whole matching lines. In content mode ordinary UTF-8 filenames keep the familiar `path:line:` label; names containing delimiter/control characters are quoted, and invalid-UTF-8 Unix names use explicit byte escapes so one filename cannot manufacture extra result lines or collapse onto another. Discovery retains only the lexically best candidates the per-call 4096-file scan budget can actually inspect. File contents are
-UTF-8-validated without copying; each content page keeps only a bounded
-selection of matching line indices and captures their bounded context once
-from the same buffer. Shorter result pages reuse those borrowed lines rather
-than rescanning deep files, with no vector of every line or hit. `grep count` reports
-`page_total` for the returned page. `read` streams a line window, so
-`max_read_bytes` bounds the returned window, its marker and one line rather than
-rejecting a large file outright; the page is assembled in one buffer, and lines
-skipped to reach `offset` are scanned rather than buffered, so a long first line
-never blocks a later window; a single returned line larger than the ceiling is
-an error naming it, since cutting it silently would hide content. `read.max_read_bytes` is a per-call page budget exposed in the tool schema, defaulting to the profile `max_read_bytes` ceiling and clamped to it. New profiles default `max_read_bytes`, `max_write_bytes`, and `max_output_bytes` to 1 MiB; configured raw/tool transfer ceilings may be raised to 8 MiB. The OpenAI adapter allows a complete embedded MCP message up to 9 MiB and reserves the final 1 MiB below the hosted 10 MiB tunnel-envelope limit for tunnel framing. `bread` derives encoding-safe raw windows automatically (base64/MCP about 3/4 of the MCP payload room, hex about 1/2); an explicit binary window that cannot fit returns an actionable smaller limit before encoding.
-
-OpenAI Secure MCP Tunnel requests have a fixed 120-second hosted lifetime. dotlink reserves 5 seconds for terminal delivery, but that window limits only how long the request waits — it never shortens command execution. Every `bash`/`powershell` call starts exactly one durable execution. If it finishes in the remaining response window and the complete ordinary result fits the transport result budget, dotlink returns that result; otherwise the same execution is exposed through either a native MCP Task or the compatibility job id—even if execution already finished. Active transports derive one shared constraint set; OpenAI's private sync/result/replay metadata is authenticated with a redacted per-runtime opaque capability, and the adapter clears dotlink's reserved `_meta` namespace before installing trusted values, so client-supplied metadata cannot spoof transport deadlines, budgets, deduplication keys, or future private fields. The same authenticated result ceiling is attached to native Task RPCs (`tasks/get`, `tasks/update`, `tasks/cancel`), so their protocol errors and completed task payloads cannot overflow the hosted response envelope. Before rmcp sees an embedded OpenAI request, reflected/routing body strings (`id`, method, protocol version, name/URI/taskId and schema-routed tool parameters) are limited to 4 KiB; oversized body selectors are rejected with a compact error, and oversized/malformed routing header groups are suppressed so rmcp can only emit bounded missing-header diagnostics. Native MCP Tasks are created only when their exact eventual `CallToolResult` is safe for the tightest active transport sharing the runtime; `tasks/get` reconstructs it from the same retained stdout/stderr spools, otherwise dotlink uses the compatibility job surface. `job_output` remains available for the full retained streams. `job_start` is the explicit return-immediately form. OpenAI request replay keys are scoped to endpoint+tunnel+organization (deliberately excluding the Runtime API key so credential rotation preserves dedupe and does not revoke unchanged job execution authority). Replayable response bodies are separately bound to the prepared execution-authority generation, so filesystem/shell/network/cache/host capability changes, prepared object identity changes, shell timeout changes, or output/read/write/task-result ceiling changes drop cached bytes while keeping the request fail-closed. Runtime API-key, ngrok-token, OAuth owner-password, and unrelated HTTP auth/bind changes do not alter execution authority; job-session reuse separately binds the OpenAI endpoint+tunnel+organization namespace so hidden request keys cannot cross logical tunnels. OpenAI control-plane base URLs use one parsed canonical form: scheme/host spelling, default ports and dot segments are normalized and trailing slashes are removed. Tunnel request identity, job-session namespace and management/runtime URLs all use that form, so equivalent endpoint spellings cannot split exactly-once replay or revoke durable jobs. Linux sandboxed hidden shell executions additionally bind the live per-command guard generation captured from the exact deny/protected set used to build that command. Cached synchronous delivery and final hidden retirement both revalidate that same generation: a later guard retarget makes cached delivery fail closed, cancellation-requests still-running hidden work, and discards terminal hidden output instead of promoting it to a compatibility handle. Each replay record also binds a canonical SHA-256 of the complete semantic MCP request: the JSON-RPC body plus every effective forwarded MCP protocol/routing header. Forwarded headers are normalized once by the same validation path used for embedded dispatch, so dropped or empty header groups cannot split replay identity. Public MCP `_meta`, MRTR fields and future request parameters participate automatically, while only locally-derived `io.abird.dotlink/*` keys in the exact top-level `params._meta` object are excluded; nested lookalikes remain semantic. Exactly-once replay protection is applied before MCP dispatch to every non-idempotent file/shell tool call (declared explicitly by the central `ToolSpec.request_replay` field). One process-lifetime replay ledger survives automatic in-process runtime restarts: the first copy owns execution and concurrent copies wait/replay the same terminal response. Each `Ready`/`Uncertain` terminal POST holds a replay delivery lease so expiry cannot remove or transform that generation during the network await; a successful terminal POST commits the outer 120-second delivered tombstone before that lease is released or any nested shell replay state is acknowledged/released, while failed/cancelled delivery releases the lease and applies any deferred expiry. Terminal responses are serialized once and cached as `Bytes`, so tunnel retries/redeliveries do not reserialize them. A full undelivered terminal body is retained for at most one hosted 120-second replay horizon; after that its memory is released while a zero-byte fail-closed identity remains, or `RecoverableShell` when the exact inner job can reconstruct the response, for one additional 120-second safety grace. At final expiry non-shell identities are removed; shell identities enter coordinated `JobManager` retirement and first revalidate the stored live guard generation. Current authority exposes the same execution through the compatibility surface; revoked authority cancellation-requests still-running hidden work and discards it once terminal. Retirement then clears the transport key and converts the outer identity to one final zero-byte `Uncertain` tombstone for another hosted replay horizon before removal, so the handoff never reopens the request. Retirement uses O(1) queue membership, handles at most 16 items per prune, and stops a batch at the first capacity-blocked handoff. Admission reserves the hosted 10 MiB worst-case response before a side effect starts under a 256 MiB serialized replay budget, then shrinks to the actual terminal bytes; up to 65,536 replay/tombstone identities are tracked. Reservation accounting is incremental and expiry pruning consumes only actually expired FIFO entries, so the hot path never scans the full map. An actively executing `InFlight` leader is never discarded merely by wall clock; once a response attempt ends, `Uncertain`/`RecoverableShell` state is bounded by the explicit safety grace described above; changing endpoint/tunnel/organization releases cached response bytes and converts the old namespace to 120-second fail-closed retired tombstones. The identity ceiling is intentionally larger than the response-memory budget because delivered tombstones are tiny and must cover the full 120-second redelivery horizon without throttling fast successful mutations. The hosted dispatch deadline bounds replay-protected response attempts as well as ordinary ones, so a blocked mutation releases its tunnel permit at the response window. If a mutation may already have crossed commit, it becomes fail-closed/uncertain and the bounded 502 explicitly warns not to retry it under a new request id; a timed-out/cancelled shell or `job_start` becomes `RecoverableShell` and may resume only while the current `JobManager` still owns that exact request key; after `Ctrl+R`/authority replacement destroys the old owner, it becomes fail-closed `Uncertain` instead of executing again. Within `JobManager`, dotlink explicitly distinguishes `Pending` from a committed synchronous or durable response representation. Positive delivery acknowledgement is enforced at that owner boundary too: `Pending` is rejected and cannot lose its request key even if a future transport caller is incorrect. A redelivery admission/capacity error while the inner response is still pending is not published as that durable request's terminal response and never retires the original request key; the outer ledger returns to `RecoverableShell`. Once committed, concurrent/redelivered shell calls replay the same synchronous result, compatibility job, or native Task. While a caller is actively deciding, a response-attempt lease protects the ordinary slot. When the last active keyed attempt disappears before that choice, the execution moves to transport-only retention and releases the scarce 256 ordinary retained-job slots. The first later live redelivery must reacquire an ordinary slot atomically before it can wait/render/choose a response; if capacity is full it fails before handoff while the request remains replayable. A dropped local unkeyed call becomes a compatibility job recoverable with `job_list`. Keyed synchronous replay is likewise transport-only while delivery is ambiguous. Positive delivery removes hidden synchronous spools+metadata as soon as cleanup succeeds; transient cleanup failure becomes `CleanupOnly`. For an exposed job/task, positive receipt delivery starts a fresh full `job_retention_secs` user-visible lifetime, so a delayed or retried receipt cannot hand back an already-expired handle. Shell request-key state plus cleanup-only retries share one separate 4096-entry transport-retention ceiling, while retained spool bytes still share the session quota. Exposed compatibility/native jobs remain ordinary retained jobs, and `job_list` recovers their ids if a creation receipt was lost. Output streams directly to private files below dotlink's protected XDG state tree. Each stdout/stderr stream retains at most 64 MiB while excess output is drained, and the whole live/retained session has a configurable aggregate `job_spool_bytes` quota (512 MiB by default). After the first byte omitted by either ceiling, that stream becomes permanently drain-only, so its retained file remains an exact prefix even if session quota later frees or increases; the stream is marked truncated. `job_output` is a pure replayable read; only explicit `job_ack` advances cleanup watermarks. After both streams are acknowledged, compatibility-job spools disappear immediately and their metadata may be reclaimed under capacity pressure; native MCP Tasks compact each stream to only the ordinary-result prefix needed to reproduce exact `tasks/get` results, then remove that prefix when task retention expires. Transient deletion/truncation failures remain pending and are retried; release is tracked per stream so a successfully removed sibling is immediately reported as released without hiding the other stream's retryable failure. At `job_retention_secs` (1 hour by default), the handle becomes unavailable to job/task APIs immediately even if internal cleanup metadata must persist to retry physical deletion. Automatic transport recovery reuses jobs only after a single prepared runtime snapshot proves the effective filesystem/shell/network/cache/host authority is unchanged. The lazily materialized per-JobManager spool root is authority-bound by its random session pathname (including lexical/resolved spellings through XDG symlink parents), not by a transient missing-vs-present inode; external protected paths remain object-identity-sensitive. The prepared shell and Bubblewrap executable identities participate in that fingerprint, so replacing either launcher invalidates authority even if its pathname is unchanged. Explicit developer caches are converted from path specs into pinned directory capabilities during preparation; the fingerprint reads those exact descriptors and each shell clones the same descriptors rather than reopening host paths. Before every command, the configured cache pathname must still canonicalize to that pinned inode, otherwise shell preparation fails closed and requires a runtime restart. Grants are fingerprinted from the same pinned native capabilities the replacement machine consumes; cache/host descriptor identities are read through one fail-closed native `fstat` helper and preparation aborts if an already-pinned capability cannot be identified. Guards/caches/host resources are resolved once into that frozen snapshot, Windows path identities include volume/file index, and construction performs no second authority resolution. If preparation cannot prove equality, or any policy/object identity changes, the old session is cancelled before recovery continues. `Ctrl+R` and normal exit likewise cancel and await the old session before removing its spool directory.
-
-Text tools (`grep`, `read`, `write`, `edit`, `patch`) accept UTF-8
-without binary control bytes. Use `bread`, `bwrite`, or `bedit` for
-byte-oriented files.
-
-Every write is atomic: the new bytes go beside the target and are installed only
-at commit, so a failed or interrupted write leaves the old file intact and a
-reader never sees a half-written one. The native filesystem mutators (`write`,
-`bwrite`, `edit`, `patch`, `bedit`) coordinate from snapshot read through
-commit with exact pathname locks plus stable Unix directory-entry identity locks
-within a process, then inode-coalesced directory `flock`s across processes:
-shared ancestor intent locks and one exclusive lock on the deepest existing parent. Missing parent creation is also
-covered; unreadable directories fail closed. Independent subdirectories remain
-concurrent, with no lock service or workspace lockfiles. Shell commands are
-outside that coordination because their write paths are arbitrary. Existing-file writes keep their permission
-bits; create-only writes are absent until commit. `read` with `numbered: false`
-returns the text byte for byte, so a read → write round trip preserves line
-endings. `patch` preserves the target file's line-ending style for added lines
-when an existing delimiter establishes that style, including when an
-unterminated last line gains a CRLF separator. In mixed-ending files,
-successive replacement lines retain their corresponding removed lines' LF/CRLF
-separators, not unrelated context. When adding more lines than were removed,
-extra lines reuse the last removed line's style; pure insertions follow their
-insertion position. Bare blank
-lines and explicit `+` blanks in `*** Add File` both retain the patch's CRLF
-separator. Literal terminal CR bytes remain content when an append adds a
-new LF: a separate delimiter CR is inserted so the original is not consumed
-as CRLF syntax. Added lines containing a literal final CR receive the same
-protection. CRLF-formatted patch syntax is identified by its header. `*** End of File` limits
-context matching to EOF and can anchor a context-free append to an existing
-file; context-free insertions without that marker are deliberately rejected.
-Multi-file calls preflight every file and replace each atomically, but the
-commit sequence is not a transaction.
-
-~~~bash
-dotlink --list-tools
-dotlink --allow-rw --allow-shell --list-tools
-~~~
-
-Tool inspection resolves the effective filesystem permissions without initializing transports, loading Runtime credentials, requiring a live SSH agent or preparing the sandbox. Execution still enforces all those prerequisites.
+Targets are canonicalized before checks; create targets canonicalize their nearest existing ancestor, preventing symlink escapes. The advertised MCP tool list is permission-aware, so unavailable write/shell tools are omitted rather than merely rejected later. Detailed tool, paging, mutation, replay, and platform invariants live in [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md).
 
 ### Linux sandbox
 
@@ -432,7 +333,7 @@ Unsandboxed shell execution inherently has the OS user's filesystem and network 
 dotlink --unrestricted
 ~~~
 
-This is exactly equivalent to the legacy `--allow-all --no-sandbox` pair. It grants:
+This grants:
 
 ~~~text
 filesystem   read+write /
@@ -447,7 +348,7 @@ For unrestricted filesystem access **without** removing the Linux sandbox, use t
 dotlink --allow-rw=/
 ~~~
 
-Then add `--allow-shell` and/or `--allow-network` separately if needed. On Linux, those capabilities remain Bubblewrap-sandboxed unless `--unrestricted` (or the legacy `--allow-all --no-sandbox` pair) is explicitly selected. In full-host mode, saved or CLI `--allow-cache-*`, SSH/Nix/Git, KVM, and GPU sandbox integrations are redundant: they do not perform separate mounts or discovery, and the shell inherits normal host access.
+Then add `--allow-shell` and/or `--allow-network` separately if needed. On Linux, those capabilities remain Bubblewrap-sandboxed unless `--unrestricted` is explicitly selected.
 
 ## OpenAI Secure MCP Tunnel
 
@@ -467,30 +368,20 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 
 ~~~text
 ~/.config/abird/dotlink/runtime.key
-~/.config/abird/dotlink/runtime.<generation>.key
 ~/.config/abird/dotlink/runtime.work.key
-~/.config/abird/dotlink/runtime.work.<generation>.key
 ~~~
 
 `DOTLINK_CONFIG` may move the JSONC file, but Runtime keys always stay in dotlink's private XDG directory above. The active config and credential directory are control-plane state and are not exposed through dotlink's MCP/filesystem/shell surface.
 
-When OpenAI transport is disabled for a profile, that profile does not require
-or even read a saved Runtime key. At startup, explicit environment credentials
-and `DOTLINK_API_KEY_FILE` take precedence over a saved key, so a missing
-persisted key never blocks an otherwise valid override.
-If a selected Runtime key is missing, enabled OpenAI execution fails closed;
-`dotlink profile show default` and `dotlink profile edit default` still work
-so you can inspect and replace it. Completed credential rotations prune obsolete
-generations, preserving the selected and immediately prior versions;
-deleting a profile is retryable after an interrupted cleanup.
+When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
+
+Shell execution is durable: if a `bash`/`powershell` call cannot return its complete result inside the tunnel response window, the same execution continues behind a job/task handle instead of being restarted. The shell tool surface includes explicit background start, status, output paging, acknowledgement, and cancellation controls. See [Architecture](docs/ARCHITECTURE.md) for the transport and replay model.
 
 ### Automatic tunnel recovery
 
 Transient OpenAI poll failures retry with backoff. Normal warnings stay concise; full transport diagnostics are available with `-vv`.
 
-After **10 transient poll failures without an accepted poll**, dotlink stops retrying the same runtime state. Intervening 401/403/404 responses do not falsely reset that health counter. Dotlink cancels all active transports, gives them up to 6 seconds to shut down cleanly, force-aborts any remaining transport tasks, reloads the profile and permission policy, reconstructs the local MCP runtime, and starts the configured transports again automatically.
-
-If a freshly restarted runtime keeps failing, restarts back off from 1 second up to a 30-second cap. Once a runtime has connected successfully, that restart backoff resets. A rejected Tunnel ID or Runtime API key retries for 60 seconds before requiring operator action, so a single auth outage or edge rejection cannot stop the service.
+After **10 transient poll failures without an accepted poll**, dotlink rebuilds the runtime from the current profile and policy. Repeated runtime restarts back off from 1 second to a 30-second cap and reset after a healthy connection; persistent tunnel/key rejection is given a short recovery window before operator action is required.
 
 Useful locations:
 
@@ -499,41 +390,6 @@ Useful locations:
 - Admin API keys: <https://platform.openai.com/settings/organization/admin-keys>
 - ChatGPT Workspace ID: <https://chatgpt.com/admin>
 - OpenAI Organization ID: <https://platform.openai.com/settings/organization/general>
-
-For multi-file text edits, pass an ordered `edits` array with a `path` on
-every operation (up to 512 operations and 64 distinct files per call). The `edit` tool has **no top-level `path` or `paths` input**;
-it derives the distinct target set from the edits. Planning retains at most
-64 MiB of original snapshots and editable text combined. Long success receipts
-are shortened *before* committing writes; `truncated` and `omitted_files` state
-how many per-file details were omitted, while the operation count remains exact.
-Legacy requests with a
-single top-level default path still work, but are no longer advertised.
-
-`edit`, `patch`, and `bedit` share a 64 MiB retained-buffer budget.
-`edit` (512 edits / 64 files), `patch` (32 files / 64 hunks) and `bedit`
-(32 ranges) reject excess operations early. `patch` borrows unchanged file
-lines, so dense-line patches do not multiply per-line string allocations or
-consume the output write limit as scratch memory. `bedit` hashes and stages
-binary changes in fixed-size chunks: its source and resulting file can still
-be up to 64 MiB (subject to `max_write_bytes`) without holding two copies in
-memory, and unchanged results preserve mtime. Large multi-file success receipts
-fit the profile output ceiling using `truncated` and omitted counts, checked
-before any commits; `write`/`bwrite` likewise avoid overly long path messages.
-Patch file names and update-hunk lines are borrowed from the request; add-file
-sections retain one contiguous source range rather than even a per-line slice
-vector. `patch` hunk matching uses a shared linear-time sequence scan rather than
-trying every candidate against the entire context block, while preserving
-exact-first and whitespace-tolerant fallback. Source-line matching excludes the nonexistent empty line after a terminal `\n`, but keeps real blank lines and the exact trailing-newline state. Context-only hunks avoid duplicate replacement vectors. CRLF target adjustments are represented as borrowed lines plus a flag;
-no `String` allocation is needed for each added line. This avoids millions of tiny allocations for large patches. Existing-file
-snapshots are rechecked with a fixed scratch buffer; common text replacements
-edit in place. Identical binary ranges avoid staging a temporary while still
-checking that the source has not changed. Known HTTP/embedded MCP calls also
-avoid an unnecessary second JSON tree where practical. The shared staging
-engine preserves strict all-stage-before-commit and
-`patch` best-effort behavior. Individual file replacements remain atomic;
-a multi-file commit is not a cross-file transaction.
-
-On Linux, ordinary broad grants such as `$HOME` are compatible with dotlink's own private state. Native MCP tools always reject dotlink-protected paths. For the Bubblewrap shell, dotlink masks/rebinds existing canonical protected objects and internally self-binds the writable ancestor chain as namespace anchors, so the sandboxed child can keep writing ordinary files under `$HOME` but cannot rename the path components that keep the guarded name stable. A protected directory such as `~/.config/abird/dotlink` covers nested protected files such as `runtime.key`; a standalone protected regular file becomes its own masked mountpoint. Only missing guard names and symlink spellings still fail closed when a broad live bind would make their name lifetime-unstable. For an intentional unrestricted filesystem grant, **`--allow-rw=/ --allow-shell` works with Bubblewrap still enabled** and remains the explicit private-path isolation opt-out for that shell. Shell network, PID namespace and host integrations retain independent controls, and native filesystem tools continue enforcing dotlink's protected paths.
 
 ## Logging
 
@@ -553,25 +409,6 @@ Example with `-v`:
 [01:06:47.411] TOOL read       ← ok  1ms
 ~~~
 
-Shell commands are logged as capped 256-character quoted excerpts by default
-when TOOL verbosity is enabled, using a compact single-line, escaped format.
-Truncated `c=` values end with `…` inside the closing quote:
-
-~~~text
-[01:06:48.410] TOOL bash       → d="./src" c="echo hello\nls -la" max_b=30000 max_t=60
-[01:06:48.418] TOOL bash       ← ok  8ms
-~~~
-
-`p` and `d` show `./...` for resolved paths inside Dotlink's launch directory
-and absolute `/...` paths outside it. The labels follow existing symlinks on a
-best-effort basis, so a symlink pointing outside normally logs its outside
-target; actual permission checks remain independent. `p=`, `d=`, and `paths=[...]`
-show complete path names. A valid `edit` call shows all its distinct files (up
-to 64); invalid oversized calls report their limits without scanning unbounded
-operations. For writes, `b="N"` reports payload bytes; These are audit
-labels only: permissions use the original paths. Enable TOOL logs deliberately,
-since shell commands may include inline credentials.
-
 With `-vv`, transport diagnostics are added:
 
 ~~~text
@@ -579,9 +416,9 @@ With `-vv`, transport diagnostics are added:
 [01:06:47.427] REQ  stdio      → tools/call
 ~~~
 
-TOOL logs prioritize `p` (path), `d` (working directory), then `c` (shell command). At `-v`, `c=` is limited by default to **256 rendered characters**, counting quotes and escape sequences; truncated commands end with `…` immediately before the closing quote. Only interactive `V` **while TOOL logging is active** removes the command limit; otherwise its hint is hidden and the key does nothing. `p=`, `d=`, and `paths=[...]` always show complete path names. Interactive logs color keys, values, and success/error outcomes separately (unless `--color=never`); noninteractive logs have plain argument fields. **Inline passwords or tokens within the visible command prefix—or full commands enabled by `V`—can still be stored in journald.** Restrict journal access and retention accordingly. File contents, patches, search patterns, binary data and stdin remain byte counts; the default is quiet.
+TOOL logs include bounded command previews plus complete path labels, methods, status, and latency; file contents, binary payloads, Runtime keys, and raw request bodies are not intentionally logged. Interactive `V` removes the command-preview cap while TOOL logging is active, so use it only when command text is safe to retain.
 
-Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. Interactive terminal runs also support `v` for live verbosity cycling, `V` for full commands only when TOOL logging is enabled, and `Ctrl+R` for a full runtime restart; stdio keeps stdin protocol-clean and exposes only `Ctrl+C`. In a manual TTY stdio run, dotlink ensures `Ctrl+C` generates an interrupt and restores the terminal state afterward.
+Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. stdio keeps stdin protocol-clean and exposes only `Ctrl+C`.
 
 ## CLI summary
 
@@ -783,28 +620,9 @@ See [.agents/docs/nixos-service.md](.agents/docs/nixos-service.md).
 
 ## Parallel tool execution
 
-A single tunnel can dispatch up to sixteen in-flight MCP requests. On Linux,
-file tools use descriptor-rooted `openat2` access and Bubblewrap shells run
-independently; **tools execute concurrently by default**. Local HTTP and stdio
-intentionally have **no global admission cap**: the client/model directs
-parallelism. The tunnel maintains its own in-flight limit. Choose
-`dotlink -s` or `dotlink --serialize` if you want one MCP call at a time
-across all transports handled by this process. This is an *ordering preference*,
-not an additional security boundary. It does not serialize separate dotlink
-processes or subprocesses that outlive their MCP call.
+A single OpenAI tunnel admits up to sixteen in-flight MCP requests; local HTTP and stdio follow client-directed concurrency. Tools execute concurrently by default. `dotlink -s` / `--serialize` opts into one call at a time within the process; it is an ordering preference, not a security boundary.
 
-The Linux path enforces access beneath pinned directory handles, refuses
-symlink traversal during the final operation, and rejects nested mountpoints
-unless the user has explicitly authorized filesystem root `/`. It requires
-Linux `openat2` (kernel 5.6+); if unavailable, native tool startup fails
-closed rather than falling back to unsafe pathname I/O. Existing safe symlink
-aliases are canonicalized before the final descriptor-relative access.
-On macOS, the pinned Unix directory model uses a component-wise
-openat/O_NOFOLLOW walk. On Windows, native tools pin directory handles and
-reject reparse points, while named cross-process mutexes coordinate writers
-to the same path across services and CLI instances. Windows also retains
-its in-process gate; -s opts into global serial execution. External applications
-do not participate in these advisory locks.
+Native filesystem access is fail-closed and platform-specific: Linux uses descriptor-rooted `openat2`, macOS uses a pinned no-follow `openat` walk, and Windows uses pinned handles/reparse-point checks plus cross-process mutation coordination. See [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) for the exact invariants.
 
 ## FAQ
 
@@ -870,7 +688,7 @@ services.dotlink.credentials.runtimeApiKeyFile =
   config.sops.secrets.dotlink-runtime.path;
 ~~~
 
-Omitting this option retains the user's saved Runtime key. `credentials.ngrokAuthTokenFile` works similarly. There are also `instances.<name>` for independent named services, `extraPackages` for shell tools, and `logging.verbosity = "lifecycle" | "tools" | "requests"` (default: lifecycle). The service disables stdio MCP, gracefully handles SIGTERM, and logs to journald. Exits 2 and 78 stay stopped until fixed and explicitly restarted; exit 6 (`NOTCONFIGURED`, setup still pending) also stays stopped but counts as a clean stop, so an unprovisioned host never fails its own activation; any other termination, including exit 0 or a clean signal outside a systemd stop/restart job, restarts with exponential backoff up to 10 minutes. Explicit `systemctl stop` remains stopped. The module requires systemd 255 or newer and warns on 255–257 because backoff reset notifications require 258:
+Omitting this option retains the user's saved Runtime key. `credentials.ngrokAuthTokenFile` works similarly. There are also `instances.<name>` for independent named services, `extraPackages` for shell tools, and `logging.verbosity = "lifecycle" | "tools" | "requests"` (default: lifecycle). The service disables stdio MCP, gracefully handles SIGTERM, and logs to journald:
 
 ~~~bash
 systemctl status dotlink
@@ -919,7 +737,7 @@ nix build .#release-all
 
 The bundle contains static Linux x86_64/ARM64 binaries, Windows x86_64/ARM64, and macOS ARM64. The static Linux builds run across NixOS, Debian, and other compatible distributions. Individual Nix outputs are available as `dist-linux-*`, `dist-windows-*`, and `dist-macos-aarch64`.
 
-To publish a GitHub Release, push a matching version tag such as `v0.8.0`. CI rebuilds the Nix release graph and uploads each binary plus its `.sha256` sidecar as an individual release asset; the Actions ZIP bundle is not published as the release.
+To publish a GitHub Release, push a tag matching the Cargo version, such as `v0.14.2`. CI rebuilds the Nix release graph and uploads each binary plus its `.sha256` sidecar as an individual release asset; the Actions ZIP bundle is not published as the release.
 
 Cross-build outputs, stable filenames, installer overrides, and platform release details: `.agents/docs/release-install.md`.
 
