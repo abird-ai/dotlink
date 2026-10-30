@@ -232,6 +232,20 @@ pub(crate) enum RequestDeliveryState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestDeliveryAck {
+    Acknowledged,
+    Pending,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestRetirement {
+    Retired,
+    Busy,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JobDisposition {
     /// No response representation has been committed yet. A redelivery may
     /// still choose synchronous replay or one durable exposure form.
@@ -290,6 +304,9 @@ struct JobEntry {
     response_attempts: usize,
     retention: RetentionClass,
     request_key: Option<String>,
+    /// Exact live Linux sandbox guard generation used to prepare this command.
+    /// None for unsandboxed/non-Linux commands and pre-execution failures.
+    shell_guard_generation: Option<[u8; 32]>,
     /// When user-visible retention began. For request-key responses this is
     /// rebased on positive delivery acknowledgement; execution completion stays
     /// independently represented by `terminal_at`.
@@ -402,7 +419,7 @@ pub(crate) struct JobHandle {
 }
 
 impl JobHandle {
-    pub(crate) fn mark_running(&self) -> bool {
+    pub(crate) fn mark_running(&self, shell_guard_generation: Option<[u8; 32]>) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
@@ -417,6 +434,7 @@ impl JobHandle {
             return false;
         }
         entry.phase = JobPhase::Running;
+        entry.shell_guard_generation = shell_guard_generation;
         entry.updated_at = chrono::Utc::now().to_rfc3339();
         entry.notify.notify_waiters();
         true
@@ -807,6 +825,7 @@ impl JobManager {
                 response_attempts: 1,
                 retention: RetentionClass::Ordinary,
                 request_key: request_key.clone(),
+                shell_guard_generation: None,
                 retention_anchor: None,
                 notify,
             },
@@ -889,6 +908,7 @@ impl JobManager {
                 response_attempts: 0,
                 retention: RetentionClass::Ordinary,
                 request_key: None,
+                shell_guard_generation: None,
                 retention_anchor: None,
                 notify: Arc::new(Notify::new()),
             },
@@ -1322,6 +1342,15 @@ impl JobManager {
             .then(|| id.clone())
     }
 
+    pub(crate) fn request_shell_guard_generation(&self, request_key: &str) -> Option<[u8; 32]> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let id = state.request_jobs.get(request_key)?;
+        let entry = state.jobs.get(id)?;
+        (entry.request_key.as_deref() == Some(request_key))
+            .then_some(entry.shell_guard_generation)
+            .flatten()
+    }
+
     pub(crate) fn request_delivery_state(&self, request_key: &str) -> Option<RequestDeliveryState> {
         let state = self.inner.state.lock().expect("job manager lock");
         let id = state.request_jobs.get(request_key)?;
@@ -1343,18 +1372,23 @@ impl JobManager {
     /// becomes unnecessary. Hidden synchronous jobs release their spools and
     /// metadata once cleanup succeeds; exposed jobs keep their task/job state
     /// but no longer occupy the dedupe ledger.
-    pub(crate) fn acknowledge_request_delivery(&self, request_key: &str) {
+    pub(crate) fn acknowledge_request_delivery(&self, request_key: &str) -> RequestDeliveryAck {
         let mut state = self.inner.state.lock().expect("job manager lock");
         let Some(id) = state.request_jobs.get(request_key).cloned() else {
-            return;
+            return RequestDeliveryAck::Missing;
         };
-        if state
-            .jobs
-            .get(&id)
-            .is_none_or(|entry| entry.request_key.as_deref() != Some(request_key))
-        {
-            return;
+        let Some(disposition) = state.jobs.get(&id).and_then(|entry| {
+            (entry.request_key.as_deref() == Some(request_key)).then_some(entry.disposition)
+        }) else {
+            return RequestDeliveryAck::Missing;
+        };
+        if disposition == JobDisposition::Pending {
+            // Delivery acknowledgement is valid only for a response representation
+            // that was already committed under the manager lock. Never let a
+            // transport caller turn a pending execution into an unkeyed hidden job.
+            return RequestDeliveryAck::Pending;
         }
+
         state.request_jobs.remove(request_key);
         let mut remove_hidden = false;
         if let Some(entry) = state.jobs.get_mut(&id) {
@@ -1366,12 +1400,7 @@ impl JobManager {
                 // independently anchored by `terminal_at`.
                 entry.retention_anchor = Some(Instant::now());
                 entry.expiration_pending = false;
-            } else if !entry.disposition.exposed() && entry.status().terminal() {
-                // Positive terminal delivery makes any still-hidden response
-                // final even if a caller was dropped before recording the local
-                // disposition. Retire the hidden execution rather than leaving
-                // an inaccessible job behind.
-                entry.disposition = JobDisposition::Synchronous;
+            } else if entry.status().terminal() {
                 entry.retention = RetentionClass::CleanupOnly;
                 if let Some(completion) = entry.completion.as_mut() {
                     entry.stdout_consumed = completion.stdout.stored_bytes;
@@ -1385,6 +1414,107 @@ impl JobManager {
         if remove_hidden {
             let _ = remove_job_locked(&mut state, &id);
         }
+        RequestDeliveryAck::Acknowledged
+    }
+
+    /// Revoke an undelivered hidden execution after its live shell guard
+    /// generation is no longer authorized. Already-exposed jobs are never
+    /// affected. A still-running hidden job is cancellation-requested and keeps
+    /// its request key until it becomes terminal, so cleanup cannot race output.
+    pub(crate) fn discard_hidden_request_delivery(&self, request_key: &str) -> RequestRetirement {
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let Some(id) = state.request_jobs.get(request_key).cloned() else {
+            return RequestRetirement::Missing;
+        };
+        let Some(entry) = state.jobs.get_mut(&id) else {
+            return RequestRetirement::Missing;
+        };
+        if entry.request_key.as_deref() != Some(request_key) || entry.disposition.exposed() {
+            return RequestRetirement::Missing;
+        }
+        if entry.response_attempts != 0 {
+            return RequestRetirement::Busy;
+        }
+        if !entry.status().terminal() {
+            entry.cancel.cancel();
+            return RequestRetirement::Busy;
+        }
+
+        state.request_jobs.remove(request_key);
+        let entry = state
+            .jobs
+            .get_mut(&id)
+            .expect("request mapping validated above");
+        entry.request_key = None;
+        entry.retention = RetentionClass::CleanupOnly;
+        if let Some(completion) = entry.completion.as_ref() {
+            entry.stdout_consumed = completion.stdout.stored_bytes;
+            entry.stderr_consumed = completion.stderr.stored_bytes;
+            entry.output_cleanup_requested = true;
+            maybe_release_output(&self.inner, entry);
+        }
+        let remove_hidden = entry.output_released && entry.readers == 0;
+        if remove_hidden {
+            let _ = remove_job_locked(&mut state, &id);
+        }
+        RequestRetirement::Retired
+    }
+
+    /// The hosted transport can no longer redeliver this request identity. Make
+    /// any still-hidden execution user-discoverable, then release the transport
+    /// dedupe key so ordinary retention can bound its remaining lifetime.
+    pub(crate) fn retire_request_delivery(&self, request_key: &str) -> RequestRetirement {
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let Some(id) = state.request_jobs.get(request_key).cloned() else {
+            return RequestRetirement::Missing;
+        };
+        let Some(entry) = state.jobs.get(&id) else {
+            return RequestRetirement::Missing;
+        };
+        if entry.request_key.as_deref() != Some(request_key) {
+            return RequestRetirement::Missing;
+        }
+        if entry.response_attempts != 0 {
+            return RequestRetirement::Busy;
+        }
+
+        let needs_ordinary_slot = state.jobs.get(&id).is_some_and(|entry| {
+            matches!(
+                entry.disposition,
+                JobDisposition::Pending | JobDisposition::Synchronous
+            ) && entry.retention != RetentionClass::Ordinary
+        });
+        if needs_ordinary_slot && !ensure_retained_capacity(&self.inner, &mut state, 1) {
+            return RequestRetirement::Busy;
+        }
+
+        state.request_jobs.remove(request_key);
+        let entry = state
+            .jobs
+            .get_mut(&id)
+            .expect("request mapping validated above");
+        entry.request_key = None;
+        let now = Instant::now();
+        match entry.disposition {
+            JobDisposition::Pending | JobDisposition::Synchronous => {
+                // The original transport response is no longer reachable. Expose
+                // the same durable execution through the compatibility surface.
+                // Once the transport key is gone it is ordinary user-visible
+                // retained state and must participate in the shared 256-job cap.
+                entry.disposition = JobDisposition::Compatibility;
+                entry.retention = RetentionClass::Ordinary;
+                entry.retention_anchor = Some(now);
+                entry.expiration_pending = false;
+            }
+            JobDisposition::Compatibility | JobDisposition::NativeTask => {
+                // The handle already exists; retirement merely starts a fresh
+                // user-visible retention window from the point transport replay
+                // ceased to be possible.
+                entry.retention_anchor = Some(now);
+                entry.expiration_pending = false;
+            }
+        }
+        RequestRetirement::Retired
     }
 
     pub(crate) fn output_page(
@@ -3100,7 +3230,11 @@ mod tests {
         };
         fs::remove_file(&stderr).unwrap();
         fs::create_dir(&stderr).unwrap();
-        manager.acknowledge_request_delivery("cleanup-only");
+        manager.mark_synchronous_result(&started.id).unwrap();
+        assert_eq!(
+            manager.acknowledge_request_delivery("cleanup-only"),
+            RequestDeliveryAck::Acknowledged
+        );
         {
             let state = manager.inner.state.lock().unwrap();
             let entry = &state.jobs[&started.id];
@@ -3190,6 +3324,94 @@ mod tests {
                 StreamSummary::default(),
             ),
         );
+    }
+
+    #[tokio::test]
+    async fn revoked_hidden_request_discards_output_without_exposing_job() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let request_key = "revoked-sync".to_owned();
+        let started = manager
+            .spawn(30, 1024, Some(request_key.clone()), |job| async move {
+                assert!(job.mark_running(Some([7; 32])));
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                )
+            })
+            .unwrap();
+        let id = started.id.clone();
+        drop(started);
+        assert!(matches!(
+            manager.wait_until(&id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        assert_eq!(
+            manager.mark_synchronous_result(&id).unwrap(),
+            JobDisposition::Synchronous
+        );
+        assert_eq!(
+            manager.request_shell_guard_generation(&request_key),
+            Some([7; 32])
+        );
+
+        assert_eq!(
+            manager.discard_hidden_request_delivery(&request_key),
+            RequestRetirement::Retired
+        );
+        assert!(manager.request_job_id(&request_key).is_none());
+        assert!(
+            !manager.inner.state.lock().unwrap().jobs.contains_key(&id),
+            "revoked hidden synchronous result must be cleaned rather than exposed"
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoked_running_hidden_request_cancels_then_discards_without_exposure() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let request_key = "revoked-running".to_owned();
+        let started = manager
+            .spawn(30, 1024, Some(request_key.clone()), |job| async move {
+                assert!(job.mark_running(Some([8; 32])));
+                job.cancel.cancelled().await;
+                JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+            })
+            .unwrap();
+        let id = started.id.clone();
+        drop(started);
+
+        for _ in 0..100 {
+            if manager.request_shell_guard_generation(&request_key) == Some([8; 32]) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            manager.request_shell_guard_generation(&request_key),
+            Some([8; 32])
+        );
+        assert_eq!(
+            manager.discard_hidden_request_delivery(&request_key),
+            RequestRetirement::Busy,
+            "running revoked work must be cancelled before its hidden state is cleaned"
+        );
+        assert!(manager.owns_request_key(&request_key));
+
+        assert!(matches!(
+            manager.wait_until(&id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        assert_eq!(
+            manager.discard_hidden_request_delivery(&request_key),
+            RequestRetirement::Retired
+        );
+        assert!(!manager.owns_request_key(&request_key));
+        assert!(manager.status(&id).is_err());
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(64)).unwrap();
+        assert!(listed["jobs"].as_array().unwrap().is_empty());
+        manager.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3834,6 +4056,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_delivery_cannot_be_acknowledged_and_final_retirement_exposes_it() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("pending-delivery".to_owned()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        let id = started.id.clone();
+        assert!(matches!(
+            manager.wait_until(&id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        assert_eq!(
+            manager.acknowledge_request_delivery("pending-delivery"),
+            RequestDeliveryAck::Pending
+        );
+        assert!(manager.owns_request_key("pending-delivery"));
+        drop(started);
+        assert_eq!(
+            manager.retire_request_delivery("pending-delivery"),
+            RequestRetirement::Retired
+        );
+        assert!(!manager.owns_request_key("pending-delivery"));
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&id];
+            assert_eq!(entry.disposition, JobDisposition::Compatibility);
+            assert_eq!(entry.retention, RetentionClass::Ordinary);
+            assert_eq!(retained_job_slots(&state), 1);
+        }
+        let list: serde_json::Value = serde_json::from_str(&manager.list(16)).unwrap();
+        assert!(
+            list["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|job| job["job_id"] == id),
+            "retired transport-only execution must be recoverable through job_list"
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn delivery_acknowledgement_requires_a_consistent_request_mapping() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
@@ -4339,7 +4614,11 @@ mod tests {
             entry.readers += 1;
             entry.stdout_path.clone()
         };
-        manager.acknowledge_request_delivery("request-reader");
+        manager.mark_synchronous_result(&started.id).unwrap();
+        assert_eq!(
+            manager.acknowledge_request_delivery("request-reader"),
+            RequestDeliveryAck::Acknowledged
+        );
         assert!(
             stdout_path.exists(),
             "active reader must defer spool deletion"

@@ -38,8 +38,7 @@ use tokio_util::task::AbortOnDropHandle;
 use super::{LocalMachine, dot, resolve_capped, tool_error};
 #[cfg(target_os = "linux")]
 use crate::mcp::{
-    AccessPolicy, PreparedCacheMount, ShellGuards, guard_identities, validate_host_mount_policy,
-    validate_shell_guards,
+    AccessPolicy, ShellGuards, guard_identities, validate_host_mount_policy, validate_shell_guards,
 };
 use crate::{
     jobs::{
@@ -221,6 +220,12 @@ where
             break;
         }
         total = total.saturating_add(read as u64);
+        if truncated {
+            // Once any byte is omitted, the durable file must remain an exact
+            // prefix forever. Aggregate quota can become available later, but
+            // appending a later suffix would corrupt byte offsets and Task replay.
+            continue;
+        }
         let remaining = cap.saturating_sub(stored);
         let wanted = remaining.min(read as u64);
         let reserved = job.reserve_spool(wanted);
@@ -287,49 +292,6 @@ fn effectively_executable(path: &Path) -> bool {
     effective_access(path, libc::X_OK)
 }
 
-#[cfg(target_os = "linux")]
-fn sandbox_has_write_alias(
-    path: &Path,
-    access: &AccessPolicy,
-    cache_mounts: &[PreparedCacheMount],
-) -> bool {
-    access.can_write(path)
-        || cache_mounts
-            .iter()
-            .any(|cache| cache.writable && path.starts_with(&cache.source))
-}
-
-#[cfg(target_os = "linux")]
-fn sandbox_launcher_source_is_trusted(
-    path: &Path,
-    access: &AccessPolicy,
-    cache_mounts: &[PreparedCacheMount],
-) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let euid = unsafe { libc::geteuid() };
-    let mut current = Some(path);
-    let mut source = true;
-    while let Some(candidate) = current {
-        let metadata = std::fs::metadata(candidate).with_context(|| {
-            format!(
-                "cannot inspect Bubblewrap launcher trust boundary {}",
-                candidate.display()
-            )
-        })?;
-        let uid_mutable = metadata.uid() == euid || effective_access(candidate, libc::W_OK);
-        if uid_mutable && (source || sandbox_has_write_alias(candidate, access, cache_mounts)) {
-            anyhow::bail!(
-                "Bubblewrap launcher source is mutable by the dotlink uid at {}; install Bubblewrap in a system-managed path whose file is not user-owned/writable and whose sandbox-writable ancestors are not replaceable by this uid",
-                candidate.display()
-            );
-        }
-        source = false;
-        current = candidate.parent();
-    }
-    Ok(())
-}
-
 fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -363,6 +325,8 @@ pub(crate) struct PreparedExecutable {
     script: bool,
     #[cfg(target_os = "linux")]
     privileged_source: bool,
+    #[cfg(target_os = "linux")]
+    source_uid_mutable: bool,
 }
 
 #[cfg(unix)]
@@ -391,6 +355,41 @@ fn file_has_security_capability(file: &File) -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
+fn create_executable_memfd() -> Result<File> {
+    let name = CString::new("dotlink-executable").expect("static memfd name");
+    let create = |flags| {
+        // SAFETY: `name` is a live NUL-terminated CString and memfd_create
+        // returns either an owned descriptor or -1.
+        unsafe { libc::memfd_create(name.as_ptr(), flags) }
+    };
+    let base = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    let raw = create(base | libc::MFD_EXEC);
+    if raw >= 0 {
+        // SAFETY: `raw` is uniquely owned after successful memfd_create.
+        return Ok(unsafe { File::from_raw_fd(raw) });
+    }
+    let first = std::io::Error::last_os_error();
+    if first.raw_os_error() == Some(libc::EINVAL) {
+        // Linux before MFD_EXEC existed rejects the unknown flag. Those kernels
+        // also predate vm.memfd_noexec, so retain the historical executable
+        // memfd behavior as a compatibility fallback.
+        let raw = create(base);
+        if raw >= 0 {
+            // SAFETY: `raw` is uniquely owned after successful memfd_create.
+            return Ok(unsafe { File::from_raw_fd(raw) });
+        }
+        return Err(std::io::Error::last_os_error())
+            .context("cannot create sealed executable snapshot");
+    }
+    if matches!(first.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+        return Err(crate::recovery::operator(anyhow::anyhow!(
+            "kernel policy forbids executable memfd snapshots; allow MFD_EXEC (vm.memfd_noexec must not prohibit executable memfds) or disable shell access"
+        )));
+    }
+    Err(first).context("cannot create sealed executable snapshot")
+}
+
+#[cfg(target_os = "linux")]
 fn sealed_executable_snapshot(
     source: &File,
     display: &Path,
@@ -411,18 +410,7 @@ fn sealed_executable_snapshot(
             MAX_PREPARED_EXECUTABLE_BYTES
         );
     }
-    let name = CString::new("dotlink-executable").expect("static memfd name");
-    // SAFETY: `name` is a live NUL-terminated CString and memfd_create returns
-    // either an owned descriptor or -1. The descriptor is immediately wrapped
-    // in File on success.
-    let raw =
-        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("cannot create sealed executable snapshot");
-    }
-    // SAFETY: `raw` is uniquely owned after successful memfd_create.
-    let mut snapshot = unsafe { File::from_raw_fd(raw) };
+    let mut snapshot = create_executable_memfd()?;
     snapshot.set_permissions(std::fs::Permissions::from_mode(0o500))?;
 
     let mut digest = Sha256::new();
@@ -507,8 +495,11 @@ impl PreparedExecutable {
             .with_context(|| format!("cannot resolve executable {}", path.display()))?;
         #[cfg(target_os = "linux")]
         {
+            use std::os::unix::fs::MetadataExt as _;
+
             let pinned = crate::secure_fs::SecureFs::pin_canonical(&path)?;
-            if !pinned.metadata()?.is_file() {
+            let source_metadata = pinned.metadata()?;
+            if !source_metadata.is_file() {
                 anyhow::bail!("executable is not a regular file: {}", path.display());
             }
             let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
@@ -518,16 +509,19 @@ impl PreparedExecutable {
                     path.display()
                 );
             }
+            let euid = unsafe { libc::geteuid() };
+            let source_uid_mutable =
+                source_metadata.uid() == euid || effective_access(&pinned_path, libc::W_OK);
             let identity = crate::secure_fs::file_identity(&pinned)?;
             let (snapshot, digest, script, privileged_source) =
                 sealed_executable_snapshot(&pinned, &path)?;
             let snapshot = Arc::new(snapshot);
             let exec_path = PathBuf::from(format!("/proc/self/fd/{}", snapshot.as_raw_fd()));
             if !effectively_executable(&exec_path) {
-                anyhow::bail!(
-                    "sealed executable snapshot is not executable by this process: {}",
+                return Err(crate::recovery::operator(anyhow::anyhow!(
+                    "sealed executable snapshot is not executable by this process: {}; kernel executable-memfd policy may prohibit shell launchers",
                     path.display()
-                );
+                )));
             }
             Ok(Self {
                 path,
@@ -541,6 +535,7 @@ impl PreparedExecutable {
                 exec_path,
                 script,
                 privileged_source,
+                source_uid_mutable,
             })
         }
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -586,16 +581,13 @@ impl PreparedExecutable {
                 prepared.path.display()
             );
         }
+        if prepared.source_uid_mutable {
+            anyhow::bail!(
+                "Bubblewrap launcher {} is owned or writable by the dotlink uid; install Bubblewrap as a system-managed native executable",
+                prepared.path.display()
+            );
+        }
         Ok(prepared)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn validate_sandbox_source(
-        &self,
-        access: &AccessPolicy,
-        cache_mounts: &[PreparedCacheMount],
-    ) -> Result<()> {
-        sandbox_launcher_source_is_trusted(&self.path, access, cache_mounts)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -671,6 +663,18 @@ impl PreparedExecutable {
             self.revalidate_source()?;
             Ok(Command::new(&self.path))
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sandbox_host_command(&self) -> Result<Command> {
+        let mut command = self.command()?;
+        // Bubblewrap is itself host-side code. Start it with no inherited
+        // environment so dynamic-loader controls (LD_PRELOAD, LD_LIBRARY_PATH,
+        // LD_AUDIT, GLIBC_TUNABLES, etc.) cannot run attacker-controlled code
+        // before Bubblewrap establishes the sandbox. The child environment is
+        // built separately through Bubblewrap --clearenv/--setenv arguments.
+        command.env_clear();
+        Ok(command)
     }
 
     #[cfg(target_os = "linux")]
@@ -788,7 +792,7 @@ pub(crate) async fn validate_bubblewrap(program: &PreparedExecutable) -> Result<
         "--perms",
         "--dev-bind",
     ];
-    let mut command = program.command()?;
+    let mut command = program.sandbox_host_command()?;
     let mut child = command
         .arg("--help")
         .stdout(Stdio::piped())
@@ -1009,6 +1013,65 @@ impl RuntimeLayout {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn resolve_shell_guards(config: &RuntimeConfig) -> Result<ShellGuards> {
+    let access = config.access.refreshed()?;
+    let protected = guard_identities(&access.base_dir, &config.protected_paths)?;
+    let runtime = RuntimeLayout::for_shell(config.allow_network, config.host_shell.ssh_agent)?;
+    let anchors = validate_shell_guards(&access, &config.cache_mounts, &protected, &runtime)?;
+    validate_host_mount_policy(&access, &config.host_shell, &protected)?;
+    Ok(ShellGuards {
+        access,
+        protected,
+        runtime,
+        anchors,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn shell_guard_generation(guards: &ShellGuards) -> [u8; 32] {
+    fn paths<'a>(digest: &mut Sha256, tag: u8, values: impl IntoIterator<Item = &'a Path>) {
+        digest.update([tag]);
+        for path in values {
+            let bytes = path.as_os_str().as_bytes();
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        digest.update(0_u64.to_be_bytes());
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"dotlink-shell-guards-v1\0");
+    paths(
+        &mut digest,
+        1,
+        guards.access.deny_read_roots.iter().map(PathBuf::as_path),
+    );
+    paths(
+        &mut digest,
+        2,
+        guards.access.deny_write_roots.iter().map(PathBuf::as_path),
+    );
+    if guards.access.explicit_root_rw_grant() {
+        paths(&mut digest, 3, std::iter::empty());
+    } else {
+        paths(
+            &mut digest,
+            3,
+            guards.protected.iter().map(PathBuf::as_path),
+        );
+    }
+    digest.update([4]);
+    for anchor in &guards.anchors {
+        let bytes = anchor.path.as_os_str().as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+        digest.update([u8::from(anchor.writable)]);
+    }
+    digest.update(0_u64.to_be_bytes());
+    digest.finalize().into()
+}
+
 #[derive(Clone, Debug)]
 struct ShellRuntime {
     config: RuntimeConfig,
@@ -1022,7 +1085,7 @@ impl ShellRuntime {
         &self,
         args: &ShellArgs,
         powershell: bool,
-    ) -> Result<(Command, PathBuf)> {
+    ) -> Result<(Command, PathBuf, Option<[u8; 32]>)> {
         if let Some(stdin_text) = args.stdin.as_ref()
             && stdin_text.len() > self.config.max_write_bytes
         {
@@ -1043,32 +1106,35 @@ impl ShellRuntime {
             .ok_or_else(|| anyhow::anyhow!("shell execution is disabled"))?;
 
         #[cfg(target_os = "linux")]
-        let command = if self.config.sandbox_shell && !powershell {
-            self.bubblewrap_command(shell_launcher, &working_dir, &args.command)?
+        let (command, shell_guard_generation) = if self.config.sandbox_shell && !powershell {
+            let guards = self.shell_guards()?;
+            let generation = shell_guard_generation(&guards);
+            (
+                self.bubblewrap_command_with_guards(
+                    shell_launcher,
+                    &working_dir,
+                    &args.command,
+                    guards,
+                )?,
+                Some(generation),
+            )
         } else {
-            direct_shell_command(shell_launcher, powershell, &working_dir, &args.command)?
+            (
+                direct_shell_command(shell_launcher, powershell, &working_dir, &args.command)?,
+                None,
+            )
         };
         #[cfg(not(target_os = "linux"))]
-        let command =
-            direct_shell_command(shell_launcher, powershell, &working_dir, &args.command)?;
-        Ok((command, working_dir))
+        let (command, shell_guard_generation) = (
+            direct_shell_command(shell_launcher, powershell, &working_dir, &args.command)?,
+            None,
+        );
+        Ok((command, working_dir, shell_guard_generation))
     }
 
     #[cfg(target_os = "linux")]
     fn shell_guards(&self) -> Result<ShellGuards> {
-        let access = self.config.access.refreshed()?;
-        let protected = guard_identities(&access.base_dir, &self.config.protected_paths)?;
-        let runtime =
-            RuntimeLayout::for_shell(self.config.allow_network, self.config.host_shell.ssh_agent)?;
-        let anchors =
-            validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
-        validate_host_mount_policy(&access, &self.config.host_shell, &protected)?;
-        Ok(ShellGuards {
-            access,
-            protected,
-            runtime,
-            anchors,
-        })
+        resolve_shell_guards(&self.config)
     }
 
     fn output_limit(&self, requested: Option<usize>) -> usize {
@@ -1076,23 +1142,32 @@ impl ShellRuntime {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn bubblewrap_command(
         &self,
         shell: &PreparedExecutable,
         working_dir: &Path,
         script: &str,
     ) -> Result<Command> {
+        let guards = self.shell_guards()?;
+        self.bubblewrap_command_with_guards(shell, working_dir, script, guards)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bubblewrap_command_with_guards(
+        &self,
+        shell: &PreparedExecutable,
+        working_dir: &Path,
+        script: &str,
+        guards: ShellGuards,
+    ) -> Result<Command> {
         let bwrap = self
             .launchers
             .bwrap
             .as_ref()
             .expect("bwrap validated and pinned at startup");
-        // Deny and protected aliases can change between machine construction
-        // and a shell call. Re-resolve them and rerun all overlap checks before
-        // opening any mount source or constructing a mask.
-        let guards = self.shell_guards()?;
         let access = &guards.access;
-        let mut command = bwrap.command()?;
+        let mut command = bwrap.sandbox_host_command()?;
         let mut mount_fds: Vec<std::fs::File> = Vec::new();
         #[derive(Clone, Copy)]
         enum BindFdKind {
@@ -1524,6 +1599,28 @@ impl LocalMachine {
         Ok(Some((value, requires_owner)))
     }
 
+    pub(crate) fn job_request_shell_guard_generation(&self, request_key: &str) -> Option<[u8; 32]> {
+        self.jobs.request_shell_guard_generation(request_key)
+    }
+
+    pub(crate) fn current_shell_guard_generation(&self) -> Result<Option<[u8; 32]>> {
+        #[cfg(target_os = "linux")]
+        if self.config.allow_shell && self.config.sandbox_shell {
+            let guards = resolve_shell_guards(&self.config)?;
+            return Ok(Some(shell_guard_generation(&guards)));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn shell_guard_generation_is_current(&self, expected: Option<[u8; 32]>) -> bool {
+        expected.is_none_or(|expected| {
+            matches!(
+                self.current_shell_guard_generation(),
+                Ok(Some(current)) if current == expected
+            )
+        })
+    }
+
     pub(crate) fn job_request_delivery_state(
         &self,
         request_key: &str,
@@ -1726,7 +1823,7 @@ impl LocalMachine {
                         );
                     }
 
-                    let (mut command, working_dir) =
+                    let (mut command, working_dir, shell_guard_generation) =
                         match runtime.prepare_shell_command(&args, powershell).await {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -1750,7 +1847,7 @@ impl LocalMachine {
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .kill_on_drop(true);
-                    if !job.mark_running() {
+                    if !job.mark_running(shell_guard_generation) {
                         return JobCompletion::cancelled(
                             StreamSummary::default(),
                             StreamSummary::default(),
@@ -2254,6 +2351,81 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn aggregate_quota_truncation_never_resumes_after_capacity_returns() {
+        struct ReleasingReader {
+            step: u8,
+            job: crate::jobs::JobHandle,
+        }
+
+        impl AsyncRead for ReleasingReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let chunk: &[u8] = match self.step {
+                    0 => b"AAAA",
+                    1 => b"BBBB",
+                    2 => {
+                        // Simulate another job releasing quota after this stream
+                        // has already dropped a middle chunk.
+                        self.job.release_spool(4);
+                        b"CCCC"
+                    }
+                    _ => return std::task::Poll::Ready(Ok(())),
+                };
+                self.step += 1;
+                buf.put_slice(chunk);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let manager =
+            crate::jobs::JobManager::with_spool_limit(std::time::Duration::from_secs(60), 8)
+                .unwrap();
+        let (path_tx, path_rx) = tokio::sync::oneshot::channel();
+        let started = manager
+            .spawn(30, 4096, None, move |job| async move {
+                let _ = path_tx.send(job.stdout_path.clone());
+                // Four bytes model retained state owned by another stream/job.
+                assert_eq!(job.reserve_spool(4), 4);
+                let summary = spool_job_output(
+                    ReleasingReader {
+                        step: 0,
+                        job: job.clone(),
+                    },
+                    job.stdout_path.clone(),
+                    job.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(summary.total_bytes, 12);
+                assert_eq!(summary.stored_bytes, 4);
+                assert!(summary.truncated);
+                crate::jobs::JobCompletion::completed(
+                    Some(0),
+                    true,
+                    summary,
+                    crate::jobs::StreamSummary::default(),
+                )
+            })
+            .unwrap();
+        let id = started.id.clone();
+        let path = path_rx.await.unwrap();
+        assert!(matches!(
+            manager.wait_until(&id, None).await.unwrap(),
+            crate::jobs::JobWait::Terminal
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"AAAA",
+            "retained output must stay a contiguous prefix after the first dropped byte"
+        );
+        drop(started);
+        manager.shutdown().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn executable_discovery_skips_non_executable_path_entries() {
@@ -2441,62 +2613,52 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn sandbox_launcher_rejects_user_mutable_source_tree() {
+    fn sandbox_launcher_rejects_user_owned_source_even_outside_sandbox_write_authority() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
-        let temp = tempfile::tempdir().unwrap();
-        let launcher = temp.path().join("bwrap");
+        let launcher_root = tempfile::tempdir().unwrap();
+        let launcher = launcher_root.path().join("bwrap");
         std::fs::copy(bash, &launcher).unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let prepared = PreparedExecutable::prepare_sandbox_launcher(launcher).unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let access = AccessPolicy::from_spec(AccessSpec {
-            base_dir: root.clone(),
-            read_roots: vec![root.clone()],
-            write_roots: vec![root],
-            deny_read_roots: Vec::new(),
-            deny_write_roots: Vec::new(),
-            unrestricted_fs: false,
-        })
-        .unwrap();
-        let error = prepared
-            .validate_sandbox_source(&access, &[])
+        let error = PreparedExecutable::prepare_sandbox_launcher(launcher)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("mutable by the dotlink uid"), "{error}");
-        assert!(error.contains("system-managed path"), "{error}");
+        assert!(
+            error.contains("owned or writable by the dotlink uid"),
+            "{error}"
+        );
+        assert!(
+            error.contains("system-managed native executable"),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn sandbox_launcher_trust_includes_writable_cache_aliases() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache = temp.path().join("cache");
-        std::fs::create_dir(&cache).unwrap();
-        let cache = cache.canonicalize().unwrap();
-        let access = AccessPolicy::from_spec(AccessSpec {
-            base_dir: temp.path().canonicalize().unwrap(),
-            read_roots: Vec::new(),
-            write_roots: Vec::new(),
-            deny_read_roots: Vec::new(),
-            deny_write_roots: Vec::new(),
-            unrestricted_fs: false,
-        })
-        .unwrap();
-        let mounts = vec![PreparedCacheMount {
-            source: cache.clone(),
-            target: PathBuf::from("/tmp/home/.cache/test"),
-            writable: true,
-            pinned: Arc::new(crate::secure_fs::SecureFs::open_canonical_directory(&cache).unwrap()),
-        }];
-        let candidate = cache.join("bin").join("bwrap");
-        assert!(!access.can_write(&candidate));
+    #[tokio::test]
+    async fn sandbox_host_launcher_inherits_no_process_environment() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        if std::env::var_os("HOME").is_none() {
+            return;
+        }
+        let prepared = PreparedExecutable::prepare_sandbox_launcher(bash).unwrap();
+        let status = prepared
+            .sandbox_host_command()
+            .unwrap()
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-c")
+            .arg("test -z \"${HOME+x}\" && test -z \"${SSH_AUTH_SOCK+x}\" && test -z \"${LD_PRELOAD+x}\" && test -z \"${LD_LIBRARY_PATH+x}\"")
+            .status()
+            .await
+            .unwrap();
         assert!(
-            sandbox_has_write_alias(&candidate, &access, &mounts),
-            "writable cache sources are alternate sandbox write paths to the same host objects"
+            status.success(),
+            "host-side sandbox launcher inherited process environment"
         );
     }
 
@@ -3723,6 +3885,83 @@ mod tests {
                     .unwrap(),
             ),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn final_retirement_discards_hidden_synchronous_output_after_guard_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let root = workspace.canonicalize().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        let alias = temp.path().join("deny-link");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        symlink(&first, &alias).unwrap();
+
+        let mut machine = sandbox_machine(&root, Vec::new());
+        machine.config.access.deny_read_roots =
+            crate::mcp::guard_identities(&root, std::slice::from_ref(&alias)).unwrap();
+        let generation = machine
+            .current_shell_guard_generation()
+            .unwrap()
+            .expect("sandboxed Linux shell has a live guard generation");
+
+        let request_key = "retirement-guard-revocation".to_owned();
+        let started = machine
+            .jobs
+            .spawn(30, 4096, Some(request_key.clone()), move |job| async move {
+                assert!(job.mark_running(Some(generation)));
+                std::fs::write(&job.stdout_path, b"secret").unwrap();
+                crate::jobs::JobCompletion::completed(
+                    Some(0),
+                    true,
+                    crate::jobs::StreamSummary {
+                        total_bytes: 6,
+                        stored_bytes: 6,
+                        truncated: false,
+                    },
+                    crate::jobs::StreamSummary::default(),
+                )
+            })
+            .unwrap();
+        let id = started.id.clone();
+        assert!(matches!(
+            machine.jobs.wait_until(&id, None).await.unwrap(),
+            crate::jobs::JobWait::Terminal
+        ));
+        assert_eq!(
+            machine.jobs.mark_synchronous_result(&id).unwrap(),
+            crate::jobs::JobDisposition::Synchronous
+        );
+        drop(started);
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        assert!(
+            !machine.shell_guard_generation_is_current(Some(generation)),
+            "retargeting a live deny alias must revoke the launch generation"
+        );
+
+        assert_eq!(
+            machine.retire_job_request_delivery(&request_key),
+            crate::jobs::RequestRetirement::Retired
+        );
+        assert!(machine.jobs.request_job_id(&request_key).is_none());
+        assert!(
+            machine.jobs.status(&id).is_err(),
+            "revoked hidden synchronous output must be discarded, not promoted to compatibility"
+        );
+        let listed: serde_json::Value = serde_json::from_str(&machine.jobs.list(64)).unwrap();
+        assert!(
+            listed["jobs"].as_array().unwrap().is_empty(),
+            "revoked hidden output must never become discoverable through job_list"
+        );
+        machine.jobs.shutdown().await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -5421,6 +5660,43 @@ mod tests {
         );
         let _ = agent.kill().await;
         let _ = agent.wait().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandboxed_root_rw_preparation_accepts_system_managed_bubblewrap() {
+        if resolve_executable("bash").is_none() || resolve_executable("bwrap").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: temp.path().to_path_buf(),
+                read_roots: vec![PathBuf::from("/")],
+                write_roots: vec![PathBuf::from("/")],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: true,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: true,
+            sandbox_shell: true,
+            allow_network: false,
+            max_shell_timeout_secs: 8,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .expect("sandboxed root-RW must not reject a system-managed Bubblewrap launcher");
     }
 
     #[cfg(target_os = "linux")]

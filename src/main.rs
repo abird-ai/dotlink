@@ -1187,52 +1187,33 @@ struct RuntimePlan {
     transports: ActiveTransports,
 }
 
-fn transport_authority_value(
-    setup: &SetupResult,
-    transports: &ActiveTransports,
-) -> serde_json::Value {
-    let openai = transports.openai.as_ref().map(|config| {
-        serde_json::json!({
-            "base_url": config.base_url,
-            "tunnel_id": config.tunnel_id,
-            "organization_id": config.organization_id,
-        })
-    });
-    let http = transports.http.as_ref().map(|config| {
-        serde_json::json!({
-            "bind": config.bind.to_string(),
-            "ngrok": config.ngrok,
-            "ngrok_domain": config.ngrok_domain,
-            "http_ephemeral_url": config.http_ephemeral_url,
-            "ngrok_ephemeral_url": config.ngrok_ephemeral_url,
-            "local_oauth": config.local_oauth,
-            "ngrok_oauth": config.ngrok_oauth,
-            "oauth_public_url": config.oauth_public_url.as_ref().map(ToString::to_string),
-            "ngrok_no_auth": config.ngrok_no_auth,
-            "ngrok_token": config.ngrok_authtoken.as_ref().map(|token| {
-                hex::encode(crate::mcp::sha256(token.as_bytes()))
-            }),
-        })
-    });
-    let constraints = transports.constraints();
-    serde_json::json!({
-        "openai": openai,
-        "stdio": transports.stdio,
-        "http": http,
-        "constraints": {
-            "task_result_budget": constraints.task_result_budget,
-        },
-        "owner_password_revision": setup.config.owner_password_revision,
-    })
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeAuthorityIntent {
+    execution: [u8; 32],
+    job_session: [u8; 32],
 }
 
-fn job_authority_intent_fingerprint(
+fn openai_job_namespace_value(transports: &ActiveTransports) -> serde_json::Value {
+    transports
+        .openai
+        .as_ref()
+        .map_or(serde_json::Value::Null, |config| {
+            serde_json::json!({
+                "base_url": transports::openai::canonical_base_url(&config.base_url),
+                "tunnel_id": config.tunnel_id,
+                "organization_id": config.organization_id,
+            })
+        })
+}
+
+fn runtime_authority_intent(
     args: &Args,
     setup: &SetupResult,
     policy: &Policy,
     transports: &ActiveTransports,
-) -> Result<[u8; 32]> {
-    let mut authority = serde_json::json!({
+) -> Result<RuntimeAuthorityIntent> {
+    let constraints = transports.constraints();
+    let mut execution = serde_json::json!({
         "base_dir": policy.base_dir,
         "read_roots": policy.read_roots,
         "write_roots": policy.write_roots,
@@ -1243,14 +1224,19 @@ fn job_authority_intent_fingerprint(
         "sandbox_shell": policy.sandbox_shell,
         "allow_network": policy.allow_network,
         "max_shell_timeout_secs": setup.config.max_shell_timeout_secs,
+        "max_output_bytes": setup.config.max_output_bytes,
+        "max_read_bytes": setup.config.max_read_bytes,
+        "max_write_bytes": setup.config.max_write_bytes,
         "saved_caches": setup.config.caches,
         "cli_caches": args.cache_flags.requested(),
         "protected_paths": setup.protected_paths,
-        "active_transports": transport_authority_value(setup, transports),
+        "transport_constraints": {
+            "task_result_budget": constraints.task_result_budget,
+        },
     });
     #[cfg(target_os = "linux")]
     {
-        authority["host_access"] = serde_json::json!({
+        execution["host_access"] = serde_json::json!({
             "nix_daemon": policy.host_access.nix_daemon,
             "nix_config": policy.host_access.nix_config,
             "ssh_agent": policy.host_access.ssh_agent,
@@ -1259,10 +1245,24 @@ fn job_authority_intent_fingerprint(
             "gpu": policy.allow_gpu,
         });
     }
-    Ok(crate::mcp::sha256(&serde_json::to_vec(&authority)?))
+    let execution = crate::mcp::sha256(&serde_json::to_vec(&execution)?);
+    let job_session = crate::mcp::sha256(&serde_json::to_vec(&serde_json::json!({
+        "execution": hex::encode(execution),
+        // Hidden OpenAI request keys are namespace-scoped. A logical tunnel
+        // change must retire the old JobManager even when machine authority is
+        // otherwise identical.
+        "openai_job_namespace": openai_job_namespace_value(transports),
+    }))?);
+    Ok(RuntimeAuthorityIntent {
+        execution,
+        job_session,
+    })
 }
 
-fn job_authority_fingerprint(intent: [u8; 32], prepared: &PreparedMachine) -> Result<[u8; 32]> {
+fn execution_authority_fingerprint(
+    intent: [u8; 32],
+    prepared: &PreparedMachine,
+) -> Result<[u8; 32]> {
     let authority = serde_json::json!({
         "intent": hex::encode(intent),
         "machine": prepared.authority_value(),
@@ -1329,11 +1329,12 @@ async fn plan_runtime(
             anyhow::anyhow!("OpenAI transport is enabled but tunnel_id is missing")
         })?;
         Some(transports::openai::Config {
-            base_url: setup.config.base_url.clone(),
+            base_url: transports::openai::canonical_base_url(&setup.config.base_url).to_owned(),
             tunnel_id,
             runtime_api_key: setup.config.runtime_api_key.clone(),
             organization_id: setup.config.organization_id.clone(),
             new_tunnel: setup.new_tunnel,
+            execution_authority: None,
             log: log.clone(),
             process_state: openai_state.clone(),
         })
@@ -1376,13 +1377,13 @@ async fn prepare_runtime(
     args: &Args,
     log: &LogConfig,
     plan: RuntimePlan,
-    intent: [u8; 32],
+    intent: RuntimeAuthorityIntent,
     jobs: &mut Option<jobs::JobManager>,
 ) -> Result<(ActiveTransports, LocalMachine)> {
     let RuntimePlan {
         setup,
         policy,
-        transports,
+        mut transports,
     } = plan;
 
     // Startup depends on the host (devices, caches and filesystem state), so
@@ -1447,7 +1448,7 @@ async fn prepare_runtime(
         protected_paths: setup.protected_paths.clone(),
     };
 
-    let (job_manager, prepared) = if let Some(existing) = jobs.as_ref() {
+    let (job_manager, prepared, authority) = if let Some(existing) = jobs.as_ref() {
         let prepared = match LocalMachine::prepare_with_job_root(
             machine_config.clone(),
             existing.protected_path(),
@@ -1464,38 +1465,41 @@ async fn prepare_runtime(
                 return Err(error);
             }
         };
-        let authority = job_authority_fingerprint(intent, &prepared)?;
+        let authority = execution_authority_fingerprint(intent.execution, &prepared)?;
         if existing.bind_policy(authority) {
-            (existing.clone(), prepared)
+            (existing.clone(), prepared, authority)
         } else {
             shutdown_job_session(jobs).await?;
             let created = jobs::JobManager::with_spool_limit(retention, spool_limit)?;
-            let bound_intent = created.bind_intent(intent);
+            let bound_intent = created.bind_intent(intent.job_session);
             debug_assert!(bound_intent);
             let prepared =
                 LocalMachine::prepare_with_job_root(machine_config, created.protected_path())
                     .await?;
             prepared.validate_launchers().await?;
-            let authority = job_authority_fingerprint(intent, &prepared)?;
+            let authority = execution_authority_fingerprint(intent.execution, &prepared)?;
             let bound_policy = created.bind_policy(authority);
             debug_assert!(bound_policy);
             *jobs = Some(created.clone());
-            (created, prepared)
+            (created, prepared, authority)
         }
     } else {
         let created = jobs::JobManager::with_spool_limit(retention, spool_limit)?;
-        let bound_intent = created.bind_intent(intent);
+        let bound_intent = created.bind_intent(intent.job_session);
         debug_assert!(bound_intent);
         let prepared =
             LocalMachine::prepare_with_job_root(machine_config, created.protected_path()).await?;
         prepared.validate_launchers().await?;
-        let authority = job_authority_fingerprint(intent, &prepared)?;
+        let authority = execution_authority_fingerprint(intent.execution, &prepared)?;
         let bound_policy = created.bind_policy(authority);
         debug_assert!(bound_policy);
         *jobs = Some(created.clone());
-        (created, prepared)
+        (created, prepared, authority)
     };
 
+    if let Some(openai) = transports.openai.as_mut() {
+        openai.execution_authority = Some(authority);
+    }
     let machine = LocalMachine::from_prepared(prepared, job_manager)?;
     Ok((transports, machine))
 }
@@ -1529,11 +1533,10 @@ async fn run_runtime(
     let Some(plan) = planned.map_err(recovery::config_failure)? else {
         return Ok(RuntimeOutcome::Exit);
     };
-    let intent =
-        job_authority_intent_fingerprint(args, &plan.setup, &plan.policy, &plan.transports)?;
+    let intent = runtime_authority_intent(args, &plan.setup, &plan.policy, &plan.transports)?;
     if jobs
         .as_ref()
-        .is_some_and(|existing| !existing.bind_intent(intent))
+        .is_some_and(|existing| !existing.bind_intent(intent.job_session))
     {
         // Config/CLI authority changed. Revoke the old session before any
         // potentially failing startup/discovery work for the replacement.
@@ -1953,16 +1956,68 @@ mod tests {
             stdio: true,
             http: None,
         };
-        let before = job_authority_intent_fingerprint(&args, &setup, &policy, &transports).unwrap();
+        let before = runtime_authority_intent(&args, &setup, &policy, &transports)
+            .unwrap()
+            .execution;
 
         let mut changed = setup;
         changed.config.max_shell_timeout_secs = 61;
-        let after =
-            job_authority_intent_fingerprint(&args, &changed, &policy, &transports).unwrap();
+        let after = runtime_authority_intent(&args, &changed, &policy, &transports)
+            .unwrap()
+            .execution;
         assert_ne!(
             before, after,
             "execution-lifetime policy changes must revoke the old job session"
         );
+    }
+
+    #[test]
+    fn data_exposure_ceiling_changes_revoke_execution_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let mut config: crate::setup::AppConfig =
+            serde_json::from_value(serde_json::json!({"version": 10})).unwrap();
+        config.transports.openai = false;
+        config.transports.stdio = true;
+        config.permissions.default_allow = true;
+        let setup = SetupResult {
+            config,
+            new_tunnel: false,
+            protected_paths: Vec::new(),
+        };
+        let policy = Policy::from_args(&args, root, &setup.config.permissions).unwrap();
+        let transports = ActiveTransports {
+            openai: None,
+            stdio: true,
+            http: None,
+        };
+        let baseline = runtime_authority_intent(&args, &setup, &policy, &transports)
+            .unwrap()
+            .execution;
+
+        let mut setup = setup;
+        let output = setup.config.max_output_bytes;
+        let read = setup.config.max_read_bytes;
+        let write = setup.config.max_write_bytes;
+        for field in ["max_output_bytes", "max_read_bytes", "max_write_bytes"] {
+            match field {
+                "max_output_bytes" => setup.config.max_output_bytes = output + 1024,
+                "max_read_bytes" => setup.config.max_read_bytes = read + 1024,
+                "max_write_bytes" => setup.config.max_write_bytes = write + 1024,
+                _ => unreachable!(),
+            }
+            let after = runtime_authority_intent(&args, &setup, &policy, &transports)
+                .unwrap()
+                .execution;
+            assert_ne!(
+                baseline, after,
+                "{field} changes must invalidate replayable response authority"
+            );
+            setup.config.max_output_bytes = output;
+            setup.config.max_read_bytes = read;
+            setup.config.max_write_bytes = write;
+        }
     }
 
     #[test]
@@ -1985,6 +2040,7 @@ mod tests {
             runtime_api_key: key.to_owned(),
             organization_id: Some("org".to_owned()),
             new_tunnel: false,
+            execution_authority: Some([0; 32]),
             log: LogConfig::default(),
             process_state: transports::openai::ProcessState::default(),
         };
@@ -1998,13 +2054,167 @@ mod tests {
             stdio: false,
             http: None,
         };
-        let before =
-            job_authority_intent_fingerprint(&args, &setup, &policy, &before_transports).unwrap();
-        let after =
-            job_authority_intent_fingerprint(&args, &setup, &policy, &after_transports).unwrap();
+        let before = runtime_authority_intent(&args, &setup, &policy, &before_transports).unwrap();
+        let after = runtime_authority_intent(&args, &setup, &policy, &after_transports).unwrap();
         assert_eq!(
             before, after,
             "transport credential rotation must not revoke execution-lifetime job authority"
+        );
+    }
+
+    #[test]
+    fn transport_credentials_do_not_revoke_job_execution_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let mut config: crate::setup::AppConfig =
+            serde_json::from_value(serde_json::json!({"version": 10})).unwrap();
+        config.permissions.default_allow = true;
+        let setup = SetupResult {
+            config,
+            new_tunnel: false,
+            protected_paths: Vec::new(),
+        };
+        let policy = Policy::from_args(&args, root, &setup.config.permissions).unwrap();
+        let http = |token: &str| transports::http::Config {
+            bind: "127.0.0.1:3000".parse().unwrap(),
+            ngrok: true,
+            ngrok_domain: None,
+            http_ephemeral_url: false,
+            ngrok_ephemeral_url: false,
+            oauth: None,
+            local_oauth: false,
+            ngrok_oauth: false,
+            oauth_public_url: None,
+            ngrok_no_auth: true,
+            ngrok_authtoken: Some(token.to_owned()),
+            log: LogConfig::default(),
+        };
+        let before = ActiveTransports {
+            openai: None,
+            stdio: true,
+            http: Some(http("token-one")),
+        };
+        let after = ActiveTransports {
+            openai: None,
+            stdio: true,
+            http: Some(http("token-two")),
+        };
+        assert_eq!(
+            runtime_authority_intent(&args, &setup, &policy, &before).unwrap(),
+            runtime_authority_intent(&args, &setup, &policy, &after).unwrap(),
+            "ngrok credential rotation must not revoke execution-lifetime job authority"
+        );
+
+        let mut changed_setup = setup;
+        let before_revision =
+            runtime_authority_intent(&args, &changed_setup, &policy, &before).unwrap();
+        changed_setup.config.owner_password_revision = Some("rotated".to_owned());
+        let after_revision =
+            runtime_authority_intent(&args, &changed_setup, &policy, &before).unwrap();
+        assert_eq!(
+            before_revision, after_revision,
+            "OAuth owner-password rotation must not revoke execution-lifetime job authority"
+        );
+    }
+
+    #[test]
+    fn openai_logical_namespace_revokes_job_session_not_execution_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let mut config: crate::setup::AppConfig =
+            serde_json::from_value(serde_json::json!({"version": 10})).unwrap();
+        config.permissions.default_allow = true;
+        let setup = SetupResult {
+            config,
+            new_tunnel: false,
+            protected_paths: Vec::new(),
+        };
+        let policy = Policy::from_args(&args, root, &setup.config.permissions).unwrap();
+        let openai = |tunnel: &str| transports::openai::Config {
+            base_url: "https://api.openai.com".to_owned(),
+            tunnel_id: tunnel.to_owned(),
+            runtime_api_key: "same-key".to_owned(),
+            organization_id: Some("org".to_owned()),
+            new_tunnel: false,
+            execution_authority: None,
+            log: LogConfig::default(),
+            process_state: transports::openai::ProcessState::default(),
+        };
+        let before = ActiveTransports {
+            openai: Some(openai("tunnel-one")),
+            stdio: false,
+            http: None,
+        };
+        let after = ActiveTransports {
+            openai: Some(openai("tunnel-two")),
+            stdio: false,
+            http: None,
+        };
+        let before = runtime_authority_intent(&args, &setup, &policy, &before).unwrap();
+        let after = runtime_authority_intent(&args, &setup, &policy, &after).unwrap();
+        assert_eq!(
+            before.execution, after.execution,
+            "logical tunnel topology must not change machine execution authority"
+        );
+        assert_ne!(
+            before.job_session, after.job_session,
+            "changing the OpenAI replay namespace must revoke hidden request-key authority"
+        );
+    }
+
+    #[test]
+    fn equivalent_openai_base_url_spellings_preserve_job_session_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let mut config: crate::setup::AppConfig =
+            serde_json::from_value(serde_json::json!({"version": 10})).unwrap();
+        config.permissions.default_allow = true;
+        let setup = SetupResult {
+            config,
+            new_tunnel: false,
+            protected_paths: Vec::new(),
+        };
+        let policy = Policy::from_args(&args, root, &setup.config.permissions).unwrap();
+        let openai = |base_url: &str| transports::openai::Config {
+            base_url: base_url.to_owned(),
+            tunnel_id: "tunnel".to_owned(),
+            runtime_api_key: "key".to_owned(),
+            organization_id: Some("org".to_owned()),
+            new_tunnel: false,
+            execution_authority: None,
+            log: LogConfig::default(),
+            process_state: transports::openai::ProcessState::default(),
+        };
+        let transports = |base_url: &str| ActiveTransports {
+            openai: Some(openai(base_url)),
+            stdio: false,
+            http: None,
+        };
+
+        let plain = runtime_authority_intent(
+            &args,
+            &setup,
+            &policy,
+            &transports("https://api.openai.com"),
+        )
+        .unwrap();
+        let slashed = runtime_authority_intent(
+            &args,
+            &setup,
+            &policy,
+            &transports("https://api.openai.com///"),
+        )
+        .unwrap();
+        assert_eq!(
+            plain, slashed,
+            "equivalent control-plane endpoint spellings must not revoke durable job authority"
+        );
+        assert_eq!(
+            transports::openai::canonical_base_url("https://api.openai.com///"),
+            "https://api.openai.com"
         );
     }
 
@@ -2053,7 +2263,7 @@ mod tests {
             LocalMachine::prepare_with_job_root(config.clone(), manager.protected_path())
                 .await
                 .unwrap();
-        let before = job_authority_fingerprint([7; 32], &prepared_before).unwrap();
+        let before = execution_authority_fingerprint([7; 32], &prepared_before).unwrap();
 
         std::fs::remove_file(&deny_alias).unwrap();
         std::fs::remove_file(&protected_alias).unwrap();
@@ -2062,14 +2272,76 @@ mod tests {
 
         assert_eq!(
             before,
-            job_authority_fingerprint([7; 32], &prepared_before).unwrap(),
+            execution_authority_fingerprint([7; 32], &prepared_before).unwrap(),
             "one prepared snapshot must not re-resolve host names during fingerprinting"
         );
         let prepared_after = LocalMachine::prepare_with_job_root(config, manager.protected_path())
             .await
             .unwrap();
-        let after = job_authority_fingerprint([7; 32], &prepared_after).unwrap();
+        let after = execution_authority_fingerprint([7; 32], &prepared_after).unwrap();
         assert_ne!(before, after, "re-preparing must observe guard retargeting");
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lazy_job_session_root_materialization_preserves_execution_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        assert!(!manager.protected_path().exists());
+
+        let config = MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 60,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: 60,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        };
+        let before = LocalMachine::prepare_with_job_root(config.clone(), manager.protected_path())
+            .await
+            .unwrap();
+        let before = execution_authority_fingerprint([63; 32], &before).unwrap();
+
+        let started = manager
+            .spawn(30, 1024, None, |_job| async {
+                jobs::JobCompletion::completed(
+                    Some(0),
+                    true,
+                    jobs::StreamSummary::default(),
+                    jobs::StreamSummary::default(),
+                )
+            })
+            .unwrap();
+        drop(started);
+        assert!(manager.protected_path().exists());
+        let after = LocalMachine::prepare_with_job_root(config, manager.protected_path())
+            .await
+            .unwrap();
+        let after = execution_authority_fingerprint([63; 32], &after).unwrap();
+        assert_eq!(
+            before, after,
+            "materializing dotlink's own lazy session root must not revoke an unchanged job session"
+        );
         manager.shutdown().await.unwrap();
     }
 
@@ -2167,20 +2439,20 @@ mod tests {
             LocalMachine::prepare_with_job_root(config.clone(), manager.protected_path())
                 .await
                 .unwrap();
-        let before = job_authority_fingerprint([9; 32], &prepared).unwrap();
+        let before = execution_authority_fingerprint([9; 32], &prepared).unwrap();
 
         std::fs::remove_file(&grant).unwrap();
         symlink(&second, &grant).unwrap();
         assert_eq!(
             before,
-            job_authority_fingerprint([9; 32], &prepared).unwrap(),
+            execution_authority_fingerprint([9; 32], &prepared).unwrap(),
             "the prepared snapshot must use its already-pinned root capability"
         );
 
         let reparsed = LocalMachine::prepare_with_job_root(config, manager.protected_path())
             .await
             .unwrap();
-        let after = job_authority_fingerprint([9; 32], &reparsed).unwrap();
+        let after = execution_authority_fingerprint([9; 32], &reparsed).unwrap();
         assert_ne!(
             before, after,
             "a new preparation must observe the new grant target"

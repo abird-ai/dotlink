@@ -2047,7 +2047,10 @@ async fn create_tunnel(
     let client = reqwest::Client::builder()
         .user_agent(format!("dotlink/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let url = format!("{}/v1/tunnels", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/v1/tunnels",
+        crate::transports::openai::canonical_base_url(base_url)
+    );
     let response = client
         .post(url)
         .bearer_auth(admin_key)

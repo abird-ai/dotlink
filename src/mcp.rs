@@ -1548,6 +1548,7 @@ pub(crate) fn authority_path_identity(path: &Path) -> serde_json::Value {
 fn prepared_authority_value(
     config: &RuntimeConfig,
     launchers: &PreparedLaunchers,
+    job_root: &Path,
     #[cfg(any(target_os = "linux", target_os = "macos"))] secure_fs: &crate::secure_fs::SecureFs,
 ) -> Result<serde_json::Value> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1640,13 +1641,36 @@ fn prepared_authority_value(
     let bwrap_program_authority = launchers.bwrap.as_ref().map(&executable_authority);
     #[cfg(not(target_os = "linux"))]
     let bwrap_program_authority: Option<serde_json::Value> = None;
+    let job_root_spec = [job_root.to_path_buf()];
+    let job_root_identities = guard_identities(&config.access.base_dir, &job_root_spec)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let protected_paths = config
+        .protected_paths
+        .iter()
+        .map(|path| {
+            if job_root_identities.contains(path) {
+                // The per-JobManager spool root is intentionally materialized
+                // lazily. Its random session pathname (including lexical and
+                // resolved spellings through XDG symlink parents) is the stable
+                // capability; hashing a missing inode on first prepare and a
+                // real inode after the first job would revoke an unchanged session.
+                serde_json::json!({
+                    "kind": "job_session_root",
+                    "path": path,
+                })
+            } else {
+                authority_path_identity(path)
+            }
+        })
+        .collect::<Vec<_>>();
     let mut authority = serde_json::json!({
         "base_dir": authority_path_identity(&config.access.base_dir),
         "read_roots": read_roots,
         "write_roots": write_roots,
         "deny_read_roots": config.access.deny_read_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
         "deny_write_roots": config.access.deny_write_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
-        "protected_paths": config.protected_paths.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
+        "protected_paths": protected_paths,
         "cache_mounts": caches,
         "shell_program": shell_program_authority,
         "bwrap_program": bwrap_program_authority,
@@ -1832,12 +1856,10 @@ impl LocalMachine {
                     "an executable Bubblewrap (bwrap) is required for sandboxed shell access"
                 ))
             })?;
-            let launcher = tools::shell::PreparedExecutable::prepare_sandbox_launcher(program)
-                .map_err(crate::recovery::operator)?;
-            launcher
-                .validate_sandbox_source(&access, &cache_mounts)
-                .map_err(crate::recovery::operator)?;
-            Some(launcher)
+            Some(
+                tools::shell::PreparedExecutable::prepare_sandbox_launcher(program)
+                    .map_err(crate::recovery::operator)?,
+            )
         } else {
             None
         };
@@ -1874,6 +1896,7 @@ impl LocalMachine {
         let authority = prepared_authority_value(
             &config,
             &launchers,
+            job_root,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             &secure_fs,
         )?;
@@ -2324,8 +2347,38 @@ impl LocalMachine {
         self.jobs.owns_request_key(request_key)
     }
 
-    pub(crate) fn acknowledge_job_request_delivery(&self, request_key: &str) {
-        self.jobs.acknowledge_request_delivery(request_key);
+    pub(crate) fn acknowledge_job_request_delivery(
+        &self,
+        request_key: &str,
+    ) -> crate::jobs::RequestDeliveryAck {
+        self.jobs.acknowledge_request_delivery(request_key)
+    }
+
+    pub(crate) fn retire_job_request_delivery(
+        &self,
+        request_key: &str,
+    ) -> crate::jobs::RequestRetirement {
+        if let Some(expected) = self.jobs.request_shell_guard_generation(request_key)
+            && !self.shell_guard_generation_is_current(Some(expected))
+        {
+            match self.jobs.discard_hidden_request_delivery(request_key) {
+                crate::jobs::RequestRetirement::Retired => {
+                    return crate::jobs::RequestRetirement::Retired;
+                }
+                crate::jobs::RequestRetirement::Busy => {
+                    return crate::jobs::RequestRetirement::Busy;
+                }
+                crate::jobs::RequestRetirement::Missing => {}
+            }
+        }
+        self.jobs.retire_request_delivery(request_key)
+    }
+
+    pub(crate) fn discard_hidden_job_request_delivery(
+        &self,
+        request_key: &str,
+    ) -> crate::jobs::RequestRetirement {
+        self.jobs.discard_hidden_request_delivery(request_key)
     }
 
     fn policy_tool_router(&self) -> &ToolRouter<Self> {
@@ -3524,7 +3577,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             bwrap: None,
         };
-        let before = prepared_authority_value(&config, &first, &secure_fs).unwrap();
+        let before =
+            prepared_authority_value(&config, &first, &root.join("job-root"), &secure_fs).unwrap();
 
         let replacement = root.join("replacement");
         std::fs::copy(bash, &replacement).unwrap();
@@ -3535,7 +3589,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             bwrap: None,
         };
-        let after = prepared_authority_value(&config, &second, &secure_fs).unwrap();
+        let after =
+            prepared_authority_value(&config, &second, &root.join("job-root"), &secure_fs).unwrap();
 
         assert_ne!(before["shell_program"], after["shell_program"]);
         assert_ne!(

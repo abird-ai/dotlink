@@ -681,6 +681,7 @@ mod constraint_tests {
                 runtime_api_key: "test-key".to_owned(),
                 organization_id: None,
                 new_tunnel: false,
+                execution_authority: Some([0; 32]),
                 log: crate::logging::LogConfig::default(),
                 process_state: openai::ProcessState::default(),
             }),
