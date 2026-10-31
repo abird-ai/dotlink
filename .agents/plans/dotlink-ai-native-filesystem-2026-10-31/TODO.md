@@ -2,7 +2,7 @@
 
 Base: `84cd9b7`
 
-Status: **design sealed** after a fresh correctness/regression/minimality review for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
+Status: **design sealed** after a second full correctness/security/edge-case review for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
 
 ## Committed
 
@@ -79,15 +79,24 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   sealed the three exact shell interpreter capabilities, and centralized shared
   Job lifecycle/replay/output semantics before the final correctness review.
 
+### `81a54ce` — sealed reviewed AI-native Job graph design
+
+- [x] Re-ran the complete design for correctness/regressions/minimality, removed
+  stale status/runtime assumptions, and sealed the implementation-facing v1/v2
+  contract before this edge-case review.
+
 ## Implementation roadmap
 
 ### Phase 1 — shared discovery/metadata architecture
 
-- [ ] Introduce one shared metadata model with `size`, `mtime`, `ctime`,
-  `btime`, `mode` and platform-precise availability.
-- [ ] Refactor descriptor-rooted traversal so `hidden`, `gitignore`,
-  `depth`, budgets and incomplete reasons are single-sourced.
-- [ ] Introduce shared selector, ordering and compact-rendering primitives.
+- [ ] Introduce one shared metadata model with portable file/symlink `size`,
+  POSIX `mode`, `mtime`, `ctime`, `btime` and precise unavailable semantics.
+- [ ] Refactor descriptor-rooted traversal so `hidden`, `gitignore`, `depth`,
+  budgets, active mutation-private-name exclusion and incomplete reasons are
+  single-sourced.
+- [ ] Introduce shared selector, ordering and compact-rendering primitives with
+  canonical `/` path separators, reversible UTF-8 labels, and fail-closed
+  `path_encoding` coverage for unaddressable invalid-UTF-8 Unix names.
 - [ ] Preserve current deny/protected-path and symlink non-traversal invariants.
 - [ ] Preserve file/path-level mutation coordination as the correctness baseline;
   do not add model-facing range/revision coordination knobs in v1.
@@ -109,16 +118,24 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   `context`; use follow-up `read` for asymmetric inspection.
 - [ ] Make content results always line-numbered and remove advertised
   `numbered`.
-- [ ] Convert files/count results to compact deterministic text.
+- [ ] Convert files/count results to compact deterministic text; define a grep
+  hit/count as one matching logical line and order content by path then line.
+- [ ] Remove the legacy fixed per-file match-count cap; bounded file bytes/global
+  scan work plus logical paging keep work finite while making later matches
+  reachable.
+- [ ] Make `offset`/`limit` count primary hits in content mode and matching files
+  in files/count mode; context never consumes page slots or leaks hits across
+  page boundaries.
 - [ ] Stop advertising `read.max_read_bytes`; retain it as runtime/profile
   policy and surface the effective limit only in actionable errors.
 - [ ] Replace advertised read `offset`/`limit` with
   `line`/`lines`/`byte` and support continuation inside oversized UTF-8
   lines.
-- [ ] Use the same continuation cursor when the profile or transport result
-  ceiling ends a page.
-- [ ] Define mid-read I/O faults as error-marked incomplete results with any
-  safely obtained prefix and cursor.
+- [ ] Use the same continuation cursor when a direct-call profile/transport
+  ceiling ends a page; Graph-node modifiers instead come only from the semantic
+  node ceilings captured at Job creation.
+- [ ] Define mid-read I/O faults as error-marked/fault-marked results with any
+  safely obtained prefix and cursor, never as a complete successful read.
 
 ### Phase 4 — text mutation schema/output cleanup
 
@@ -141,21 +158,34 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   unknown, and explicit mixed multi-object commit state.
 - [ ] Ensure write/edit/binary staging failures never expose partial target
   contents; over-limit writes fail before staging/publication.
+- [ ] Keep `write`/`bwrite` genuinely write-authority-only: successful publish is
+  `ok` and must not perform a hidden equality read to manufacture `unchanged`.
+- [ ] Preserve existing target access protection during atomic replacement; an
+  in-flight temporary must never be broader than the target it replaces.
+- [ ] Single-source final-component symlink semantics: content tools follow only
+  after lexical + resolved authorization and preserve the link entry; create-only
+  paths reject dangling links; lifecycle tools act on the link itself/no-follow.
 - [ ] Keep Codex patch grammar, advertise strict-only `patch(patch)`, and
-  leave move/delete to dedicated tools.
+  leave move/delete to dedicated tools; coalesce shared missing-parent Add File
+  sections into deterministic atomic namespace publication units.
 - [ ] Accept legacy `best_effort` only at the compatibility boundary if a
   migration window is required.
 
 ### Phase 5 — lifecycle primitives
 
-- [ ] Design/implement `cp(from,to)` through shared mutation/staging:
-  files copy as files, symlinks as links, directories as complete bounded trees;
-  any missing destination-parent suffix is part of the same atomic publication.
-- [ ] Design/implement same-filesystem `mv(from,to)`; never implicit
-  copy+delete and require the destination parent to already exist.
-- [ ] Design/implement `rm(paths,recursive=false)` with full-request preflight
-  and safe recursive namespace removal; reject duplicate/alias/ancestor-
-  descendant-overlapping roots before any mutation.
+- [ ] Design/implement `cp(from,to)` through shared mutation/staging: files copy
+  as files, symlinks as exact no-follow links, directories as complete bounded
+  trees; missing parent suffixes publish atomically; special descendants and
+  destination-inside-source fail closed; hard-link topology is not promised.
+- [ ] Design/implement same-filesystem `mv(from,to)`; never implicit copy+delete,
+  require the destination parent to exist, reject self/descendant moves by
+  namespace identity, and handle hard-link aliases/case-only renames explicitly.
+- [ ] Design/implement `rm(paths,recursive=false)` with full-request preflight;
+  recursive roots commit by atomic detach to exact private tombstones before
+  cleanup, never caller-visible child-by-child deletion. Durably reserve bounded
+  identity-bound cleanup records before detach, reconcile them before serving
+  filesystem discovery after restart, and reject duplicate/alias/ancestor-
+  descendant overlaps before any mutation.
 - [ ] Auto-create missing destination parents only for `cp`, inside the same
   staged publication unit; `mv` is strictly one rename or no namespace change.
 - [ ] Do not add glob expansion, destination inference or implicit overwrite.
@@ -196,9 +226,10 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
 - [ ] Default omitted `when` to previous **complete** success
   (`ok|unchanged` with no `more`/`incomplete`); use `*` for an independent
   root.
-- [ ] Implement backward-only dependency expressions with `&`, `|`,
-  parentheses, exact status/modifier predicates and `N.*` for any terminal
-  outcome; add no status classes such as `.err` or `.done`.
+- [ ] Implement bounded backward-only dependency expressions with insignificant
+  whitespace, `&` binding tighter than `|`, parentheses, exact status/modifier
+  predicates and `N.*` for any terminal outcome; reject empty graphs and add no
+  negation/implicit adjacency/status classes such as `.err` or `.done`.
 - [ ] Reject forward references/cycles by construction and evaluate conditions
   only after all referenced operations are terminal.
 - [ ] Support sequence, fan-out, joins and status-based decision branches without
@@ -210,8 +241,14 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
 - [ ] Add one central Graph-node eligibility/version property; initially restrict
   v1 Graph nodes to exact-result native filesystem tools and reuse it for both
   `batch` and `job_start` validation; keep typed-content `bread` direct-only.
-- [ ] Add deterministic aggregate result budgeting; child tools must emit native
-  `more` cursors rather than being silently truncated by the outer Job/Graph.
+- [ ] Give every native node adapter a conservative machine-only read/write
+  footprint derived from the same normalized/resolved planning as the tool. Gate
+  conflicting native nodes deterministically by lower Graph coordinate before
+  claim; widen uncertain scopes instead of guessing disjointness.
+- [ ] Capture deterministic per-node semantic work/result ceilings when the Job
+  is created; outer transport/result budgets may hand off/page the Job result but
+  must never re-page a child or change `more`/`incomplete` and thereby alter
+  dependent side effects.
 - [ ] Aggregate `more`/`incomplete` modifiers explicitly and never duplicate
   exceptional nodes in both detail blocks and summaries.
 - [ ] Add compact fixed-total Graph/Job progress (`3/12 2 ok`) and forward known
@@ -223,7 +260,8 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   complete Graph preflight and before any root node starts; lost receipts must be
   recoverable through `job_list` without duplicate creation.
 - [ ] Enforce hard operation-count, parallel-width, aggregate byte/work and
-  result ceilings.
+  retained-result ceilings; reserve bounded immutable Graph/replay/control state
+  before any root node is claimed.
 - [ ] Add one process-wide Graph node-runner permit budget shared by every Job;
   acquire a permit before `pending -> claimed`, keep a per-Job parallel-width
   ceiling, and keep active-Job/runner/retained-Job/spool budgets distinct.
@@ -248,7 +286,8 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
 - [ ] Resolve relative hint paths from effective shell `dir`; use no globs,
   shell expansion or environment interpolation.
 - [ ] Treat scopes as advisory scheduling metadata only; never as authorization,
-  sandbox policy, replay identity or a correctness proof.
+  sandbox policy, replay identity, correctness proof or happens-before edge;
+  explicit Graph dependencies are the ordering contract.
 - [ ] Preserve each shell node's `writes` arguments unchanged inside
   `batch(ops)` and `job_start(ops)` so durable/graph execution does not discard
   scheduler information.
@@ -299,7 +338,8 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   redelivery horizon, fail closed as `unknown`, and never persist the full Graph
   merely for deduplication.
 - [ ] Reuse bounded shell spooling for child stdout/stderr and deterministic
-  aggregate result budgeting/paging.
+  retained-result rendering/paging without feeding outer delivery budgets back
+  into node terminal modifiers.
 - [ ] Keep one `job_*` lifecycle and one ID namespace for all exposed Jobs;
   derive compact status labels from Graph shape/tool identity rather than
   durability kinds, and do not add parallel `batch_get/cancel/output/ack` tools.
@@ -323,17 +363,25 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   one authorized LocalMachine/runtime share one exposed Job namespace.
 - [ ] On incompatible execution-authority change, revoke the old Job session as
   a whole: stop new starts, mark pending nodes `skip revoked`, terminate
-  ShellNode trees, let active native mutations settle safely, and settle the Job
-  lifecycle cancelled/revoked before replacing the session.
+  ShellNode trees, let active native mutations settle safely, fail closed all old
+  `job_output`/Task-result payload reads, and settle cancelled/revoked before
+  replacing the session.
 - [ ] Job cancellation records intent before action, prevents pending node
   starts, marks them `skip cancelled`, terminates running ShellNode trees, and
   preserves safe native-mutation terminal semantics.
 - [ ] Repeated cancellation is idempotent; cancelling a terminal run is a no-op
-  returning its terminal state.
+  returning its terminal state. If process termination/reattachment cannot prove
+  a running ShellNode stopped, settle that node `unknown`, never fake `fail`.
+- [ ] Treat shell spool truncation as retained-output observability only; it must
+  not add Graph `incomplete` or alter process-success dependencies.
+- [ ] Keep `job_output` offsets/acks in raw retained bytes across UTF-8-lossy text
+  and exact base64 projections; ack is monotonic/idempotent and cannot release
+  bytes still owned by an exact native Task result/replay owner.
 - [ ] Forward compact Job/Graph progress while ShellNodes run without inventing
   a shell percentage.
 - [ ] Allow `writes` hints to reduce known scheduling conflicts inside the graph;
-  unknown hints may be treated conservatively and never become authority.
+  a shell write scope conflicts with native reads as well as writes it may
+  invalidate, while unknown hints remain conservative and never become authority.
 - [ ] Do not enable ShellNodes by a registry bit alone; exact interpreter
   binding, runtime-session Job control, durability, replay, cancellation and
   output retention ship as one coherent v2 feature.
@@ -358,16 +406,35 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
 
 ## Tests and verification
 
-- [ ] Unit tests for shared metadata semantics on supported platforms.
-- [ ] Unit tests for `hidden` and `gitignore` parity across discovery tools.
-- [ ] Unit tests for glob/regex/depth/kind/time selectors.
-- [ ] Unit tests for compact escaping/rendering and result-budget truncation.
+- [ ] Unit tests for shared metadata semantics on supported platforms: portable
+  file/symlink size, unavailable directory/other size, POSIX-mode availability,
+  timestamp precision and exclusive RFC3339 range endpoints.
+- [ ] Unit tests for `hidden` and `gitignore` parity across discovery tools,
+  including hidden ignore control files and bounded/unreadable ignore coverage.
+- [ ] Unit tests for glob/regex/depth/kind/time selectors and rejection of invalid
+  ranges/regex/globs/zero page sizes.
+- [ ] Unit tests for compact escaping/rendering and result-budget fitting:
+  canonical `/` separators, reusable quoted UTF-8 paths, invalid-UTF-8 Unix
+  `path_encoding` incompleteness, exact active private-name exclusion even with
+  `hidden=true`, indivisible discovery/grep units, and an actionable error (never
+  a non-advancing cursor) when the first selected unit cannot fit.
 - [ ] Read continuation tests for a single UTF-8 line larger than
-  `max_read_bytes` and larger than the transport result budget.
-- [ ] Read I/O fault tests proving useful prefixes are marked incomplete/error
-  and never presented as complete data.
+  `max_read_bytes` and larger than the direct transport result budget, including
+  CRLF preservation, EOF/empty-file behavior, UTF-8 scalar-boundary validation,
+  and `byte == line-content-length` terminator handling.
+- [ ] Read I/O fault tests proving useful prefixes are fault-marked/tool-errors
+  and never presented as complete successful data.
 - [ ] Write failure-injection tests before staging, during staging, before
-  publication and after publication, asserting the reported commit state.
+  publication and after publication, asserting the reported commit state;
+  separately prove write-only `write`/`bwrite` never read target contents for
+  equality and staged replacement never broadens target mode/DACL protection.
+- [ ] Final-symlink matrix tests: read/write/edit/binary/patch Update follow only
+  after lexical + resolved authorization and preserve the link; dangling/create-
+  only links fail closed; `cp`/`mv`/`rm` operate on the link object without
+  touching its target.
+- [ ] Binary tests for original-snapshot offsets, same-offset ordered inserts,
+  insert-before-replace ordering, positive-range overlap rejection and SHA
+  precondition revalidation.
 - [ ] Batch mutation failure-injection tests proving mixed commit ledgers are
   exact and never hidden behind a generic error.
 - [ ] Unit tests for globally correct sorting/paging under bounded traversal.
@@ -384,19 +451,31 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
 - [ ] Shell capability tests proving `bash`, `pwsh` and `powershell` are exposed
   independently only when their exact prepared interpreters are available, with
   no alias/fallback between PowerShell generations.
-- [ ] Tests proving shell `writes` does not change authorization/sandboxing and
-  inaccurate hints cannot grant access.
+- [ ] Tests proving shell `writes` does not change authorization/sandboxing,
+  inaccurate hints cannot grant access, and only Graph dependencies—not advisory
+  hints—provide model-visible execution ordering.
 - [ ] Shared Graph-parser tests proving `batch(ops)` and `job_start(ops)` accept
   the same valid graphs/reject the same invalid graphs and never permit nested
   `batch`, `job_start`, `job_*` or Task-control nodes.
 - [ ] Graph execution tests for complete-success default sequencing, multiple
   roots, fan-out, joins, modifier/status branches, condition skips and
   backward-reference validation.
+- [ ] Native Graph conflict tests proving overlapping read/write scopes are
+  admitted in stable lower-coordinate order independent of runner timing, skip/
+  failure does not become an implicit status dependency, uncertain scopes widen
+  conservatively, and disjoint scopes still run in parallel.
 - [ ] Assert paged/incomplete child results do not satisfy a bare dependency.
 - [ ] Batch replay tests proving committed mutation nodes are not re-executed
   after response loss/redelivery.
-- [ ] Batch aggregate-result-budget tests proving pageable children return
-  deterministic native `more` cursors independent of completion order.
+- [ ] Graph budget tests proving node `more`/`incomplete` and downstream side
+  effects are identical across outer transport/result budgets and completion
+  order; an oversized aggregate must hand off the same Job rather than re-page a
+  child.
+- [ ] Graph parser tests for empty-op rejection, precedence (`&` before `|`),
+  whitespace/grouping, bounded expressions and rejection of hidden extra syntax.
+- [ ] Graph admission tests proving immutable definition/result/control quotas and
+  replay-tombstone capacity fail before any root node is claimed, with unexpired
+  correctness tombstones never evicted merely to admit new work.
 - [ ] V2 shell-node graph tests for exit-0 success, non-zero error branch,
   timeout, launch failure, cancellation, joins and downstream skips.
 - [ ] V2 durability/replay tests proving transport handoff does not mark a shell
@@ -407,14 +486,17 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   stale spool/session directories are cleaned rather than treated as live Jobs.
 - [ ] Cross-process replay tests proving retired-session redelivery is either
   protocol-impossible or rejected from a minimal replay claim/tombstone without
-  re-executing the Graph.
+  re-executing the Graph; race two processes on one request and prove exactly one
+  can atomically create the durable claim, semantic-hash mismatch fails closed,
+  and crash-after-claim-before-root never permits speculative reclamation.
 - [ ] Security tests proving retained live-session Graph definitions/spools stay
   in protected private state, do not leak commands/stdin/args into routine logs,
   and are cleaned with Job/session retention.
 - [ ] Shared durable-control tests for compact shape-derived `job_list`/`job_get`,
   idempotent `job_cancel`, cancel races, automatic resume, generic `job_restart`
-  generation/history retention, current-authority revalidation and replay-safe
-  restart delivery.
+  generation/history retention, full current schema/authority/resource-policy
+  recompilation with newly captured node ceilings, and replay-safe restart
+  delivery.
 - [ ] Lost `job_start` response tests proving its durable ID is discoverable and
   the Graph is never created/executed twice.
 - [ ] Abandoned optimistic-`batch` tests proving local transports expose the
@@ -430,25 +512,43 @@ Status: **design sealed** after a fresh correctness/regression/minimality review
   content-aware retained-result representation exists.
 - [ ] `job_output`/`job_ack` tests for one-node implicit node 1, required
   multi-node selection, ShellNode stdout/stderr/result, NativeToolNode result,
-  paging, acknowledgement and cleanup.
+  raw-byte offsets across UTF-8-lossy text/base64, monotonic/idempotent ack,
+  acknowledgement cleanup and multi-owner Task/replay retention.
+- [ ] Authority-revocation tests proving old `job_output` and native Task result
+  payloads fail closed while compact settle/cancel control remains sufficient for
+  safe shutdown and replacement policy never re-authorizes old payloads.
+- [ ] Cancellation ambiguity tests proving an unprovable process-stop state is
+  `unknown`, not fabricated `fail cancelled`.
 - [ ] V2 output-spool tests proving large ShellNode output remains
-  bounded/pageable under one durable Job owner.
+  bounded/pageable under one durable Job owner and spool truncation never adds a
+  Graph `incomplete` modifier or changes process-success dependencies.
 - [ ] Edit tests for multiple independent substitutions, multiline tuples,
   `all`, ambiguity, duplicate/overlapping ranges, order-independence and one
   atomic publication.
 - [ ] Strict-patch tests proving legacy best-effort behavior is absent from the
-  advertised schema.
+  advertised schema and shared missing-parent Add File sections publish as one
+  deterministic namespace unit with exact mixed ledgers after commit faults.
 - [ ] `cp` tests proving directories copy as complete bounded trees without a
-  recursive flag.
-- [ ] Grep tests for one symmetric `context` field and compatibility-only old
+  recursive flag; symlink payloads are copied verbatim/no-follow, special
+  descendants and destination-inside-source fail closed, and hard-link topology
+  is not accidentally promised.
+- [ ] Grep tests for one symmetric `context` field, path/line deterministic order,
+  one-hit-per-matching-line count semantics, matches beyond the old per-file cap,
+  coalesced context and page-boundary clipping; cover compatibility-only old
   asymmetric fields if retained.
-- [ ] Mutation race/alias/replay tests for `cp`, `mv`, `rm`.
+- [ ] Mutation race/alias/replay tests for `cp`, `mv`, `rm`, including hard-link
+  aliases and case-only rename behavior where supported.
 - [ ] `mv` tests proving missing destination parents fail without creating any
   namespace entries.
 - [ ] `cp` failure-injection tests proving auto-created parent suffixes publish
   atomically with the destination or remain invisible.
-- [ ] `rm(paths)` tests rejecting duplicates, aliases and ancestor/descendant
-  overlaps before any deletion.
+- [ ] `rm(paths)` tests rejecting empty input, duplicates, aliases and
+  ancestor/descendant overlaps before any deletion; recursive deletion must
+  atomically detach each root before cleanup, hide only identity-owned exact
+  private names, and never fall back to visible child-by-child removal. Inject
+  crashes after cleanup-record reservation and after detach; restart recovery
+  must safely retire/clean the exact object while an absent or identity-mismatched
+  name is never hidden/deleted.
 - [ ] Directory-tree copy / recursive-delete protected-path and symlink tests.
 - [ ] Cross-device `mv` rejection tests.
 - [ ] Cross-platform native Windows/macOS filesystem tests.

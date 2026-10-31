@@ -10,7 +10,7 @@
 
 ## Icebox
 
-- [ ] P2 DL-150 — AI-native, token-efficient tool core; v1 + v2 canonical Job/Graph/runtime design fully sealed after correctness/regression/minimality review, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)
+- [ ] P2 DL-150 — AI-native, token-efficient tool core; v1 + v2 canonical Job/Graph/runtime design fully sealed after a second correctness/security/edge-case review, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)
 
 ## Closed
 

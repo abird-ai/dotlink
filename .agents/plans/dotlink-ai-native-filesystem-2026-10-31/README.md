@@ -6,7 +6,7 @@ Co-authors: ChatGPT (GPT-5.6 Sol)
 
 Owner: @pvl
 
-Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
+Status: **design sealed** after a second full correctness/security/edge-case review for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
 
 Implementation should follow this specification as written. A model-facing surface or
 semantic change discovered during implementation must explicitly reopen/update DL-150
@@ -30,7 +30,7 @@ Deliberately deferred rather than forgotten:
 - line/range-level collaborative locking or automatic merge/rebase;
 - runtime revision tokens or fail-fast coordination metadata beyond the v1 shell
   `writes` scheduling hint;
-- `mkdir`, `touch`, `chmod`, `chown`, symlink/hardlink creation;
+- `mkdir`, `touch`, `chmod`, `chown`, arbitrary symlink/hardlink creation;
 - cross-device `mv` implemented as copy+delete;
 - output-value/dataflow expressions, loops or nested workflows in `batch`;
 - additional overwrite/replace convenience flags.
@@ -156,13 +156,28 @@ Do not advertise aliases such as `pattern` for a path glob, `created`,
 A backend/filesystem may not provide every timestamp. Missing values are
 represented as unavailable rather than synthesized.
 
-For sorting, unavailable timestamp values sort last.
+For sorting, an unavailable value for the selected key sorts last.
 
 For timestamp filtering, an entry lacking the requested timestamp does not
 match.
 
+Timestamp range endpoints are RFC3339 instants. `after` is exclusive and
+`before` is exclusive; an invalid or inverted range is a request error rather
+than an empty match. Filesystem timestamp precision is not synthesized: compare
+the native value to the parsed instant at the precision the backend actually
+provides.
+
 The native metadata layer should gather these values in one operation where the
 platform permits it; individual tools must not implement their own definitions.
+
+`size` is the byte length of the named regular file (and, where natively
+available, the stored symlink payload); it is never a recursive directory-tree
+size. Directory/other sizes that have no portable content-length meaning render
+unavailable rather than exposing backend inode-allocation trivia. `mode` means
+POSIX permission/special mode bits, rendered in canonical octal where available;
+it is unavailable on a backend without an equivalent POSIX-mode value rather
+than being overloaded with unrelated native attributes. Symlink metadata
+describes the link entry itself, never its target.
 
 ### Hidden and gitignore
 
@@ -179,8 +194,26 @@ gitignore=false
 - `gitignore=false`: ignore files do not affect traversal.
 - `gitignore=true`: bounded, descriptor-rooted `.gitignore` semantics apply.
 
+Within the requested root, use normal Git `.gitignore` pattern semantics,
+including directory-relative nested files, anchored/directory-only patterns and
+negation; later matching rules win within one file and the deepest applicable
+ignore file takes precedence. Do not implicitly consult ancestor ignore files above the requested root, `.git/info/exclude`, or
+global user ignore configuration.
+
+An ignore file is parsed only after its complete bounded contents are available;
+never apply a truncated prefix as though it were the file. An unreadable,
+malformed or over-limit ignore file, or exhaustion of the bounded ignore-loader
+work budget, leaves other safe results usable but adds `incomplete gitignore`.
+Ignore rules are filtering policy, not filesystem authority, so this condition
+must not widen read grants or bypass deny/protected checks.
+
 On Unix, dot-prefixed names are hidden. On platforms with a native hidden
 attribute, that attribute should also participate.
+
+`hidden=false` filters user-visible discovery entries; it does not prevent the
+walker from consulting a hidden `.gitignore` control file when
+`gitignore=true`. A caller-named root is always admitted as the traversal root
+even when its own basename is hidden.
 
 ## Compact output contract
 
@@ -190,6 +223,19 @@ filesystem entry is unnecessary token overhead.
 Discovery tools should return deterministic compact text with one entry per
 line. Unsafe/control characters in path labels must be escaped so a single
 entry cannot create ambiguous extra records.
+
+Use one reversible path-label grammar everywhere: ordinary safe UTF-8 path
+components stay bare and labels containing record-breaking/ambiguous characters
+are JSON-quoted. Quoting is rendering only; matching and authorization still use
+the exact underlying path.
+
+Public path arguments are JSON/UTF-8 strings. An invalid-UTF-8 Unix filename is
+therefore not exactly addressable through the v1 path schema. Never lossy-render
+it as if it were reusable: discovery omits that entry and reports
+`incomplete path_encoding`. Diagnostic-only contexts may show explicit byte
+escapes, but those escapes are not accepted as a hidden second path DSL. This
+preserves the stronger invariant that every emitted discovery path is exactly
+composable.
 
 Kind prefixes:
 
@@ -239,10 +285,54 @@ Unavailable metadata renders as `-`.
 
 `find` returns paths that can be copied directly into another tool's `path`
 argument. If `find(path="src", ...)` returns a file, render `src/main.rs`, not
-just `main.rs`.
+just `main.rs`. Model-facing path output uses `/` separators on every platform,
+including Windows; the path parser accepts that canonical spelling while the
+backend retains native host spelling internally.
+
+For an exceptionally JSON-quoted label, "reusable" means the decoded string
+value is the exact path argument; the display quoting itself is not re-parsed as
+a shell/path mini-language.
 
 `ls` is the deliberate exception: it returns basenames because the caller
 already supplied the directory and repeating that prefix wastes tokens.
+
+### Final-component symlink semantics
+
+Use one operation-class rule rather than letting backend calls decide ad hoc:
+
+- **content tools** (`read`, `bread`, `write`, `bwrite`, `edit`, `bedit`, and
+  `patch` Update File) may follow an existing final symlink to its resolved
+  regular-file target. They first enforce lexical deny/protected rules, then
+  resolve and re-authorize the target under the operation's normal authority.
+  Mutations replace the resolved regular-file entry and leave the symlink entry
+  itself intact;
+- **create-only content paths** (a missing `write`/`bwrite` target and `patch`
+  Add File) create the named entry only. A dangling final symlink is not a
+  missing file and is never followed to synthesize a target; concurrent link
+  insertion loses the no-replace race and fails closed;
+- **lifecycle tools** (`cp`, `mv`, `rm`) act on a final symlink as the object
+  itself and never follow its target; discovery reports symlinks as entries but
+  never traverses them.
+
+This preserves normal symlink-based repository layouts without letting a link
+turn lexical authority into resolved-target authority.
+
+### Atomic compact records
+
+Compact discovery/search records are never split merely to fit a response. For
+`ls`, `find`, and `grep` files/count mode, one rendered entry is the atomic unit.
+For `grep` content mode, one selected primary hit plus its requested/coalesced
+context group is the atomic unit. Result fitting may stop **before** the next
+unit and return `more offset=<next-primary-unit>`, but it must never truncate a
+path label, metadata field, line number, matched line, or requested context group
+and then pretend the unit was complete.
+
+If the first selected unit itself cannot fit the effective semantic result
+budget, return a concise actionable tool error instead of an empty/non-advancing
+page. For grep, identify the path/line when that bounded diagnostic itself fits
+and suggest `context=0`, `read(path,line=...)`, narrowing the query, or raising
+the operator result ceiling as appropriate. A continuation cursor must always
+make logical progress.
 
 ## Limits, partial data and commit outcomes
 
@@ -269,6 +359,13 @@ Do not advertise operator ceilings as routine model choices merely because the
 implementation needs them. Surface the effective ceiling only when it is
 actionable, such as an over-limit error.
 
+All logical page sizes (`limit`, `lines`, `job_list.limit` and an explicit
+`bread.limit`) are positive when supplied; zero is rejected so a successful page
+can never return a non-advancing continuation cursor. Offsets/bytes are
+non-negative, line numbers are 1-based positive values, and explicit depths are
+positive and bounded. Validate offset+limit/range arithmetic before work rather
+than relying on saturating arithmetic to reinterpret an invalid request.
+
 ### Read-class operations may return partial data
 
 A bounded read/search/list is not a failed mutation. When a valid prefix/page
@@ -286,9 +383,13 @@ The first form continues at the next logical line. The second continues inside
 an unusually long logical line.
 
 The cursor always names the first byte not returned and must be on a valid UTF-8
-boundary. A transport result ceiling tighter than `max_read_bytes` uses the
-same continuation mechanism; the model does not need to know which lower layer
-caused the page boundary.
+boundary. For a **direct** call, a transport result ceiling tighter than
+`max_read_bytes` uses the same continuation mechanism; the model does not need
+to know which direct-call lower layer caused the page boundary. A Graph node is
+the deliberate exception: its `more`/`incomplete` semantics are fixed by the
+node ceilings captured when the Job is created, and a later outer transport
+ceiling may only trigger Job handoff/presentation paging, never change that
+node's terminal modifiers.
 
 Discovery tools use the same canonical `more` and `incomplete` modifiers.
 
@@ -396,8 +497,8 @@ mixed ok=2 fail=1
 ~~~
 
 Such a result is an MCP tool error, not an ordinary success. The word
-`mixed` is reserved for a real visible mutation split; never use it for
-private staging progress.
+`mixed` describes a real externally meaningful split for this multi-object
+mutation; never use it for private staging progress.
 
 Where a multi-object mutation can cheaply roll back unpublished/tombstoned
 objects while locks are still held, it should do so, but rollback failure must itself be
@@ -443,21 +544,31 @@ ok 7
 
 A count is included only when it materially helps the next model step.
 
-`unchanged` is a successful no-op:
+`unchanged` is a successful operation that can prove it made no externally
+visible change:
 
 ~~~text
 unchanged
 ~~~
 
-For a mutation, `fail` means the requested visible mutation is known not to
-have committed:
+Do not perform an otherwise unauthorized read merely to discover
+`unchanged`. In particular, write-only `write`/`bwrite` must not become
+content-equality oracles; they return ordinary `ok` when their authorized
+publication succeeds.
+
+`fail` is a known unsuccessful terminal outcome. For a native mutation, it
+additionally means the requested visible mutation is known not to have
+committed:
 
 ~~~text
 fail destination exists
 fail write limit 1048576; content 1400000
 ~~~
 
-A mutation must never use `fail` after its publication commit point.
+A native mutation must never use `fail` after its publication commit point.
+ShellNodes use `fail` for a known unsuccessful process outcome under their
+separate shell semantics; that does not claim arbitrary shell side effects are
+absent.
 
 `unknown` means dotlink genuinely cannot prove the externally visible
 side-effect/execution state:
@@ -490,8 +601,8 @@ an otherwise uniform aggregate mixed.
 
 Aggregate primary selection is deterministic:
 
-- all material components successful -> `ok`, or `unchanged` when every
-  successful component is unchanged;
+- all material components are in the success family (`ok|unchanged`) ->
+  `ok`, or `unchanged` when every material component is unchanged;
 - all material components known failures -> `fail`;
 - all material components unknown -> `unknown`;
 - more than one material outcome family, or any child already `mixed` ->
@@ -540,6 +651,16 @@ normal paging, uniformly unknown coverage, or private staging progress.
 
 The continuation uses the actual follow-up argument names so the model can copy
 it directly.
+
+For live filesystem queries/reads, "exact" identifies the next logical position
+in the snapshot observed by **this call**; it is not a hidden cross-call
+filesystem snapshot or revision token. A follow-up revalidates authority and
+observes the then-current object/tree. External mutation between calls may
+therefore move discovery offsets or change line/byte contents. Retained Job
+streams/results are different: their byte offsets refer to immutable retained
+output and remain stable until acknowledged/expired. Do not add revision tokens
+or server-side discovery snapshots in v1 merely to hide this normal host
+concurrency boundary.
 
 Unknown total:
 
@@ -707,12 +828,16 @@ ctime
 btime
 ~~~
 
+`meta` is a unique array drawn from `size`, `mtime`, `ctime`, `btime`
+and `mode`. Duplicate/unknown metadata keys are request errors rather than
+silently re-rendered columns.
+
 Ordering is fixed to avoid another model-facing parameter:
 
 - `path`: ascending.
 - `size`, `mtime`, `ctime`, `btime`: descending.
 - ties: path ascending.
-- unavailable timestamps: last.
+- unavailable values for the selected key: last.
 
 ### Removed from `ls`
 
@@ -772,6 +897,13 @@ other
 
 `depth=null` means recursive within dotlink's bounded traversal budget.
 `depth=1` means immediate children. The named root itself is not a result.
+A non-null depth is a positive integer; `depth=0` is rejected because it would
+only describe the deliberately excluded root.
+
+For `ls`, `find` and `grep`, the caller-named `path` must resolve to an
+authorized directory. The explicit root may itself be reached through a symlink
+only after the normal lexical + resolved authority/protected-path checks; child
+symlinks discovered beneath that root are entries and are never traversed.
 
 ### Glob semantics
 
@@ -804,6 +936,8 @@ engine. It is a path matcher, not a content matcher.
 
 When both `glob` and `regex` are supplied, both must match. All filters are
 ANDed.
+
+Invalid glob/regex syntax is a request error, not an empty match.
 
 ### Time filters
 
@@ -859,8 +993,10 @@ files
 count
 ~~~
 
-`glob` remains a cheap path prefilter. `depth`, `hidden` and `gitignore`
-share exactly the same traversal semantics as `find`.
+`glob` remains a cheap path prefilter and reuses `find`'s exact glob grammar,
+including basename matching when the pattern has no `/` and relative-path
+matching when it does. `depth`, `hidden` and `gitignore` share exactly the same
+traversal semantics as `find`.
 
 Remove model-facing `numbered`: content matches always include line numbers.
 Raw unnumbered content remains available through `read(numbered=false)`.
@@ -881,11 +1017,46 @@ src/lib.rs
 1  src/lib.rs
 ~~~
 
+`grep` matches **logical lines**, not individual regex occurrences within a
+line. A line whose pattern matches several times is one content hit and
+contributes one to `count`. Results are ordered deterministically by reusable
+path ascending, then line number ascending for `content`; `files`/`count`
+are path ascending. The pattern must be non-empty after schema decoding; an
+invalid regex is a request error.
+
 `context` is symmetric before/after context and remains bounded. For asymmetric
 inspection, follow the match with `read`.
 
-Existing bounded regex, UTF-8 classification, per-file scan caps, paging and
-output ceilings remain.
+Paging units are mode-specific and stable:
+
+- `content`: `offset`/`limit` count primary matches, never context lines;
+- `files` and `count`: `offset`/`limit` count matching files;
+- overlapping context windows coalesce, and a match outside the selected page
+  is clipped rather than leaking in as context and consuming no page slot.
+
+With context enabled, use the familiar grep rendering grammar:
+
+~~~text
+path:line:text   # primary hit
+path-line-text   # context line
+--               # only between disjoint context groups
+~~~
+
+The path portion uses the same escaped reusable label in both forms. Overlapping
+windows coalesce, so the separator appears only when a real gap exists. This
+keeps page boundaries unambiguous without another result format.
+
+Existing bounded regex, UTF-8 classification, file-byte/aggregate scan budgets,
+paging and output ceilings remain. Do **not** carry forward the legacy fixed
+per-file match-count cap: once a candidate text file is admitted within its byte
+budget, scan that bounded file completely and let logical `offset`/`limit` select
+its hits. This keeps match 51 reachable without making work unbounded.
+
+Files skipped because they are outside the text-tool domain (binary/control-byte
+or invalid UTF-8) are intentional filtering. Discovered text candidates that
+cannot be searched because of traversal, read/work or file-size budgets instead
+make coverage `incomplete`; a normal page must never imply those files were
+searched.
 
 ## `read`
 
@@ -907,28 +1078,46 @@ read(
 ~~~
 
 - `line` is the first 1-based logical line.
-- `lines` is the maximum number of logical lines requested.
+- `lines` is the positive maximum number of logical lines requested.
 - `byte` is a zero-based UTF-8 byte offset inside the first requested logical
   line. It normally remains zero and exists primarily for long-line
   continuation.
 - `numbered` controls the ordinary line-number prefix.
 
-The profile `max_read_bytes`, scan budget and transport result budget remain
-enforced internally. They are runtime/operator policy, not routine
+`byte` counts only logical-line content bytes, excluding its LF/CRLF
+terminator. A nonzero byte must be at or before that line's content end and on a
+UTF-8 scalar boundary; otherwise the request fails rather than rounding. Source
+line endings are preserved in returned file data. If `byte` equals the content
+length, the remaining line terminator is still part of the continuation before
+subsequent lines.
+
+An empty file read from `line=1, byte=0` returns a complete empty result.
+Otherwise a requested starting line past EOF is an error; EOF is not reported as
+an artificial empty page.
+
+The profile `max_read_bytes` and scan budget always remain enforced internally.
+For a direct `read`, the current transport result budget also bounds that page;
+for a Graph-node `read`, the captured node result ceiling replaces that delivery
+constraint for semantic paging and the outer transport can only hand off/page
+the Job presentation. These remain runtime/operator policy, not routine
 model-controlled pagination fields.
 
-The effective page budget is the tightest relevant lower-layer ceiling. The
-renderer reserves room for the continuation marker before accepting the final
-fragment.
+The effective semantic page budget is the tightest applicable ceiling under
+those rules. The renderer reserves room for the continuation marker before
+accepting the final fragment.
 
 Default output remains line-numbered because those numbers are useful for
-follow-up reasoning:
+follow-up reasoning. The actual prefix is the 1-based line number plus one tab:
 
 ~~~text
-41  fn foo() {
-42      ...
-43  }
+41\tfn foo() {
+42\t    ...
+43\t}
 ~~~
+
+A continuation inside a long line repeats that logical line's number for the new
+fragment. The source fragment following the prefix otherwise retains its
+original bytes/line ending.
 
 ### Long lines
 
@@ -938,7 +1127,7 @@ an error.
 Return the largest valid UTF-8 fragment that fits, then an exact cursor:
 
 ~~~text
-42  {"very":"long", ... bounded fragment ...
+42\t{"very":"long", ... bounded fragment ...
 
 more line=42 byte=1048217
 ~~~
@@ -968,6 +1157,10 @@ tighter transport result ceiling.
 continuation/incomplete footer is control information, not file content, and
 must remain clearly separated from the returned fragment.
 
+For `numbered=false`, the data block is the exact source-byte slice selected by
+the logical line/byte window; status/progress rendering must never normalize its
+line endings or append a marker inside that data block.
+
 Compatibility may accept the old `offset`/`limit` fields at the wire
 boundary, but the new advertised schema is `line`/`lines`/`byte`.
 
@@ -985,19 +1178,21 @@ Missing parent directories are created automatically **only as part of the same 
 
 The shared mutation layer should stage the complete missing suffix beneath the nearest existing authorized ancestor and publish the first missing component atomically where the platform provides the required no-replace namespace primitive. Any platform fallback must preserve the same externally visible all-or-nothing contract rather than exposing parent directories incrementally.
 
+After the shared final-symlink resolution/authorization rule, the resolved
+target must be a regular file. Directories and special objects are never replaced
+as though they were regular files, and the lexical symlink entry (when present)
+remains intact.
+
 Success:
 
 ~~~text
 ok
 ~~~
 
-No-op:
-
-~~~text
-unchanged
-~~~
-
-Do not echo the path/content.
+`write` requires write authority only, so it does not read an existing file to
+manufacture `unchanged`; successful publication is `ok` even if an
+independently readable comparison would have found identical bytes. Do not echo
+the path/content.
 
 ## `edit`
 
@@ -1028,6 +1223,8 @@ Each tuple is:
 ~~~
 
 The optional third value defaults to `false`.
+`edits` must be non-empty and remains bounded by the shared request/planning
+limits.
 
 This tuple form avoids repeating `path`, `old`, `new` and `all` object keys
 for the common multi-replacement case.
@@ -1142,6 +1339,24 @@ The advertised API is strict-only: preflight and stage every section before the
 first publication. Each file replacement is atomic while the multi-file commit
 sequence is not a filesystem transaction.
 
+Preserve the existing patcher's line-ending semantics: untouched source bytes
+stay unchanged; added lines in an existing file inherit the local target line
+ending chosen from the corresponding removed/insertion position, including CRLF
+and mixed-ending files. Add-file payload decoding preserves the patch grammar's
+actual line separators. Do not normalize an entire file merely because a hunk
+was edited.
+
+`*** Add File` uses the same create-only, atomic missing-parent publication
+contract as `write`. Strict preflight rejects duplicate/alias targets and
+file/directory or ancestor/descendant conflicts. If several add sections share a
+missing parent suffix, coalesce them into one staged namespace publication unit;
+those sections become visible together rather than publishing intermediate
+parents between file commits. Publication units are ordered deterministically by
+the earliest contributing patch section, while ordinary existing-file
+replacement units follow section order. Any unavoidable post-commit `mixed`
+ledger records the exact affected section coordinates and is therefore replayable
+and reproducible.
+
 Legacy `best_effort` may be accepted temporarily at the compatibility boundary,
 but it is not advertised to new models.
 
@@ -1167,13 +1382,27 @@ the source basename.
 - destination must not exist;
 - missing destination parents are created only inside the same staged publication unit; a failed copy must not leave newly visible parent directories behind;
 - files copy as files and directories copy as complete directory trees;
-- symlinks are copied as symlinks and never followed;
+- symlinks are copied as symlinks and never followed; their stored link text is
+  copied verbatim rather than resolved/rebased;
 - recursive traversal is descriptor-rooted and bounded;
 - policy-denied/protected descendants fail the operation closed;
+- a directory destination may not be inside the source directory tree;
+- unsupported/special descendants fail the whole copy explicitly rather than
+  being silently skipped;
 - file bytes and directory structure are preserved;
 - basic mode metadata is preserved where the platform safely supports it;
 - ownership, ACL, xattr and timestamp preservation are not promised as
   filesystem-administration semantics.
+
+Hard-link topology is not promised: copying two hard-linked source files may
+produce two independent destination files. This keeps `cp` a safe content/tree
+copy rather than a filesystem-cloning primitive.
+
+Lifecycle operations that act on a symlink use a no-follow final-component
+entry identity. Copying/moving/removing the link never authorizes or opens its
+target, and a copied symlink's target grants no later filesystem authority;
+ordinary lexical/resolved checks still apply when some future tool chooses to
+follow that path.
 
 Do not initially expose `replace=true`. Replacement is deliberately a
 separate destructive decision.
@@ -1211,7 +1440,8 @@ mv(from, to)
 - the destination parent must already exist; `mv` never creates parent directories because that would require a second namespace publication and violate rename-or-no-change semantics;
 - files, directories and symlinks are supported;
 - symlinks themselves move; their targets are never followed;
-- moving a directory into itself is rejected;
+- moving a directory into itself or any descendant is rejected using resolved
+  namespace identity rather than textual-prefix comparison;
 - authorization/protected-path checks cover both source and destination;
 - directory moves must not permit a protected/denied subtree to escape policy.
 
@@ -1232,11 +1462,18 @@ Success:
 ok
 ~~~
 
-Source and destination resolving to the same operation may return:
+Only a request that names the same namespace entry with no requested spelling
+change may return:
 
 ~~~text
 unchanged
 ~~~
+
+A distinct existing destination that happens to be a hard-link alias remains
+`fail destination exists`; it is not a no-op. A case-only rename on a
+case-insensitive filesystem is a real rename when the platform can perform it
+atomically; if it cannot, fail before change rather than collapsing the request
+to `unchanged`.
 
 ## `rm`
 
@@ -1256,7 +1493,7 @@ rm(
 `paths` is an array because bulk deletion is common and cheaper than one tool
 call per path.
 
-No globs.
+It must be non-empty. No globs.
 
 ### Semantics
 
@@ -1265,7 +1502,9 @@ Without `recursive`:
 - files: allowed;
 - symlinks: allowed and never followed;
 - empty directories: allowed;
-- non-empty directories: rejected.
+- non-empty directories: rejected;
+- unsupported/special objects are rejected explicitly rather than guessed into
+  file semantics.
 
 With `recursive=true`:
 
@@ -1279,18 +1518,38 @@ not look like a successful deletion.
 
 For multiple roots, preflight the complete request before making any namespace change. Reject duplicate roots, aliases resolving to the same removable object, and ancestor/descendant-overlapping requested namespaces before the first mutation. The caller should pass the single highest root when recursive removal would otherwise subsume another requested path.
 
-For robust recursive deletion, prefer:
+Recursive directory deletion commits by atomically detaching each validated root
+from the caller-visible namespace before private cleanup:
 
 ~~~text
-validate
+validate + identify root object
+→ durably reserve exact private tombstone + cleanup record
 → atomically rename root to private tombstone
 → namespace removal committed
 → delete tombstone
+→ retire cleanup record
 ~~~
 
-rather than exposing a tree that disappears child-by-child. Private cleanup
-names must remain invisible to discovery. Cleanup failure must not resurrect the
-original path.
+The cleanup record is a small bounded protected-state record, not persistent Job
+state. Before the detach it records the exact original/tombstone names and the
+stable no-follow object identity of the validated root. Its durable commit must
+precede the namespace rename. If that reservation/quota/durability step fails,
+`rm` fails before mutation.
+
+The shared walker registers these exact pending private names and reloads pending
+cleanup records before serving filesystem tools after restart. Recovery may hide
+or delete a recorded tombstone only when its current no-follow object identity
+still matches the recorded root. A stale record with an absent or identity-
+mismatched path is retired/diagnosed but never hides or removes a user-created
+replacement. This gives crash recovery an exact ownership proof without
+reserving a magic filename prefix.
+
+This avoids exposing a tree that disappears child-by-child. Cleanup failure must
+not resurrect the original path. Do not fall back to caller-visible child-by-
+child deletion when the platform cannot provide an equivalent safe detach or a
+stable recoverable object identity; fail before mutation instead. For multiple
+roots, reserve all cleanup records during full preflight, then detach in stable
+request order and retain an exact per-root ledger if a later detach fails.
 
 Success:
 
@@ -1333,6 +1592,10 @@ Both constructors advertise the same one graph argument:
 batch(ops)
 job_start(ops)
 ~~~
+
+The `ops` array must be non-empty and is bounded by one shared Graph request
+policy. An empty Graph is rejected rather than inventing an outcome/identity for
+work that cannot run.
 
 Each operation is the shortest unambiguous tuple:
 
@@ -1427,6 +1690,12 @@ N.*
 ~~~
 
 There are no additional status classes. `N.*` is the one shorthand for any terminal node outcome.
+
+Whitespace is insignificant around tokens. `&` binds tighter than `|`;
+parentheses override precedence. There is no unary negation, implicit
+adjacency/AND, wildcard operation number, range syntax or comparison operator.
+Condition strings are bounded during Graph preflight. This keeps one canonical
+parse for every accepted expression.
 
 Examples:
 
@@ -1556,8 +1825,24 @@ Once an operation starts, it is allowed to reach a safe terminal state.
 A sibling failure does not blindly cancel an already-running mutation merely to
 make the graph look transactional.
 
-Normal dotlink mutation coordination still serializes conflicting filesystem
-operations where required.
+For native filesystem nodes, the Graph scheduler has one additional deterministic
+conflict gate below the model-facing DAG. Every eligible native adapter derives a
+conservative machine-only read/write path footprint from its already validated
+arguments. Two footprints conflict when their scopes overlap and at least one is
+a write/mutation scope.
+
+Among conflicting native nodes, lower Graph coordinate has admission priority: a
+higher-coordinate node is not claimed while a lower-coordinate conflicting node
+is still nonterminal and could still execute. Once the lower node reaches any
+terminal state, including `skip`, the higher node is evaluated/admitted according
+to its own `when`. Because conditions reference only earlier coordinates, this
+stable conflict order cannot introduce a dependency cycle.
+
+This gate makes native read/write observations independent of runner-completion
+timing without adding model-facing locks. It is **not** a success dependency:
+status does not flow through it and models must still use `when` when outcome-
+based ordering matters. Normal mutation coordination remains the final safety
+layer at publication time.
 
 ### Graph results
 
@@ -1619,14 +1904,22 @@ make the Job an error.
 
 A node retains its native paging semantics.
 
-A Graph Job must never silently truncate a node result merely because the
-aggregate response is large. If the aggregate result budget constrains a pageable child,
-that child returns its normal `more` cursor.
+A Graph Job must never silently truncate or re-page a node result merely because
+the **outer** aggregate/transport response is large. That would be a semantic
+bug: bare dependencies branch on whether a node has `more`/`incomplete`, so
+transport envelope size must not change which later mutations run.
 
-Per-operation result budgets must be assigned **deterministically**, independent
-of parallel completion order, under the aggregate transport/result ceiling.
-The exact allocator is an implementation detail, but it must not make replayed
-results depend on scheduling.
+At Job creation, capture deterministic per-node semantic work/result ceilings
+from the effective runtime/profile Graph policy. Those ceilings are identical
+for `batch` and `job_start` and independent of parallel completion order,
+polling, handoff and the current response envelope. A pageable node returns its
+native `more` cursor only when **its captured node ceiling/request** requires
+one.
+
+The outer response budget controls presentation only. If an exact completed
+Graph result cannot fit, expose the same Job and retain/fetch its already-fixed
+node results through `job_output`; never shrink/rerun a node or alter its
+terminal modifiers to make the response fit.
 
 ### Graph progress
 
@@ -1704,6 +1997,7 @@ schema and normal permission/capability checks.
 The shared Graph parser validates before execution:
 
 - total operation count and aggregate request bytes;
+- non-empty operation list;
 - eligible Graph-node tool names;
 - each nested argument object;
 - backward-only references;
@@ -1727,7 +2021,11 @@ concurrent nodes. The shared execution layer therefore owns one process-wide
 - direct `bash` / `pwsh` / `powershell` are one-ShellNode Jobs and use the
   same runner admission;
 - active-Job count, running-node permits, retained-Job count and spool bytes are
-  separate limits and must not be conflated.
+  separate limits and must not be conflated;
+- retained immutable Graph-definition bytes and retained native-result/shell
+  payload bytes are bounded process-wide as well as per Job; admission that
+  cannot reserve its required durable control state fails before any node is
+  claimed.
 
 This preserves the resource bound that one-shell-per-Job provided implicitly
 today while allowing Graph Jobs without process/fan-out amplification across
@@ -1887,8 +2185,9 @@ For Graph control, ShellNodes map process state onto the canonical node outcome
 vocabulary:
 
 - successful process completion (`success=true`, normally exit code 0) -> `ok`;
-- known non-zero exit, timeout, launch/preparation failure or cancellation -> `fail` with compact process detail;
-- genuinely ambiguous process/side-effect state -> `unknown`;
+- known non-zero exit or launch/preparation failure -> `fail` with compact process detail;
+- timeout/cancellation whose process-tree stop is confirmed -> `fail` with compact process detail;
+- genuinely ambiguous process/side-effect state, including an unprovable timeout/cancellation stop -> `unknown`;
 - `N.*` matches any terminal node outcome.
 
 The ShellNode retains compact exit/success/timeout/error metadata plus separate
@@ -1964,6 +2263,10 @@ rather than inventing a second execution.
 The Job retains:
 
 - immutable Graph definition and semantic request identity;
+- captured execution context needed to keep the run deterministic: Graph/tool
+  registry generation, effective authority generation, prepared interpreter
+  identities where applicable, and the node work/result ceilings used by this
+  execution;
 - per-node state and deterministic replay identity;
 - ShellNode process identity/lifecycle;
 - bounded shell stdout/stderr spool state;
@@ -2167,9 +2470,16 @@ expressions see only canonical node outcomes; Job lifecycle is observed through
 
 ### Listing and polling
 
-`job_list(limit=64)` lists all exposed Jobs in one compact namespace so a lost
-creation/handoff response can be recovered. The display label is derived from
+`job_list(limit=64)` lists the newest exposed Jobs in one compact namespace so a
+lost creation/handoff response can be recovered. The display label is derived from
 the Graph shape, not from a separate durability kind:
+
+Order is newest exposed Job first with the Job ID as a deterministic tie-breaker.
+`limit` may be raised through the runtime's retained-Job cap. If the default
+page omits older retained Jobs, return a compact `more limit=<cap>` remedy
+rather than silently implying the namespace is exhaustive. This keeps the common
+schema small while preserving lost-receipt recovery within the bounded live
+session.
 
 - one ShellNode -> its interpreter name (`bash`, `pwsh`, `powershell`);
 - one NativeToolNode -> its tool name;
@@ -2255,6 +2565,12 @@ Running ShellNode process trees receive termination requests. Already-started
 native mutations are allowed to reach their existing safe terminal semantics
 rather than being interrupted at an unsafe publication point.
 
+If termination/reattachment cannot prove whether a running process stopped, that
+ShellNode becomes `unknown`; cancellation must not manufacture `fail
+cancelled` from an ambiguous live-process state. The Job settles only after no
+new node can start and every previously claimed node is terminal or explicitly
+unknown.
+
 For a one-ShellNode Job this naturally reduces to terminating its one contained
 process tree while preserving already-spooled output.
 
@@ -2311,18 +2627,36 @@ resurrected. Each transport must explicitly establish one of two strategies:
 2. use a minimal protected replay tombstone.
 
 Where a tombstone is required, its claim is committed crash-atomically **before
-any root node may start**. It stores only the fixed-width request/namespace
-identity digest, semantic request hash, claim state and bounded timestamps/
-terminal summary needed to reject mismatched reuse and prevent re-execution. It
-does not store the Graph, command/stdin, file contents or node payloads. After a
-process replacement, a matching claimed request whose exact original result is
-not reconstructible fails closed as `unknown`; it is never executed again merely
-to regenerate a response.
+any root node may start**. Claim admission is also cross-process exclusive: every
+process for the same transport replay namespace contends on one protected
+create-if-absent identity key, and only the process that atomically creates the
+claim may execute the Graph. A loser never starts work; it revalidates the
+existing record instead.
+
+The protected record stores only the fixed-width request/namespace identity
+digest, semantic request hash, claim state and bounded timestamps/terminal
+summary needed to reject mismatched reuse and prevent re-execution. A matching
+identity with a different semantic hash is request-id reuse/collision and fails
+closed. A matching claim whose exact original result is not reconstructible also
+fails closed as `unknown`; it is never executed again merely to regenerate a
+response. A crash after the durable claim but before the first root starts may
+therefore sacrifice that request to `unknown` rather than risk duplicate side
+effects. Safety wins over speculative claim reclamation.
+
+The claim commit must be durable before execution admission is released: use the
+platform's protected-state equivalent of exclusive creation plus the required
+file/directory durability barriers. Do not implement this as "check then create"
+or as a process-local mutex. The record still does not store the Graph,
+command/stdin, file contents or node payloads.
 
 Tombstones use a bounded protected-state quota and expire only after the
 transport's maximum redelivery horizon (or an authoritative positive retirement)
 so cleanup cannot reopen the duplicate-execution window. This is a transport
 correctness mechanism, not a persistent Graph/Job store.
+
+An unexpired tombstone is correctness state and is never evicted merely to admit
+new work. If the bounded tombstone quota cannot reserve a required replay claim,
+reject the new Job before any root node starts.
 
 The complete graph request, including command, `dir`, `stdin`, timeout/output
 limits, `writes` hints and dependency expressions, participates in the outer
@@ -2386,6 +2720,20 @@ ledger while the Job itself remains retained.
 `job_ack` advances the cleanup watermark for exactly one Job/node/stream after
 the caller safely receives it.
 
+Offsets and acknowledgement watermarks are raw retained-byte positions
+regardless of `encoding`: `text` is the UTF-8-lossy readable projection for
+arbitrary shell bytes and `base64` is the exact byte projection. A text page may
+therefore begin/end with replacement characters when its raw byte window splits
+an invalid/incomplete UTF-8 sequence; `next_offset` still advances only by raw
+source bytes. Acknowledgement is monotonic/idempotent
+and cannot move beyond the stream/result bytes that have actually been retained.
+If a shell stream overflowed its retention cap, acknowledging the retained
+prefix does not erase the immutable truncation/omitted-byte metadata.
+
+Retention may have multiple protocol owners. In particular, `job_ack` must not
+release bytes still required to reproduce an exact retained native MCP Task
+result; physical cleanup happens only after every owner has released that range.
+
 The Job ledger stores stream/result identity and bounded metadata, not unbounded
 payload copies. Existing shell stdout/stderr spooling is reused.
 
@@ -2395,6 +2743,11 @@ with stable offsets.
 
 Output allocation/rendering must be deterministic and independent of parallel
 completion order.
+
+Shell stdout/stderr truncation is an **observability** property, not a Graph
+query modifier. A process that exits successfully is still node `ok` even if
+its retained stdout prefix is truncated; bare dependencies branch on process/
+tool outcome, not on whether every diagnostic byte was retained.
 
 ### Progress
 
@@ -2412,7 +2765,9 @@ percentage, so do not invent a child total.
 ### Shell write hints inside v2 graphs
 
 The scheduler may use `writes` to avoid known overlap between simultaneously
-runnable shell/native mutation nodes.
+runnable shell/native nodes. A shell write scope conflicts with both native
+write scopes **and read scopes** it may invalidate; this is scheduling quality,
+not authorization.
 
 This remains an optimization, not a correctness boundary. A missing/inaccurate
 hint does not become authority and V2 does not claim transactional safety for
@@ -2438,14 +2793,43 @@ text schema carry encoding and byte-range concerns.
 
 Retain the existing byte-window model and typed MCP image/audio/blob support.
 
+For `base64`/`hex`, paging is by raw byte offset and uses the normal exact
+continuation shape:
+
+~~~text
+more offset=N
+~~~
+
+`format=mcp` is complete-object only: if the exact typed content cannot fit its
+effective direct-result budget, fail with an actionable request to use an
+encoded byte-window format. It stays direct-only while the Graph retained-result
+channel is text/result-stream based.
+
 ### `bwrite`
 
 Retain path + encoded payload + encoding.
+
+Namespace/publication semantics are identical to `write`: an existing final
+symlink is resolved/re-authorized and its regular-file target is replaced while
+the link stays intact; directories/special objects are rejected; and a missing
+parent suffix is published atomically with the file. `bwrite` also remains
+write-authority-only, so it does not read existing bytes merely to return
+`unchanged`.
 
 ### `bedit`
 
 Retain the existing offset/length/data range model and optional SHA-256
 precondition.
+
+`bedit` requires an existing regular-file snapshot, validates all original-byte
+ranges before staging, re-verifies its snapshot/SHA precondition and publishes
+one replacement image atomically. Every offset is relative to the original
+snapshot. A zero-length range is an insertion; several inserts at one offset are
+allowed in request order and occur before any positive-length replacement
+starting there. Positive-length source ranges must not overlap. A missing
+`length` keeps the existing decoded-payload-length default. Byte-identical
+selected ranges may return `unchanged` because `bedit` already has read
+authority; no extra authority probe is introduced.
 
 These are specialized enough that aggressive public-field shortening is not a
 priority unless schema measurement shows material savings.
@@ -2472,7 +2856,9 @@ ctime      descending
 btime      descending
 ~~~
 
-Path ascending is the deterministic tie-breaker.
+Path ascending means case-sensitive unsigned UTF-8 byte ordering of the canonical
+model-facing `/` path spelling, with no locale, natural-sort or filesystem
+case-fold rules. It is the deterministic tie-breaker for every metadata sort.
 
 Do not initially add `reverse` or `order`. Add it only if real model traces
 show that oldest/smallest-first queries justify another parameter.
@@ -2549,6 +2935,13 @@ CompactRenderer
 - metadata acquisition;
 - incomplete-reason collection.
 
+The walker also excludes exact active mutation-private staging/tombstone names
+registered by the shared mutation layer, regardless of `hidden`. Pending durable
+cleanup records are reconciled and registered before the filesystem surface is
+served after restart. Exclusion is valid only while the internal record still
+proves ownership of that exact object/name; this is never a magic filename
+prefix that could hide arbitrary user files.
+
 `ls` becomes essentially depth-one traversal + ordering + rendering.
 
 `find` becomes traversal + entry selector + ordering + rendering.
@@ -2598,6 +2991,21 @@ islands.
 All three new lifecycle tools are side-effecting and therefore require tunnel
 request replay protection.
 
+Atomic replacement changes one directory entry, not every alias of an inode.
+For existing regular files, `write`, `bwrite`, `edit`, `patch` and
+`bedit` therefore may break a pre-existing hard-link relationship at the
+replaced pathname; other hard links continue to reference the old inode. Do not
+silently switch to in-place writes merely to preserve hard-link topology, because
+that would weaken atomic publication/snapshot safety.
+
+Replacement staging must also preserve the existing target's basic access
+protection before content is written or published: Unix mode bits and the
+Windows DACL (or the backend-equivalent protection already enforced by the live
+staging layer). An in-flight temporary must never be more permissive than the
+target it will replace. New-file creation uses the platform's normal bounded
+create/parent-inheritance policy; the tools do not promise ownership, ACL/xattr
+or timestamp cloning unless the specific operation above says so.
+
 ### Shared execution layer
 
 The Job/Graph runtime is a shared execution substrate, not a wrapper around the
@@ -2619,9 +3027,16 @@ Key rules:
   themselves Graph nodes.
 
 The shared registry should carry at least tool name, Graph-node eligibility,
-version gate, capability requirements, replay/side-effect classification and
-node adapter. Schema/visibility metadata must remain single-sourced with
-`TOOL_SPECS` or its successor rather than copied into the Graph engine.
+version gate, capability requirements, replay/side-effect classification,
+machine-only conservative native access-footprint extraction, and the node
+adapter. Schema/visibility metadata must remain single-sourced with `TOOL_SPECS`
+or its successor rather than copied into the Graph engine.
+
+Native footprint extraction reuses the same normalized/resolved path planning as
+the underlying tool rather than reparsing strings independently. Exact-file and
+subtree scopes are sufficient; do not add model-facing range locks. When a safe
+narrow scope cannot be proved, widen conservatively to the authorized enclosing
+scope rather than guessing disjointness.
 
 ## Shell naming + write hints — v1
 
@@ -2703,6 +3118,11 @@ footprints should be scheduled conservatively when contention matters. A wrong
 or incomplete hint can reduce scheduling quality and may allow shell-level
 contention; it never grants additional filesystem authority.
 
+`writes` never creates a happens-before guarantee. In a Graph, explicit
+`when`/dependency edges are the model-visible ordering mechanism. Independent
+roots are semantically concurrent even if the scheduler sometimes serializes
+them because their advisory footprints overlap.
+
 Do not add line/range hints, read footprints, scheduler IDs or revision tokens
 to the v1 shell schema.
 
@@ -2731,9 +3151,15 @@ read/bread(path)   reads path
 ls/find/grep       read-side scopes
 ~~~
 
-A runtime may therefore serialize mutations that target the same path and run
-disjoint mutations in parallel. This scheduling is an optimization only; it
-must never be required for correctness.
+An external runtime may therefore serialize mutations that target the same path
+and run disjoint mutations in parallel. That external scheduling is an
+optimization only and must never be required for native mutation safety.
+
+Inside one Graph, dotlink itself uses the registry's conservative native
+read/write footprints for the deterministic lower-coordinate conflict gate
+defined above. This is stronger than an external optimization because it removes
+runner-timing nondeterminism from native-node observations, while still adding no
+new public schema or outcome dependency.
 
 Do not add range-level concurrent commits in v1. Two edits touching different
 byte/line ranges still construct whole-file replacement images from snapshots;
@@ -2749,7 +3175,10 @@ to come from dotlink's mutation layer.
 
 Arbitrary shell writes are inherently outside the native transactional mutation
 model. `writes` improves scheduling visibility but does not make shell effects
-atomic, verified or rollback-safe.
+atomic, verified or rollback-safe. A native read/search running concurrently
+with a ShellNode (or an external host process) has no transactional snapshot
+promise against that opaque writer; if the model needs a stable ordering, it
+must express a Graph dependency rather than relying on `writes`.
 
 The design preference is to coalesce compatible same-file work into one
 `edit(path, edits)` call when a runtime can do so safely, rather than creating a
@@ -2809,14 +3238,25 @@ for that Job. An incompatible policy/launcher/interpreter change revokes the
 Never leave pending nodes indefinitely non-terminal under stale authority, and
 never widen an existing Job because configuration became more permissive.
 
-`job_restart(id)` is a **new execution** and therefore revalidates the retained
-immutable Graph against current authority and current prepared interpreter/tool
-availability before any new side effect starts. The old Job's authority is not a
-capability token for the restart.
+`job_restart(id)` is a **new execution** and therefore recompiles/revalidates the
+retained immutable Graph against the current schema/Graph registry, authority,
+prepared interpreter/tool availability, request/work ceilings and admission
+quotas before any new side effect starts. The restarted Job captures **new**
+per-node semantic ceilings from current policy; it does not inherit the source
+run's execution context/limits. A retained Graph that no longer fits current
+policy fails before the new Job is exposed or any root starts. The old Job's
+authority is not a capability token for the restart.
 
-Status/output/cancellation of an exposed Job in the current Job session must remain possible
-as needed for observation and safe shutdown even when new execution authority is
-no longer available; they must never confer authority to start new work.
+After incompatible execution-authority revocation, retain only the control
+needed to settle safely: compact status and cancellation remain available until
+the old Job session is discarded. `job_output`/payload reads for that revoked
+Job fail closed, including any native MCP Task result projection; retained node
+payloads/stdout/stderr are cleaned when no protocol/replay owner still requires
+them. A replacement runtime never
+re-authorizes an old Job's payload merely because its new policy happens to
+permit the same paths. `job_restart` always requires full current Graph
+authority. Revocation must never turn old execution authority into a capability
+token for reading retained data or starting new work.
 
 If the effective policy cannot execute a tool at all, do not advertise it.
 
@@ -2839,8 +3279,9 @@ A stream transformer belongs to shell/process composition.
 
 ### No `mkdir` initially
 
-`write`, `cp` and `mv` create missing destination parents. Intentionally
-empty directories are rare in coding repositories and Git does not track them.
+`write` and `cp` create missing destination parents inside their atomic
+publication unit; `mv` deliberately does not. Intentionally empty directories
+are rare in coding repositories and Git does not track them.
 
 Add a dedicated primitive only if model traces show a real need.
 
@@ -2848,11 +3289,14 @@ Add a dedicated primitive only if model traces show a real need.
 
 Timestamp-only mutation is not a core coding operation.
 
-### No `chmod`, `chown`, symlink or hardlink creation initially
+### No `chmod`, `chown`, arbitrary symlink or hardlink creation initially
 
 These are filesystem-administration capabilities beyond the basic repository
 editing surface. Add them independently only when real workloads justify the
 extra authority and schema.
+
+`cp` may preserve an existing symlink as the exact object being copied; that is
+object duplication, not an API for supplying a new arbitrary link target.
 
 ## Non-shell completeness
 
@@ -3058,15 +3502,27 @@ The v1 implementation is complete only when all of the following hold:
 - discovery defaults produce compact text rather than per-entry JSON objects.
 - every `find` path is directly reusable as another tool path; `ls` is the
   basename-only token-saving exception.
-- metadata is opt-in.
+- metadata is opt-in; `size` has portable content-length semantics, `mode` is
+  POSIX mode or unavailable, and timestamp range endpoints are explicit
+  exclusive RFC3339 instants.
+- discovery emits canonical `/` UTF-8 paths only; an invalid-UTF-8 Unix name is
+  omitted with `incomplete path_encoding` rather than lossy-rendered as reusable.
+- active dotlink staging/tombstone names are excluded by exact internal identity,
+  even with `hidden=true`, without reserving a user-hideable filename prefix.
 - mutation success does not echo redundant request data.
 - `max_read_bytes` and `max_write_bytes` remain runtime/profile policy rather
   than routine model-facing knobs.
 - `read` can continue inside a line larger than the effective result budget
   using an exact UTF-8 `line` + `byte` cursor.
 - ordinary read pagination returns usable partial data; a mid-read I/O fault is
-  explicitly incomplete and error-marked.
+  fault-marked/error and is never presented as a complete successful read.
 - over-limit or mid-stage writes never expose partial target contents.
+- `write`/`bwrite` remain write-authority-only and never read target bytes merely
+  to return `unchanged`; atomic replacement preserves existing basic access
+  protection and never publishes a more-permissive staging object.
+- content tools preserve safe existing final-symlink workflows by enforcing
+  lexical policy, resolving/re-authorizing the regular-file target, and leaving
+  the symlink entry intact; create-only paths do not follow dangling links.
 - post-publication failures are reported as committed/unknown rather than as
   generic retryable mutation failures.
 - `edit(path,edits)` owns one or more independent exact substitutions in one
@@ -3083,7 +3539,13 @@ The v1 implementation is complete only when all of the following hold:
 - `mv` never silently becomes copy + delete and requires its destination parent
   to exist, preserving strict rename-or-no-change semantics.
 - multi-root `rm` rejects duplicate/alias/ancestor-descendant overlaps before
-  the first deletion.
+  the first deletion; recursive roots durably reserve identity-bound cleanup
+  records, then commit by atomic namespace detach before private cleanup and
+  never degrade to visible child-by-child deletion. Restart reconciliation hides
+  or deletes only the exact recorded object identity, never a reused name.
+- lifecycle operations copy/move/remove symlink entries without following their
+  targets; `cp` rejects destination-inside-source and unsupported descendants,
+  and does not promise hard-link topology preservation.
 - directory-tree `cp` and recursive `rm` remain bounded and fail closed
   around protected/denied content.
 - all new mutation tools participate in replay protection and shared mutation
@@ -3100,7 +3562,8 @@ The v1 implementation is complete only when all of the following hold:
   including mixtures containing unknown components; uniformly unknown material
   outcomes use `unknown`; expected `skip` is structurally neutral.
 - dependency grammar has literal status/modifier predicates plus `N.*` for any
-  terminal outcome and no `.err`/`.done` status classes.
+  terminal outcome, `&` binds tighter than `|`, and there are no `.err`/`.done`
+  classes, negation, implicit adjacency or empty Graphs.
 - `batch(ops)` and `job_start(ops)` share one native-node Graph parser/registry;
   `batch` waits optimistically while `job_start` exposes the Job immediately.
 - `job_start` commits durable Job identity/exposure/replay state after complete
@@ -3109,8 +3572,17 @@ The v1 implementation is complete only when all of the following hold:
 - Graph control/job/task tools cannot appear as nodes.
 - `bread(format=mcp)` remains direct-only until durable retained results support
   typed MCP content exactly; Graph eligibility never depends on `bread` args.
+- each Job captures deterministic per-node semantic work/result ceilings;
+  changing the outer transport/result envelope may hand off/page the same Job but
+  can never change a node's `more`/`incomplete` status or downstream side effects.
+- native Graph nodes derive conservative machine-only read/write footprints;
+  conflicting native nodes are admitted in stable lower-coordinate order so
+  runner timing cannot decide whether a read observes before/after a native write.
+  This gate carries no success status and adds no model-facing lock schema.
 - one process-wide node-runner admission budget bounds concurrency across all
-  Graph Jobs, independently from active/retained Job and spool quotas.
+  Graph Jobs, independently from active/retained Job and spool quotas; immutable
+  Graph/replay/control/result state also has explicit bounded admission before a
+  root node can be claimed.
 - Job controls are visible independently of shell permission whenever the
   runtime can expose Jobs, including native-only profiles.
 - native MCP Task projection is used only when the exact eventual ordinary
@@ -3123,7 +3595,8 @@ The v1 implementation is complete only when all of the following hold:
 - `pwsh` and `powershell` are distinct interpreter capabilities with no aliasing
   or silent fallback; discovery advertises only prepared/authorized interpreters.
 - `writes` never changes authorization, sandbox policy or native mutation
-  correctness semantics.
+  correctness semantics and never creates a happens-before edge; explicit Graph
+  dependencies are the model-visible ordering contract.
 - the public edit field remains `edits`, not an opaque abbreviation.
 - native v1 tools need no model-facing coordination hints/revisions/range locks;
   shell exposes only advisory `writes` path scopes because its footprint is
@@ -3143,8 +3616,9 @@ The v2 extension is complete only when:
   exact prepared interpreters are available; no PowerShell alias/fallback exists;
 - shell node success/error follows actual process terminal state, never
   job/task handoff;
-- non-zero exit, timeout, launch failure and cancellation map to canonical
-  ShellNode `fail` and retain raw process details;
+- non-zero exit and launch failure map to canonical ShellNode `fail`; confirmed
+  timeout/cancellation termination also maps to `fail`, while an unprovable stop
+  is `unknown`; all retain the applicable raw process details;
 - a normally launched direct shell process that exits non-zero preserves the
   existing MCP-success process-result contract with `success=false`; Graph
   `fail` does not redefine process exit as protocol/tool failure;
@@ -3160,7 +3634,9 @@ The v2 extension is complete only when:
   Job/Graph objects are not resurrected after process/session replacement;
 - cross-process request replay cannot duplicate execution: the transport must
   prove retired requests cannot redeliver or use a minimal replay
-  claim/tombstone to fail closed, without persisting a full Job database;
+  claim/tombstone to fail closed, without persisting a full Job database. A
+  tombstone-backed strategy uses crash-durable cross-process create-if-absent
+  admission so exactly one process can own a request before any root starts;
 - the v1 `batch(ops)` / `job_start(ops)` Graph parser, registry, preflight and
   creation-order guarantees remain unchanged when ShellNodes are enabled;
 - `job_list` labels Jobs from Graph shape/tool identity rather than a separate
@@ -3170,19 +3646,23 @@ The v2 extension is complete only when:
   omit `node`, multi-node Jobs require it, and nodes expose retained `result`
   plus ShellNode stdout/stderr;
 - `job_cancel(id)` is idempotent and durably freezes new graph-node starts before
-  terminating/settling running work;
+  terminating/settling running work; an unprovable process-stop/reattachment
+  state becomes node `unknown`, never fabricated `fail cancelled`;
 - generic replay-protected `job_restart(id)` creates a fresh Job from the
   retained immutable Graph, never mutates or resets history in place, and
   revalidates the whole Graph against current authority/interpreter availability
   before any new node starts;
 - `job_output`/`job_ack` support structural node selection and retained `result`
-  streams without special durability kinds;
+  streams without special durability kinds; offsets/acks are raw bytes across
+  UTF-8-lossy text and exact base64 projections, and physical cleanup waits for
+  every Task/replay/output owner of those retained bytes;
 - cancellation, bounded output spooling/paging and deterministic rendering work
-  through the graph owner;
+  through the graph owner; shell spool truncation is observability only and never
+  adds Graph `incomplete` or changes process-success dependencies;
 - execution-authority revocation terminates the old Job session rather than
   stranding pending nodes: pending nodes become `skip revoked`, ShellNodes are
-  terminated, active native mutations settle safely, and the Job settles
-  cancelled/revoked;
+  terminated, active native mutations settle safely, old `job_output`/Task-result
+  payload reads fail closed, and the Job settles cancelled/revoked;
 - the advertised `job_start(ops)` migration never creates an intermediate
   release regression: legacy shell-shaped `job_start` is accepted only at the
   compatibility boundary until the one-ShellNode path is available;
@@ -3279,9 +3759,10 @@ The v2 extension is complete only when:
     `mixed` may contain unknown components and is therefore conservatively
     ambiguous for retry/compensation. The DSL does not add a second class system
     to introspect mixed counts.
-39. Shell-node process success maps to `ok`; known non-zero exit, timeout,
-    launch failure or cancellation maps to `fail`. Shell failure never implies
-    rollback of arbitrary filesystem side effects.
+39. Shell-node process success maps to `ok`; known non-zero exit/launch failure
+    and confirmed timeout/cancellation termination map to `fail`; an unprovable
+    process stop maps to `unknown`. Shell failure never implies rollback of
+    arbitrary filesystem side effects.
 40. `pwsh` and `powershell` are both first-class, distinct interpreter
     capabilities: modern PowerShell versus Windows PowerShell. Neither aliases
     or falls back to the other, and only actually available interpreters are
@@ -3322,6 +3803,44 @@ The v2 extension is complete only when:
 52. The public `job_start(ops)` switch ships only with the one-ShellNode
     compatibility path ready; the old shell-shaped request may exist only at the
     wire/deserialization boundary during migration.
+53. Direct-call response ceilings may page a direct query, but Graph-node
+    `more`/`incomplete` semantics come only from deterministic ceilings captured
+    at Job creation; outer Job delivery can never change dependency behavior.
+54. Write-only `write`/`bwrite` never gain an equality oracle merely to report
+    `unchanged`; successful authorized publication is `ok` without a hidden read.
+55. Recursive `rm` commits by atomic namespace detach before private cleanup;
+    visible child-by-child deletion is not an acceptable fallback.
+56. Model-facing paths are UTF-8 JSON strings with canonical `/` separators.
+    Invalid-UTF-8 Unix names are diagnostic/incomplete coverage rather than a
+    second byte-path argument language.
+57. Existing-file replacement may break hard-link topology at the replaced
+    pathname, but must preserve the target's basic access protection before any
+    new bytes become visible.
+58. Active staging/tombstone names are hidden by exact internal registration,
+    never by a broad user-creatable filename prefix.
+59. `job_output` positions and acknowledgement watermarks are raw retained-byte
+    offsets; text is UTF-8-lossy for readability while base64 is exact.
+60. Shell output truncation is retained-output observability, not Graph query
+    incompleteness, and therefore cannot alter dependency success semantics.
+61. Incompatible execution-authority revocation keeps only safe settle/control
+    state: old Job/Task payload reads fail closed and replacement policy never
+    re-authorizes an old payload implicitly.
+62. A persistent replay tombstone is not merely crash-durable; its first claim is
+    cross-process exclusive. Exactly one process may create the protected claim
+    for a transport request identity, and every loser observes/revalidates that
+    claim rather than executing the Graph.
+63. Recursive-delete private names survive crash/restart through bounded protected
+    cleanup records committed before detach and bound to the stable no-follow
+    object identity. Restart recovery never hides/deletes a path by name or prefix
+    alone.
+64. Native Graph conflicts use machine-only conservative read/write footprints
+    and a stable lower-coordinate admission order. This removes runner-timing
+    nondeterminism without turning the conflict gate into a status dependency or
+    another model-facing coordination language.
+65. Existing final symlinks are a content-versus-lifecycle boundary: content
+    tools resolve/re-authorize the regular-file target and preserve the link;
+    create-only paths do not follow dangling links; lifecycle tools act on the
+    link object itself.
 
 ## References
 
