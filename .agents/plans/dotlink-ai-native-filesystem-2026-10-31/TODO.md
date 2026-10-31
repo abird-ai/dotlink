@@ -6,7 +6,18 @@ Status: specification only; implementation intentionally not started.
 
 ## Committed
 
-None yet. The initial commit records only the approved design and queue entry.
+### `c6f0e1c` — initial AI-native filesystem specification
+
+- [x] Recorded the approved core tool split, token-efficiency rules, lifecycle
+  primitives and implementation roadmap.
+
+### `9b7d4b4` — read limits, partial mutation state and singular edit
+
+- [x] Kept read/write byte ceilings as runtime policy rather than routine model
+  parameters.
+- [x] Specified long-line read continuation and singular
+  `edit(path,old,new,all)`.
+- [x] Specified pre/post-publication mutation outcome handling.
 
 ## Uncommitted
 
@@ -72,7 +83,43 @@ None yet. The initial commit records only the approved design and queue entry.
 - [ ] Do not add glob expansion, destination inference or implicit overwrite.
 - [ ] Add replay protection/capability visibility for all lifecycle mutations.
 
-### Phase 6 — compatibility, measurements and docs
+### Phase 6 — canonical status, paging and progress
+
+- [ ] Implement one shared status grammar: `ok`, `unchanged`, `more`,
+  `incomplete`, `fail`, `partial`, `uncertain`, `skip`.
+- [ ] Make `partial` represent exact mixed known outcomes and list only
+  exceptional indexed items.
+- [ ] Support known-total paging (`2/7`) and unknown-total cursor paging without
+  extra counting scans.
+- [ ] Keep `more` (recoverable continuation) distinct from `incomplete`
+  (coverage not guaranteed), including combined states.
+- [ ] Separate exact data and status into distinct MCP content blocks when status
+  text would corrupt returned bytes/text.
+- [ ] Standardize progress as cumulative snapshots: fixed total when known,
+  omitted total when open-ended, stable units and terse phase messages.
+- [ ] Ensure progress never carries the only copy of result data.
+
+### Phase 7 — optional thin batch orchestration
+
+- [ ] Measure real round-trip savings before enabling model-visible `batch`.
+- [ ] If justified, add one `batch(steps)`: outer sequence, one-level parallel
+  groups, compact `[tool,args]` calls.
+- [ ] Do not introduce a natural-text batch DSL, nested batches, variables,
+  conditions, loops or output substitution.
+- [ ] Runtime-validate nested args against the already registered tool schema
+  instead of duplicating every schema into `batch`.
+- [ ] Add a central batchable-tool property; initially restrict to native
+  filesystem tools.
+- [ ] Add deterministic 1-based batch coordinates and aggregate status using the
+  shared outcome grammar.
+- [ ] Add fixed-total batch progress by completed calls and optional forwarded
+  child snapshots for known/unknown child progress.
+- [ ] Before mutation-capable batch ships, implement deterministic subcall replay
+  identity/ledger so redelivery cannot repeat committed sub-operations.
+- [ ] Enforce hard call-count, parallel-width, aggregate byte/work and result
+  ceilings.
+
+### Phase 8 — compatibility, measurements and docs
 
 - [ ] Keep compatibility strictly at wire/deserialization boundaries.
 - [ ] Measure total serialized advertised-tool schema tokens before/after.
@@ -98,6 +145,14 @@ None yet. The initial commit records only the approved design and queue entry.
 - [ ] Batch mutation failure-injection tests proving partial commit ledgers are
   exact and never hidden behind a generic error.
 - [ ] Unit tests for globally correct sorting/paging under bounded traversal.
+- [ ] Status grammar tests for success, failure, known partial, uncertain and
+  skipped outcomes.
+- [ ] Paging tests for known total, unknown total, final page and
+  `more + incomplete` combined state.
+- [ ] Progress tests for fixed-total, unknown-total and phase-only updates,
+  asserting cumulative/monotonic semantics.
+- [ ] If batch is implemented, sequential/parallel barrier, failure/skip,
+  mixed-result, nested-rejection and aggregate-budget tests.
 - [ ] Mutation race/alias/replay tests for `cp`, `mv`, `rm`.
 - [ ] Recursive copy/delete protected-path and symlink tests.
 - [ ] Cross-device `mv` rejection tests.

@@ -58,11 +58,12 @@ useful when shell authority is deliberately withheld.
 ## Target surface
 
 ~~~text
-discovery   ls      find    grep
-text        read    write   edit    patch
-lifecycle   cp      mv      rm
-binary      bread   bwrite  bedit
-shell       bash    powershell      # separate capability, not required
+discovery     ls      find    grep
+text          read    write   edit    patch
+lifecycle     cp      mv      rm
+binary        bread   bwrite  bedit
+orchestration batch
+shell         bash    powershell      # separate capability, not required
 ~~~
 
 The model-facing decision boundary should be nearly mechanical:
@@ -369,6 +370,247 @@ private staging progress.
 Where a batch operation can cheaply roll back unpublished/tombstoned objects
 while locks are still held, it should do so, but rollback failure must itself be
 reported as a partial/uncertain state rather than hidden.
+
+## Canonical status, paging and progress grammar
+
+Every native tool uses one small status vocabulary. MCP's own success/error bit
+remains authoritative; text carries only state the protocol cannot express.
+
+~~~text
+ok
+unchanged
+more
+incomplete
+fail
+partial
+uncertain
+skip
+~~~
+
+These words are reserved and mean the same thing everywhere.
+
+### Terminal outcomes
+
+`ok` means the requested operation completed fully:
+
+~~~text
+ok
+ok 7
+~~~
+
+A count is included only when it materially helps the next model step.
+
+`unchanged` is a successful no-op:
+
+~~~text
+unchanged
+~~~
+
+For a mutation, `fail` means the requested visible mutation is known not to
+have committed:
+
+~~~text
+fail destination exists
+fail write limit 1048576; content 1400000
+~~~
+
+A mutation must never use `fail` after its publication commit point.
+
+`uncertain` means dotlink genuinely cannot establish the visible commit
+state:
+
+~~~text
+uncertain commit; do not retry
+~~~
+
+It is an error result and is reserved for fail-closed ambiguity.
+
+### Known mixed outcomes: `partial`
+
+`partial` means the request has multiple known outcomes: some requested
+results/data are valid or committed and at least one requested component
+failed, was uncertain, or was skipped.
+
+It is an MCP error result even when useful data or successful mutations are
+present.
+
+For indexed multi-item operations, summarize counts first and list only
+non-`ok` exceptions:
+
+~~~text
+partial ok=5 fail=2 uncertain=1
+2 fail not found
+6 fail permission denied
+8 uncertain commit
+~~~
+
+Input coordinates are stable and 1-based. Unlisted coordinates are `ok`.
+
+If successful sub-operations have substantive return data, their data blocks
+remain in the result; the aggregate status still names the mixed outcome.
+
+A read that obtained a valid prefix before an I/O failure uses the same
+principle:
+
+~~~text
+<valid prefix>
+
+partial fail=io next=line:81:0
+~~~
+
+The prefix is useful, but the error status prevents the model from treating it
+as a complete successful read.
+
+Reserve `partial` for *known* mixed state. Do not use it for normal paging,
+unknown search coverage, or private staging progress.
+
+### `skip`
+
+`skip` means an operation was deliberately not started because a required
+earlier step failed:
+
+~~~text
+skip dependency
+~~~
+
+It is primarily useful in batch ledgers. A skipped mutation has no side effect.
+
+### Paging: known and unknown totals
+
+`more` means the current page is valid and an exact continuation exists.
+
+When the total number of pages/items is not known cheaply:
+
+~~~text
+more next=200
+more next=line:42:1048217
+~~~
+
+The second form is a compact `line:byte` read cursor.
+
+When a fixed total is already known without an extra traversal:
+
+~~~text
+more 2/7 next=400
+~~~
+
+The final known page may end with:
+
+~~~text
+ok 7/7
+~~~
+
+An unknown-total final page simply ends normally or with `ok` when an explicit
+status is useful.
+
+Never perform an extra full scan merely to discover a page count. Unknown-total
+cursor paging is the default whenever total discovery would add material work.
+
+### `incomplete` is not paging
+
+`incomplete` means returned data is valid but dotlink cannot guarantee that it
+observed the complete search/input space:
+
+~~~text
+incomplete budget
+incomplete walk,gitignore
+~~~
+
+There may be no cursor capable of recovering the missing region.
+
+Known paging and incomplete coverage can coexist:
+
+~~~text
+more next=200 incomplete=walk
+~~~
+
+This means there are additional known results to page through *and* the
+underlying scan was itself incomplete.
+
+### Data and status blocks
+
+When status text would corrupt exact returned data, especially
+`read(numbered=false)`, return separate MCP content blocks:
+
+~~~text
+content[0] = exact data fragment
+content[1] = status/control line
+~~~
+
+A complete exact read needs only the data block.
+
+A partial/error read can therefore carry both useful exact data and a terminal
+status without inserting control text into file bytes.
+
+### Progress notifications
+
+Progress is ephemeral execution state, not result data. The final tool result
+must be fully understandable even if the client observed zero progress
+notifications.
+
+Progress values are **absolute cumulative snapshots**, never deltas. A client
+must not have to add previous updates to reconstruct current progress.
+
+Use one stable unit for a request whenever possible: bytes copied, entries
+visited, or calls completed.
+
+#### Known fixed end
+
+When the operation has a cheap, fixed denominator, send normal MCP progress
+with both current and total:
+
+~~~text
+progress=37 total=100 message=copy
+~~~
+
+The numeric fields carry the fraction. Keep `message` to a short phase/name;
+do not repeat `37/100` in the message.
+
+The final tool result, not a 100% progress event, is authoritative completion.
+A tool may emit `progress=total` immediately before its final result, but must
+not use reaching the total as a substitute for the terminal outcome.
+
+#### Unknown end
+
+When the final amount of work is genuinely unknown, omit `total` and still
+emit monotonically nondecreasing cumulative progress:
+
+~~~text
+progress=412 message=scan
+progress=918 message=scan
+~~~
+
+This communicates forward motion without inventing a denominator.
+
+Do not switch an unknown operation to a guessed total. If a total becomes known
+naturally and the protocol/client permits adding it without changing the unit,
+later updates may include it; otherwise keep the request in unknown-total mode.
+
+#### Multi-phase work
+
+Do not mix unrelated units merely to manufacture a percentage. Keep the
+numeric unit stable and use the short message for phase transitions:
+
+~~~text
+message=scan
+message=copy
+message=commit
+message=cleanup
+~~~
+
+If a phase has no meaningful numeric advance, the progress value may remain
+unchanged while the phase message changes, subject to the MCP progress
+monotonicity contract.
+
+#### Streaming partial data vs progress
+
+Progress notifications never carry the only copy of tool result data.
+
+- execution progress streams through MCP progress notifications;
+- result pagination/streaming uses ordinary tool results plus `more`;
+- a final complete result remains authoritative.
+
+This keeps UI progress optional while preserving exact model-visible semantics.
 
 ## `ls`
 
@@ -936,6 +1178,239 @@ or for multiple roots:
 ok 7
 ~~~
 
+## `batch` — thin orchestration, not a workflow language
+
+The semantic filesystem tools remain the core. A single optional `batch` tool
+may sit above them to reduce round trips for predetermined independent work.
+
+Do not add separate `seq` and `parallel` tools.
+
+### Why not a natural-text batch DSL
+
+A custom textual syntax such as:
+
+~~~text
+read path=a
+parallel:
+  read path=b
+  grep pattern=foo
+mv from=a to=c
+~~~
+
+looks smaller for trivial calls but is worse overall:
+
+- MCP tool arguments are structured JSON already;
+- arbitrary strings, multiline `write` content, Codex patch text, arrays and
+  binary payloads immediately require a second quoting/escaping grammar;
+- the parser and permanent tool description must teach that grammar;
+- nested tool arguments lose ordinary schema validation/guidance;
+- punctuation saved per invocation is small compared with payload tokens and
+  the permanent complexity cost.
+
+Use natural compact text for **results/status**, where it saves repeated JSON
+keys. Keep batch **inputs minimally structured** and reuse each underlying
+tool's normal argument object.
+
+### Compact batch syntax
+
+Advertise one argument:
+
+~~~text
+batch(steps)
+~~~
+
+A call is the shortest unambiguous structured pair:
+
+~~~text
+[tool, args]
+~~~
+
+The outer `steps` list is sequential. A step that is itself a list of calls is
+one parallel stage:
+
+~~~text
+steps=[
+  ["write", {"path":"a","content":"..."}],
+
+  [
+    ["read", {"path":"b"}],
+    ["grep", {"pattern":"foo"}]
+  ],
+
+  ["mv", {"from":"a","to":"src/a"}]
+]
+~~~
+
+Semantics:
+
+~~~text
+write
+  ↓
+read ─┐
+grep ─┘  parallel
+  ↓
+mv
+~~~
+
+This deliberately uses JSON's existing structure instead of introducing a new
+language. The runtime distinguishes a call tuple from a parallel stage by
+shape.
+
+Do not embed the complete schemas of every tool into the `batch` schema.
+`args` remains an object validated at runtime against the already registered
+named tool. The model already sees the underlying tool schemas once; duplicating
+them inside `batch` would waste permanent context.
+
+### Batch grammar and limits
+
+Conceptually:
+
+~~~text
+steps = [step, step, ...]
+step  = call | [call, call, ...]
+call  = [tool, args]
+~~~
+
+Only one parallel nesting level exists.
+
+No:
+
+- nested `batch`;
+- variables;
+- output substitution;
+- condition expressions;
+- loops;
+- labels/IDs;
+- arbitrary DAG edges;
+- rollback language.
+
+The batch has explicit hard limits on total calls, parallel width, aggregate
+input/output bytes and total work. These are runtime ceilings, not user-facing
+workflow features.
+
+### Execution
+
+Sequential calls finish before the next step begins.
+
+All calls in a parallel stage start independently under the normal dotlink
+concurrency/admission rules. Started siblings are allowed to reach a safe
+terminal state even if another sibling fails; mutation calls are never blindly
+cancelled merely to make the stage look atomic.
+
+If any call in a stage ends as `fail`, `partial`, or `uncertain`, later
+sequential stages do not start and are reported as `skip dependency`.
+
+`ok`, `unchanged`, `more`, and `incomplete` are successful terminal
+states for that requested call and do not by themselves stop later stages.
+
+Batch has no dataflow: later steps cannot use earlier outputs as arguments. If
+the next operation depends on model reasoning over a result, that boundary
+belongs in a new model turn rather than in `batch`.
+
+### Batch coordinates and results
+
+Coordinates are 1-based and derived only from position:
+
+~~~text
+1
+2.1
+2.2
+3
+~~~
+
+Results use those coordinates rather than repeating tool/path names:
+
+~~~text
+1
+ok
+
+2.1
+<read result>
+more next=line:200:0
+
+2.2
+fail permission denied
+
+3
+skip dependency
+
+partial ok=2 fail=1 skip=1
+~~~
+
+The final aggregate uses the same canonical outcome grammar as every other
+tool. Successful data-bearing sub-results remain available; the summary lists
+only counts and exceptional coordinates.
+
+### Batch progress
+
+The total number of calls is known before execution, so batch-level progress has
+a fixed denominator:
+
+~~~text
+progress=3 total=12 message=2.1
+~~~
+
+The numeric value is completed calls; the short message identifies the call
+that most recently reached a terminal state.
+
+For a long-running child that itself reports progress, batch may forward a
+compact child snapshot while leaving the aggregate completed-call progress
+unchanged:
+
+~~~text
+progress=3 total=12 message="2.2 copy 412/1000"
+progress=3 total=12 message="2.3 scan 918"
+~~~
+
+The first child has a known total; the second has an unknown end. These are
+status hints only. The child's eventual result and the final batch ledger remain
+authoritative.
+
+### Batchable tools
+
+Initially batch only the deterministic native filesystem surface:
+
+~~~text
+ls find grep
+read write edit patch
+cp mv rm
+bread bwrite bedit
+~~~
+
+Do not batch `batch`, shell/powershell, jobs or task-control methods in the
+first design. Those already have independent execution, durability and timeout
+semantics.
+
+A central tool-spec property should declare batchability so visibility,
+validation and tests cannot drift.
+
+### Replay and mutation safety
+
+A batch containing any mutation is replay-protected.
+
+Every subcall receives a deterministic internal identity derived from the outer
+request identity and its positional coordinate. A redelivery can therefore
+replay/resume the known ledger without repeating a committed sub-operation.
+
+The outer result records the exact terminal status of every started mutation.
+If dotlink cannot prove whether a subcall crossed its commit point, that
+coordinate is `uncertain`; later dependent stages are skipped.
+
+Do not ship mutation-capable batch until this subcall replay ledger is correct
+under cancellation, response loss and runtime recovery. A read-only batch may
+be implemented earlier if useful.
+
+### Design boundary
+
+Prefer semantic batching inside domain tools:
+
+- one `grep` over many files instead of N greps;
+- one multi-hunk `patch` instead of N edits;
+- one `rm(paths)` instead of N removes.
+
+Use `batch` only for heterogeneous predetermined calls where reducing
+round-trip latency materially helps.
+
 ## Binary tools
 
 Keep binary operations separate from text operations. This avoids making every
@@ -1351,6 +1826,17 @@ The implementation is complete only when all of the following hold:
 16. Every mutation has an explicit publication commit point; post-commit
     failures must never masquerade as safe-to-retry pre-commit failures.
 17. `edit` is intentionally singular; batching/context belongs to `patch`.
+18. Terminal outcomes use one reserved status vocabulary: `ok`, `unchanged`,
+    `more`, `incomplete`, `fail`, `partial`, `uncertain`, `skip`.
+19. Paging supports both known totals and cursor-only unknown totals without
+    performing extra work merely to count pages.
+20. Progress updates are cumulative snapshots. Known work uses a fixed total;
+    unknown work omits the total while still reporting monotonic progress.
+21. Result data is never available only through progress notifications; final
+    results and explicit paging remain authoritative.
+22. If generic batching is implemented, use one shallow structured `batch`
+    tool: outer sequence, one-level parallel groups, no custom text DSL and no
+    dataflow/workflow language.
 
 ## References
 
