@@ -3090,16 +3090,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_launcher_rejects_privilege_bearing_source() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
-        let temp = tempfile::tempdir().unwrap();
-        let launcher = temp.path().join("bwrap");
-        std::fs::copy(bash, &launcher).unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o4755)).unwrap();
-        let prepared = PreparedExecutable::prepare(launcher).unwrap();
+        let mut prepared = PreparedExecutable::prepare(bash).unwrap();
+        // The rejection logic consumes privilege provenance recorded during
+        // preparation. Set that recorded fact directly so the test does not
+        // depend on the surrounding filesystem allowing setuid chmod (Nix
+        // builders intentionally prohibit creating privilege-bearing files).
+        prepared.privileged_source = true;
         let error = validate_sandbox_launcher(&prepared)
             .unwrap_err()
             .to_string();
@@ -3888,7 +3887,7 @@ mod tests {
         let machine = direct_shell_machine(root, bash, 64 * 1024);
         let request = CallToolRequestParams::new("bash").with_arguments(
             serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
-                "command": "python3 - <<'PY'\nprint('x' * 8192, end='')\nPY",
+                "command": "for ((i=0; i<8192; i++)); do printf x; done",
                 "timeout_secs": 3,
                 "max_output_bytes": 16384
             }))
