@@ -302,7 +302,7 @@ valid prefix, preserve the useful prefix but mark the MCP tool result as an
 error and terminate it with an explicit fault marker, for example:
 
 ~~~text
-partial fail=io more line=81 byte=0
+mixed ok=prefix fail=io more line=81 byte=0
 ~~~
 
 The model must never infer completeness from such a result. The cursor is
@@ -365,12 +365,12 @@ that invites the model to repeat the mutation. Report a committed success with
 a concise exceptional qualifier only when the model needs to know, for example:
 
 ~~~text
-ok; durability uncertain
+ok; durability unknown
 ok; cleanup pending
 ~~~
 
 A platform backend that genuinely cannot determine whether publication crossed
-the commit point must surface an explicit `uncertain` outcome and must not
+the commit point must surface an explicit `unknown` outcome and must not
 encourage automatic retry.
 
 The OpenAI transport replay layer separately protects the case where the
@@ -391,17 +391,17 @@ These exceptional outcomes must be explicit and must list only the information
 the model needs to recover, for example:
 
 ~~~text
-partial ok=2 fail=1
+mixed ok=2 fail=1
 3 fail permission denied
 ~~~
 
 Such a result is an MCP tool error, not an ordinary success. The word
-`partial` is reserved for a real visible mutation split; never use it for
+`mixed` is reserved for a real visible mutation split; never use it for
 private staging progress.
 
 Where a multi-object mutation can cheaply roll back unpublished/tombstoned
 objects while locks are still held, it should do so, but rollback failure must itself be
-reported as a partial/uncertain state rather than hidden.
+reported as a mixed/unknown state rather than hidden.
 
 ## Canonical status, paging and progress grammar
 
@@ -417,8 +417,8 @@ Primary outcomes:
 ok
 unchanged
 fail
-partial
-uncertain
+mixed
+unknown
 skip
 ~~~
 
@@ -459,13 +459,19 @@ fail write limit 1048576; content 1400000
 
 A mutation must never use `fail` after its publication commit point.
 
-`uncertain` means dotlink genuinely cannot establish the visible commit state:
+`unknown` means dotlink genuinely cannot prove the externally visible
+side-effect/execution state:
 
 ~~~text
-uncertain commit; do not retry
+unknown commit; do not retry
 ~~~
 
-It is an error result and is reserved for fail-closed ambiguity.
+It is an error result reserved for fail-closed ambiguity: the operation may
+already have produced externally visible effects, so automatic retry is unsafe.
+
+The canonical name is deliberately **`unknown`**, not `maybe`. `unknown` is
+a precise machine-contract state; `maybe` is conversational and does not say
+what is unknown. There is no `maybe` alias.
 
 `skip` means an operation was deliberately not started:
 
@@ -475,11 +481,26 @@ skip condition
 
 It is primarily useful in conditional Graphs. A skipped mutation has no side effect.
 
-### Known mixed outcomes: `partial`
+### Mixed outcomes: `mixed`
 
-`partial` means one request has multiple known outcomes and at least one
-requested component failed or became uncertain while another component produced
-useful data or committed successfully.
+`mixed` means one request contains more than one kind of **material** terminal
+component outcome. It may include known successes, known failures and unknown
+components together. `skip` is structural/neutral and does not by itself make
+an otherwise uniform aggregate mixed.
+
+Aggregate primary selection is deterministic:
+
+- all material components successful -> `ok`, or `unchanged` when every
+  successful component is unchanged;
+- all material components known failures -> `fail`;
+- all material components unknown -> `unknown`;
+- more than one material outcome family, or any child already `mixed` ->
+  `mixed`;
+- no material component started -> `skip`.
+
+Thus `ok + unknown`, `fail + unknown`, and `ok + fail + unknown` are all
+`mixed`, preserving the known parts without pretending the unknown component
+is safe to retry.
 
 It is an MCP error result even when useful data or successful mutations are
 present.
@@ -488,30 +509,30 @@ For indexed multi-item operations, summarize counts first and list only
 exceptions:
 
 ~~~text
-partial ok=5 fail=2 uncertain=1
+mixed ok=5 fail=2 unknown=1
 2 fail not found
 6 fail permission denied
-8 uncertain commit
+8 unknown commit
 ~~~
 
 Input coordinates are stable and 1-based. Unlisted coordinates are complete
 successes unless a modifier summary says otherwise.
 
 A read that obtained a valid prefix before an I/O failure may combine a primary
-partial outcome with an exact continuation modifier:
+mixed outcome with an exact continuation modifier:
 
 ~~~text
 <valid prefix>
 
-partial fail=io more line=81 byte=0
+mixed ok=prefix fail=io more line=81 byte=0
 ~~~
 
 The prefix is useful, the error result prevents it from being mistaken for a
 complete read, and `more` identifies a safe continuation only when one is
 known.
 
-Reserve `partial` for known mixed state. Do not use it for normal paging,
-unknown search coverage, or private staging progress.
+Reserve `mixed` for materially mixed terminal outcomes. Do not use it for
+normal paging, uniformly unknown coverage, or private staging progress.
 
 ### Paging: `more`
 
@@ -960,7 +981,9 @@ Create or completely replace one UTF-8 file.
 write(path, content)
 ~~~
 
-Missing parent directories are created automatically.
+Missing parent directories are created automatically **only as part of the same publication unit**. A failed `write` must not leave newly visible parent directories behind.
+
+The shared mutation layer should stage the complete missing suffix beneath the nearest existing authorized ancestor and publish the first missing component atomically where the platform provides the required no-replace namespace primitive. Any platform fallback must preserve the same externally visible all-or-nothing contract rather than exposing parent directories incrementally.
 
 Success:
 
@@ -1142,7 +1165,7 @@ the source basename.
 ### Semantics
 
 - destination must not exist;
-- missing destination parents are created;
+- missing destination parents are created only inside the same staged publication unit; a failed copy must not leave newly visible parent directories behind;
 - files copy as files and directories copy as complete directory trees;
 - symlinks are copied as symlinks and never followed;
 - recursive traversal is descriptor-rooted and bounded;
@@ -1158,9 +1181,9 @@ separate destructive decision.
 For robust publication:
 
 - file copy writes staged bytes and atomically publishes the destination;
-- directory copy should construct a staged destination tree and publish the
-  completed root by rename where the platform permits;
-- a failed copy must not expose a partially built destination.
+- when destination parents are missing, stage the complete missing suffix under the nearest existing authorized ancestor and publish its top component once;
+- directory copy constructs a staged destination tree and publishes the completed root/suffix by rename;
+- a failed copy must not expose either a partially built destination or newly created parent directories.
 
 Success:
 
@@ -1185,7 +1208,7 @@ mv(from, to)
 ### Semantics
 
 - destination must not exist;
-- missing destination parents are created;
+- the destination parent must already exist; `mv` never creates parent directories because that would require a second namespace publication and violate rename-or-no-change semantics;
 - files, directories and symlinks are supported;
 - symlinks themselves move; their targets are never followed;
 - moving a directory into itself is rejected;
@@ -1201,7 +1224,7 @@ with a concise actionable error:
 fail cross-device move; use cp then rm
 ~~~
 
-The invariant is: rename the existing object or change nothing.
+The invariant is: rename the existing object or change nothing. A failed `mv` leaves the source and surrounding destination namespace unchanged.
 
 Success:
 
@@ -1254,8 +1277,7 @@ With `recursive=true`:
 Missing paths are errors rather than silently successful operations. A typo must
 not look like a successful deletion.
 
-For multiple roots, preflight the complete request before making namespace
-changes wherever possible.
+For multiple roots, preflight the complete request before making any namespace change. Reject duplicate roots, aliases resolving to the same removable object, and ancestor/descendant-overlapping requested namespaces before the first mutation. The caller should pass the single highest root when recursive removal would otherwise subsume another requested path.
 
 For robust recursive deletion, prefer:
 
@@ -1326,7 +1348,7 @@ ops=[
   ["read", {"path":"b"}, "*"],
   ["edit", {"path":"x","edits":[["a","b"]]}, "1&2"],
   ["mv", {"from":"x","to":"y"}],
-  ["read", {"path":"fallback"}, "3.err"]
+  ["read", {"path":"fallback"}, "3.fail|3.mixed"]
 ]
 ~~~
 
@@ -1363,8 +1385,9 @@ The optional `when` string is deliberately tiny:
 
 ~~~text
 *          unconditional root
-N          operation N succeeded
-N.status   exact/status-class predicate
+N          operation N completed successfully
+N.*        operation N reached any terminal outcome
+N.status   exact primary outcome / query modifier
 &          AND
 |          OR
 (...)      grouping
@@ -1389,7 +1412,7 @@ that may coexist with a successful primary outcome.
 A paged or incomplete query therefore does not satisfy a bare dependency. This
 makes default sequencing safe for dependent mutations.
 
-Exact canonical statuses may be selected explicitly:
+Exact canonical outcomes/modifiers may be selected explicitly:
 
 ~~~text
 N.ok
@@ -1397,17 +1420,13 @@ N.unchanged
 N.more
 N.incomplete
 N.fail
-N.partial
-N.uncertain
+N.mixed
+N.unknown
 N.skip
+N.*
 ~~~
 
-Two compact classes are also available:
-
-~~~text
-N.err     known error: fail | partial
-N.done    any terminal state
-~~~
+There are no additional status classes. `N.*` is the one shorthand for any terminal node outcome.
 
 Examples:
 
@@ -1415,7 +1434,7 @@ Examples:
 1&2
 1|2
 1&(2|3)
-3.err
+3.fail|3.mixed
 4.more|4.incomplete
 ~~~
 
@@ -1423,9 +1442,7 @@ All referenced operations must reach terminal state before the expression is
 evaluated. `|` is a boolean branch, not a timing race. This keeps execution
 deterministic and replayable.
 
-`uncertain` is deliberately **not** included in `.err`. Recovery/compensation
-logic must opt into `N.uncertain` explicitly because the prior operation may
-already have produced side effects.
+`N.unknown` matches a uniformly unknown material outcome. `N.mixed` may itself include unknown components, so a `mixed` branch must be treated as potentially ambiguous unless the caller only needs generic non-success handling. The dependency DSL intentionally does not introspect mixed-result counts; if a workflow requires different execution for known-failure versus unknown-containing subsets, split those operations into separate nodes instead of adding another status-class language. `N.*` deliberately matches every terminal outcome.
 
 ### Sequence, parallelism, joins and decisions
 
@@ -1461,10 +1478,10 @@ Decision branch:
 
 ~~~text
 4 when=3
-5 when=3.err
+5 when=3.fail|3.mixed
 ~~~
 
-selects the success or error path after operation 3.
+selects the success path or a generic non-success/mixed path after operation 3. Because `mixed` may contain unknown components, a mutation on that branch must not assume the prior side effects are fully known.
 
 A realistic graph:
 
@@ -1474,7 +1491,7 @@ ops=[
   ["read", {"path":"Cargo.toml"}, "*"],
   ["edit", {"path":"config.toml","edits":[["a","b"]]}, "1&2"],
   ["mv", {"from":"old","to":"new"}],
-  ["read", {"path":"config.example.toml"}, "3.err"],
+  ["read", {"path":"config.example.toml"}, "3.fail|3.mixed"],
   ["rm", {"paths":["tmp"],"recursive":true}, "4"]
 ]
 ~~~
@@ -1485,7 +1502,7 @@ Conceptually:
 1 ─┐
    ├─> 3 ──success──> 4 ──> 6
 2 ─┘      \
-           err
+          fail/mixed
             \
              > 5
 ~~~
@@ -1564,7 +1581,7 @@ more offset=200
 4 fail destination exists
 5 skip condition
 
-partial ok=2 more=1 fail=1 skip=1
+mixed ok=2 more=1 fail=1 skip=1
 ~~~
 
 Aggregate counts distinguish complete successes from query modifiers:
@@ -1572,7 +1589,7 @@ Aggregate counts distinguish complete successes from query modifiers:
 - `ok=N`: complete successful nodes;
 - `more=N`: nodes with exact continuation;
 - `incomplete=N`: nodes with incomplete coverage; may overlap `more`;
-- `fail=N`, `partial=N`, `uncertain=N`, `skip=N`: primary outcomes.
+- `fail=N`, `mixed=N`, `unknown=N`, `skip=N`: primary outcomes.
 
 If every started node is non-error but one or more query nodes have modifiers,
 the aggregate remains successful but exposes them:
@@ -1585,10 +1602,11 @@ ok more=2 incomplete=1 skip=1
 8 skip condition
 ~~~
 
-If errors coexist, the aggregate primary outcome is `partial`:
+If materially different terminal outcomes coexist, the aggregate primary
+outcome is `mixed`:
 
 ~~~text
-partial ok=3 more=1 fail=1 skip=1
+mixed ok=3 more=1 fail=1 skip=1
 2 more offset=200
 4 fail permission denied
 5 skip condition
@@ -1655,8 +1673,15 @@ V1 admits the deterministic native filesystem surface as Graph nodes:
 ls find grep
 read write edit patch
 cp mv rm
-bread bwrite bedit
+bwrite bedit
 ~~~
+
+Keep `bread` direct-only in v1. `bread(format="mcp")` may return typed MCP
+image/audio/blob content; the v1 durable Graph result channel is intentionally
+text/result-stream based and must not flatten typed content into a lossy
+representation. Do not add argument-dependent Graph eligibility merely to admit
+base64/hex `bread`. A later content-aware retained-result design may make
+`bread` Graph-eligible as one coherent feature.
 
 V1 does not admit shell, job-control or task-control tools as Graph nodes.
 
@@ -1683,10 +1708,30 @@ The shared Graph parser validates before execution:
 - each nested argument object;
 - backward-only references;
 - condition grammar;
-- maximum graph fan-out/concurrency;
+- maximum per-Job Graph fan-out/concurrency;
 - aggregate work and result ceilings.
 
 Invalid graphs fail before any operation starts.
+
+### Execution admission
+
+Job count is not a sufficient execution limit once one Graph may contain many
+concurrent nodes. The shared execution layer therefore owns one process-wide
+**Graph node-runner permit budget** across all Jobs.
+
+- every Graph node acquires a runner permit before `pending -> claimed`;
+- claimed therefore continues to mean one execution attempt has actually been
+  admitted, rather than "waiting for capacity";
+- each Job also has a bounded parallel width no greater than the global runner
+  budget;
+- direct `bash` / `pwsh` / `powershell` are one-ShellNode Jobs and use the
+  same runner admission;
+- active-Job count, running-node permits, retained-Job count and spool bytes are
+  separate limits and must not be conflated.
+
+This preserves the resource bound that one-shell-per-Job provided implicitly
+today while allowing Graph Jobs without process/fan-out amplification across
+many concurrent Jobs.
 
 ### Replay and mutation safety
 
@@ -1705,7 +1750,7 @@ state/result and are never executed again. Pending graph nodes resume only when
 their dependency predicates are satisfied by that same ledger.
 
 If dotlink cannot prove whether one mutation crossed its commit point, that node
-is `uncertain`; dependent predicates evaluate from that explicit status.
+is `unknown`; dependent predicates evaluate from that explicit status.
 
 Do not ship Graph execution (`batch` or `job_start`) until this outer-Job and
 per-node replay model is correct under cancellation, response loss and runtime
@@ -1785,7 +1830,7 @@ Job / JobManager
   retention
   Task projection
   output paging/ack
-  durable node ledger
+  Job-session node ledger
 
 Graph
   Node 1
@@ -1822,7 +1867,7 @@ batch(ops=[
   ["bash", {"command":"cargo fmt","writes":["src"]}],
   ["bash", {"command":"cargo test"}, "2"],
   ["rm", {"paths":["tmp"]}, "3"],
-  ["read", {"path":"failure.log"}, "3.err"]
+  ["read", {"path":"failure.log"}, "3.fail|3.mixed"]
 ])
 ~~~
 
@@ -1831,7 +1876,7 @@ that shell tool is available to the caller.
 
 Graph node dispatch excludes `batch`, `job_start`, all `job_*` controls and
 Task-control methods. A ShellNode is graph-owned execution; explicit child
-handoff APIs would break Job ownership.
+handoff APIs would violate the single outer-Job lifecycle.
 
 ### Shell-node terminal semantics
 
@@ -1842,21 +1887,16 @@ For Graph control, ShellNodes map process state onto the canonical node outcome
 vocabulary:
 
 - successful process completion (`success=true`, normally exit code 0) -> `ok`;
-- known non-zero exit, timeout, launch/preparation failure or cancellation ->
-  `fail` with compact process detail;
-- genuinely ambiguous process/side-effect state -> `uncertain`;
-- `N.err` remains the shared **known-error class** (`fail | partial`), not a new
-  primary status;
-- `N.done` means any terminal node state.
+- known non-zero exit, timeout, launch/preparation failure or cancellation -> `fail` with compact process detail;
+- genuinely ambiguous process/side-effect state -> `unknown`;
+- `N.*` matches any terminal node outcome.
 
 The ShellNode retains compact exit/success/timeout/error metadata plus separate
 bounded stdout/stderr streams and their truncation/paging state.
 
-Because direct `bash` / `pwsh` / `powershell` are the one-ShellNode Job case,
-the same outcome mapping applies to their ordinary tool projection: successful
-exit is MCP success; a known process failure is an MCP error carrying the bounded
-process result/output; ambiguity is `uncertain`. Do not maintain a second rule
-where exit code 1 is Graph-`fail` but direct-shell success.
+Graph outcome and MCP envelope semantics remain deliberately distinct. A ShellNode uses `fail` for Graph branching when the process is known unsuccessful, but a direct synchronous shell call preserves the existing process-result wire contract: if the process launched and exited normally with a non-zero code, the tool call itself is MCP success carrying `success=false` and the exit/output metadata. Pre-execution failure, timeout/cancellation and internal execution failure remain MCP errors as appropriate.
+
+This keeps process failure separate from protocol/tool failure without weakening Graph control semantics.
 
 A ShellNode `fail` is a process outcome, not the native mutation `fail`
 commit guarantee. A shell command may mutate files and then exit non-zero, time
@@ -1866,7 +1906,7 @@ followed a known-error branch.
 Aggregate summaries may count shell process errors explicitly:
 
 ~~~text
-partial ok=3 fail=1 skip=1
+mixed ok=3 fail=1 skip=1
 4 fail exit=1
 5 skip condition
 ~~~
@@ -1900,15 +1940,17 @@ Job
        +-- ShellNode -- bounded stdout/stderr spool
        +-- ...
   |
-  +-- durable node ledger
+  +-- Job-session node ledger
 ~~~
 
 For direct `bash`/`pwsh`/`powershell`, the Graph contains one ShellNode. For
 `batch` and `job_start`, it contains the submitted `ops` Graph.
 
 If the Job finishes inside the caller/transport window and its result fits,
-return the ordinary tool result. Otherwise expose that same Job through the
-durable layer: native MCP Task when available, compatible job handle otherwise.
+return the ordinary tool result. Otherwise expose that same Job durably. Native
+MCP Task may be used only when the eventual ordinary tool result is guaranteed
+to fit the Task result budget; otherwise use the same Job through the `job_*`
+handle.
 
 A compact compatibility receipt for a multi-node graph may be:
 
@@ -1929,9 +1971,9 @@ The Job retains:
 - dependency/skip decisions;
 - aggregate result/progress state.
 
-### Durable node checkpoints
+### Job-session node checkpoints
 
-Each node follows a fail-closed durable state machine:
+Each node follows a fail-closed Job-session state machine that survives request/transport handoff but is not resurrected across dotlink process replacement:
 
 ~~~text
 pending
@@ -1940,8 +1982,7 @@ pending
   -> terminal
 ~~~
 
-`claimed` is persisted before execution may start. It means this graph/node
-owns exactly one execution attempt.
+`claimed` is recorded in the Job-session ledger before execution may start. It means this graph/node owns exactly one admitted execution attempt.
 
 A shell child uses a deterministic internal runner identity derived from graph
 run identity + node coordinate. Duplicate dispatch inside the live durable
@@ -1966,7 +2007,7 @@ is no `job_resume` tool.
 
 Terminal node checkpoints remain terminal and pending nodes may continue when
 their dependencies are conclusively satisfied. A claimed/running node must
-reattach to the exact existing execution or become `uncertain`; it is never
+reattach to the exact existing execution or become `unknown`; it is never
 silently relaunched.
 
 **Restart is explicit through `job_restart(id)`.** It creates a fresh Job with a
@@ -1980,7 +2021,7 @@ fail running; cancel first
 ~~~
 
 After the source job is terminal, restart is permitted even after `ok`,
-`fail`, `partial`, `cancelled` or `uncertain`; the explicit restart action
+`fail`, `mixed`, `cancelled` or `unknown`; the explicit restart action
 acknowledges that side effects may happen again.
 
 `job_restart` is replay-protected so duplicate delivery of one restart request
@@ -2043,8 +2084,28 @@ merely to obtain another ID.
 optimistically synchronous Job until it needs durable exposure. If handoff is
 needed, promote/expose that **same Job** and preserve all node checkpoints.
 
+The existing abandoned-response safety rule generalizes to every optimistic Job:
+
+- when the transport has a durable replay/request identity, retain the hidden
+  Job/replay owner until that transport redelivers or positively retires it;
+- when no durable replay identity exists and the last undecided response attempt
+  disappears, atomically expose the still-running/committed Job so `job_list`
+  can recover it.
+
+No completed or side-effecting Graph execution may become permanently hidden
+merely because a local response future/client disappeared.
+
 The advertised control schemas use concise `id`; compatibility may continue to
 accept legacy `job_id` at deserialization.
+
+The current public `job_start(command, dir, stdin, timeout_secs)` shape is a
+compatibility migration concern. Implementation phases are **not release
+boundaries**: do not ship an intermediate release that replaces shell
+`job_start` with native-only `job_start(ops)` before ShellNodes are available.
+At the final schema switch, advertise only `job_start(ops)` and, for the
+migration window, accept the old shell-shaped request only at the
+deserialization boundary by translating it into the matching one-ShellNode
+Graph. Remove that adapter after the compatibility window.
 
 Semantics:
 
@@ -2062,9 +2123,11 @@ with every node initially pending, preserves the old Job as history, may repeat
 side effects, and is replay-protected so duplicate delivery returns the same
 restarted Job.
 
-Native MCP Tasks map onto the same durable owner rather than creating another
-state machine: Task get/poll is the same underlying status operation and Task
-cancel is the same underlying cancellation intent.
+When eligible, native MCP Tasks map onto the same Job rather than creating
+another state machine: Task get/poll is the same underlying status operation and
+Task cancel is the same underlying cancellation intent. A Job that is not
+exact-result-fit eligible simply uses the `job_*` projection; it is never
+forced into a lossy Task representation.
 
 No control operation mutates or deletes the historical ledger of a terminal
 execution.
@@ -2077,7 +2140,7 @@ outcome grammar.
 Node outcomes remain:
 
 ~~~text
-ok  unchanged  fail  partial  uncertain  skip
+ok  unchanged  fail  mixed  unknown  skip
 ~~~
 
 plus query modifiers `more` / `incomplete`.
@@ -2092,7 +2155,7 @@ cancelled
 ~~~
 
 A terminal one-node Job may surface its node outcome directly
-(`ok/unchanged/fail/partial/uncertain`). A multi-node Job uses the aggregate
+(`ok/unchanged/fail/mixed/unknown`). A multi-node Job uses the aggregate
 Graph outcome. After an explicit cancellation request has settled, the Job
 lifecycle is `cancelled` while individual nodes retain their exact terminal
 outcomes (for example earlier `ok`, running ShellNode `fail cancelled`, and
@@ -2164,9 +2227,9 @@ ok graph 12/12
 ~~~
 
 ~~~text
-partial graph 12/12
+mixed graph 12/12
 4 fail exit=1
-9 uncertain
+9 unknown
 10-12 skip condition
 ~~~
 
@@ -2179,7 +2242,7 @@ every status poll.
 `job_cancel(id)` is the one idempotent cancellation primitive for every
 exposed Job.
 
-Cancellation first persists Job cancellation intent. Once durable, no new
+Cancellation first records Job cancellation intent in the live Job session. Once recorded, no new
 pending node may start.
 
 Pending nodes become:
@@ -2221,57 +2284,45 @@ Cancellation does not imply rollback. Shell or native operations that already
 produced externally visible side effects remain visible and are represented by
 their retained outcomes.
 
-### Process-restart boundary
+### Process/session durability boundary
 
-Request/transport durability is mandatory and fully resumable: a disconnect,
-hosted request timeout or lost response never restarts work.
+Request/transport durability is mandatory within one live dotlink Job session: a disconnect, hosted request timeout, lost response, reconnect or redelivery attaches to the same Job and never restarts work.
 
-Exposed Job metadata/checkpoints are persistent across dotlink process restart
-for the Job retention window. The protected durable ledger retains at least:
+V1/v2 do **not** make JobManager a persistent workflow database. A dotlink
+process exit, crash, or execution-authority/session replacement ends that Job
+session:
 
-~~~text
-Job id
-immutable Graph definition
-node pending/claimed/running/terminal checkpoints
-dependency/skip decisions
-cancellation intent
-terminal outcome metadata
-retained stream/result descriptors
-creation/update/retention timestamps
-restart ancestry where applicable
-~~~
+- old Job IDs are not resurrected in the replacement process;
+- running work is cancelled on controlled shutdown where possible;
+- leftover spool/session state is protected cleanup state, not reconstructed as
+  live Jobs;
+- `job_restart(id)` creates another execution only from a retained Job in the
+  current live session.
 
-The ledger stores the authority/interpreter fingerprint needed to detect stale
-ownership, but never treats that historical fingerprint as authority for new
-work.
+Cross-process Job resurrection is deliberately deferred. It requires a separate
+design for crash-atomic storage, schema/version migration, corruption recovery,
+quota ownership, binary-upgrade compatibility and OS child reattachment.
 
-Payload bytes may remain in the existing protected spool/storage mechanism; the
-persistent ledger owns/references them so restart cleanup cannot mistake a live
-retained Job for an orphan. Physical cleanup and retention remain bounded.
+Cross-process **replay safety** remains mandatory even though Jobs are not
+resurrected. Each transport must explicitly establish one of two strategies:
 
-The retained Graph definition is **sensitive state**: tool arguments may contain
-shell commands, stdin, patches, file contents or credentials supplied explicitly
-by the caller. Persist exact definitions only for Jobs whose durable semantics
-require them, under dotlink's private protected state tree with owner-only
-permissions/handles appropriate to the platform. Never emit the retained Graph
-or raw stdin/command into routine logs, telemetry or status output. Delete it
-with the Job at retention expiry/explicit cleanup.
+1. prove from its protocol/session contract that a request belonging to a retired
+   process session cannot be redelivered to the replacement process; or
+2. use a minimal protected replay tombstone.
 
-This retained definition exists to resume/control/restart that Job; it is not a
-new source of authority and must remain subject to the same protected-path/state
-guarding as existing job spools.
+Where a tombstone is required, its claim is committed crash-atomically **before
+any root node may start**. It stores only the fixed-width request/namespace
+identity digest, semantic request hash, claim state and bounded timestamps/
+terminal summary needed to reject mismatched reuse and prevent re-execution. It
+does not store the Graph, command/stdin, file contents or node payloads. After a
+process replacement, a matching claimed request whose exact original result is
+not reconstructible fails closed as `unknown`; it is never executed again merely
+to regenerate a response.
 
-A full dotlink process crash is stricter. If the exact in-flight child can be
-proven and reattached safely, continue it. Otherwise mark the claimed/running
-node `uncertain` and do not relaunch it automatically.
-
-Independent graph branches whose dependencies remain conclusively satisfied may
-continue. Nodes depending on an uncertain predecessor proceed only when their
-explicit `when` expression handles `N.uncertain`.
-
-A later implementation may strengthen OS-level child reattachment across
-process restarts, but v2 never trades possible duplicate side effects for
-automatic convenience.
+Tombstones use a bounded protected-state quota and expire only after the
+transport's maximum redelivery horizon (or an authoritative positive retirement)
+so cleanup cannot reopen the duplicate-execution window. This is a transport
+correctness mechanism, not a persistent Graph/Job store.
 
 The complete graph request, including command, `dir`, `stdin`, timeout/output
 limits, `writes` hints and dependency expressions, participates in the outer
@@ -2312,15 +2363,20 @@ When `stream` is omitted, infer the natural primary stream:
 
 An explicit invalid stream/node combination fails rather than guessing.
 
-`result` is the retained serialized node result/control payload. For a
-NativeToolNode it is the tool result. For a ShellNode it is compact terminal
+`result` is the retained canonical **Graph-node result representation**, not a
+serialized copy of the public MCP `CallToolResult` envelope. Native node
+adapters retain the structured outcome/modifiers/payload needed by the common
+Graph renderer; v1 Graph-eligible native tools must have an exact compact
+text/result representation. For a ShellNode, `result` is compact terminal
 metadata (exit/success/timeout/error/context/truncation counters as applicable),
 **not another copy of stdout/stderr**; those bytes live only in their dedicated
 streams.
 
 Large native results therefore use the same durable paging/ack lifecycle as
 shell streams without being copied into every `job_get` response or duplicated
-inside shell metadata.
+inside shell metadata. Typed MCP content is not silently flattened; a tool whose
+result cannot be represented exactly by this channel is not Graph-eligible until
+the retained-result layer explicitly supports that content type.
 
 Acknowledging a node stream/result may release retained bytes but never erases
 the node's terminal checkpoint/status or immutable Graph definition from the Job
@@ -2713,11 +2769,24 @@ Tool visibility remains permission-aware.
 | `rm` | mutation/write authority |
 | `bash`, `pwsh`, `powershell` | shell authority + exact prepared interpreter |
 | `batch`, `job_start` | every referenced node must be visible/authorized |
-| `job_list`, `job_get`, `job_output`, `job_ack`, `job_cancel` | ownership of the exposed Job |
-| `job_restart` | Job ownership + current authority for the entire retained Graph |
+| `job_list`, `job_get`, `job_output`, `job_ack`, `job_cancel` | access to the current runtime Job session |
+| `job_restart` | current runtime Job-session access + current authority for the entire retained Graph |
 
-The final implementation should determine whether `TOOL_SPECS` needs a more
-precise capability representation for mixed-source/destination operations,
+The current `Capability::Job => shell` coupling must be removed. Job control is
+not shell authority: native-only `batch` / `job_start` can create durable Jobs
+when shell is disabled. Introduce a control-plane Job visibility capability (or
+derive it directly from the presence of any visible Job-producing surface)
+independently of shell permission. A runtime that can expose a Job must expose
+the controls needed to observe/cancel/consume that Job.
+
+Jobs are deliberately **runtime-session scoped**, not per-MCP-client objects.
+All callers authorized to use the same LocalMachine/runtime Job session share
+its exposed Job namespace. Do not add per-client principals/ACLs to JobManager
+without a real multi-principal isolation requirement; the runtime/profile is the
+security boundary today.
+
+The implementation should also evolve `TOOL_SPECS` (or its successor) toward a
+more precise capability representation for mixed-source/destination operations,
 rather than weakening policy semantics to fit the current enum.
 
 Graph creation preflights every node against the current effective tool
@@ -2725,17 +2794,27 @@ visibility, schema and capability rules before the first node starts. Conditiona
 branches do not bypass authorization merely because they may later be skipped.
 
 A running Job is bound to the prepared execution-authority generation captured
-for that Job. An incompatible policy/launcher/interpreter change must follow the
-existing fail-closed job-revocation semantics: do not start new pending nodes
-under stale authority, and never widen an existing Job because configuration
-became more permissive.
+for that Job. An incompatible policy/launcher/interpreter change revokes the
+**old Job session as a whole**, matching the current runtime-reload model:
+
+- record revocation intent before allowing further scheduling;
+- start no new pending nodes;
+- mark pending nodes `skip revoked`;
+- terminate running ShellNode process trees;
+- let already-started native mutations reach their safe publication/terminal
+  semantics rather than interrupting an unsafe commit window;
+- settle the Job lifecycle as cancelled with reason `revoked` before the old
+  session is discarded/replaced.
+
+Never leave pending nodes indefinitely non-terminal under stale authority, and
+never widen an existing Job because configuration became more permissive.
 
 `job_restart(id)` is a **new execution** and therefore revalidates the retained
 immutable Graph against current authority and current prepared interpreter/tool
 availability before any new side effect starts. The old Job's authority is not a
 capability token for the restart.
 
-Status/output/cancellation of an already-owned exposed Job must remain possible
+Status/output/cancellation of an exposed Job in the current Job session must remain possible
 as needed for observation and safe shutdown even when new execution authority is
 no longer available; they must never confer authority to start new work.
 
@@ -2908,7 +2987,7 @@ Do not repeat JSON keys per filesystem entry.
 Do not echo successful request arguments.
 
 Do not return verbose success receipts unless an operation has a materially
-different partial/uncertain outcome that the model must reason about.
+different mixed/unknown outcome that the model must reason about.
 
 For read-only pagination, return usable data plus a compact continuation marker.
 For mutation failures, never return physical staging progress as partial
@@ -2988,7 +3067,7 @@ The v1 implementation is complete only when all of the following hold:
 - ordinary read pagination returns usable partial data; a mid-read I/O fault is
   explicitly incomplete and error-marked.
 - over-limit or mid-stage writes never expose partial target contents.
-- post-publication failures are reported as committed/uncertain rather than as
+- post-publication failures are reported as committed/unknown rather than as
   generic retryable mutation failures.
 - `edit(path,edits)` owns one or more independent exact substitutions in one
   file, planned against one original snapshot and published once; strict-only
@@ -2997,9 +3076,14 @@ The v1 implementation is complete only when all of the following hold:
   controls.
 - `cp(from,to)` copies files, symlinks or complete directory trees without a
   shell-derived recursive flag.
+- `cp` publishes any missing destination-parent suffix atomically with the
+  destination; failure leaves no newly visible parent entries.
 - `cp`, `mv` and `rm` provide the missing non-shell lifecycle operations.
 - no mutation tool expands globs or performs destination inference.
-- `mv` never silently becomes copy + delete.
+- `mv` never silently becomes copy + delete and requires its destination parent
+  to exist, preserving strict rename-or-no-change semantics.
+- multi-root `rm` rejects duplicate/alias/ancestor-descendant overlaps before
+  the first deletion.
 - directory-tree `cp` and recursive `rm` remain bounded and fail closed
   around protected/denied content.
 - all new mutation tools participate in replay protection and shared mutation
@@ -3012,12 +3096,28 @@ The v1 implementation is complete only when all of the following hold:
   require explicit predicates and cannot silently unlock later mutations.
 - condition-selected Graph skips are non-errors; aggregate summaries expose
   query modifiers without duplicating exceptional nodes.
+- aggregate outcomes use `mixed` for multiple material outcome families,
+  including mixtures containing unknown components; uniformly unknown material
+  outcomes use `unknown`; expected `skip` is structurally neutral.
+- dependency grammar has literal status/modifier predicates plus `N.*` for any
+  terminal outcome and no `.err`/`.done` status classes.
 - `batch(ops)` and `job_start(ops)` share one native-node Graph parser/registry;
   `batch` waits optimistically while `job_start` exposes the Job immediately.
 - `job_start` commits durable Job identity/exposure/replay state after complete
   Graph preflight and before any root node starts; a lost receipt is recoverable
   through `job_list` without duplicate creation/execution.
 - Graph control/job/task tools cannot appear as nodes.
+- `bread(format=mcp)` remains direct-only until durable retained results support
+  typed MCP content exactly; Graph eligibility never depends on `bread` args.
+- one process-wide node-runner admission budget bounds concurrency across all
+  Graph Jobs, independently from active/retained Job and spool quotas.
+- Job controls are visible independently of shell permission whenever the
+  runtime can expose Jobs, including native-only profiles.
+- native MCP Task projection is used only when the exact eventual ordinary
+  result is guaranteed to fit; otherwise the same Job uses `job_*`.
+- an abandoned optimistic `batch` can never hide execution: durable-request
+  transports retain replay ownership, while transports without such identity
+  expose the same Job for `job_list` recovery.
 - `bash`, `pwsh`, and `powershell` expose the same optional advisory `writes`
   scopes; omission means unknown and `[]` means expected no writes.
 - `pwsh` and `powershell` are distinct interpreter capabilities with no aliasing
@@ -3044,15 +3144,23 @@ The v2 extension is complete only when:
 - shell node success/error follows actual process terminal state, never
   job/task handoff;
 - non-zero exit, timeout, launch failure and cancellation map to canonical
-  ShellNode `fail`, satisfy the `.err` predicate, and retain raw process details;
+  ShellNode `fail` and retain raw process details;
+- a normally launched direct shell process that exits non-zero preserves the
+  existing MCP-success process-result contract with `success=false`; Graph
+  `fail` does not redefine process exit as protocol/tool failure;
 - shell errors never imply rollback or absence of arbitrary shell side effects;
 - the outer Job is the sole durable owner of its Graph and running ShellNodes,
   and its scheduler continues after transport handoff without active polling;
 - nodes use durable `pending -> claimed -> running -> terminal` checkpoints;
   terminal predecessors are never rerun;
 - redelivery/recovery never duplicates an already-started process; ambiguous
-  in-flight state becomes `uncertain` rather than being relaunched;
+  in-flight state becomes `unknown` rather than being relaunched;
 - one durable Job model controls every exposed Graph in one ID namespace;
+- that Job namespace is runtime-session scoped rather than per-client, and
+  Job/Graph objects are not resurrected after process/session replacement;
+- cross-process request replay cannot duplicate execution: the transport must
+  prove retired requests cannot redeliver or use a minimal replay
+  claim/tombstone to fail closed, without persisting a full Job database;
 - the v1 `batch(ops)` / `job_start(ops)` Graph parser, registry, preflight and
   creation-order guarantees remain unchanged when ShellNodes are enabled;
 - `job_list` labels Jobs from Graph shape/tool identity rather than a separate
@@ -3071,6 +3179,13 @@ The v2 extension is complete only when:
   streams without special durability kinds;
 - cancellation, bounded output spooling/paging and deterministic rendering work
   through the graph owner;
+- execution-authority revocation terminates the old Job session rather than
+  stranding pending nodes: pending nodes become `skip revoked`, ShellNodes are
+  terminated, active native mutations settle safely, and the Job settles
+  cancelled/revoked;
+- the advertised `job_start(ops)` migration never creates an intermediate
+  release regression: legacy shell-shaped `job_start` is accepted only at the
+  compatibility boundary until the one-ShellNode path is available;
 - `writes` may improve scheduling but never becomes authority or a transactional
   guarantee;
 - v2 durability/replay/cancellation/output, lost-receipt, authority-revalidation
@@ -3108,8 +3223,8 @@ The v2 extension is complete only when:
 17. `edit` batches the hot case of multiple independent exact substitutions
     in one file; every tuple matches the same original snapshot and overlapping
     ranges fail before publication.
-18. Primary outcomes are `ok`, `unchanged`, `fail`, `partial`,
-    `uncertain`, `skip`; `more` and `incomplete` are orthogonal query
+18. Primary outcomes are `ok`, `unchanged`, `fail`, `mixed`,
+    `unknown`, `skip`; `more` and `incomplete` are orthogonal query
     modifiers that may coexist.
 19. Paging supports both known totals and cursor-only unknown totals without
     performing extra work merely to count pages.
@@ -3153,24 +3268,60 @@ The v2 extension is complete only when:
 35. Durability is automatic at the Job level: long ShellNodes continue after
     transport handoff, and terminal predecessors are checkpointed before they
     unlock dependents.
-36. Resume means reattach to the same durable Job; restart means create a new
-    Job from the retained immutable Graph. Only explicit restart may
-    intentionally re-execute terminal nodes.
+36. Resume means reattach to the same durable Job **within the live Job
+    session**; restart means create a new Job from the retained immutable Graph.
+    Only explicit restart may intentionally re-execute terminal nodes.
 37. Durable lifecycle control is shared through `job_*`, not duplicated under
     `batch_*`: `job_get` polls, `job_cancel` cancels, `job_output`/`job_ack`
     manage retained output, and generic replay-protected `job_restart` creates a
     fresh execution while preserving history.
-38. A claimed/running node that cannot be safely reattached after process loss
-    becomes `uncertain`; `.err` excludes `uncertain`, which must be handled
-    explicitly.
+38. `unknown` is a primary outcome for uniformly unknown material results;
+    `mixed` may contain unknown components and is therefore conservatively
+    ambiguous for retry/compensation. The DSL does not add a second class system
+    to introspect mixed counts.
 39. Shell-node process success maps to `ok`; known non-zero exit, timeout,
-    launch failure or cancellation maps to `fail` and therefore satisfies
-    `N.err`. Shell failure never implies rollback of arbitrary filesystem side
-    effects.
+    launch failure or cancellation maps to `fail`. Shell failure never implies
+    rollback of arbitrary filesystem side effects.
 40. `pwsh` and `powershell` are both first-class, distinct interpreter
     capabilities: modern PowerShell versus Windows PowerShell. Neither aliases
     or falls back to the other, and only actually available interpreters are
     advertised.
+41. `mixed` is the aggregate material-outcome state: success/failure/unknown
+    families may coexist inside it; `unknown` means all material outcomes are
+    unknown, while `skip` is structural/neutral when other material outcomes
+    exist.
+42. The dependency DSL has no status classes. Bare `N` means complete
+    `ok|unchanged`; exact predicates select primary outcomes/modifiers; `N.*`
+    alone means any terminal outcome.
+43. `mv` requires an existing destination parent so it remains exactly one
+    rename or no namespace change. `cp` may create missing parent suffixes only
+    as part of the same atomic publication; `rm(paths)` rejects overlapping
+    roots before deletion.
+44. `bread(format=mcp)` stays direct-only until retained Graph results can
+    preserve typed MCP content exactly; Graph eligibility never varies by
+    runtime argument shape merely to admit base64/hex variants.
+45. Graph execution has a process-wide node-runner admission budget in addition
+    to per-Job width, active/retained Job limits and spool quotas.
+46. Job control is a runtime control-plane capability, not shell authority.
+    Native-only runtimes can expose/control Jobs, and Jobs are runtime-session
+    scoped rather than per-client ACL objects.
+47. Native MCP Task is only an exact projection of the same Job when the
+    eventual ordinary result is guaranteed to fit; otherwise the Job stays on
+    the `job_*` projection without lossy conversion.
+48. Dotlink process/session replacement ends the live Job session; v1/v2 do not
+    add a persistent workflow database. Cross-process replay safety is solved at
+    the transport identity/tombstone layer, not by resurrecting Graphs.
+49. Execution-authority revocation terminates the old Job session instead of
+    freezing pending nodes indefinitely.
+50. A ShellNode may be Graph-`fail` for a non-zero process exit while the direct
+    shell tool preserves its existing MCP-success process-result envelope with
+    `success=false`; process failure and tool/protocol failure are distinct.
+51. Optimistic Jobs inherit the existing abandoned-response invariant: execution
+    is either replay-owned or exposed for `job_list` recovery, never hidden by a
+    vanished response future.
+52. The public `job_start(ops)` switch ships only with the one-ShellNode
+    compatibility path ready; the old shell-shaped request may exist only at the
+    wire/deserialization boundary during migration.
 
 ## References
 

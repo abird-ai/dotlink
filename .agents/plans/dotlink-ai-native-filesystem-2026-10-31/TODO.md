@@ -2,7 +2,7 @@
 
 Base: `84cd9b7`
 
-Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
+Status: **design sealed** after a fresh correctness/regression/minimality review for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
 
 ## Committed
 
@@ -73,7 +73,13 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 - [x] Established `pwsh` as the modern PowerShell name; the final sealed design
   below further makes Windows `powershell` a distinct first-class interpreter.
 
-## Uncommitted
+### `bec528f` — finalized canonical Job graph design
+
+- [x] Unified `batch(ops)` and `job_start(ops)` on one Graph grammar/runtime,
+  sealed the three exact shell interpreter capabilities, and centralized shared
+  Job lifecycle/replay/output semantics before the final correctness review.
+
+## Implementation roadmap
 
 ### Phase 1 — shared discovery/metadata architecture
 
@@ -132,7 +138,7 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 - [ ] Replace verbose successful mutation receipts with compact outcomes where
   no additional information is needed.
 - [ ] Define one shared mutation outcome model: not committed, committed,
-  uncertain, and explicit partial batch commit.
+  unknown, and explicit mixed multi-object commit state.
 - [ ] Ensure write/edit/binary staging failures never expose partial target
   contents; over-limit writes fail before staging/publication.
 - [ ] Keep Codex patch grammar, advertise strict-only `patch(patch)`, and
@@ -143,22 +149,28 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 ### Phase 5 — lifecycle primitives
 
 - [ ] Design/implement `cp(from,to)` through shared mutation/staging:
-  files copy as files, symlinks as links, directories as complete bounded trees.
+  files copy as files, symlinks as links, directories as complete bounded trees;
+  any missing destination-parent suffix is part of the same atomic publication.
 - [ ] Design/implement same-filesystem `mv(from,to)`; never implicit
-  copy+delete.
+  copy+delete and require the destination parent to already exist.
 - [ ] Design/implement `rm(paths,recursive=false)` with full-request preflight
-  and safe recursive namespace removal.
-- [ ] Create missing destination parents for `cp`/`mv`.
+  and safe recursive namespace removal; reject duplicate/alias/ancestor-
+  descendant-overlapping roots before any mutation.
+- [ ] Auto-create missing destination parents only for `cp`, inside the same
+  staged publication unit; `mv` is strictly one rename or no namespace change.
 - [ ] Do not add glob expansion, destination inference or implicit overwrite.
 - [ ] Add replay protection/capability visibility for all lifecycle mutations.
 
 ### Phase 6 — canonical status, paging and progress
 
-- [ ] Implement primary outcomes `ok`, `unchanged`, `fail`, `partial`,
-  `uncertain`, `skip` plus orthogonal query modifiers `more` and
-  `incomplete`.
-- [ ] Make `partial` represent exact mixed known outcomes and list only
-  exceptional indexed items.
+- [ ] Implement primary outcomes `ok`, `unchanged`, `fail`, `mixed`,
+  `unknown`, `skip` plus orthogonal query modifiers `more` and
+  `incomplete`; keep `unknown` as the sole fail-closed ambiguity name (no
+  `maybe` alias).
+- [ ] Make `mixed` represent multiple material terminal outcome families,
+  including mixtures that contain unknown components; use `unknown` only when
+  all material components are unknown, and treat `skip` as structurally
+  neutral when another material outcome exists.
 - [ ] Use one paging grammar based on actual follow-up argument names
   (`more offset=200`, `more line=42 byte=...`), with optional known page
   fractions only when already cheap.
@@ -185,7 +197,8 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
   (`ok|unchanged` with no `more`/`incomplete`); use `*` for an independent
   root.
 - [ ] Implement backward-only dependency expressions with `&`, `|`,
-  parentheses, exact status predicates, `.err` and `.done`.
+  parentheses, exact status/modifier predicates and `N.*` for any terminal
+  outcome; add no status classes such as `.err` or `.done`.
 - [ ] Reject forward references/cycles by construction and evaluate conditions
   only after all referenced operations are terminal.
 - [ ] Support sequence, fan-out, joins and status-based decision branches without
@@ -195,8 +208,8 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 - [ ] Runtime-validate Graph-node args against the already registered tool schema
   instead of duplicating every schema into `batch` or `job_start`.
 - [ ] Add one central Graph-node eligibility/version property; initially restrict
-  v1 Graph nodes to native filesystem tools and reuse it for both `batch` and
-  `job_start` validation.
+  v1 Graph nodes to exact-result native filesystem tools and reuse it for both
+  `batch` and `job_start` validation; keep typed-content `bread` direct-only.
 - [ ] Add deterministic aggregate result budgeting; child tools must emit native
   `more` cursors rather than being silently truncated by the outer Job/Graph.
 - [ ] Aggregate `more`/`incomplete` modifiers explicitly and never duplicate
@@ -211,6 +224,18 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
   recoverable through `job_list` without duplicate creation.
 - [ ] Enforce hard operation-count, parallel-width, aggregate byte/work and
   result ceilings.
+- [ ] Add one process-wide Graph node-runner permit budget shared by every Job;
+  acquire a permit before `pending -> claimed`, keep a per-Job parallel-width
+  ceiling, and keep active-Job/runner/retained-Job/spool budgets distinct.
+- [ ] Decouple Job controls from shell permission: any runtime that can expose a
+  Job must expose the controls needed to observe/cancel/consume it, including
+  native-only read/write profiles.
+- [ ] Generalize abandoned-response safety: durable-request transports retain
+  hidden replay ownership; transports without durable request identity expose
+  the same Job through `job_list` when the last undecided response disappears.
+- [ ] Project a Job as native MCP Task only when its exact eventual ordinary
+  tool result is guaranteed to fit the Task-result budget; otherwise use the
+  same Job through `job_*` without truncation or semantic rewriting.
 
 ### Phase 8 — shell naming + write hints
 
@@ -243,9 +268,11 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
   constructors when adding ShellNodes; do not fork shell-specific graph parsing.
 - [ ] Map ShellNode process outcomes canonically everywhere: successful exit ->
   `ok`; known non-zero/timeout/launch-failure/cancellation -> `fail`; ambiguous
-  state -> `uncertain`; `.err` remains the known-error predicate class.
-- [ ] Apply the same mapping to direct `bash`/`pwsh`/`powershell` one-node Job
-  results so direct calls, durable status and Graph branches cannot disagree.
+  state -> `unknown`.
+- [ ] Keep Graph outcome separate from the direct MCP envelope: a normally
+  launched process that exits non-zero is Graph-`fail` but preserves the
+  existing direct-shell MCP-success process result with `success=false`;
+  pre-execution/timeout/internal failures remain MCP errors as appropriate.
 - [ ] Keep compact ShellNode exit/success/timeout/error metadata plus separate
   bounded stdout/stderr streams; shell failure must never imply rollback of
   shell side effects.
@@ -261,14 +288,16 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
   relaunch.
 - [ ] Checkpoint every terminal node before unlocking dependents; later failures
   or lost responses must never re-execute terminal predecessors.
-- [ ] Redelivery reattaches to the same running child or marks it `uncertain`
+- [ ] Redelivery reattaches to the same running child or marks it `unknown`
   rather than restarting it.
-- [ ] Persist exposed Job id, immutable Graph, node checkpoints, dependency/
-  cancellation state, retained-stream descriptors and retention metadata across
-  dotlink restart under the protected state tree.
-- [ ] Preserve terminal checkpoints across dotlink restart; if an exact in-flight
-  child cannot be safely reattached, mark that node uncertain rather than
-  rerunning the Graph.
+- [ ] Keep Job/Graph durability scoped to one live dotlink Job session; do not
+  resurrect Job IDs or Graphs after process exit/crash/session replacement.
+- [ ] Preserve cross-process **request replay safety** separately: either prove a
+  retired-session request cannot be redelivered to a replacement process or use
+  a bounded protected replay tombstone committed crash-atomically before root
+  execution; bind request identity + semantic hash, retain through the maximum
+  redelivery horizon, fail closed as `unknown`, and never persist the full Graph
+  merely for deduplication.
 - [ ] Reuse bounded shell spooling for child stdout/stderr and deterministic
   aggregate result budgeting/paging.
 - [ ] Keep one `job_*` lifecycle and one ID namespace for all exposed Jobs;
@@ -290,7 +319,13 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 - [ ] Revalidate the entire retained Graph against current tool visibility,
   authority and exact prepared interpreter availability before a restart can
   begin; old Job authority must never authorize new work.
-- [ ] Job cancellation persists intent before action, prevents pending node
+- [ ] Make Jobs runtime-session scoped rather than per-client; callers sharing
+  one authorized LocalMachine/runtime share one exposed Job namespace.
+- [ ] On incompatible execution-authority change, revoke the old Job session as
+  a whole: stop new starts, mark pending nodes `skip revoked`, terminate
+  ShellNode trees, let active native mutations settle safely, and settle the Job
+  lifecycle cancelled/revoked before replacing the session.
+- [ ] Job cancellation records intent before action, prevents pending node
   starts, marks them `skip cancelled`, terminates running ShellNode trees, and
   preserves safe native-mutation terminal semantics.
 - [ ] Repeated cancellation is idempotent; cancelling a terminal run is a no-op
@@ -300,12 +335,16 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 - [ ] Allow `writes` hints to reduce known scheduling conflicts inside the graph;
   unknown hints may be treated conservatively and never become authority.
 - [ ] Do not enable ShellNodes by a registry bit alone; exact interpreter
-  binding, Job ownership, durability, replay, cancellation and output retention
-  ship as one coherent v2 feature.
+  binding, runtime-session Job control, durability, replay, cancellation and
+  output retention ship as one coherent v2 feature.
 
 ### Phase 10 — compatibility, measurements and docs
 
 - [ ] Keep compatibility strictly at wire/deserialization boundaries.
+- [ ] Do not publish an intermediate `job_start` regression: advertise the new
+  `job_start(ops)` shape only when ShellNodes are ready; temporarily accept the
+  old shell-shaped `job_start(command,...)` request only at deserialization and
+  translate it to one ShellNode.
 - [ ] Measure exact serialized advertised-tool schema bytes before/after,
   including the explicit `edits` vs abbreviation tradeoff.
 - [ ] Record a representative tokenizer estimate for the same serialized surface.
@@ -329,12 +368,12 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
   and never presented as complete data.
 - [ ] Write failure-injection tests before staging, during staging, before
   publication and after publication, asserting the reported commit state.
-- [ ] Batch mutation failure-injection tests proving partial commit ledgers are
+- [ ] Batch mutation failure-injection tests proving mixed commit ledgers are
   exact and never hidden behind a generic error.
 - [ ] Unit tests for globally correct sorting/paging under bounded traversal.
 - [ ] Path-composability tests: every `find` result is directly reusable as a
   tool path; `ls` intentionally returns basenames.
-- [ ] Status grammar tests for primary success/failure/partial/uncertain/skip
+- [ ] Status grammar tests for primary success/failure/mixed/unknown/skip
   outcomes plus orthogonal `more`/`incomplete` modifiers.
 - [ ] Paging tests for one canonical cursor grammar, known total, unknown total,
   final page and `more + incomplete` combined state.
@@ -363,21 +402,32 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 - [ ] V2 durability/replay tests proving transport handoff does not mark a shell
   node terminal, the scheduler continues after handoff, terminal predecessors
   never rerun, and redelivery never starts a duplicate process.
-- [ ] Crash/restart failure-injection around `claimed -> running -> terminal`
-  proving persistent terminal checkpoints survive and ambiguous in-flight shell
-  state becomes `uncertain` rather than being relaunched.
-- [ ] Restart-retention tests proving persistent Job metadata/spool ownership is
-  bounded, live retained Jobs are not reaped as stale sessions, and expired Jobs
-  are cleaned safely.
-- [ ] Security tests for retained Graph definitions: private storage permissions,
-  no routine-log leakage of commands/stdin/args, protected-state denial to
-  tunneled tools, and cleanup at Job expiry.
+- [ ] Process/session-boundary tests proving controlled shutdown/reload revokes
+  the old Job session, replacement runtimes do not resurrect old Job IDs, and
+  stale spool/session directories are cleaned rather than treated as live Jobs.
+- [ ] Cross-process replay tests proving retired-session redelivery is either
+  protocol-impossible or rejected from a minimal replay claim/tombstone without
+  re-executing the Graph.
+- [ ] Security tests proving retained live-session Graph definitions/spools stay
+  in protected private state, do not leak commands/stdin/args into routine logs,
+  and are cleaned with Job/session retention.
 - [ ] Shared durable-control tests for compact shape-derived `job_list`/`job_get`,
   idempotent `job_cancel`, cancel races, automatic resume, generic `job_restart`
   generation/history retention, current-authority revalidation and replay-safe
   restart delivery.
 - [ ] Lost `job_start` response tests proving its durable ID is discoverable and
   the Graph is never created/executed twice.
+- [ ] Abandoned optimistic-`batch` tests proving local transports expose the
+  same Job when the last response attempt disappears while durable-request
+  transports retain replay ownership instead of duplicating execution.
+- [ ] Job capability tests proving native-only runtimes expose the shared
+  `job_*` controls without shell authority.
+- [ ] Global runner-admission tests proving many Graph Jobs cannot exceed the
+  process-wide running-node/process budget.
+- [ ] Native Task projection tests proving Tasks are used only when the exact
+  eventual ordinary result fits; otherwise the same Job uses `job_*`.
+- [ ] Typed-result tests proving `bread(format=mcp)` remains direct-only until a
+  content-aware retained-result representation exists.
 - [ ] `job_output`/`job_ack` tests for one-node implicit node 1, required
   multi-node selection, ShellNode stdout/stderr/result, NativeToolNode result,
   paging, acknowledgement and cleanup.
@@ -393,6 +443,12 @@ Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runti
 - [ ] Grep tests for one symmetric `context` field and compatibility-only old
   asymmetric fields if retained.
 - [ ] Mutation race/alias/replay tests for `cp`, `mv`, `rm`.
+- [ ] `mv` tests proving missing destination parents fail without creating any
+  namespace entries.
+- [ ] `cp` failure-injection tests proving auto-created parent suffixes publish
+  atomically with the destination or remain invisible.
+- [ ] `rm(paths)` tests rejecting duplicates, aliases and ancestor/descendant
+  overlaps before any deletion.
 - [ ] Directory-tree copy / recursive-delete protected-path and symlink tests.
 - [ ] Cross-device `mv` rejection tests.
 - [ ] Cross-platform native Windows/macOS filesystem tests.
