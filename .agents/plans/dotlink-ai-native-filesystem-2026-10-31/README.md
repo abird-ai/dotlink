@@ -6,9 +6,36 @@ Co-authors: ChatGPT (GPT-5.6 Sol)
 
 Owner: @pvl
 
-Status: design approved; specification only. No implementation has begun.
+Status: **design sealed**; implementation intentionally not started.
+
+Implementation should follow this specification as written. A model-facing surface or
+semantic change discovered during implementation must explicitly reopen/update DL-150
+rather than silently drifting from the sealed design.
 
 Base: `84cd9b7` (`release: dotlink v0.14.3`)
+
+## Seal boundary
+
+No model-facing design questions remain open for the v1 implementation in this
+plan.
+
+Implementation may refactor internals, improve performance, tighten validation,
+or choose platform-specific mechanisms while preserving the sealed public
+semantics. Any change to tool names, advertised arguments, status/paging
+grammar, edit matching semantics, batch graph semantics, lifecycle behavior or
+coordination policy requires an explicit DL-150 design update before code lands.
+
+Deliberately deferred rather than forgotten:
+
+- line/range-level collaborative locking or automatic merge/rebase;
+- runtime revision tokens or fail-fast coordination metadata;
+- `mkdir`, `touch`, `chmod`, `chown`, symlink/hardlink creation;
+- cross-device `mv` implemented as copy+delete;
+- output-value/dataflow expressions, loops or nested workflows in `batch`;
+- additional overwrite/replace convenience flags.
+
+These should be reconsidered only from measured model/runtime workloads, not
+added speculatively during implementation.
 
 ## Why
 
@@ -54,6 +81,9 @@ useful when shell authority is deliberately withheld.
 10. **Compatibility is a wire-boundary concern.** Transitional aliases may be
     accepted while deserializing old requests, but never appear in the new
     advertised schema.
+11. **Coordination stays below the model surface.** External runtimes may schedule
+    conservatively from existing path arguments, while dotlink's mutation layer
+    remains the correctness authority.
 
 ## Target surface
 
@@ -75,12 +105,13 @@ The model-facing decision boundary should be nearly mechanical:
 | locate text in files | `grep` |
 | inspect a known text file | `read` |
 | create/replace complete text | `write` |
-| replace exact known text | `edit` |
+| make exact independent substitutions in one file | `edit` |
 | make contextual/multi-file text changes | `patch` |
 | duplicate an object | `cp` |
 | rename an object | `mv` |
 | remove objects | `rm` |
 | inspect/create/mutate arbitrary bytes | `bread` / `bwrite` / `bedit` |
+| run a predetermined dependency graph | `batch` |
 
 ## Shared vocabulary
 
@@ -1830,6 +1861,49 @@ islands.
 All three new lifecycle tools are side-effecting and therefore require tunnel
 request replay protection.
 
+## Concurrency and external runtime coordination
+
+The v1 model-facing surface adds **no** line/range lock hints, revision tokens,
+scheduler IDs or coordination flags.
+
+dotlink remains the correctness authority. Existing mutation coordination,
+snapshot verification, staging and atomic publication must keep concurrent
+writers safe even when an external runtime schedules poorly.
+
+An orchestration runtime such as aw already has enough information for a
+conservative path-level scheduler from normal tool arguments:
+
+~~~text
+write(path)        writes path
+edit(path, edits)  writes path
+patch(patch)       writes paths named by patch sections
+cp(from, to)       reads from, writes to
+mv(from, to)       mutates both namespace paths
+rm(paths)          mutates those paths
+read/bread(path)   reads path
+ls/find/grep       read-side scopes
+~~~
+
+A runtime may therefore serialize mutations that target the same path and run
+disjoint mutations in parallel. This scheduling is an optimization only; it
+must never be required for correctness.
+
+Do not add range-level concurrent commits in v1. Two edits touching different
+byte/line ranges still construct whole-file replacement images from snapshots;
+allowing simultaneous commits safely would require merge/rebase semantics, not
+merely finer locks.
+
+Do not add model-facing strict revision preconditions or fail-fast lock controls
+in v1 either. If measured high-concurrency workloads later show a need, add
+machine/runtime-only coordination metadata below the AI schema, for example
+opaque revisions, resolved mutation ranges or fail-fast admission. Such metadata
+must remain advisory/optimizing; hard safety continues to come from dotlink's
+mutation layer.
+
+The design preference is to coalesce compatible same-file work into one
+`edit(path, edits)` call when a runtime can do so safely, rather than creating a
+distributed line-locking protocol.
+
 ## Capability model
 
 Tool visibility remains permission-aware.
@@ -2095,6 +2169,9 @@ The implementation is complete only when all of the following hold:
   mutations.
 - condition-selected batch skips are non-errors; aggregate summaries expose
   query modifiers without duplicating exceptional nodes.
+- the public edit field remains `edits`, not an opaque abbreviation.
+- no model-facing coordination hints/revisions/range locks are required for v1;
+  external runtimes can schedule conservatively from existing path arguments.
 - existing correctness/security invariants remain covered on Linux, macOS,
   Windows and Nix CI.
 
@@ -2130,8 +2207,9 @@ The implementation is complete only when all of the following hold:
 17. `edit` batches the hot case of multiple independent exact substitutions
     in one file; every tuple matches the same original snapshot and overlapping
     ranges fail before publication.
-18. Terminal outcomes use one reserved status vocabulary: `ok`, `unchanged`,
-    `more`, `incomplete`, `fail`, `partial`, `uncertain`, `skip`.
+18. Primary outcomes are `ok`, `unchanged`, `fail`, `partial`,
+    `uncertain`, `skip`; `more` and `incomplete` are orthogonal query
+    modifiers that may coexist.
 19. Paging supports both known totals and cursor-only unknown totals without
     performing extra work merely to count pages.
 20. Progress updates are cumulative snapshots. Model-visible status uses
@@ -2157,6 +2235,12 @@ The implementation is complete only when all of the following hold:
     remains for heterogeneous operations.
 29. `edit` has one advertised shape for both one and many replacements; do not
     add a singular shorthand that would make the schema polymorphic.
+30. Keep the descriptive `edits` field name. Abbreviating it to `v` saves
+    negligible bytes while losing semantic clarity; the compact inner tuples
+    capture the meaningful token savings.
+31. V1 adds no line/range locks, revision tokens or coordination knobs to the AI
+    schema. Path-level scheduling from existing arguments is sufficient as an
+    optimization while dotlink enforces correctness.
 
 ## References
 

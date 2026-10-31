@@ -10,7 +10,7 @@
 
 ## Icebox
 
-- [ ] P2 DL-150 — AI-native, token-efficient filesystem tool surface; design approved, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)
+- [ ] P2 DL-150 — AI-native, token-efficient filesystem tool surface; design sealed, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)
 
 ## Closed
 

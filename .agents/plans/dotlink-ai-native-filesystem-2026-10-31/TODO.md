@@ -2,7 +2,7 @@
 
 Base: `84cd9b7`
 
-Status: specification only; implementation intentionally not started.
+Status: **design sealed**; implementation intentionally not started.
 
 ## Committed
 
@@ -11,12 +11,12 @@ Status: specification only; implementation intentionally not started.
 - [x] Recorded the approved core tool split, token-efficiency rules, lifecycle
   primitives and implementation roadmap.
 
-### `9b7d4b4` — read limits, partial mutation state and singular edit
+### `9b7d4b4` — read limits and intermediate singular-edit design
 
 - [x] Kept read/write byte ceilings as runtime policy rather than routine model
   parameters.
-- [x] Specified long-line read continuation and singular
-  `edit(path,old,new,all)`.
+- [x] Specified long-line read continuation and the then-intermediate singular
+  edit shape, later superseded by `f09790d`.
 - [x] Specified pre/post-publication mutation outcome handling.
 
 ### `6c1cb16` — status, paging, progress and initial batch grammar
@@ -39,6 +39,12 @@ Status: specification only; implementation intentionally not started.
 - [x] Removed advertised patch best-effort, cp recursive and asymmetric grep
   context knobs; unified paging and path composability.
 
+### `f09790d` — single-file multi-replacement edit hot path
+
+- [x] Made `edit(path,edits)` batch independent exact substitutions against one
+  original snapshot with overlap rejection and one atomic publication.
+- [x] Kept one advertised shape for one or many edits.
+
 ## Uncommitted
 
 ### Phase 1 — shared discovery/metadata architecture
@@ -49,6 +55,8 @@ Status: specification only; implementation intentionally not started.
   `depth`, budgets and incomplete reasons are single-sourced.
 - [ ] Introduce shared selector, ordering and compact-rendering primitives.
 - [ ] Preserve current deny/protected-path and symlink non-traversal invariants.
+- [ ] Preserve file/path-level mutation coordination as the correctness baseline;
+  do not add model-facing range/revision coordination knobs in v1.
 
 ### Phase 2 — `ls` + `find`
 
@@ -168,7 +176,8 @@ Status: specification only; implementation intentionally not started.
 ### Phase 8 — compatibility, measurements and docs
 
 - [ ] Keep compatibility strictly at wire/deserialization boundaries.
-- [ ] Measure exact serialized advertised-tool schema bytes before/after.
+- [ ] Measure exact serialized advertised-tool schema bytes before/after,
+  including the explicit `edits` vs abbreviation tradeoff.
 - [ ] Record a representative tokenizer estimate for the same serialized surface.
 - [ ] Add a repeatable baseline/regression gate for permanent schema cost.
 - [ ] Measure representative `ls`/`find`/`grep` result token cost
