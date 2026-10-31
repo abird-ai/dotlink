@@ -10,6 +10,8 @@
 
 ## Icebox
 
+- [ ] P2 DL-150 — AI-native, token-efficient filesystem tool surface; design approved, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)
+
 ## Closed
 
 - [x] DL-100 — `716ad06` + follow-ups through `dc7f59b` — 2026-10-26 — MCP modularization, safe writes, transport hardening, and regression coverage — [details](dotlink-tool-review-2026-10-26/README.md)
