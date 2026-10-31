@@ -32,6 +32,13 @@ Status: specification only; implementation intentionally not started.
 - [x] Kept nested tool arguments structured while limiting text syntax to the
   small dependency expression.
 
+### `60b348d` — simplified fresh model-facing surface
+
+- [x] Made query modifiers orthogonal to primary outcomes and made bare batch
+  dependencies require complete success.
+- [x] Removed advertised patch best-effort, cp recursive and asymmetric grep
+  context knobs; unified paging and path composability.
+
 ## Uncommitted
 
 ### Phase 1 — shared discovery/metadata architecture
@@ -73,11 +80,19 @@ Status: specification only; implementation intentionally not started.
 
 ### Phase 4 — text mutation schema/output cleanup
 
-- [ ] Make `edit(path,old,new,all=false)` singular.
-- [ ] Move batching/contextual/multi-file editing responsibility entirely to
-  `patch`.
-- [ ] Keep the old edit array/names only as compatibility deserialization if
-  needed.
+- [ ] Make `edit(path,edits)` the single-file hot-path primitive, with compact
+  tuples `[old,new,all?]`.
+- [ ] Resolve every tuple against one original snapshot; `all` uses
+  left-to-right non-overlapping matches; reject ambiguous non-`all` matches and
+  overlaps between selected ranges before staging.
+- [ ] Build/verify/publish the file once so several independent replacements
+  remain one atomic visible mutation.
+- [ ] Keep contextual, dependent, overlapping and multi-file editing
+  responsibility in strict `patch`.
+- [ ] Keep one advertised edit shape even for a single replacement; do not add a
+  top-level singular shorthand.
+- [ ] Keep legacy multi-file edit objects and the temporary singular edit shape
+  only as compatibility deserialization if needed.
 - [ ] Replace verbose successful mutation receipts with compact outcomes where
   no additional information is needed.
 - [ ] Define one shared mutation outcome model: not committed, committed,
@@ -194,6 +209,9 @@ Status: specification only; implementation intentionally not started.
   after response loss/redelivery.
 - [ ] Batch aggregate-result-budget tests proving pageable children return
   deterministic native `more` cursors independent of completion order.
+- [ ] Edit tests for multiple independent substitutions, multiline tuples,
+  `all`, ambiguity, duplicate/overlapping ranges, order-independence and one
+  atomic publication.
 - [ ] Strict-patch tests proving legacy best-effort behavior is absent from the
   advertised schema.
 - [ ] `cp` tests proving directories copy as complete bounded trees without a

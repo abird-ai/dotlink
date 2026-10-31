@@ -938,36 +938,94 @@ Do not echo the path/content.
 
 ### Purpose
 
-Perform one exact old-to-new text substitution in one known file.
+Perform one or more exact, independent text substitutions in one known file.
 
-Batch/contextual editing belongs to `patch`; keeping `edit` singular makes
-the model's tool choice obvious and substantially reduces schema/call tokens.
+This is a hot coding-model operation and belongs inside `edit`, not generic
+`batch`: one file should be read, locked, planned, verified and atomically
+published once even when several exact replacements are requested.
 
 ### Proposed schema
 
 ~~~text
 edit(
   path,
-  old,
-  new,
-  all=false
+  edits=[
+    [old, new],
+    [old, new, all]
+  ]
 )
 ~~~
 
-Semantics:
+Each tuple is:
+
+~~~text
+[old, new, all?]
+~~~
+
+The optional third value defaults to `false`.
+
+This tuple form avoids repeating `path`, `old`, `new` and `all` object keys
+for the common multi-replacement case.
+
+There is one advertised shape even for a single replacement:
+
+~~~text
+edit(path="src/x.rs", edits=[["old", "new"]])
+~~~
+
+Do not add a second top-level `old/new/all` shorthand; the small one-tuple cost
+is preferable to a polymorphic schema and another model decision.
+
+### Snapshot semantics
+
+Every requested edit is matched against the **same original file snapshot**.
+
+For each tuple:
 
 - `old` must be non-empty;
-- without `all`, `old` must occur exactly once;
+- with omitted/false `all`, `old` must occur exactly once;
 - zero matches are an error;
 - multiple matches are an error with a concise count/remedy;
-- `all=true` replaces every exact occurrence;
-- `old == new` is a no-op;
-- snapshot/verification, shared mutation locking, staging and atomic publication
-  remain mandatory;
-- the complete resulting file must fit the configured mutation/write planning
-  limits before publication.
+- `all=true` selects left-to-right non-overlapping exact occurrences in the
+  original snapshot, matching normal replace-all semantics;
+- zero selected occurrences are an error even with `all=true`;
+- `old == new` still validates matching/ambiguity but contributes no changed
+  range.
 
-Results:
+After every tuple is resolved, all selected source ranges are sorted by original
+byte offset. Any overlap, including two edits selecting the same source bytes,
+fails the whole call before staging:
+
+~~~text
+fail edits 2,3 overlap
+~~~
+
+Independent edits are therefore order-independent. A later edit can never
+accidentally match text created by an earlier edit.
+
+The final file is built once from the original snapshot plus the non-overlapping
+replacement ranges, then the original snapshot is reverified and the result is
+staged/published atomically.
+
+The complete resulting file and aggregate plan must fit the configured
+mutation/write limits before publication.
+
+### Multiline replacements
+
+`old` and `new` are ordinary UTF-8 strings and may span multiple lines:
+
+~~~text
+edit(path="src/x.rs", edits=[
+  ["old line 1\nold line 2",
+   "new line 1\nnew line 2"],
+  ["OldType", "NewType", true]
+])
+~~~
+
+This covers both one multiline replacement and several independent locations in
+the same file.
+
+### Results
 
 ~~~text
 ok
@@ -977,20 +1035,25 @@ unchanged
 Typical ambiguity error:
 
 ~~~text
-fail old matches 4 times; set all=true or use patch
+fail edit 2 old matches 4 times; set all=true or use patch
 ~~~
 
-This creates a sharp decision boundary:
+The model-facing decision boundary becomes:
 
 ~~~text
-complete desired file                 write
-one exact old -> new substitution     edit
-multiple/contextual/multi-file edits  patch
+complete desired file                         write
+exact independent substitutions in one file  edit
+contextual/dependent/overlapping/multi-file   patch
+heterogeneous tool orchestration              batch
 ~~~
 
-Compatibility may accept the old array form and old field names only at the
-wire/deserialization boundary. They must not appear in the advertised schema or
-new shared internal representation.
+If transformation B intentionally depends on text produced by transformation A,
+or requested changes overlap/context-match rather than independently matching
+the original snapshot, use `patch` rather than relying on edit ordering.
+
+Compatibility may accept the previous multi-file edit objects and the temporary
+singular `path/old/new/all` shape only at the wire/deserialization boundary.
+Neither appears in the advertised schema or new shared internal representation.
 
 ## `patch`
 
@@ -1864,7 +1927,7 @@ grep(pattern, path=".", glob=null, depth=null,
 read(path, line=1, lines=4096, byte=0, numbered=true)
 
 write(path, content)
-edit(path, old, new, all=false)
+edit(path, edits)
 patch(patch)
 
 cp(from, to)
@@ -1955,8 +2018,8 @@ grep.skip_hidden
 read.offset / read.limit
   → line / lines
 
-legacy edit array + old_text/new_text/replace_all
-  → singular path / old / new / all
+legacy multi-file edit objects or temporary singular edit
+  → path + edits=[[old,new,all?], ...]
 ~~~
 
 Old recursive `ls` fields may temporarily be accepted by a compatibility
@@ -2009,8 +2072,9 @@ The implementation is complete only when all of the following hold:
 - over-limit or mid-stage writes never expose partial target contents.
 - post-publication failures are reported as committed/uncertain rather than as
   generic retryable mutation failures.
-- singular `edit(path,old,new,all)` owns one exact replacement; strict-only
-  `patch(patch)` owns multiple/contextual/multi-file changes.
+- `edit(path,edits)` owns one or more independent exact substitutions in one
+  file, planned against one original snapshot and published once; strict-only
+  `patch(patch)` owns contextual/dependent/overlapping/multi-file changes.
 - `grep` exposes one symmetric `context` field rather than separate before/after
   controls.
 - `cp(from,to)` copies files, symlinks or complete directory trees without a
@@ -2063,7 +2127,9 @@ The implementation is complete only when all of the following hold:
     not expose partial target bytes as a paging mechanism.
 16. Every mutation has an explicit publication commit point; post-commit
     failures must never masquerade as safe-to-retry pre-commit failures.
-17. `edit` is intentionally singular; batching/context belongs to `patch`.
+17. `edit` batches the hot case of multiple independent exact substitutions
+    in one file; every tuple matches the same original snapshot and overlapping
+    ranges fail before publication.
 18. Terminal outcomes use one reserved status vocabulary: `ok`, `unchanged`,
     `more`, `incomplete`, `fail`, `partial`, `uncertain`, `skip`.
 19. Paging supports both known totals and cursor-only unknown totals without
@@ -2086,6 +2152,11 @@ The implementation is complete only when all of the following hold:
     never silently unlock dependent mutations.
 27. `patch` is strict-only, `cp` copies complete named objects, and `grep`
     uses one symmetric context field to keep the advertised surface smaller.
+28. Semantic batching stays inside domain tools where it improves the hot path:
+    `edit` batches independent replacements within one file; generic `batch`
+    remains for heterogeneous operations.
+29. `edit` has one advertised shape for both one and many replacements; do not
+    add a singular shorthand that would make the schema polymorphic.
 
 ## References
 
