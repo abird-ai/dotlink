@@ -35,14 +35,29 @@ None yet. The initial commit records only the approved design and queue entry.
 - [ ] Make content results always line-numbered and remove advertised
   `numbered`.
 - [ ] Convert files/count results to compact deterministic text.
-- [ ] Stop advertising `read.max_read_bytes`; retain internal ceilings.
+- [ ] Stop advertising `read.max_read_bytes`; retain it as runtime/profile
+  policy and surface the effective limit only in actionable errors.
+- [ ] Replace advertised read `offset`/`limit` with
+  `line`/`lines`/`byte` and support continuation inside oversized UTF-8
+  lines.
+- [ ] Use the same continuation cursor when the profile or transport result
+  ceiling ends a page.
+- [ ] Define mid-read I/O faults as error-marked incomplete results with any
+  safely obtained prefix and cursor.
 
 ### Phase 4 — text mutation schema/output cleanup
 
-- [ ] Advertise `edit` fields as `old`, `new`, `all`.
-- [ ] Keep old edit names only as compatibility deserialization if needed.
+- [ ] Make `edit(path,old,new,all=false)` singular.
+- [ ] Move batching/contextual/multi-file editing responsibility entirely to
+  `patch`.
+- [ ] Keep the old edit array/names only as compatibility deserialization if
+  needed.
 - [ ] Replace verbose successful mutation receipts with compact outcomes where
   no additional information is needed.
+- [ ] Define one shared mutation outcome model: not committed, committed,
+  uncertain, and explicit partial batch commit.
+- [ ] Ensure write/edit/binary staging failures never expose partial target
+  contents; over-limit writes fail before staging/publication.
 - [ ] Keep Codex patch grammar and leave move/delete to dedicated tools.
 
 ### Phase 5 — lifecycle primitives
@@ -74,6 +89,14 @@ None yet. The initial commit records only the approved design and queue entry.
 - [ ] Unit tests for `hidden` and `gitignore` parity across discovery tools.
 - [ ] Unit tests for glob/regex/depth/kind/time selectors.
 - [ ] Unit tests for compact escaping/rendering and result-budget truncation.
+- [ ] Read continuation tests for a single UTF-8 line larger than
+  `max_read_bytes` and larger than the transport result budget.
+- [ ] Read I/O fault tests proving useful prefixes are marked incomplete/error
+  and never presented as complete data.
+- [ ] Write failure-injection tests before staging, during staging, before
+  publication and after publication, asserting the reported commit state.
+- [ ] Batch mutation failure-injection tests proving partial commit ledgers are
+  exact and never hidden behind a generic error.
 - [ ] Unit tests for globally correct sorting/paging under bounded traversal.
 - [ ] Mutation race/alias/replay tests for `cp`, `mv`, `rm`.
 - [ ] Recursive copy/delete protected-path and symlink tests.

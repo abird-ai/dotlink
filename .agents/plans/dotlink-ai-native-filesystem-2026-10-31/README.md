@@ -208,6 +208,168 @@ complete result has no footer. Partial results end with one compact marker:
 The exact internal reasons may remain richer, but the public vocabulary should
 be small, stable and actionable.
 
+## Limits, partial data and commit outcomes
+
+Resource ceilings and logical pagination are different concerns.
+
+The model chooses the logical region it wants. dotlink owns the hard resource
+policy:
+
+~~~text
+profile/runtime policy
+  max_read_bytes
+  max_write_bytes
+  max_output_bytes
+  scan/planning/work budgets
+
+transport
+  request/result envelope ceilings
+
+tool call
+  line/lines/byte, offset/limit, depth, etc.
+~~~
+
+Do not advertise operator ceilings as routine model choices merely because the
+implementation needs them. Surface the effective ceiling only when it is
+actionable, such as an over-limit error.
+
+### Read-class operations may return partial data
+
+A bounded read/search/list is not a failed mutation. When a valid prefix/page
+fits but more data exists, return the usable data as a successful tool result
+plus an exact continuation/incomplete marker.
+
+For `read`, the continuation marker is a cursor, not merely prose:
+
+~~~text
+… continue line=57 byte=0
+… continue line=42 byte=1048217
+~~~
+
+The first form means continue at the next logical line. The second continues
+inside an unusually long logical line.
+
+The cursor always names the first byte not returned and must be on a valid UTF-8
+boundary. A transport result ceiling tighter than `max_read_bytes` uses the
+same continuation mechanism; the model does not need to know which lower layer
+caused the page boundary.
+
+For discovery tools, bounded traversal remains a successful partial result with
+the compact `… more` / `… incomplete:reason` footer.
+
+A hard root/open/authorization failure before useful data exists is an ordinary
+tool error.
+
+### Mid-read I/O failure
+
+If a single-file `read` encounters an I/O failure after already obtaining a
+valid prefix, preserve the useful prefix but mark the MCP tool result as an
+error and terminate it with an explicit fault marker, for example:
+
+~~~text
+… incomplete:io continue line=81 byte=0
+~~~
+
+The model must never infer completeness from such a result. The cursor is
+provided only when the implementation can identify the first unreturned UTF-8
+byte safely.
+
+If no useful text was obtained, return only the concise error.
+
+A semantic text failure such as invalid UTF-8/binary content is also an error;
+do not convert the file into a misleading successful text prefix. Direct the
+model to `bread` where appropriate.
+
+For tree-wide `find`/`grep` discovery, an unreadable individual entry may
+instead contribute an incomplete-scan reason while the rest of the result
+remains useful. Root-level failures still fail the call.
+
+### Writes never use partial output as pagination
+
+`max_write_bytes` is an atomic-operation ceiling, not a chunk size.
+
+If the complete requested result exceeds it, reject the request before staging
+or mutating anything:
+
+~~~text
+content is 1400000 bytes; write limit is 1048576
+~~~
+
+The model may then choose a different operation or the operator may raise the
+profile limit. dotlink must never write the first N bytes and call that a
+partial write.
+
+The same principle applies when the transport request ceiling rejects a payload:
+the tool has not executed and no mutation occurred.
+
+### Mutation commit states
+
+Every mutation backend must classify failures around an explicit publication
+commit point:
+
+~~~text
+preflight / plan / stage
+        |
+        | failure => NOT COMMITTED
+        |            visible target unchanged/absent
+        v
+atomic publication
+        |
+        | success => COMMITTED
+        v
+durability / hidden cleanup
+~~~
+
+Before publication, a failure is a normal tool error and the visible namespace
+must remain unchanged. Temporary/staged data is private implementation state and
+is cleaned best-effort without becoming a user-visible partial result.
+
+After publication succeeds, the requested namespace mutation has happened.
+Later sync/cleanup failures must never be reported as a generic "write failed"
+that invites the model to repeat the mutation. Report a committed success with
+a concise exceptional qualifier only when the model needs to know, for example:
+
+~~~text
+ok; durability uncertain
+ok; cleanup pending
+~~~
+
+A platform backend that genuinely cannot determine whether publication crossed
+the commit point must surface an explicit `uncertain` outcome and must not
+encourage automatic retry.
+
+The OpenAI transport replay layer separately protects the case where the
+mutation committed but its response could not be delivered: redelivery replays
+the committed result rather than executing the side effect again, and an
+unrecoverable ambiguity remains fail-closed.
+
+### Batch mutations
+
+A multi-object operation cannot generally promise one filesystem transaction.
+
+Strict multi-file `patch` preflights and stages everything before the first
+publication, but a later commit failure can still occur after earlier files
+were committed. Likewise a multi-path `rm` may encounter a platform failure
+after one namespace operation has committed even after full preflight.
+
+These exceptional outcomes must be explicit and must list only the information
+the model needs to recover, for example:
+
+~~~text
+partial 2/3 committed
+src/a.rs
+src/b.rs
+failed src/c.rs: permission denied
+~~~
+
+Such a result is an MCP tool error, not an ordinary success. The word
+`partial` is reserved for a real visible mutation split; never use it for
+private staging progress.
+
+Where a batch operation can cheaply roll back unpublished/tombstoned objects
+while locks are still held, it should do so, but rollback failure must itself be
+reported as a partial/uncertain state rather than hidden.
+
 ## `ls`
 
 ### Purpose
@@ -422,22 +584,35 @@ windows, paging and output ceilings remain.
 
 ### Purpose
 
-Read a known UTF-8 file.
+Read a known UTF-8 file with line-oriented paging and safe continuation inside
+an unusually long line.
 
 ### Proposed schema
 
 ~~~text
 read(
   path,
-  offset=1,
-  limit=4096,
+  line=1,
+  lines=4096,
+  byte=0,
   numbered=true
 )
 ~~~
 
-The profile/transport byte ceiling remains enforced internally, but
-`max_read_bytes` should not be advertised to the model. The model thinks in
-lines; transport framing is not a useful selection decision.
+- `line` is the first 1-based logical line.
+- `lines` is the maximum number of logical lines requested.
+- `byte` is a zero-based UTF-8 byte offset inside the first requested logical
+  line. It normally remains zero and exists primarily for long-line
+  continuation.
+- `numbered` controls the ordinary line-number prefix.
+
+The profile `max_read_bytes`, scan budget and transport result budget remain
+enforced internally. They are runtime/operator policy, not routine
+model-controlled pagination fields.
+
+The effective page budget is the tightest relevant lower-layer ceiling. The
+renderer reserves room for the continuation marker before accepting the final
+fragment.
 
 Default output remains line-numbered because those numbers are useful for
 follow-up reasoning:
@@ -448,7 +623,45 @@ follow-up reasoning:
 43  }
 ~~~
 
-`numbered=false` returns exact text.
+### Long lines
+
+A logical line may be much larger than the effective page budget. That is not
+an error.
+
+Return the largest valid UTF-8 fragment that fits, then an exact cursor:
+
+~~~text
+42  {"very":"long", ... bounded fragment ...
+… continue line=42 byte=1048217
+~~~
+
+A follow-up:
+
+~~~text
+read(path="large.json", line=42, byte=1048217)
+~~~
+
+continues the same logical line. Once that line is complete, the call may
+continue with subsequent lines up to `lines` and the page budget.
+
+The byte cursor counts UTF-8 source bytes inside the logical line, not rendered
+line-number prefix bytes, and always lands on a valid UTF-8 boundary.
+
+When the page ends between complete lines, use `byte=0` for the next line:
+
+~~~text
+… continue line=57 byte=0
+~~~
+
+This same cursor shape covers the logical line limit, `max_read_bytes` and a
+tighter transport result ceiling.
+
+`numbered=false` removes line-number prefixes from returned file text. A
+continuation/incomplete footer is control information, not file content, and
+must remain clearly separated from the returned fragment.
+
+Compatibility may accept the old `offset`/`limit` fields at the wire
+boundary, but the new advertised schema is `line`/`lines`/`byte`.
 
 ## `write`
 
@@ -480,49 +693,59 @@ Do not echo the path/content.
 
 ### Purpose
 
-Exact text replacement when the model knows the old and new text.
+Perform one exact old-to-new text substitution in one known file.
+
+Batch/contextual editing belongs to `patch`; keeping `edit` singular makes
+the model's tool choice obvious and substantially reduces schema/call tokens.
 
 ### Proposed schema
 
 ~~~text
 edit(
-  edits=[
-    {
-      path,
-      old,
-      new,
-      all=false
-    }
-  ]
+  path,
+  old,
+  new,
+  all=false
 )
 ~~~
 
-Use `old`, `new`, `all` rather than the longer
-`old_text`, `new_text`, `replace_all` in the advertised schema.
+Semantics:
 
-Semantics remain:
+- `old` must be non-empty;
+- without `all`, `old` must occur exactly once;
+- zero matches are an error;
+- multiple matches are an error with a concise count/remedy;
+- `all=true` replaces every exact occurrence;
+- `old == new` is a no-op;
+- snapshot/verification, shared mutation locking, staging and atomic publication
+  remain mandatory;
+- the complete resulting file must fit the configured mutation/write planning
+  limits before publication.
 
-- operations apply in array order;
-- repeated operations on one file see the evolving buffer;
-- without `all`, `old` must match uniquely;
-- planning/verification happens before commit;
-- per-file publication remains atomic;
-- shared mutation locking/race protection remains mandatory;
-- existing bounds on files, edits and bytes remain.
-
-Compact result:
-
-~~~text
-ok 3 edits 2 files
-~~~
-
-or:
+Results:
 
 ~~~text
+ok
 unchanged
 ~~~
 
-Compatibility aliases may be accepted only at the deserialization boundary.
+Typical ambiguity error:
+
+~~~text
+old matches 4 times; set all=true or use patch
+~~~
+
+This creates a sharp decision boundary:
+
+~~~text
+complete desired file                 write
+one exact old -> new substitution     edit
+multiple/contextual/multi-file edits  patch
+~~~
+
+Compatibility may accept the old array form and old field names only at the
+wire/deserialization boundary. They must not appear in the advertised schema or
+new shared internal representation.
 
 ## `patch`
 
@@ -1013,7 +1236,11 @@ Do not repeat JSON keys per filesystem entry.
 Do not echo successful request arguments.
 
 Do not return verbose success receipts unless an operation has a materially
-different partial outcome that the model must reason about.
+different partial/uncertain outcome that the model must reason about.
+
+For read-only pagination, return usable data plus a compact continuation marker.
+For mutation failures, never return physical staging progress as partial
+success. Report only externally visible commit state.
 
 ## Compatibility strategy
 
@@ -1026,10 +1253,11 @@ deserializing:
 grep.skip_hidden
   → hidden = !skip_hidden
 
-edit.old_text
-edit.new_text
-edit.replace_all
-  → old / new / all
+read.offset / read.limit
+  → line / lines
+
+legacy edit array + old_text/new_text/replace_all
+  → singular path / old / new / all
 ~~~
 
 Old recursive `ls` fields may temporarily be accepted by a compatibility
@@ -1068,6 +1296,17 @@ The implementation is complete only when all of the following hold:
 - discovery defaults produce compact text rather than per-entry JSON objects.
 - metadata is opt-in.
 - mutation success does not echo redundant request data.
+- `max_read_bytes` and `max_write_bytes` remain runtime/profile policy rather
+  than routine model-facing knobs.
+- `read` can continue inside a line larger than the effective result budget
+  using an exact UTF-8 `line` + `byte` cursor.
+- ordinary read pagination returns usable partial data; a mid-read I/O fault is
+  explicitly incomplete and error-marked.
+- over-limit or mid-stage writes never expose partial target contents.
+- post-publication failures are reported as committed/uncertain rather than as
+  generic retryable mutation failures.
+- singular `edit(path,old,new,all)` owns one exact replacement; `patch` owns
+  multiple/contextual/multi-file changes.
 - `cp`, `mv` and `rm` provide the missing non-shell lifecycle operations.
 - no mutation tool expands globs or performs destination inference.
 - `mv` never silently becomes copy + delete.
@@ -1105,6 +1344,13 @@ The implementation is complete only when all of the following hold:
 12. Tool count is not minimized at the expense of semantic clarity. Small
     orthogonal schemas are preferable to overloaded tools.
 13. Token cost is a first-class metric for both tool definitions and results.
+14. Runtime byte ceilings bound work; they are not ordinary model pagination
+    controls.
+15. Read-only operations may return marked usable prefixes/pages. Mutations do
+    not expose partial target bytes as a paging mechanism.
+16. Every mutation has an explicit publication commit point; post-commit
+    failures must never masquerade as safe-to-retry pre-commit failures.
+17. `edit` is intentionally singular; batching/context belongs to `patch`.
 
 ## References
 
