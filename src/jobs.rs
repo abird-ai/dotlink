@@ -54,6 +54,10 @@ const SESSION_LOCK_FILE: &str = ".session.lock";
 const SESSION_COORDINATION_LOCK: &str = ".sessions.lock";
 const SESSION_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_JOB_ERROR_BYTES: usize = 16 * 1024;
+#[cfg(windows)]
+const SESSION_REMOVE_RETRIES: usize = 40;
+#[cfg(windows)]
+const SESSION_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 fn bounded_job_error(message: impl Into<String>) -> String {
     let mut message = message.into();
@@ -567,6 +571,41 @@ impl fmt::Debug for JobManagerInner {
     }
 }
 
+#[cfg(not(windows))]
+fn remove_session_directory(root: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn remove_session_directory(root: &Path) -> std::io::Result<()> {
+    for attempt in 0..=SESSION_REMOVE_RETRIES {
+        match fs::remove_dir_all(root) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if attempt < SESSION_REMOVE_RETRIES
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+            {
+                // Windows may keep a just-closed file/lock handle temporarily
+                // non-deletable. All dotlink-owned runners, spool writers and
+                // the session lock are already closed before this helper is
+                // called; retry only this bounded delete-on-close window.
+                std::thread::sleep(SESSION_REMOVE_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("session removal loop always returns")
+}
+
 impl Drop for JobManagerInner {
     fn drop(&mut self) {
         if let Some(handle) = self.sweeper.lock().ok().and_then(|mut value| value.take()) {
@@ -588,18 +627,20 @@ impl Drop for JobManagerInner {
             lock.take();
         }
         let root = self.root.clone();
-        if root.exists() && fs::remove_dir_all(&root).is_err() {
-            let _ = std::thread::Builder::new()
-                .name("dotlink-job-cleanup".into())
-                .spawn(move || {
-                    for _ in 0..40 {
-                        if fs::remove_dir_all(&root).is_ok() || !root.exists() {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(25));
-                    }
-                    tracing::warn!(path = %root.display(), "could not remove job spool directory on shutdown");
-                });
+        if root.exists() {
+            match fs::remove_dir_all(&root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    let _ = std::thread::Builder::new()
+                        .name("dotlink-job-cleanup".into())
+                        .spawn(move || {
+                            if let Err(error) = remove_session_directory(&root) {
+                                tracing::warn!(%error, path = %root.display(), "could not remove job spool directory on shutdown");
+                            }
+                        });
+                }
+            }
         }
     }
 }
@@ -1295,18 +1336,13 @@ impl JobManager {
             .lock()
             .expect("job session lock")
             .take();
-        match tokio::fs::remove_dir_all(&self.inner.root).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "cannot remove job spool session {}",
-                        self.inner.root.display()
-                    )
-                });
-            }
-        }
+        let root = self.inner.root.clone();
+        crate::blocking::run(|| remove_session_directory(&root)).with_context(|| {
+            format!(
+                "cannot remove job spool session {}",
+                self.inner.root.display()
+            )
+        })?;
         Ok(())
     }
 

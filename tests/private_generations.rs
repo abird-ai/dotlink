@@ -27,8 +27,9 @@ fn trusted_bubblewrap_available() -> bool {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.code() == Some(78)
-        && stderr.contains("Bubblewrap launcher")
-        && stderr.contains("not from a trusted host-managed source")
+        && (stderr.contains("an executable Bubblewrap (bwrap) is required")
+            || (stderr.contains("Bubblewrap launcher")
+                && stderr.contains("not from a trusted host-managed source")))
     {
         return false;
     }
