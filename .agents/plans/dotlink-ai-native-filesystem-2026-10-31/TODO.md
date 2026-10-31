@@ -2,7 +2,7 @@
 
 Base: `84cd9b7`
 
-Status: **design sealed** for v1 plus the specified v2 shared durable-job / shell-node extension; implementation intentionally not started.
+Status: **design sealed** for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
 
 ## Committed
 
@@ -53,13 +53,18 @@ Status: **design sealed** for v1 plus the specified v2 shared durable-job / shel
 ### `5942393` — shell write hints and durable shell-node v2
 
 - [x] Added advisory shell `writes` scopes and specified graph-owned Bash/
-  PowerShell nodes with process-terminal branching and durable graph ownership.
+  PowerShell nodes with process-terminal branching; later design converged on
+  the canonical shared Job/Graph/Node runtime.
 
 ### `2a255f3` — durable batch controls/checkpoints
 
 - [x] Added automatic resume, explicit restart generations, compact polling,
-  idempotent cancellation and fail-closed node checkpoint semantics; this
-  revision folds those controls into the shared `job_*` lifecycle.
+  idempotent cancellation and fail-closed node checkpoint semantics.
+
+### `8a3e7bb` — unified durable lifecycle under `job_*`
+
+- [x] Replaced parallel batch control concepts with the shared `job_*` namespace,
+  one durable ID space, generic restart, and node-aware output/ack semantics.
 
 ## Uncommitted
 
@@ -158,9 +163,13 @@ Status: **design sealed** for v1 plus the specified v2 shared durable-job / shel
   omitted total when open-ended, stable units and terse phase messages.
 - [ ] Ensure progress never carries the only copy of result data.
 
-### Phase 7 — batch execution graph
+### Phase 7 — shared Job/Graph/Node runtime + native `batch`
 
-- [ ] Add first-class `batch(ops)` to the planned native tool surface.
+- [ ] Introduce the canonical execution model: one `Job` owns one immutable
+  `Graph`; a Graph owns one or more `Node`s; nodes are never nested Jobs.
+- [ ] Generalize the existing JobManager around a lightweight shared Graph/Node
+  runtime without duplicating replay, cancellation, retention or Task state.
+- [ ] Add first-class `batch(ops)` as the multi-node Graph constructor.
 - [ ] Represent each operation as compact `[tool,args,when?]` with stable
   1-based coordinates derived from position.
 - [ ] Default omitted `when` to previous **complete** success
@@ -176,10 +185,10 @@ Status: **design sealed** for v1 plus the specified v2 shared durable-job / shel
   otherwise successful batch an error.
 - [ ] Runtime-validate nested args against the already registered tool schema
   instead of duplicating every schema into `batch`.
-- [ ] Add a central batchable-tool property; initially restrict to native
-  filesystem tools.
+- [ ] Add a central graph-node/batchable-tool property; initially restrict v1
+  `batch` nodes to native filesystem tools.
 - [ ] Add deterministic aggregate result budgeting; child tools must emit native
-  `more` cursors rather than being silently truncated by the outer batch.
+  `more` cursors rather than being silently truncated by the outer Job/Graph.
 - [ ] Aggregate `more`/`incomplete` modifiers explicitly and never duplicate
   exceptional nodes in both detail blocks and summaries.
 - [ ] Add compact fixed-total batch progress (`3/12 2 ok`) and forward known
@@ -189,10 +198,14 @@ Status: **design sealed** for v1 plus the specified v2 shared durable-job / shel
 - [ ] Enforce hard operation-count, parallel-width, aggregate byte/work and
   result ceilings.
 
-### Phase 8 — shell write hints
+### Phase 8 — shell naming + write hints
 
-- [ ] Add optional `writes` path scopes to Bash and PowerShell shell arguments;
-  omission means unknown, `[]` means expected no writes.
+- [ ] Rename the advertised modern PowerShell tool/node to `pwsh`; accept legacy
+  `powershell` only at the compatibility/deserialization boundary.
+- [ ] Bind `pwsh` to the modern PowerShell executable semantics; do not silently
+  substitute legacy `powershell.exe` under the `pwsh` name.
+- [ ] Add optional `writes` path scopes to Bash and PowerShell (`pwsh`) shell
+  arguments; omission means unknown, `[]` means expected no writes.
 - [ ] Resolve relative hint paths from effective shell `dir`; use no globs,
   shell expansion or environment interpolation.
 - [ ] Treat scopes as advisory scheduling metadata only; never as authorization,
@@ -202,18 +215,22 @@ Status: **design sealed** for v1 plus the specified v2 shared durable-job / shel
 - [ ] Document create/modify/delete/rename semantics and conservative subtree
   scope behavior.
 
-### Phase 9 — shared durable jobs + batch v2 shell nodes
+### Phase 9 — one-node shell Jobs + v2 shell Graph nodes
 
-- [ ] Add `bash` and `powershell` as v2 batchable nodes; keep `job_start`,
-  job/task controls and nested batch excluded.
+- [ ] Route ordinary `bash` and `pwsh` through the canonical one-node Job Graph
+  path rather than separate shell execution/durability machinery.
+- [ ] Keep the one-node path lightweight; architectural unification must not add
+  unnecessary persistence/allocation to short synchronous shell commands.
+- [ ] Add `bash` and `pwsh` as v2 Graph nodes; keep `job_start`, job/task controls
+  and nested `batch` excluded from Graph node dispatch.
 - [ ] Make bare shell dependency / `.ok` mean actual terminal process success,
   `.err` mean non-zero/timeout/launch-failure/cancellation, and `.done` any
   terminal process state.
 - [ ] Keep raw exit/success/timeout/stdout/stderr details in the node result;
   shell error must never imply rollback of shell side effects.
-- [ ] Make the outer batch graph the durable execution owner automatically when
-  the graph outlives a synchronous transport window; no per-node durability flag
-  and no child shell execution escapes as an independent user-visible job/task.
+- [ ] Make the outer Job the sole durable owner automatically when execution
+  outlives a synchronous transport window; no per-node durability flag and no
+  ShellNode escapes as an independent user-visible child Job/Task.
 - [ ] Keep the graph scheduler running after handoff so dependents continue when
   long shell nodes terminate even without active client polling.
 - [ ] Persist/retain per-node `pending/claimed/running/terminal` state and
@@ -230,20 +247,22 @@ Status: **design sealed** for v1 plus the specified v2 shared durable-job / shel
   rerunning the graph.
 - [ ] Reuse bounded shell spooling for child stdout/stderr and deterministic
   aggregate result budgeting/paging.
-- [ ] Generalize the existing `job_*` lifecycle to durable execution kinds
-  `shell` and `batch`; do not add parallel `batch_get/cancel/output/ack` tools.
+- [ ] Keep one `job_*` lifecycle and one ID namespace for all exposed Jobs;
+  `shell`/`batch` are compact presentation/plan-shape labels, not separate
+  durability implementations; do not add parallel `batch_get/cancel/output/ack`
+  tools.
 - [ ] Prefer concise advertised `id` in new job control schemas while accepting
   legacy `job_id` at the compatibility boundary.
 - [ ] Make `job_get(id)` a cheap status snapshot only; it must not repeatedly dump
   retained bulk node output while polling.
 - [ ] Define resume as automatic reattachment to the same job/checkpoint ledger;
   do not add a redundant `job_resume` tool.
-- [ ] Extend `job_output`/`job_ack` with optional batch `node`; shell jobs keep
-  existing no-node stdout/stderr behavior, batch native nodes expose `result`,
-  and batch shell nodes expose stdout/stderr/result.
-- [ ] Add generic replay-protected `job_restart(id)`: terminal shell jobs rerun
-  their retained definition; terminal batch jobs create a fresh graph generation
-  from node 1 while retaining the source job as history.
+- [ ] Extend `job_output`/`job_ack` with optional Graph `node`; one-ShellNode
+  Jobs keep existing no-node stdout/stderr behavior, native nodes expose
+  `result`, and ShellNodes expose stdout/stderr/result.
+- [ ] Add generic replay-protected `job_restart(id)`: any terminal exposed Job
+  creates a fresh Job from its retained immutable Graph while retaining the
+  source Job as history.
 - [ ] Batch cancellation persists intent before action, prevents pending starts,
   marks them `skip cancelled`, terminates running shell trees, and preserves
   safe native-mutation terminal semantics.
