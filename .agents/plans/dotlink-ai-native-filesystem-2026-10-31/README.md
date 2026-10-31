@@ -193,21 +193,14 @@ f  98127  2026-10-30T22:10:11Z  src/mcp.rs
 
 Unavailable metadata renders as `-`.
 
-### Incomplete results
+### Path composability
 
-Do not wrap every successful discovery result in a JSON status envelope. A
-complete result has no footer. Partial results end with one compact marker:
+`find` returns paths that can be copied directly into another tool's `path`
+argument. If `find(path="src", ...)` returns a file, render `src/main.rs`, not
+just `main.rs`.
 
-~~~text
-… more
-… incomplete:budget
-… incomplete:walk
-… incomplete:gitignore
-… incomplete:walk,gitignore
-~~~
-
-The exact internal reasons may remain richer, but the public vocabulary should
-be small, stable and actionable.
+`ls` is the deliberate exception: it returns basenames because the caller
+already supplied the directory and repeating that prefix wastes tokens.
 
 ## Limits, partial data and commit outcomes
 
@@ -240,23 +233,22 @@ A bounded read/search/list is not a failed mutation. When a valid prefix/page
 fits but more data exists, return the usable data as a successful tool result
 plus an exact continuation/incomplete marker.
 
-For `read`, the continuation marker is a cursor, not merely prose:
+For `read`, use the canonical `more` cursor:
 
 ~~~text
-… continue line=57 byte=0
-… continue line=42 byte=1048217
+more line=57 byte=0
+more line=42 byte=1048217
 ~~~
 
-The first form means continue at the next logical line. The second continues
-inside an unusually long logical line.
+The first form continues at the next logical line. The second continues inside
+an unusually long logical line.
 
 The cursor always names the first byte not returned and must be on a valid UTF-8
 boundary. A transport result ceiling tighter than `max_read_bytes` uses the
 same continuation mechanism; the model does not need to know which lower layer
 caused the page boundary.
 
-For discovery tools, bounded traversal remains a successful partial result with
-the compact `… more` / `… incomplete:reason` footer.
+Discovery tools use the same canonical `more` and `incomplete` modifiers.
 
 A hard root/open/authorization failure before useful data exists is an ordinary
 tool error.
@@ -268,7 +260,7 @@ valid prefix, preserve the useful prefix but mark the MCP tool result as an
 error and terminate it with an explicit fault marker, for example:
 
 ~~~text
-… incomplete:io continue line=81 byte=0
+partial fail=io more line=81 byte=0
 ~~~
 
 The model must never infer completeness from such a result. The cursor is
@@ -293,7 +285,7 @@ If the complete requested result exceeds it, reject the request before staging
 or mutating anything:
 
 ~~~text
-content is 1400000 bytes; write limit is 1048576
+fail write limit 1048576; content 1400000
 ~~~
 
 The model may then choose a different operation or the operator may raise the
@@ -357,10 +349,8 @@ These exceptional outcomes must be explicit and must list only the information
 the model needs to recover, for example:
 
 ~~~text
-partial 2/3 committed
-src/a.rs
-src/b.rs
-failed src/c.rs: permission denied
+partial ok=2 fail=1
+3 fail permission denied
 ~~~
 
 Such a result is an MCP tool error, not an ordinary success. The word
@@ -373,25 +363,36 @@ reported as a partial/uncertain state rather than hidden.
 
 ## Canonical status, paging and progress grammar
 
-Every native tool uses one small status vocabulary. MCP's own success/error bit
-remains authoritative; text carries only state the protocol cannot express.
+MCP's own success/error bit remains authoritative. The model-visible grammar has
+two dimensions:
+
+1. one **primary outcome**;
+2. zero or more orthogonal **query modifiers**.
+
+Primary outcomes:
 
 ~~~text
 ok
 unchanged
-more
-incomplete
 fail
 partial
 uncertain
 skip
 ~~~
 
-These words are reserved and mean the same thing everywhere.
+Query modifiers:
 
-### Terminal outcomes
+~~~text
+more
+incomplete
+~~~
 
-`ok` means the requested operation completed fully:
+This distinction matters because a successful query can simultaneously have an
+exact continuation and incomplete coverage.
+
+### Primary outcomes
+
+`ok` means the requested operation completed successfully:
 
 ~~~text
 ok
@@ -416,8 +417,7 @@ fail write limit 1048576; content 1400000
 
 A mutation must never use `fail` after its publication commit point.
 
-`uncertain` means dotlink genuinely cannot establish the visible commit
-state:
+`uncertain` means dotlink genuinely cannot establish the visible commit state:
 
 ~~~text
 uncertain commit; do not retry
@@ -425,17 +425,25 @@ uncertain commit; do not retry
 
 It is an error result and is reserved for fail-closed ambiguity.
 
+`skip` means an operation was deliberately not started:
+
+~~~text
+skip condition
+~~~
+
+It is primarily useful in batch graphs. A skipped mutation has no side effect.
+
 ### Known mixed outcomes: `partial`
 
-`partial` means the request has multiple known outcomes: some requested
-results/data are valid or committed and at least one requested component
-failed, was uncertain, or was skipped.
+`partial` means one request has multiple known outcomes and at least one
+requested component failed or became uncertain while another component produced
+useful data or committed successfully.
 
 It is an MCP error result even when useful data or successful mutations are
 present.
 
 For indexed multi-item operations, summarize counts first and list only
-non-`ok` exceptions:
+exceptions:
 
 ~~~text
 partial ok=5 fail=2 uncertain=1
@@ -444,57 +452,46 @@ partial ok=5 fail=2 uncertain=1
 8 uncertain commit
 ~~~
 
-Input coordinates are stable and 1-based. Unlisted coordinates are `ok`.
+Input coordinates are stable and 1-based. Unlisted coordinates are complete
+successes unless a modifier summary says otherwise.
 
-If successful sub-operations have substantive return data, their data blocks
-remain in the result; the aggregate status still names the mixed outcome.
-
-A read that obtained a valid prefix before an I/O failure uses the same
-principle:
+A read that obtained a valid prefix before an I/O failure may combine a primary
+partial outcome with an exact continuation modifier:
 
 ~~~text
 <valid prefix>
 
-partial fail=io next=line:81:0
+partial fail=io more line=81 byte=0
 ~~~
 
-The prefix is useful, but the error status prevents the model from treating it
-as a complete successful read.
+The prefix is useful, the error result prevents it from being mistaken for a
+complete read, and `more` identifies a safe continuation only when one is
+known.
 
-Reserve `partial` for *known* mixed state. Do not use it for normal paging,
+Reserve `partial` for known mixed state. Do not use it for normal paging,
 unknown search coverage, or private staging progress.
 
-### `skip`
+### Paging: `more`
 
-`skip` means an operation was deliberately not started because a required
-earlier step failed:
+`more` means the current data is valid and an exact continuation exists.
 
-~~~text
-skip dependency
-~~~
+The continuation uses the actual follow-up argument names so the model can copy
+it directly.
 
-It is primarily useful in batch ledgers. A skipped mutation has no side effect.
-
-### Paging: known and unknown totals
-
-`more` means the current page is valid and an exact continuation exists.
-
-When the total number of pages/items is not known cheaply:
+Unknown total:
 
 ~~~text
-more next=200
-more next=line:42:1048217
+more offset=200
+more line=42 byte=1048217
 ~~~
 
-The second form is a compact `line:byte` read cursor.
-
-When a fixed total is already known without an extra traversal:
+Known total, only when already available cheaply:
 
 ~~~text
-more 2/7 next=400
+more 2/7 offset=400
 ~~~
 
-The final known page may end with:
+A final known page may use:
 
 ~~~text
 ok 7/7
@@ -503,10 +500,9 @@ ok 7/7
 An unknown-total final page simply ends normally or with `ok` when an explicit
 status is useful.
 
-Never perform an extra full scan merely to discover a page count. Unknown-total
-cursor paging is the default whenever total discovery would add material work.
+Never perform an extra scan merely to discover a page count.
 
-### `incomplete` is not paging
+### Coverage modifier: `incomplete`
 
 `incomplete` means returned data is valid but dotlink cannot guarantee that it
 observed the complete search/input space:
@@ -518,18 +514,18 @@ incomplete walk,gitignore
 
 There may be no cursor capable of recovering the missing region.
 
-Known paging and incomplete coverage can coexist:
+Paging and incomplete coverage can coexist:
 
 ~~~text
-more next=200 incomplete=walk
+more offset=200 incomplete=walk
 ~~~
 
-This means there are additional known results to page through *and* the
-underlying scan was itself incomplete.
+This means more known results are pageable while the underlying scan itself was
+not exhaustive.
 
 ### Data and status blocks
 
-When status text would corrupt exact returned data, especially
+When control/status text would corrupt exact returned data, especially
 `read(numbered=false)`, return separate MCP content blocks:
 
 ~~~text
@@ -539,22 +535,16 @@ content[1] = status/control line
 
 A complete exact read needs only the data block.
 
-A partial/error read can therefore carry both useful exact data and a terminal
-status without inserting control text into file bytes.
-
 ### Progress notifications
 
 Progress is ephemeral execution state, not result data. The final tool result
 must be fully understandable even if the client observed zero progress
 notifications.
 
-Progress values are **absolute cumulative snapshots**, never deltas. A client
-must not have to add previous updates to reconstruct current progress.
+Progress values are absolute cumulative snapshots, never deltas. Use one stable
+unit for a request whenever possible.
 
-Use one stable unit for a request whenever possible: bytes copied, entries
-visited, or operations completed.
-
-The compact model/UI convention is:
+Compact model/UI convention:
 
 ~~~text
 37/100 copy
@@ -566,14 +556,12 @@ The presence of `/total` means the end is known. A bare number means progress
 is measurable but the end is unknown. A phase word alone is valid when there is
 no useful numeric unit.
 
-At the MCP protocol boundary, dotlink still maps these to the protocol's
-structured progress fields. Do not duplicate those field names in model-visible
-text.
+At the MCP protocol boundary, dotlink maps these to the protocol's structured
+progress fields; model-visible text does not repeat field names.
 
 #### Known fixed end
 
-When the denominator is known cheaply before progress begins, use a fixed
-fraction:
+When the denominator is naturally known before meaningful progress begins:
 
 ~~~text
 0/100 copy
@@ -581,56 +569,40 @@ fraction:
 100/100 copy
 ~~~
 
-The numerator is the absolute cumulative amount completed in one stable unit.
-The denominator remains fixed for the request.
-
-The final tool result, not `100/100`, is authoritative completion. Reaching
-the denominator may immediately precede the terminal result but never replaces
-it.
+The denominator remains fixed. The final tool result, not `100/100`, is
+authoritative completion.
 
 #### Unknown end
 
-When the final amount of work is genuinely unknown, omit the denominator and
-still emit monotonic cumulative progress:
+When the final amount of work is genuinely unknown:
 
 ~~~text
 412 scan
 918 scan
 ~~~
 
-This communicates forward motion without inventing a total.
-
-Choose known-total mode only when the denominator is naturally available before
-the first meaningful progress update. Otherwise keep the request open-ended for
-its lifetime rather than switching modes or guessing a denominator later.
+Do not invent a denominator. Keep the request in unknown-total mode for its
+lifetime rather than switching from a guessed or late-discovered total.
 
 #### Multi-phase work
 
 Do not mix unrelated units merely to manufacture a percentage. Keep the numeric
-unit stable and use a terse suffix for phase/status:
+unit stable and use a terse phase suffix:
 
 ~~~text
 37/100 scan
 37/100 commit
 37/100 cleanup
-~~~
 
-For open-ended work:
-
-~~~text
 918 scan
 918 commit
-~~~
 
-If no numeric unit is meaningful for a phase, a phase-only update is enough:
-
-~~~text
 commit
 cleanup
 ~~~
 
-Progress may stay numerically unchanged while the phase text changes, subject
-to the protocol's monotonicity requirements.
+Progress may stay numerically unchanged while phase text changes, subject to
+protocol monotonicity.
 
 #### Streaming partial data vs progress
 
@@ -638,9 +610,7 @@ Progress notifications never carry the only copy of tool result data.
 
 - execution progress streams through progress notifications;
 - result pagination/streaming uses ordinary tool results plus `more`;
-- a final complete result remains authoritative.
-
-This keeps UI progress optional while preserving exact model-visible semantics.
+- final tool results remain authoritative.
 
 ## `ls`
 
@@ -808,8 +778,7 @@ grep(
   ignore_case=false,
 
   mode="content",
-  before=0,
-  after=0,
+  context=0,
 
   hidden=false,
   gitignore=false,
@@ -849,8 +818,11 @@ src/lib.rs
 1  src/lib.rs
 ~~~
 
-Existing bounded regex, UTF-8 classification, per-file scan caps, context
-windows, paging and output ceilings remain.
+`context` is symmetric before/after context and remains bounded. For asymmetric
+inspection, follow the match with `read`.
+
+Existing bounded regex, UTF-8 classification, per-file scan caps, paging and
+output ceilings remain.
 
 ## `read`
 
@@ -904,7 +876,8 @@ Return the largest valid UTF-8 fragment that fits, then an exact cursor:
 
 ~~~text
 42  {"very":"long", ... bounded fragment ...
-… continue line=42 byte=1048217
+
+more line=42 byte=1048217
 ~~~
 
 A follow-up:
@@ -922,7 +895,7 @@ line-number prefix bytes, and always lands on a valid UTF-8 boundary.
 When the page ends between complete lines, use `byte=0` for the next line:
 
 ~~~text
-… continue line=57 byte=0
+more line=57 byte=0
 ~~~
 
 This same cursor shape covers the logical line limit, `max_read_bytes` and a
@@ -1004,7 +977,7 @@ unchanged
 Typical ambiguity error:
 
 ~~~text
-old matches 4 times; set all=true or use patch
+fail old matches 4 times; set all=true or use patch
 ~~~
 
 This creates a sharp decision boundary:
@@ -1029,10 +1002,7 @@ Keep the Codex patch grammar. Models already know it and it is much more
 token-efficient than a nested JSON hunk schema.
 
 ~~~text
-patch(
-  patch,
-  best_effort=false
-)
+patch(patch)
 ~~~
 
 Continue supporting update and add-file sections.
@@ -1040,9 +1010,12 @@ Continue supporting update and add-file sections.
 Do not add patch-level delete or move directives. `rm` and `mv` provide
 dedicated, explicit lifecycle semantics instead.
 
-Strict mode continues to preflight every section before commits; each file
-replacement is atomic while the multi-file commit sequence is not a filesystem
-transaction.
+The advertised API is strict-only: preflight and stage every section before the
+first publication. Each file replacement is atomic while the multi-file commit
+sequence is not a filesystem transaction.
+
+Legacy `best_effort` may be accepted temporarily at the compatibility boundary,
+but it is not advertised to new models.
 
 ## `cp`
 
@@ -1053,11 +1026,7 @@ Duplicate one exact filesystem object.
 ### Proposed schema
 
 ~~~text
-cp(
-  from,
-  to,
-  recursive=false
-)
+cp(from, to)
 ~~~
 
 `to` is always the exact resulting path.
@@ -1069,7 +1038,7 @@ the source basename.
 
 - destination must not exist;
 - missing destination parents are created;
-- directories require `recursive=true`;
+- files copy as files and directories copy as complete directory trees;
 - symlinks are copied as symlinks and never followed;
 - recursive traversal is descriptor-rooted and bounded;
 - policy-denied/protected descendants fail the operation closed;
@@ -1124,7 +1093,7 @@ It never silently degrades to copy + delete. Cross-device/volume moves fail
 with a concise actionable error:
 
 ~~~text
-cross-device move; use cp then rm
+fail cross-device move; use cp then rm
 ~~~
 
 The invariant is: rename the existing object or change nothing.
@@ -1297,11 +1266,21 @@ N.status   exact/status-class predicate
 An operation may reference **only earlier operation numbers**. Cycles and
 forward references are therefore impossible by construction.
 
-Bare `N` means the referenced call ended as an MCP-success result:
+Bare `N` means the referenced operation completed successfully **and
+completely**:
 
 ~~~text
-ok | unchanged | more | incomplete
+ok | unchanged
 ~~~
+
+with neither `more` nor `incomplete`.
+
+The explicit predicates remain two-dimensional: `N.ok` and `N.unchanged`
+match the primary outcome, while `N.more` and `N.incomplete` test modifiers
+that may coexist with a successful primary outcome.
+
+A paged or incomplete query therefore does not satisfy a bare dependency. This
+makes default sequencing safe for dependent mutations.
 
 Exact canonical statuses may be selected explicitly:
 
@@ -1457,9 +1436,9 @@ operations where required.
 Results are keyed by the same 1-based coordinates and do not repeat tool/path
 names unnecessarily.
 
-Trivial `ok` results may be omitted when the aggregate summary makes them
-unambiguous. Data-bearing results, `unchanged`, skips and exceptional states
-remain visible when needed for recovery/reasoning.
+Trivial complete `ok` results may be omitted. Data-bearing results and
+status-bearing nodes appear exactly once; do not duplicate an exceptional node
+both in an individual block and again below the summary.
 
 Example:
 
@@ -1469,30 +1448,43 @@ Example:
 
 2
 <read data>
+more offset=200
 
-3
-ok
-
-4
-fail destination exists
-
-5
-skip condition
-
-partial ok=3 fail=1 skip=1
 4 fail destination exists
+5 skip condition
+
+partial ok=2 more=1 fail=1 skip=1
+~~~
+
+Aggregate counts distinguish complete successes from query modifiers:
+
+- `ok=N`: complete successful nodes;
+- `more=N`: nodes with exact continuation;
+- `incomplete=N`: nodes with incomplete coverage; may overlap `more`;
+- `fail=N`, `partial=N`, `uncertain=N`, `skip=N`: primary outcomes.
+
+If every started node is non-error but one or more query nodes have modifiers,
+the aggregate remains successful but exposes them:
+
+~~~text
+ok more=2 incomplete=1 skip=1
+2 more offset=200
+5 more line=42 byte=1048217
+7 incomplete walk
+8 skip condition
+~~~
+
+If errors coexist, the aggregate primary outcome is `partial`:
+
+~~~text
+partial ok=3 more=1 fail=1 skip=1
+2 more offset=200
+4 fail permission denied
 5 skip condition
 ~~~
 
-The final aggregate reuses the canonical status grammar:
-
-- `ok` when every started operation is non-error; condition skips are allowed;
-- `fail` when the graph failed with no useful/committed successful component;
-- `uncertain` when the aggregate outcome itself cannot be established;
-- `partial` for known mixed success/error/uncertain outcomes.
-
-The summary lists counts first and only exceptional coordinates after it.
-Successful data blocks remain available separately.
+A condition-selected `skip` is expected graph behavior and by itself does not
+make the batch an error.
 
 ### Paging inside batch
 
@@ -1633,31 +1625,6 @@ precondition.
 
 These are specialized enough that aggressive public-field shortening is not a
 priority unless schema measurement shows material savings.
-
-## Compact success and error contract
-
-MCP already distinguishes success from tool errors. Do not wrap successful
-mutations in JSON such as `{"success":true}`.
-
-Preferred successful vocabulary:
-
-~~~text
-ok
-unchanged
-ok 12
-~~~
-
-Errors should be concise and actionable:
-
-~~~text
-destination exists: src/new.rs
-non-empty directory; set recursive=true
-cross-device move; use cp then rm
-old matches 3 times; set all=true or provide more context
-~~~
-
-Do not echo complete requests, payloads or long path lists unless necessary to
-identify the failure.
 
 ## Sorting and paging
 
@@ -1875,6 +1842,54 @@ binary work               bread / bwrite / bedit
 The remaining omissions are filesystem-administration features rather than
 ordinary coding/file-management operations.
 
+## Final model-facing surface snapshot
+
+This is the target advertised core after the design reductions above:
+
+~~~text
+ls(path=".", sort="path", meta=[], hidden=false, gitignore=false,
+   offset=0, limit=256)
+
+find(path=".", glob=null, regex=null, depth=null, kind="any",
+     hidden=false, gitignore=false,
+     mtime=null, ctime=null, btime=null,
+     sort="path", meta=[], offset=0, limit=200)
+
+grep(pattern, path=".", glob=null, depth=null,
+     literal=false, ignore_case=false,
+     mode="content", context=0,
+     hidden=false, gitignore=false,
+     offset=0, limit=200)
+
+read(path, line=1, lines=4096, byte=0, numbered=true)
+
+write(path, content)
+edit(path, old, new, all=false)
+patch(patch)
+
+cp(from, to)
+mv(from, to)
+rm(paths, recursive=false)
+
+bread(...)
+bwrite(...)
+bedit(...)
+
+batch(ops)
+~~~
+
+The surface is intentionally asymmetric where safety requires it:
+
+- `cp` copies the named object completely, including a directory tree, with no
+  shell-derived `recursive` flag.
+- `rm` keeps explicit `recursive=false` because recursive deletion is a
+  destructive escalation.
+- `patch` is strict-only in the advertised API.
+- `grep` uses one symmetric `context`; asymmetric inspection belongs to
+  follow-up `read`.
+- `find` returns directly reusable paths; `ls` returns basenames to avoid
+  repeating its already-known directory prefix.
+
 ## Token-efficiency policy
 
 Tool-schema size and result size are first-class engineering budgets.
@@ -1890,9 +1905,16 @@ Tool-schema size and result size are first-class engineering budgets.
 - no overloaded shell-compatible flags;
 - use the same property name for the same concept everywhere.
 
-Measure the serialized tool schemas before and after implementation. Treat a
-material increase in total advertised schema tokens as a design regression that
-requires justification.
+Measure the complete serialized advertised tool surface before and after
+implementation.
+
+Keep two regression metrics:
+
+1. exact serialized schema bytes, which is model-independent and stable;
+2. a representative tokenizer estimate, which approximates model context cost.
+
+Record a baseline for the filesystem/tool surface in CI or an equivalent
+repeatable gate. A material increase requires explicit justification.
 
 ### Result rules
 
@@ -1955,8 +1977,11 @@ plan is activated:
 3. align `grep` traversal vocabulary and compact output;
 4. simplify `read`/`edit` model-facing schemas with compatibility adapters;
 5. add `cp`, `mv`, `rm` through the shared mutation layer;
-6. measure tool-schema and result token costs;
-7. run the full cross-platform, Nix, replay, mutation and CI validation matrix.
+6. add `batch(ops)` only after the shared outcome/replay foundations are
+   ready;
+7. measure exact serialized schema bytes, tokenizer estimates and representative
+   result token costs;
+8. run the full cross-platform, Nix, replay, mutation and CI validation matrix.
 
 Do not implement lifecycle operations before their shared mutation semantics are
 designed against Unix, macOS and Windows rename/delete behavior.
@@ -1971,6 +1996,8 @@ The implementation is complete only when all of the following hold:
 - `hidden`, `gitignore`, `mtime`, `ctime`, `btime` mean the same thing
   everywhere.
 - discovery defaults produce compact text rather than per-entry JSON objects.
+- every `find` path is directly reusable as another tool path; `ls` is the
+  basename-only token-saving exception.
 - metadata is opt-in.
 - mutation success does not echo redundant request data.
 - `max_read_bytes` and `max_write_bytes` remain runtime/profile policy rather
@@ -1982,19 +2009,28 @@ The implementation is complete only when all of the following hold:
 - over-limit or mid-stage writes never expose partial target contents.
 - post-publication failures are reported as committed/uncertain rather than as
   generic retryable mutation failures.
-- singular `edit(path,old,new,all)` owns one exact replacement; `patch` owns
-  multiple/contextual/multi-file changes.
+- singular `edit(path,old,new,all)` owns one exact replacement; strict-only
+  `patch(patch)` owns multiple/contextual/multi-file changes.
+- `grep` exposes one symmetric `context` field rather than separate before/after
+  controls.
+- `cp(from,to)` copies files, symlinks or complete directory trees without a
+  shell-derived recursive flag.
 - `cp`, `mv` and `rm` provide the missing non-shell lifecycle operations.
 - no mutation tool expands globs or performs destination inference.
 - `mv` never silently becomes copy + delete.
-- recursive `cp`/`rm` remain bounded and fail closed around protected/denied
-  content.
+- directory-tree `cp` and recursive `rm` remain bounded and fail closed
+  around protected/denied content.
 - all new mutation tools participate in replay protection and shared mutation
   coordination.
 - tool visibility remains derived from the effective authority.
 - compatibility aliases are absent from advertised schemas.
-- serialized tool-schema size and representative output-token cost are measured
-  and recorded.
+- exact serialized schema bytes, a representative token estimate and
+  representative output-token costs are measured and recorded.
+- bare batch dependencies require complete success; `more`/`incomplete`
+  children require explicit predicates and cannot silently unlock later
+  mutations.
+- condition-selected batch skips are non-errors; aggregate summaries expose
+  query modifiers without duplicating exceptional nodes.
 - existing correctness/security invariants remain covered on Linux, macOS,
   Windows and Nix CI.
 
@@ -2044,6 +2080,12 @@ The implementation is complete only when all of the following hold:
     workflow language.
 24. Batch arguments stay structured; only the tiny `when` dependency
     expression is textual, avoiding a second quoting/escaping language.
+25. `more` and `incomplete` are orthogonal query modifiers, not peer primary
+    terminal outcomes.
+26. Bare batch dependencies require complete success; paged/incomplete results
+    never silently unlock dependent mutations.
+27. `patch` is strict-only, `cp` copies complete named objects, and `grep`
+    uses one symmetric context field to keep the advertised surface smaller.
 
 ## References
 

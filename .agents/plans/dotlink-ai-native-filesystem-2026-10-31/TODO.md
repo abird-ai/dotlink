@@ -23,8 +23,14 @@ Status: specification only; implementation intentionally not started.
 
 - [x] Added one canonical outcome grammar and known/unknown paging conventions.
 - [x] Added cumulative known-total/open-ended progress semantics.
-- [x] Recorded the initial shallow batch orchestration design that this revision
-  supersedes with the `ops` execution graph.
+- [x] Recorded the initial shallow batch orchestration design.
+
+### `f28ce2c` — compact `ops` execution graph
+
+- [x] Replaced shallow stages with positional graph nodes, backward-only status
+  dependencies, joins, parallel roots and decision branches.
+- [x] Kept nested tool arguments structured while limiting text syntax to the
+  small dependency expression.
 
 ## Uncommitted
 
@@ -50,6 +56,8 @@ Status: specification only; implementation intentionally not started.
 
 - [ ] Align `grep` with `depth`, `hidden`, `gitignore`.
 - [ ] Keep `glob` as the content-search path prefilter.
+- [ ] Replace advertised `before`/`after` with one bounded symmetric
+  `context`; use follow-up `read` for asymmetric inspection.
 - [ ] Make content results always line-numbered and remove advertised
   `numbered`.
 - [ ] Convert files/count results to compact deterministic text.
@@ -76,12 +84,15 @@ Status: specification only; implementation intentionally not started.
   uncertain, and explicit partial batch commit.
 - [ ] Ensure write/edit/binary staging failures never expose partial target
   contents; over-limit writes fail before staging/publication.
-- [ ] Keep Codex patch grammar and leave move/delete to dedicated tools.
+- [ ] Keep Codex patch grammar, advertise strict-only `patch(patch)`, and
+  leave move/delete to dedicated tools.
+- [ ] Accept legacy `best_effort` only at the compatibility boundary if a
+  migration window is required.
 
 ### Phase 5 — lifecycle primitives
 
-- [ ] Design/implement `cp(from,to,recursive=false)` through shared mutation
-  and staging layers.
+- [ ] Design/implement `cp(from,to)` through shared mutation/staging:
+  files copy as files, symlinks as links, directories as complete bounded trees.
 - [ ] Design/implement same-filesystem `mv(from,to)`; never implicit
   copy+delete.
 - [ ] Design/implement `rm(paths,recursive=false)` with full-request preflight
@@ -92,12 +103,14 @@ Status: specification only; implementation intentionally not started.
 
 ### Phase 6 — canonical status, paging and progress
 
-- [ ] Implement one shared status grammar: `ok`, `unchanged`, `more`,
-  `incomplete`, `fail`, `partial`, `uncertain`, `skip`.
+- [ ] Implement primary outcomes `ok`, `unchanged`, `fail`, `partial`,
+  `uncertain`, `skip` plus orthogonal query modifiers `more` and
+  `incomplete`.
 - [ ] Make `partial` represent exact mixed known outcomes and list only
   exceptional indexed items.
-- [ ] Support known-total paging (`2/7`) and unknown-total cursor paging without
-  extra counting scans.
+- [ ] Use one paging grammar based on actual follow-up argument names
+  (`more offset=200`, `more line=42 byte=...`), with optional known page
+  fractions only when already cheap.
 - [ ] Keep `more` (recoverable continuation) distinct from `incomplete`
   (coverage not guaranteed), including combined states.
 - [ ] Separate exact data and status into distinct MCP content blocks when status
@@ -111,8 +124,9 @@ Status: specification only; implementation intentionally not started.
 - [ ] Add first-class `batch(ops)` to the planned native tool surface.
 - [ ] Represent each operation as compact `[tool,args,when?]` with stable
   1-based coordinates derived from position.
-- [ ] Default omitted `when` to previous-success sequencing; use `*` for an
-  independent root.
+- [ ] Default omitted `when` to previous **complete** success
+  (`ok|unchanged` with no `more`/`incomplete`); use `*` for an independent
+  root.
 - [ ] Implement backward-only dependency expressions with `&`, `|`,
   parentheses, exact status predicates, `.err` and `.done`.
 - [ ] Reject forward references/cycles by construction and evaluate conditions
@@ -127,6 +141,8 @@ Status: specification only; implementation intentionally not started.
   filesystem tools.
 - [ ] Add deterministic aggregate result budgeting; child tools must emit native
   `more` cursors rather than being silently truncated by the outer batch.
+- [ ] Aggregate `more`/`incomplete` modifiers explicitly and never duplicate
+  exceptional nodes in both detail blocks and summaries.
 - [ ] Add compact fixed-total batch progress (`3/12 2 ok`) and forward known
   (`412/1000 copy`) or unknown (`918 scan`) child progress snapshots.
 - [ ] Before mutation-capable batch ships, implement deterministic per-operation
@@ -137,7 +153,9 @@ Status: specification only; implementation intentionally not started.
 ### Phase 8 — compatibility, measurements and docs
 
 - [ ] Keep compatibility strictly at wire/deserialization boundaries.
-- [ ] Measure total serialized advertised-tool schema tokens before/after.
+- [ ] Measure exact serialized advertised-tool schema bytes before/after.
+- [ ] Record a representative tokenizer estimate for the same serialized surface.
+- [ ] Add a repeatable baseline/regression gate for permanent schema cost.
 - [ ] Measure representative `ls`/`find`/`grep` result token cost
   before/after.
 - [ ] Update Architecture, Security and user-facing documentation only where the
@@ -160,21 +178,30 @@ Status: specification only; implementation intentionally not started.
 - [ ] Batch mutation failure-injection tests proving partial commit ledgers are
   exact and never hidden behind a generic error.
 - [ ] Unit tests for globally correct sorting/paging under bounded traversal.
-- [ ] Status grammar tests for success, failure, known partial, uncertain and
-  skipped outcomes.
-- [ ] Paging tests for known total, unknown total, final page and
-  `more + incomplete` combined state.
+- [ ] Path-composability tests: every `find` result is directly reusable as a
+  tool path; `ls` intentionally returns basenames.
+- [ ] Status grammar tests for primary success/failure/partial/uncertain/skip
+  outcomes plus orthogonal `more`/`incomplete` modifiers.
+- [ ] Paging tests for one canonical cursor grammar, known total, unknown total,
+  final page and `more + incomplete` combined state.
 - [ ] Progress tests for fixed-total, unknown-total and phase-only updates,
   asserting cumulative/monotonic semantics.
-- [ ] Batch graph tests for default sequencing, multiple roots, fan-out,
-  joins, boolean/status branches, condition skips and backward-reference
+- [ ] Batch graph tests for complete-success default sequencing, multiple roots,
+  fan-out, joins, modifier/status branches, condition skips and backward-reference
   validation.
+- [ ] Assert paged/incomplete child results do not satisfy a bare dependency.
 - [ ] Batch replay tests proving committed mutation nodes are not re-executed
   after response loss/redelivery.
 - [ ] Batch aggregate-result-budget tests proving pageable children return
   deterministic native `more` cursors independent of completion order.
+- [ ] Strict-patch tests proving legacy best-effort behavior is absent from the
+  advertised schema.
+- [ ] `cp` tests proving directories copy as complete bounded trees without a
+  recursive flag.
+- [ ] Grep tests for one symmetric `context` field and compatibility-only old
+  asymmetric fields if retained.
 - [ ] Mutation race/alias/replay tests for `cp`, `mv`, `rm`.
-- [ ] Recursive copy/delete protected-path and symlink tests.
+- [ ] Directory-tree copy / recursive-delete protected-path and symlink tests.
 - [ ] Cross-device `mv` rejection tests.
 - [ ] Cross-platform native Windows/macOS filesystem tests.
 - [ ] `cargo fmt --all -- --check`.
