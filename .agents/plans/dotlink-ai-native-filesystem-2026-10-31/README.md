@@ -6,7 +6,7 @@ Co-authors: ChatGPT (GPT-5.6 Sol)
 
 Owner: @pvl
 
-Status: **design sealed** for v1 plus the specified v2 durable shell-node extension; implementation intentionally not started.
+Status: **design sealed** for v1 plus the specified v2 shared durable-job / shell-node extension; implementation intentionally not started.
 
 Implementation should follow this specification as written. A model-facing surface or
 semantic change discovered during implementation must explicitly reopen/update DL-150
@@ -17,7 +17,7 @@ Base: `84cd9b7` (`release: dotlink v0.14.3`)
 ## Seal boundary
 
 No model-facing design questions remain open for the v1 implementation or the
-specified v2 shell-node extension in this plan.
+specified v2 shared durable-job / shell-node extension in this plan.
 
 Implementation may refactor internals, improve performance, tighten validation,
 or choose platform-specific mechanisms while preserving the sealed public
@@ -96,6 +96,7 @@ text          read    write   edit    patch
 lifecycle     cp      mv      rm
 binary        bread   bwrite  bedit
 orchestration batch
+durable       job_start job_list job_get job_output job_ack job_cancel job_restart
 shell         bash    powershell      # separate capability; optional writes hint
 ~~~
 
@@ -116,6 +117,8 @@ The model-facing decision boundary should be nearly mechanical:
 | inspect/create/mutate arbitrary bytes | `bread` / `bwrite` / `bedit` |
 | run an arbitrary command | `bash` / `powershell` |
 | run a predetermined dependency graph | `batch` |
+| explicitly start background shell work | `job_start` |
+| inspect/control durable work | `job_list` / `job_get` / `job_output` / `job_ack` / `job_cancel` / `job_restart` |
 
 ## Shared vocabulary
 
@@ -1709,11 +1712,64 @@ the work more efficiently and atomically:
 Use `batch` for heterogeneous predetermined execution graphs where reducing
 model/tool round trips materially helps.
 
-## Batch v2 — durable shell nodes
+## Batch v2 — durable shell nodes on the shared job model
 
 V1 `batch(ops)` remains deliberately restricted to native deterministic tools.
 V2 extends the same graph grammar with `bash` and `powershell` nodes without
-introducing another orchestration syntax.
+introducing another orchestration syntax or another durable-execution API.
+
+### One durable job model
+
+`job` is the model-facing durable-execution abstraction.
+
+~~~text
+job
+  shell   one durable Bash/PowerShell execution
+  batch   one durable execution graph
+~~~
+
+Both kinds use one ID namespace and the existing `job_*` lifecycle. Native MCP
+Tasks are another projection of the same underlying durable execution and use
+the same ID when supported.
+
+Ordinary `bash`, `powershell` and `batch` calls first try to return their
+normal synchronous result. If the execution outlives the response window, or a
+complete result cannot fit the response budget, the **same execution** is
+exposed as a durable job/Task. No work is restarted during handoff.
+
+Only exposed/handed-off executions enter the model-visible `job_*` namespace.
+A command/graph that completes synchronously and returns its ordinary result
+needs no durable ID; rerunning such work is simply a new ordinary tool call.
+
+`job_start` remains the explicit return-immediately form for a shell command.
+There is no separate `batch_start`: `batch(ops)` already owns the graph from
+creation and hands that same run off durably when necessary.
+
+The existing job implementation should be generalized rather than duplicated.
+Conceptually:
+
+~~~text
+DurableExecution / JobManager
+  shared
+    id + kind
+    replay/delivery identity
+    status + cancellation
+    retention
+    Task projection
+    output paging/ack
+  shell
+    command runner
+    stdout/stderr spool
+  batch
+    immutable graph definition
+    node ledger/checkpoints
+    native node results
+    shell child runners/spools
+~~~
+
+The internal type/module names may remain `JobManager` if a rename would create
+churn without value. The architectural requirement is one lifecycle and one
+durability substrate.
 
 Example:
 
@@ -1843,82 +1899,135 @@ final response was lost, or the graph was polled/reconnected.
 
 ### Resume versus restart
 
-There are exactly two high-level meanings:
+These semantics belong to the shared durable job model, not only to batches:
 
 ~~~text
-resume   continue this execution from its durable ledger
-restart  create a new execution from node 1
+resume   continue this durable execution
+restart  create a new durable execution from the retained definition
 ~~~
 
-**Resume is the default and automatic behavior.** Transport timeout, request
-loss, reconnect, polling and redelivery all attach to the same run. There is no
-separate `batch_resume` tool.
+**Resume is automatic.** Transport timeout, request loss, reconnect,
+`job_get`, Task polling and redelivery all attach to the same execution. There
+is no `job_resume` tool.
 
-If a server/runtime restart occurs, terminal checkpoints are preserved. Pending
-nodes may continue when their dependencies are conclusively satisfied. A
-claimed/running node must reattach to the exact existing execution or become
-`uncertain`; it is never silently relaunched.
+For a batch job, terminal node checkpoints remain terminal and pending nodes may
+continue when their dependencies are conclusively satisfied. A claimed/running
+node must reattach to the exact existing execution or become `uncertain`; it is
+never silently relaunched.
 
-Completed nodes therefore remain completed even if a later long-running shell
-node becomes uncertain.
+**Restart is explicit through `job_restart(id)`.** It creates a fresh durable
+job with a new ID while preserving the source job as immutable history:
 
-**Restart is explicit.** Restart creates a fresh run/generation with the same
-immutable graph definition and every node initially pending. The old run remains
-queryable history. Restart may repeat all side effects and is never triggered by
-ordinary replay/recovery.
+- shell job -> rerun the retained shell definition from the beginning;
+- batch job -> create a fresh graph generation with every node initially
+  pending.
 
-A running/cancelling run cannot be restarted concurrently:
+Restart may repeat side effects. A running/cancelling job cannot be restarted:
 
 ~~~text
 fail running; cancel first
 ~~~
 
-After the prior run is terminal, restart is permitted even after `ok`,
+After the source job is terminal, restart is permitted even after `ok`,
 `fail`, `partial`, `cancelled` or `uncertain`; the explicit restart action
-is the acknowledgement that side effects may occur again.
+acknowledges that side effects may happen again.
 
-Restart itself is replay-protected so duplicate delivery of the same restart
-request returns the same new run rather than creating multiple generations.
+`job_restart` is replay-protected so duplicate delivery of one restart request
+returns the same new job rather than creating multiple executions.
 
-A successful restart returns the new run identity, for example:
+A successful restart returns the new durable ID:
 
 ~~~text
-running <new-id> 0/12
+running <new-id>
+~~~
+
+For a batch job it may include graph progress:
+
+~~~text
+running <new-id> batch 0/12
 ~~~
 
 Selective "restart from node N" is deliberately omitted in v2. It requires
 dependency invalidation and snapshot semantics that are not justified yet.
 
-### Durable control surface
+### Shared `job_*` control surface
 
-Keep graph creation and graph control separate:
+Do not add `batch_get`, `batch_cancel`, `batch_output` or `batch_ack`.
+
+Use the existing durable execution controls for both shell and batch jobs:
 
 ~~~text
-batch(ops)           create/run a graph
-batch_get(id)        compact status snapshot; also reattaches/resumes
-batch_cancel(id)     idempotently request cancellation
-batch_restart(id)    create a fresh run from the same graph
+job_list(limit=64)
+job_get(id)
+job_output(id, node=null, stream="stdout", offset=0, ...)
+job_ack(id, node=null, stream="stdout", offset)
+job_cancel(id)
+job_restart(id)
 ~~~
 
-`batch_get` is pure/read-only. `batch_cancel` is idempotent. `batch_restart`
-is side-effecting and replay-protected.
+The new advertised control schemas should prefer the concise `id` field because
+the tool name already supplies the `job` context. Compatibility may continue to
+accept legacy `job_id` at the deserialization boundary.
 
-Native MCP Tasks map onto the same durable owner rather than creating a second
-state machine: task polling is equivalent to `batch_get`, and task cancellation
-is equivalent to `batch_cancel`.
+Semantics:
+
+- `job_list`: read-only discovery/recovery of recent exposed durable
+  executions;
+- `job_get`: pure compact status snapshot and reattachment to the same run;
+- `job_output`: pure pageable retained output/result read;
+- `job_ack`: idempotently advance cleanup watermarks after safe receipt;
+- `job_cancel`: idempotently request cancellation;
+- `job_restart`: explicitly create a fresh execution from a retained immutable
+  definition.
+
+`job_restart` is the only new lifecycle tool. It is generic:
+
+- for a shell job, rerun the same retained command/dir/stdin/timeout/`writes`
+  definition as a new job;
+- for a batch job, create a fresh graph run/generation from node 1.
+
+Restart requires the source job to be terminal and retained. It returns a new
+job ID, preserves the old job as history, may repeat side effects, and is
+replay-protected so duplicate delivery returns the same restarted job.
+
+Native MCP Tasks map onto the same durable owner rather than creating another
+state machine: Task get/poll is the same underlying status operation and Task
+cancel is the same underlying cancellation intent.
 
 No control operation mutates or deletes the historical ledger of a terminal
-run.
+execution.
 
-### Polling status
+### Listing and polling
 
-`batch_get(id)` returns **status, not bulk node output**, so repeated polling is
-cheap.
-
-Example:
+`job_list(limit=64)` lists both durable kinds in one compact namespace so a
+lost creation/handoff response can be recovered:
 
 ~~~text
-running 5/12
+j1 shell running
+j2 batch running 5/12
+j3 shell ok exit=0
+j4 batch partial 12/12
+~~~
+
+`job_get(id)` returns **status, not bulk output**, so repeated polling is cheap.
+
+Shell example:
+
+~~~text
+running shell
+~~~
+
+Terminal shell examples:
+
+~~~text
+ok shell exit=0
+err shell exit=1
+~~~
+
+Batch example:
+
+~~~text
+running batch 5/12
 1-3 ok
 4 err exit=1
 5 ok
@@ -1930,53 +2039,59 @@ Contiguous nodes with identical simple states may be range-compressed. Active
 nodes may append their latest meaningful progress snapshot:
 
 ~~~text
-running 5/12
+running batch 5/12
 6 run 412/1000 copy
 ~~~
 
 For arbitrary shell commands, do not invent a percentage:
 
 ~~~text
-running 5/12
+running batch 5/12
 6 run
 ~~~
 
-Terminal examples:
+Terminal graph examples:
 
 ~~~text
-ok 12/12
+ok batch 12/12
 ~~~
 
 ~~~text
-partial 12/12
+partial batch 12/12
 4 err exit=1
 9 uncertain
 10-12 skip condition
 ~~~
 
 Status polling never acknowledges, consumes or deletes retained results/output.
-Potentially large node output remains on the durable result/output surface and
-is not repeated on every status poll.
+Potentially large output remains behind `job_output` and is not repeated on
+every status poll.
 
 ### Cancellation
 
-`batch_cancel(id)` first persists a cancellation intent, then acts on it. Once
+`job_cancel(id)` is the one idempotent cancellation primitive for both durable
+kinds.
+
+For a shell job it preserves the current behavior: request termination of the
+contained command tree while retaining already-spooled output.
+
+For a batch job, cancellation first persists graph cancellation intent. Once
 that intent is durable, no new pending node may start.
 
-Pending nodes become:
+Pending graph nodes become:
 
 ~~~text
 skip cancelled
 ~~~
 
-Running shell process trees receive termination requests. Already-started native
+Running shell child trees receive termination requests. Already-started native
 mutations are allowed to reach their existing safe terminal semantics rather
 than being interrupted at an unsafe publication point.
 
-While running children settle:
+While children settle:
 
 ~~~text
-cancelling 11/12
+cancelling batch 11/12
 6 run
 7-12 skip cancelled
 ~~~
@@ -1984,11 +2099,11 @@ cancelling 11/12
 When all nodes are terminal:
 
 ~~~text
-cancelled 12/12
+cancelled batch 12/12
 ~~~
 
-Cancellation is idempotent. Repeating it never creates a new action. Cancelling
-an already terminal run returns an unchanged/terminal status, for example:
+Repeating `job_cancel` never creates another action. Cancelling an already
+terminal job returns an unchanged terminal status, for example:
 
 ~~~text
 unchanged ok
@@ -1997,7 +2112,7 @@ unchanged cancelled
 
 Cancellation does not imply rollback. Shell or native operations that already
 produced externally visible side effects remain visible and are represented by
-their retained node outcomes.
+their retained outcomes.
 
 ### Process-restart boundary
 
@@ -2024,14 +2139,48 @@ The shell command's execution timeout remains its process lifetime. Transport
 response windows only decide when the graph hands off to durable mode; they
 never shorten the command timeout or trigger a new execution attempt.
 
-### Output and paging
+### Output, results and acknowledgement
 
-Reuse the existing bounded shell spool/paging machinery. Do not copy full
-stdout/stderr into the graph ledger.
+Reuse the existing `job_output` / `job_ack` machinery instead of inventing
+batch-specific output tools.
 
-A completed graph result contains compact node results fitting the aggregate
-budget. Oversized shell streams stay pageable through the durable execution
-surface with stable stream identity and offsets.
+Advertised v2 shape:
+
+~~~text
+job_output(id, node=null, stream="stdout", offset=0,
+           max_output_bytes=null, encoding="text")
+
+job_ack(id, node=null, stream="stdout", offset)
+~~~
+
+The optional `node` coordinate selects one batch node:
+
+- standalone shell job: `node` is omitted;
+- batch shell node: `node=N`, `stream=stdout|stderr|result`;
+- batch native node: `node=N`, `stream=result`.
+
+For a batch job, omitting `node` from `job_output`/`job_ack` is invalid rather
+than guessing which node the model meant. Acknowledging a node stream/result may
+release retained bytes but never erases the node's terminal checkpoint/status
+from the graph ledger.
+
+`result` is the retained serialized node result/control payload. Large native
+results therefore use the same durable paging/ack lifecycle as shell streams
+without being copied into every `job_get` response.
+
+For compatibility, existing shell-job calls without `node` retain their current
+stdout/stderr semantics.
+
+`job_output` remains a pure replayable read and never advances cleanup.
+`job_ack` advances the cleanup watermark for exactly one
+job/node/stream after the caller safely receives it.
+
+The graph ledger stores stream/result identity and bounded metadata, not
+unbounded payload copies. Existing shell stdout/stderr spooling is reused.
+
+A completed graph's compact ordinary result may inline node results that fit the
+aggregate budget. Larger retained outputs stay available through `job_output`
+with stable offsets.
 
 Output allocation/rendering must be deterministic and independent of parallel
 completion order.
@@ -2453,10 +2602,14 @@ bash(command, dir=".", stdin=null, timeout_secs=null,
 powershell(command, dir=".", stdin=null, timeout_secs=null,
            max_output_bytes=null, writes=null)
 
-# v2 durable graph control
-batch_get(id)
-batch_cancel(id)
-batch_restart(id)
+# shared durable execution control
+job_start(command, dir=".", stdin=null, timeout_secs=null, writes=null)
+job_list(limit=64)
+job_get(id)
+job_output(id, node=null, stream="stdout", offset=0, ...)
+job_ack(id, node=null, stream="stdout", offset)
+job_cancel(id)
+job_restart(id)
 
 # v2: bash/powershell may also appear as graph-owned batch nodes
 ~~~
@@ -2540,6 +2693,9 @@ read.offset / read.limit
 
 legacy multi-file edit objects or temporary singular edit
   → path + edits=[[old,new,all?], ...]
+
+legacy job control `job_id`
+  → id
 ~~~
 
 Old recursive `ls` fields may temporarily be accepted by a compatibility
@@ -2628,7 +2784,7 @@ The v1 implementation is complete only when all of the following hold:
 - existing correctness/security invariants remain covered on Linux, macOS,
   Windows and Nix CI.
 
-### V2 durable shell-node extension
+### V2 shared durable-job + shell-node extension
 
 The v2 extension is complete only when:
 
@@ -2645,11 +2801,17 @@ The v2 extension is complete only when:
   terminal predecessors are never rerun;
 - redelivery/recovery never duplicates an already-started process; ambiguous
   in-flight state becomes `uncertain` rather than being relaunched;
-- `batch_get(id)` provides compact status polling and automatic resume/reattach;
-- `batch_cancel(id)` is idempotent and durably freezes new node starts before
+- one durable job model controls both shell and batch executions in one ID namespace;
+- `job_list` includes both `shell` and `batch` kinds in one durable ID namespace;
+- `job_get(id)` provides compact status polling and automatic resume/reattach;
+- `job_output`/`job_ack` reuse one paging/cleanup lifecycle with optional batch
+  node selection and retained `result` streams;
+- `job_cancel(id)` is idempotent and durably freezes new graph-node starts before
   terminating/settling running work;
-- `batch_restart(id)` explicitly creates a fresh generation from node 1 and
-  never mutates/reset the historical run in place;
+- generic replay-protected `job_restart(id)` creates a fresh durable execution
+  from a retained shell/batch definition and never mutates or resets history in place;
+- `job_output`/`job_ack` support optional batch `node` coordinates and a retained
+  `result` stream without changing standalone shell-job behavior;
 - cancellation, bounded output spooling/paging and deterministic rendering work
   through the graph owner;
 - `writes` may improve scheduling but never becomes authority or a transactional
@@ -2733,8 +2895,10 @@ The v2 extension is complete only when:
 34. Resume means reattach to the same durable run; restart means create a new
     run/generation from node 1. Only explicit restart may intentionally
     re-execute terminal nodes.
-35. `batch_get` polls compact status, `batch_cancel` is idempotent, and
-    `batch_restart` is replay-protected and preserves the prior run as history.
+35. Durable lifecycle control is shared through `job_*`, not duplicated under
+    `batch_*`: `job_get` polls, `job_cancel` cancels, `job_output`/`job_ack`
+    manage retained output, and generic replay-protected `job_restart` creates a
+    fresh execution while preserving history.
 36. A claimed/running node that cannot be safely reattached after process loss
     becomes `uncertain`; `.err` excludes `uncertain`, which must be handled
     explicitly.

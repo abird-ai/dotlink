@@ -2,7 +2,7 @@
 
 Base: `84cd9b7`
 
-Status: **design sealed** for v1 plus the specified v2 durable shell-node extension; implementation intentionally not started.
+Status: **design sealed** for v1 plus the specified v2 shared durable-job / shell-node extension; implementation intentionally not started.
 
 ## Committed
 
@@ -49,6 +49,17 @@ Status: **design sealed** for v1 plus the specified v2 durable shell-node extens
 
 - [x] Sealed the v1 public surface, token/result grammar, concurrency boundary
   and deferred-feature list before implementation.
+
+### `5942393` — shell write hints and durable shell-node v2
+
+- [x] Added advisory shell `writes` scopes and specified graph-owned Bash/
+  PowerShell nodes with process-terminal branching and durable graph ownership.
+
+### `2a255f3` — durable batch controls/checkpoints
+
+- [x] Added automatic resume, explicit restart generations, compact polling,
+  idempotent cancellation and fail-closed node checkpoint semantics; this
+  revision folds those controls into the shared `job_*` lifecycle.
 
 ## Uncommitted
 
@@ -191,7 +202,7 @@ Status: **design sealed** for v1 plus the specified v2 durable shell-node extens
 - [ ] Document create/modify/delete/rename semantics and conservative subtree
   scope behavior.
 
-### Phase 9 — batch v2 durable shell nodes
+### Phase 9 — shared durable jobs + batch v2 shell nodes
 
 - [ ] Add `bash` and `powershell` as v2 batchable nodes; keep `job_start`,
   job/task controls and nested batch excluded.
@@ -219,14 +230,20 @@ Status: **design sealed** for v1 plus the specified v2 durable shell-node extens
   rerunning the graph.
 - [ ] Reuse bounded shell spooling for child stdout/stderr and deterministic
   aggregate result budgeting/paging.
-- [ ] Add compact durable controls: read-only `batch_get(id)`, idempotent
-  `batch_cancel(id)`, and replay-protected `batch_restart(id)`.
-- [ ] Make `batch_get` a cheap status snapshot only; it must not repeatedly dump
+- [ ] Generalize the existing `job_*` lifecycle to durable execution kinds
+  `shell` and `batch`; do not add parallel `batch_get/cancel/output/ack` tools.
+- [ ] Prefer concise advertised `id` in new job control schemas while accepting
+  legacy `job_id` at the compatibility boundary.
+- [ ] Make `job_get(id)` a cheap status snapshot only; it must not repeatedly dump
   retained bulk node output while polling.
-- [ ] Define resume as automatic reattachment to the same run/checkpoint ledger;
-  do not add a redundant `batch_resume` tool.
-- [ ] Make restart create a fresh run/generation from node 1 while retaining the
-  old run as history; running/cancelling runs must be cancelled/terminal first.
+- [ ] Define resume as automatic reattachment to the same job/checkpoint ledger;
+  do not add a redundant `job_resume` tool.
+- [ ] Extend `job_output`/`job_ack` with optional batch `node`; shell jobs keep
+  existing no-node stdout/stderr behavior, batch native nodes expose `result`,
+  and batch shell nodes expose stdout/stderr/result.
+- [ ] Add generic replay-protected `job_restart(id)`: terminal shell jobs rerun
+  their retained definition; terminal batch jobs create a fresh graph generation
+  from node 1 while retaining the source job as history.
 - [ ] Batch cancellation persists intent before action, prevents pending starts,
   marks them `skip cancelled`, terminates running shell trees, and preserves
   safe native-mutation terminal semantics.
@@ -296,9 +313,11 @@ Status: **design sealed** for v1 plus the specified v2 durable shell-node extens
 - [ ] Crash/restart failure-injection around `claimed -> running -> terminal`
   proving ambiguous in-flight shell state becomes `uncertain` rather than being
   relaunched.
-- [ ] Durable control tests for compact polling, idempotent cancel, cancel races,
-  automatic resume, restart generation/history retention, and replay-safe
-  restart delivery.
+- [ ] Shared durable-control tests for compact `job_list`/`job_get`, idempotent
+  `job_cancel`, cancel races, automatic resume, generic `job_restart`
+  generation/history retention, and replay-safe restart delivery.
+- [ ] `job_output`/`job_ack` tests for optional batch node selection, shell
+  stdout/stderr, native-node result streams, paging, acknowledgement and cleanup.
 - [ ] V2 output-spool tests proving large shell output remains bounded/pageable
   under one durable batch owner.
 - [ ] Edit tests for multiple independent substitutions, multiline tuples,
