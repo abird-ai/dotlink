@@ -19,6 +19,13 @@ Status: specification only; implementation intentionally not started.
   `edit(path,old,new,all)`.
 - [x] Specified pre/post-publication mutation outcome handling.
 
+### `6c1cb16` — status, paging, progress and initial batch grammar
+
+- [x] Added one canonical outcome grammar and known/unknown paging conventions.
+- [x] Added cumulative known-total/open-ended progress semantics.
+- [x] Recorded the initial shallow batch orchestration design that this revision
+  supersedes with the `ops` execution graph.
+
 ## Uncommitted
 
 ### Phase 1 — shared discovery/metadata architecture
@@ -99,25 +106,33 @@ Status: specification only; implementation intentionally not started.
   omitted total when open-ended, stable units and terse phase messages.
 - [ ] Ensure progress never carries the only copy of result data.
 
-### Phase 7 — optional thin batch orchestration
+### Phase 7 — batch execution graph
 
-- [ ] Measure real round-trip savings before enabling model-visible `batch`.
-- [ ] If justified, add one `batch(steps)`: outer sequence, one-level parallel
-  groups, compact `[tool,args]` calls.
-- [ ] Do not introduce a natural-text batch DSL, nested batches, variables,
-  conditions, loops or output substitution.
+- [ ] Add first-class `batch(ops)` to the planned native tool surface.
+- [ ] Represent each operation as compact `[tool,args,when?]` with stable
+  1-based coordinates derived from position.
+- [ ] Default omitted `when` to previous-success sequencing; use `*` for an
+  independent root.
+- [ ] Implement backward-only dependency expressions with `&`, `|`,
+  parentheses, exact status predicates, `.err` and `.done`.
+- [ ] Reject forward references/cycles by construction and evaluate conditions
+  only after all referenced operations are terminal.
+- [ ] Support sequence, fan-out, joins and status-based decision branches without
+  variables, loops, output substitution or nested batches.
+- [ ] Mark false branches as `skip condition`; expected skips do not make an
+  otherwise successful batch an error.
 - [ ] Runtime-validate nested args against the already registered tool schema
   instead of duplicating every schema into `batch`.
 - [ ] Add a central batchable-tool property; initially restrict to native
   filesystem tools.
-- [ ] Add deterministic 1-based batch coordinates and aggregate status using the
-  shared outcome grammar.
-- [ ] Add fixed-total batch progress by completed calls and optional forwarded
-  child snapshots for known/unknown child progress.
-- [ ] Before mutation-capable batch ships, implement deterministic subcall replay
-  identity/ledger so redelivery cannot repeat committed sub-operations.
-- [ ] Enforce hard call-count, parallel-width, aggregate byte/work and result
-  ceilings.
+- [ ] Add deterministic aggregate result budgeting; child tools must emit native
+  `more` cursors rather than being silently truncated by the outer batch.
+- [ ] Add compact fixed-total batch progress (`3/12 2 ok`) and forward known
+  (`412/1000 copy`) or unknown (`918 scan`) child progress snapshots.
+- [ ] Before mutation-capable batch ships, implement deterministic per-operation
+  replay identity/ledger so redelivery cannot repeat committed sub-operations.
+- [ ] Enforce hard operation-count, parallel-width, aggregate byte/work and
+  result ceilings.
 
 ### Phase 8 — compatibility, measurements and docs
 
@@ -151,8 +166,13 @@ Status: specification only; implementation intentionally not started.
   `more + incomplete` combined state.
 - [ ] Progress tests for fixed-total, unknown-total and phase-only updates,
   asserting cumulative/monotonic semantics.
-- [ ] If batch is implemented, sequential/parallel barrier, failure/skip,
-  mixed-result, nested-rejection and aggregate-budget tests.
+- [ ] Batch graph tests for default sequencing, multiple roots, fan-out,
+  joins, boolean/status branches, condition skips and backward-reference
+  validation.
+- [ ] Batch replay tests proving committed mutation nodes are not re-executed
+  after response loss/redelivery.
+- [ ] Batch aggregate-result-budget tests proving pageable children return
+  deterministic native `more` cursors independent of completion order.
 - [ ] Mutation race/alias/replay tests for `cp`, `mv`, `rm`.
 - [ ] Recursive copy/delete protected-path and symlink tests.
 - [ ] Cross-device `mv` rejection tests.

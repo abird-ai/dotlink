@@ -552,61 +552,91 @@ Progress values are **absolute cumulative snapshots**, never deltas. A client
 must not have to add previous updates to reconstruct current progress.
 
 Use one stable unit for a request whenever possible: bytes copied, entries
-visited, or calls completed.
+visited, or operations completed.
+
+The compact model/UI convention is:
+
+~~~text
+37/100 copy
+918 scan
+commit
+~~~
+
+The presence of `/total` means the end is known. A bare number means progress
+is measurable but the end is unknown. A phase word alone is valid when there is
+no useful numeric unit.
+
+At the MCP protocol boundary, dotlink still maps these to the protocol's
+structured progress fields. Do not duplicate those field names in model-visible
+text.
 
 #### Known fixed end
 
-When the operation has a cheap, fixed denominator, send normal MCP progress
-with both current and total:
+When the denominator is known cheaply before progress begins, use a fixed
+fraction:
 
 ~~~text
-progress=37 total=100 message=copy
+0/100 copy
+37/100 copy
+100/100 copy
 ~~~
 
-The numeric fields carry the fraction. Keep `message` to a short phase/name;
-do not repeat `37/100` in the message.
+The numerator is the absolute cumulative amount completed in one stable unit.
+The denominator remains fixed for the request.
 
-The final tool result, not a 100% progress event, is authoritative completion.
-A tool may emit `progress=total` immediately before its final result, but must
-not use reaching the total as a substitute for the terminal outcome.
+The final tool result, not `100/100`, is authoritative completion. Reaching
+the denominator may immediately precede the terminal result but never replaces
+it.
 
 #### Unknown end
 
-When the final amount of work is genuinely unknown, omit `total` and still
-emit monotonically nondecreasing cumulative progress:
+When the final amount of work is genuinely unknown, omit the denominator and
+still emit monotonic cumulative progress:
 
 ~~~text
-progress=412 message=scan
-progress=918 message=scan
+412 scan
+918 scan
 ~~~
 
-This communicates forward motion without inventing a denominator.
+This communicates forward motion without inventing a total.
 
-Do not switch an unknown operation to a guessed total. If a total becomes known
-naturally and the protocol/client permits adding it without changing the unit,
-later updates may include it; otherwise keep the request in unknown-total mode.
+Choose known-total mode only when the denominator is naturally available before
+the first meaningful progress update. Otherwise keep the request open-ended for
+its lifetime rather than switching modes or guessing a denominator later.
 
 #### Multi-phase work
 
-Do not mix unrelated units merely to manufacture a percentage. Keep the
-numeric unit stable and use the short message for phase transitions:
+Do not mix unrelated units merely to manufacture a percentage. Keep the numeric
+unit stable and use a terse suffix for phase/status:
 
 ~~~text
-message=scan
-message=copy
-message=commit
-message=cleanup
+37/100 scan
+37/100 commit
+37/100 cleanup
 ~~~
 
-If a phase has no meaningful numeric advance, the progress value may remain
-unchanged while the phase message changes, subject to the MCP progress
-monotonicity contract.
+For open-ended work:
+
+~~~text
+918 scan
+918 commit
+~~~
+
+If no numeric unit is meaningful for a phase, a phase-only update is enough:
+
+~~~text
+commit
+cleanup
+~~~
+
+Progress may stay numerically unchanged while the phase text changes, subject
+to the protocol's monotonicity requirements.
 
 #### Streaming partial data vs progress
 
 Progress notifications never carry the only copy of tool result data.
 
-- execution progress streams through MCP progress notifications;
+- execution progress streams through progress notifications;
 - result pagination/streaming uses ordinary tool results plus `more`;
 - a final complete result remains authoritative.
 
@@ -1178,197 +1208,345 @@ or for multiple roots:
 ok 7
 ~~~
 
-## `batch` — thin orchestration, not a workflow language
+## `batch` — compact execution graph
 
-The semantic filesystem tools remain the core. A single optional `batch` tool
-may sit above them to reduce round trips for predetermined independent work.
+`batch` is part of the planned AI-native surface. It reduces model/tool
+round trips for predetermined heterogeneous work while keeping the semantic
+filesystem tools as the actual operations.
 
 Do not add separate `seq` and `parallel` tools.
 
-### Why not a natural-text batch DSL
+### Structured arguments, tiny graph language
 
-A custom textual syntax such as:
+Do **not** make all batch input a natural-text command DSL.
 
-~~~text
-read path=a
-parallel:
-  read path=b
-  grep pattern=foo
-mv from=a to=c
-~~~
+Natural text looks shorter for trivial calls but becomes more expensive and
+error-prone as soon as arguments contain spaces, multiline `write` content,
+Codex patch text, arrays, booleans or binary payloads. That would recreate a
+second quoting/escaping language and discard the existing tool schemas.
 
-looks smaller for trivial calls but is worse overall:
+Instead:
 
-- MCP tool arguments are structured JSON already;
-- arbitrary strings, multiline `write` content, Codex patch text, arrays and
-  binary payloads immediately require a second quoting/escaping grammar;
-- the parser and permanent tool description must teach that grammar;
-- nested tool arguments lose ordinary schema validation/guidance;
-- punctuation saved per invocation is small compared with payload tokens and
-  the permanent complexity cost.
-
-Use natural compact text for **results/status**, where it saves repeated JSON
-keys. Keep batch **inputs minimally structured** and reuse each underlying
-tool's normal argument object.
-
-### Compact batch syntax
+- tool arguments remain their normal structured JSON objects;
+- only the dependency/branch expression is compact text.
 
 Advertise one argument:
 
 ~~~text
-batch(steps)
+batch(ops)
 ~~~
 
-A call is the shortest unambiguous structured pair:
+Each operation is the shortest unambiguous tuple:
 
 ~~~text
-[tool, args]
+[tool, args, when?]
 ~~~
 
-The outer `steps` list is sequential. A step that is itself a list of calls is
-one parallel stage:
+Examples:
 
 ~~~text
-steps=[
-  ["write", {"path":"a","content":"..."}],
-
-  [
-    ["read", {"path":"b"}],
-    ["grep", {"pattern":"foo"}]
-  ],
-
-  ["mv", {"from":"a","to":"src/a"}]
+ops=[
+  ["read", {"path":"a"}],
+  ["read", {"path":"b"}, "*"],
+  ["edit", {"path":"x","old":"a","new":"b"}, "1&2"],
+  ["mv", {"from":"x","to":"y"}],
+  ["read", {"path":"fallback"}, "3.err"]
 ]
 ~~~
 
-Semantics:
+Operation coordinates are their 1-based positions: `1`, `2`, `3`, ...
+
+No explicit IDs are declared.
+
+### Default sequencing and roots
+
+For operation 1, omitted `when` means `*`: start when the batch is admitted.
+
+For operation N > 1, omitted `when` means the previous operation succeeded:
 
 ~~~text
-write
-  ↓
-read ─┐
-grep ─┘  parallel
-  ↓
-mv
+N-1
 ~~~
 
-This deliberately uses JSON's existing structure instead of introducing a new
-language. The runtime distinguishes a call tuple from a parallel stage by
-shape.
+Therefore the most common sequential batch needs no graph syntax at all:
 
-Do not embed the complete schemas of every tool into the `batch` schema.
-`args` remains an object validated at runtime against the already registered
-named tool. The model already sees the underlying tool schemas once; duplicating
-them inside `batch` would waste permanent context.
+~~~text
+ops=[
+  ["write", {...}],
+  ["edit", {...}],
+  ["mv", {...}]
+]
+~~~
 
-### Batch grammar and limits
+Use `"*"` to start an independent root immediately. Multiple roots run in
+parallel under the normal dotlink concurrency/admission rules.
+
+### Dependency expressions
+
+The optional `when` string is deliberately tiny:
+
+~~~text
+*          unconditional root
+N          operation N succeeded
+N.status   exact/status-class predicate
+&          AND
+|          OR
+(...)      grouping
+~~~
+
+An operation may reference **only earlier operation numbers**. Cycles and
+forward references are therefore impossible by construction.
+
+Bare `N` means the referenced call ended as an MCP-success result:
+
+~~~text
+ok | unchanged | more | incomplete
+~~~
+
+Exact canonical statuses may be selected explicitly:
+
+~~~text
+N.ok
+N.unchanged
+N.more
+N.incomplete
+N.fail
+N.partial
+N.uncertain
+N.skip
+~~~
+
+Two compact classes are also available:
+
+~~~text
+N.err     fail | partial | uncertain
+N.done    any terminal state
+~~~
+
+Examples:
+
+~~~text
+1&2
+1|2
+1&(2|3)
+3.err
+4.more|4.incomplete
+~~~
+
+All referenced operations must reach terminal state before the expression is
+evaluated. `|` is a boolean branch, not a timing race. This keeps execution
+deterministic and replayable.
+
+### Sequence, parallelism, joins and decisions
+
+Parallelism emerges from dependencies rather than a separate syntax.
+
+Two roots:
+
+~~~text
+1 *
+2 *
+~~~
+
+run concurrently.
+
+Fan-out:
+
+~~~text
+2 when=1
+3 when=1
+~~~
+
+runs 2 and 3 concurrently after 1 succeeds.
+
+Join:
+
+~~~text
+4 when=2&3
+~~~
+
+waits for both.
+
+Decision branch:
+
+~~~text
+4 when=3
+5 when=3.err
+~~~
+
+selects the success or error path after operation 3.
+
+A realistic graph:
+
+~~~text
+ops=[
+  ["read", {"path":"config.toml"}],
+  ["read", {"path":"Cargo.toml"}, "*"],
+  ["edit", {"path":"config.toml","old":"a","new":"b"}, "1&2"],
+  ["mv", {"from":"old","to":"new"}],
+  ["read", {"path":"config.example.toml"}, "3.err"],
+  ["rm", {"paths":["tmp"],"recursive":true}, "4"]
+]
+~~~
 
 Conceptually:
 
 ~~~text
-steps = [step, step, ...]
-step  = call | [call, call, ...]
-call  = [tool, args]
+1 ─┐
+   ├─> 3 ──success──> 4 ──> 6
+2 ─┘      \
+           err
+            \
+             > 5
 ~~~
 
-Only one parallel nesting level exists.
+### Deliberate limits: graph, not workflow language
 
-No:
+The graph may branch only on canonical execution status.
 
-- nested `batch`;
+Do not add:
+
+- output-value predicates;
 - variables;
-- output substitution;
-- condition expressions;
+- output substitution into later args;
 - loops;
-- labels/IDs;
-- arbitrary DAG edges;
-- rollback language.
+- forward references;
+- dynamic node creation;
+- nested `batch`;
+- rollback scripting;
+- timing/race predicates.
 
-The batch has explicit hard limits on total calls, parallel width, aggregate
-input/output bytes and total work. These are runtime ceilings, not user-facing
-workflow features.
-
-### Execution
-
-Sequential calls finish before the next step begins.
-
-All calls in a parallel stage start independently under the normal dotlink
-concurrency/admission rules. Started siblings are allowed to reach a safe
-terminal state even if another sibling fails; mutation calls are never blindly
-cancelled merely to make the stage look atomic.
-
-If any call in a stage ends as `fail`, `partial`, or `uncertain`, later
-sequential stages do not start and are reported as `skip dependency`.
-
-`ok`, `unchanged`, `more`, and `incomplete` are successful terminal
-states for that requested call and do not by themselves stop later stages.
-
-Batch has no dataflow: later steps cannot use earlier outputs as arguments. If
-the next operation depends on model reasoning over a result, that boundary
-belongs in a new model turn rather than in `batch`.
-
-### Batch coordinates and results
-
-Coordinates are 1-based and derived only from position:
+For example, do not support expressions such as:
 
 ~~~text
-1
-2.1
-2.2
-3
+3.output contains "foo"
+$3.path -> 4.args.path
 ~~~
 
-Results use those coordinates rather than repeating tool/path names:
+If a later action depends on understanding returned data, the model should
+receive that result and make the next decision in a new turn.
+
+This boundary preserves the value of an AI model rather than building a second
+programming language inside dotlink.
+
+### False conditions and `skip`
+
+If an operation's `when` expression evaluates false, that operation is not
+started and reaches:
+
+~~~text
+skip condition
+~~~
+
+A skipped operation has no side effect.
+
+Condition-selected skips are normal graph behavior and do **not** make an
+otherwise successful batch an error.
+
+### Started parallel operations
+
+Once an operation starts, it is allowed to reach a safe terminal state.
+A sibling failure does not blindly cancel an already-running mutation merely to
+make the graph look transactional.
+
+Normal dotlink mutation coordination still serializes conflicting filesystem
+operations where required.
+
+### Batch results
+
+Results are keyed by the same 1-based coordinates and do not repeat tool/path
+names unnecessarily.
+
+Trivial `ok` results may be omitted when the aggregate summary makes them
+unambiguous. Data-bearing results, `unchanged`, skips and exceptional states
+remain visible when needed for recovery/reasoning.
+
+Example:
 
 ~~~text
 1
+<read data>
+
+2
+<read data>
+
+3
 ok
 
-2.1
-<read result>
-more next=line:200:0
+4
+fail destination exists
 
-2.2
-fail permission denied
+5
+skip condition
 
-3
-skip dependency
-
-partial ok=2 fail=1 skip=1
+partial ok=3 fail=1 skip=1
+4 fail destination exists
+5 skip condition
 ~~~
 
-The final aggregate uses the same canonical outcome grammar as every other
-tool. Successful data-bearing sub-results remain available; the summary lists
-only counts and exceptional coordinates.
+The final aggregate reuses the canonical status grammar:
+
+- `ok` when every started operation is non-error; condition skips are allowed;
+- `fail` when the graph failed with no useful/committed successful component;
+- `uncertain` when the aggregate outcome itself cannot be established;
+- `partial` for known mixed success/error/uncertain outcomes.
+
+The summary lists counts first and only exceptional coordinates after it.
+Successful data blocks remain available separately.
+
+### Paging inside batch
+
+A child tool retains its native paging semantics.
+
+A batch must never silently truncate a child result merely because the aggregate
+response is large. If the aggregate result budget constrains a pageable child,
+that child returns its normal `more` cursor.
+
+Per-operation result budgets must be assigned **deterministically**, independent
+of parallel completion order, under the aggregate transport/result ceiling.
+The exact allocator is an implementation detail, but it must not make replayed
+results depend on scheduling.
 
 ### Batch progress
 
-The total number of calls is known before execution, so batch-level progress has
-a fixed denominator:
+The number of graph operations is fixed, so top-level batch progress has a known
+denominator. Skipped nodes count as terminal operations.
+
+Compact form:
 
 ~~~text
-progress=3 total=12 message=2.1
+3/12 2 ok
+7/12 5 skip
 ~~~
 
-The numeric value is completed calls; the short message identifies the call
-that most recently reached a terminal state.
+The fraction is terminal operations / total operations. The suffix identifies
+the operation that most recently reached a terminal state and, when useful, its
+status.
 
-For a long-running child that itself reports progress, batch may forward a
-compact child snapshot while leaving the aggregate completed-call progress
-unchanged:
+A long-running child may contribute a nested compact snapshot without advancing
+the batch completed count.
+
+Known child end:
 
 ~~~text
-progress=3 total=12 message="2.2 copy 412/1000"
-progress=3 total=12 message="2.3 scan 918"
+3/12 5 412/1000 copy
 ~~~
 
-The first child has a known total; the second has an unknown end. These are
-status hints only. The child's eventual result and the final batch ledger remain
-authoritative.
+Unknown child end:
+
+~~~text
+3/12 5 918 scan
+~~~
+
+The batch fraction stays fixed-total while the child snapshot independently
+uses the known/unknown progress convention.
+
+These updates are status hints only. Child terminal results and the final batch
+ledger remain authoritative.
 
 ### Batchable tools
 
-Initially batch only the deterministic native filesystem surface:
+Initially batch the deterministic native filesystem surface:
 
 ~~~text
 ls find grep
@@ -1381,35 +1559,59 @@ Do not batch `batch`, shell/powershell, jobs or task-control methods in the
 first design. Those already have independent execution, durability and timeout
 semantics.
 
-A central tool-spec property should declare batchability so visibility,
-validation and tests cannot drift.
+A central tool-spec property declares batchability so visibility, validation
+and tests cannot drift.
+
+### Validation and schema reuse
+
+Do not embed a discriminated union containing every tool schema inside
+`batch`; that would duplicate permanent model context.
+
+`args` is validated at runtime against the already registered named tool's
+schema and normal permission/capability checks.
+
+The batch parser validates before execution:
+
+- total operation count and aggregate request bytes;
+- allowed/batchable tool names;
+- each nested argument object;
+- backward-only references;
+- condition grammar;
+- maximum graph fan-out/concurrency;
+- aggregate work and result ceilings.
+
+Invalid graphs fail before any operation starts.
 
 ### Replay and mutation safety
 
 A batch containing any mutation is replay-protected.
 
-Every subcall receives a deterministic internal identity derived from the outer
-request identity and its positional coordinate. A redelivery can therefore
-replay/resume the known ledger without repeating a committed sub-operation.
+Every operation receives a deterministic internal replay identity derived from
+the outer request identity plus its operation coordinate. The semantic hash of
+the outer request already binds the complete operation list, arguments and
+conditions.
 
-The outer result records the exact terminal status of every started mutation.
-If dotlink cannot prove whether a subcall crossed its commit point, that
-coordinate is `uncertain`; later dependent stages are skipped.
+On redelivery, already terminal sub-operations replay their recorded terminal
+state/result and are never executed again. Pending graph nodes resume only when
+their dependency predicates are satisfied by that same ledger.
 
-Do not ship mutation-capable batch until this subcall replay ledger is correct
-under cancellation, response loss and runtime recovery. A read-only batch may
-be implemented earlier if useful.
+If dotlink cannot prove whether one mutation crossed its commit point, that node
+is `uncertain`; dependent predicates evaluate from that explicit status.
+
+Do not ship mutation-capable `batch` until this per-operation replay ledger is
+correct under cancellation, response loss and runtime recovery.
 
 ### Design boundary
 
-Prefer semantic batching inside domain tools:
+Prefer semantic batching inside domain tools when one domain operation can do
+the work more efficiently and atomically:
 
 - one `grep` over many files instead of N greps;
 - one multi-hunk `patch` instead of N edits;
 - one `rm(paths)` instead of N removes.
 
-Use `batch` only for heterogeneous predetermined calls where reducing
-round-trip latency materially helps.
+Use `batch` for heterogeneous predetermined execution graphs where reducing
+model/tool round trips materially helps.
 
 ## Binary tools
 
@@ -1830,13 +2032,18 @@ The implementation is complete only when all of the following hold:
     `more`, `incomplete`, `fail`, `partial`, `uncertain`, `skip`.
 19. Paging supports both known totals and cursor-only unknown totals without
     performing extra work merely to count pages.
-20. Progress updates are cumulative snapshots. Known work uses a fixed total;
-    unknown work omits the total while still reporting monotonic progress.
+20. Progress updates are cumulative snapshots. Model-visible status uses
+    compact `current/total phase` when the fixed end is known and
+    `current phase` when it is open-ended.
 21. Result data is never available only through progress notifications; final
     results and explicit paging remain authoritative.
-22. If generic batching is implemented, use one shallow structured `batch`
-    tool: outer sequence, one-level parallel groups, no custom text DSL and no
-    dataflow/workflow language.
+22. `batch` is a planned first-class orchestration tool using compact
+    `ops=[tool,args,when?]` nodes and backward-only status dependencies.
+23. Batch graph structure may express sequence, parallel roots/fan-out, joins
+    and status-based decisions, but never output dataflow, loops or a general
+    workflow language.
+24. Batch arguments stay structured; only the tiny `when` dependency
+    expression is textual, avoiding a second quoting/escaping language.
 
 ## References
 
