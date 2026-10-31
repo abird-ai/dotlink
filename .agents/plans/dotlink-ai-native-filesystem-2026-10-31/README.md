@@ -1,4 +1,4 @@
-# DL-150 — AI-native filesystem tool surface
+# DL-150 — AI-native tool surface + canonical Job graph runtime
 
 Author: Prasanna Loganathar
 
@@ -40,11 +40,11 @@ added speculatively during implementation.
 
 ## Why
 
-dotlink's native filesystem tools are consumed primarily by AI models, not by
-humans typing commands. The surface should therefore optimize for model tool
-selection, schema-token cost, result-token cost, deterministic composition,
-bounded work and robust filesystem semantics rather than for compatibility with
-Unix command-line conventions.
+dotlink's native tools are consumed primarily by AI models, not by humans typing
+commands. The surface should therefore optimize for model tool selection,
+schema-token cost, result-token cost, deterministic composition, bounded work
+and robust execution/filesystem semantics rather than for compatibility with
+human shell conventions.
 
 The current surface has one important overlap: `ls` is both a directory lister
 and a recursive discovery tool. It carries glob, depth, kind and sort behavior
@@ -52,8 +52,12 @@ that belongs to a finder. At the same time, a non-shell runtime still lacks the
 basic filesystem lifecycle operations needed for ordinary repository work:
 copy, rename/move and remove.
 
-The target is a complete coding/repository filesystem environment that remains
-useful when shell authority is deliberately withheld.
+The target is a complete coding/repository environment that remains useful when
+shell authority is deliberately withheld, while also giving shell-enabled
+runtimes one clean durable execution model. Native filesystem tools stay direct
+and strongly typed; `bash`/`pwsh`/`powershell`, `batch`, and `job_start` compose
+through the canonical Job/Graph/Node runtime rather than separate durability
+systems.
 
 ## Design principles
 
@@ -97,7 +101,7 @@ lifecycle     cp      mv      rm
 binary        bread   bwrite  bedit
 orchestration batch
 durable       job_start job_list job_get job_output job_ack job_cancel job_restart
-shell         bash    pwsh      # separate capability; optional writes hint
+shell         bash    pwsh    powershell   # distinct interpreter capabilities
 ~~~
 
 The model-facing decision boundary should be nearly mechanical:
@@ -115,9 +119,9 @@ The model-facing decision boundary should be nearly mechanical:
 | rename an object | `mv` |
 | remove objects | `rm` |
 | inspect/create/mutate arbitrary bytes | `bread` / `bwrite` / `bedit` |
-| run an arbitrary command | `bash` / `pwsh` |
-| run a predetermined dependency graph | `batch` |
-| explicitly start background shell work | `job_start` |
+| run an arbitrary command | `bash` / `pwsh` / `powershell` |
+| run a predetermined graph and optimistically wait | `batch` |
+| start the same graph durably and return immediately | `job_start` |
 | inspect/control durable work | `job_list` / `job_get` / `job_output` / `job_ack` / `job_cancel` / `job_restart` |
 
 ## Shared vocabulary
@@ -374,7 +378,7 @@ mutation committed but its response could not be delivered: redelivery replays
 the committed result rather than executing the side effect again, and an
 unrecoverable ambiguity remains fail-closed.
 
-### Batch mutations
+### Multi-object mutation outcomes
 
 A multi-object operation cannot generally promise one filesystem transaction.
 
@@ -395,8 +399,8 @@ Such a result is an MCP tool error, not an ordinary success. The word
 `partial` is reserved for a real visible mutation split; never use it for
 private staging progress.
 
-Where a batch operation can cheaply roll back unpublished/tombstoned objects
-while locks are still held, it should do so, but rollback failure must itself be
+Where a multi-object mutation can cheaply roll back unpublished/tombstoned
+objects while locks are still held, it should do so, but rollback failure must itself be
 reported as a partial/uncertain state rather than hidden.
 
 ## Canonical status, paging and progress grammar
@@ -469,7 +473,7 @@ It is an error result and is reserved for fail-closed ambiguity.
 skip condition
 ~~~
 
-It is primarily useful in batch graphs. A skipped mutation has no side effect.
+It is primarily useful in conditional Graphs. A skipped mutation has no side effect.
 
 ### Known mixed outcomes: `partial`
 
@@ -1278,17 +1282,18 @@ or for multiple roots:
 ok 7
 ~~~
 
-## `batch` — compact execution graph
+## Shared `ops` Graph grammar
 
-`batch` is part of the planned AI-native surface. It reduces model/tool
-round trips for predetermined heterogeneous work while keeping the semantic
-filesystem tools as the actual operations.
+`batch(ops)` and `job_start(ops)` consume one canonical compact Graph grammar.
+`batch` reduces model/tool round trips while optimistically waiting; `job_start`
+uses the same Graph but exposes the Job immediately. The semantic tools remain
+the actual node operations.
 
 Do not add separate `seq` and `parallel` tools.
 
 ### Structured arguments, tiny graph language
 
-Do **not** make all batch input a natural-text command DSL.
+Do **not** make Graph input a natural-text command DSL.
 
 Natural text looks shorter for trivial calls but becomes more expensive and
 error-prone as soon as arguments contain spaces, multiline `write` content,
@@ -1300,10 +1305,11 @@ Instead:
 - tool arguments remain their normal structured JSON objects;
 - only the dependency/branch expression is compact text.
 
-Advertise one argument:
+Both constructors advertise the same one graph argument:
 
 ~~~text
 batch(ops)
+job_start(ops)
 ~~~
 
 Each operation is the shortest unambiguous tuple:
@@ -1318,7 +1324,7 @@ Examples:
 ops=[
   ["read", {"path":"a"}],
   ["read", {"path":"b"}, "*"],
-  ["edit", {"path":"x","old":"a","new":"b"}, "1&2"],
+  ["edit", {"path":"x","edits":[["a","b"]]}, "1&2"],
   ["mv", {"from":"x","to":"y"}],
   ["read", {"path":"fallback"}, "3.err"]
 ]
@@ -1330,7 +1336,7 @@ No explicit IDs are declared.
 
 ### Default sequencing and roots
 
-For operation 1, omitted `when` means `*`: start when the batch is admitted.
+For operation 1, omitted `when` means `*`: start when the Job is admitted.
 
 For operation N > 1, omitted `when` means the previous operation succeeded:
 
@@ -1338,7 +1344,7 @@ For operation N > 1, omitted `when` means the previous operation succeeded:
 N-1
 ~~~
 
-Therefore the most common sequential batch needs no graph syntax at all:
+Therefore the most common sequential Graph needs no explicit dependency syntax:
 
 ~~~text
 ops=[
@@ -1466,7 +1472,7 @@ A realistic graph:
 ops=[
   ["read", {"path":"config.toml"}],
   ["read", {"path":"Cargo.toml"}, "*"],
-  ["edit", {"path":"config.toml","old":"a","new":"b"}, "1&2"],
+  ["edit", {"path":"config.toml","edits":[["a","b"]]}, "1&2"],
   ["mv", {"from":"old","to":"new"}],
   ["read", {"path":"config.example.toml"}, "3.err"],
   ["rm", {"paths":["tmp"],"recursive":true}, "4"]
@@ -1524,8 +1530,8 @@ skip condition
 
 A skipped operation has no side effect.
 
-Condition-selected skips are normal graph behavior and do **not** make an
-otherwise successful batch an error.
+Condition-selected skips are normal Graph behavior and do **not** make an
+otherwise successful Job an error.
 
 ### Started parallel operations
 
@@ -1536,7 +1542,7 @@ make the graph look transactional.
 Normal dotlink mutation coordination still serializes conflicting filesystem
 operations where required.
 
-### Batch results
+### Graph results
 
 Results are keyed by the same 1-based coordinates and do not repeat tool/path
 names unnecessarily.
@@ -1588,15 +1594,15 @@ partial ok=3 more=1 fail=1 skip=1
 5 skip condition
 ~~~
 
-A condition-selected `skip` is expected graph behavior and by itself does not
-make the batch an error.
+A condition-selected `skip` is expected Graph behavior and by itself does not
+make the Job an error.
 
-### Paging inside batch
+### Paging inside a Graph
 
-A child tool retains its native paging semantics.
+A node retains its native paging semantics.
 
-A batch must never silently truncate a child result merely because the aggregate
-response is large. If the aggregate result budget constrains a pageable child,
+A Graph Job must never silently truncate a node result merely because the
+aggregate response is large. If the aggregate result budget constrains a pageable child,
 that child returns its normal `more` cursor.
 
 Per-operation result budgets must be assigned **deterministically**, independent
@@ -1604,9 +1610,9 @@ of parallel completion order, under the aggregate transport/result ceiling.
 The exact allocator is an implementation detail, but it must not make replayed
 results depend on scheduling.
 
-### Batch progress
+### Graph progress
 
-The number of graph operations is fixed, so top-level batch progress has a known
+The number of Graph nodes is fixed, so top-level Job progress has a known
 denominator. Skipped nodes count as terminal operations.
 
 Compact form:
@@ -1620,8 +1626,8 @@ The fraction is terminal operations / total operations. The suffix identifies
 the operation that most recently reached a terminal state and, when useful, its
 status.
 
-A long-running child may contribute a nested compact snapshot without advancing
-the batch completed count.
+A long-running node may contribute a nested compact snapshot without advancing
+the Job's terminal-node count.
 
 Known child end:
 
@@ -1635,15 +1641,15 @@ Unknown child end:
 3/12 5 918 scan
 ~~~
 
-The batch fraction stays fixed-total while the child snapshot independently
-uses the known/unknown progress convention.
+The Job fraction stays fixed-total while the node snapshot independently uses
+the known/unknown progress convention.
 
-These updates are status hints only. Child terminal results and the final batch
+These updates are status hints only. Node terminal results and the final Job
 ledger remain authoritative.
 
-### Batchable tools
+### Graph-node eligibility
 
-V1 batches the deterministic native filesystem surface:
+V1 admits the deterministic native filesystem surface as Graph nodes:
 
 ~~~text
 ls find grep
@@ -1652,27 +1658,28 @@ cp mv rm
 bread bwrite bedit
 ~~~
 
-V1 does not batch shell, jobs or task-control methods.
+V1 does not admit shell, job-control or task-control tools as Graph nodes.
 
-V2 adds `bash` and `pwsh` as graph-owned shell nodes under the durable
-shell-node design specified below. It still excludes `job_start`, job/task
-control methods and nested `batch`.
+V2 adds `bash`, `pwsh` and `powershell` as ShellNodes under the canonical
+Job/Graph/Node design specified below. Graph node dispatch still excludes
+`batch`, `job_start`, all `job_*` controls and task-control methods.
 
-A central tool-spec property declares batchability/version gating so visibility,
-validation and tests cannot drift.
+A central tool-spec property declares **Graph-node eligibility** and version
+availability so `batch`, `job_start`, visibility, validation and tests cannot
+drift. This supersedes a narrowly named `batchable` concept.
 
 ### Validation and schema reuse
 
 Do not embed a discriminated union containing every tool schema inside
-`batch`; that would duplicate permanent model context.
+`batch` or `job_start`; that would duplicate permanent model context.
 
 `args` is validated at runtime against the already registered named tool's
 schema and normal permission/capability checks.
 
-The batch parser validates before execution:
+The shared Graph parser validates before execution:
 
 - total operation count and aggregate request bytes;
-- allowed/batchable tool names;
+- eligible Graph-node tool names;
 - each nested argument object;
 - backward-only references;
 - condition grammar;
@@ -1683,12 +1690,15 @@ Invalid graphs fail before any operation starts.
 
 ### Replay and mutation safety
 
-A batch containing any mutation is replay-protected.
+Every Graph Job constructor (`batch` and `job_start`) is request-replay
+protected, regardless of the apparent node mix. This gives one stable Job
+creation/execution identity, prevents duplicate expensive read-only Graphs, and
+avoids trusting shell hints/classification to decide whether replay matters.
 
-Every operation receives a deterministic internal replay identity derived from
-the outer request identity plus its operation coordinate. The semantic hash of
-the outer request already binds the complete operation list, arguments and
-conditions.
+Every node receives a deterministic internal replay identity derived from the
+outer Job/request identity plus its node coordinate. The semantic hash of the
+outer request binds the complete Graph definition: operation list, arguments
+and conditions.
 
 On redelivery, already terminal sub-operations replay their recorded terminal
 state/result and are never executed again. Pending graph nodes resume only when
@@ -1697,8 +1707,10 @@ their dependency predicates are satisfied by that same ledger.
 If dotlink cannot prove whether one mutation crossed its commit point, that node
 is `uncertain`; dependent predicates evaluate from that explicit status.
 
-Do not ship mutation-capable `batch` until this per-operation replay ledger is
-correct under cancellation, response loss and runtime recovery.
+Do not ship Graph execution (`batch` or `job_start`) until this outer-Job and
+per-node replay model is correct under cancellation, response loss and runtime
+recovery. Mutation nodes make this a correctness requirement; read-only nodes
+benefit from the same uniform identity model.
 
 ### Design boundary
 
@@ -1709,8 +1721,9 @@ the work more efficiently and atomically:
 - one multi-hunk `patch` instead of N edits;
 - one `rm(paths)` instead of N removes.
 
-Use `batch` for heterogeneous predetermined execution graphs where reducing
-model/tool round trips materially helps.
+Use `batch` for heterogeneous predetermined Graphs where reducing model/tool
+round trips materially helps; use `job_start` when the same Graph should be
+exposed durably immediately.
 
 ## V2 — one durable Job graph runtime
 
@@ -1728,19 +1741,20 @@ There are no nested child Jobs inside a Graph.
 This makes the public constructors simple specializations of one runtime:
 
 ~~~text
-bash(...)       Job(Graph[ShellNode::Bash])
-pwsh(...)       Job(Graph[ShellNode::Pwsh])
-job_start(...)  same one-node shell Job, exposed immediately
-batch(ops)      Job(Graph[Node...])
+bash(...)        Job(Graph[ShellNode::Bash])
+pwsh(...)        Job(Graph[ShellNode::Pwsh])
+powershell(...)  Job(Graph[ShellNode::WindowsPowerShell])
+batch(ops)       Job(Graph[Node...]), optimistically wait
+job_start(ops)   Job(Graph[Node...]), expose immediately
 ~~~
 
-`bash` and `pwsh` remain first-class model-facing tools because they are the
-clearest intent for ordinary shell work; they are not separate execution
-engines. `batch` is similarly the compact multi-node graph-construction tool,
-not a second durable runtime.
+`bash`, `pwsh` and `powershell` remain first-class model-facing tools because
+they express the interpreter intent directly; they are not separate execution
+engines. `batch` and `job_start` consume the same `ops` graph grammar and differ
+only in presentation: optimistic wait versus immediate durable exposure.
 
 V1 `batch(ops)` may still restrict allowed nodes to deterministic native tools.
-V2 adds `bash` and `pwsh` nodes to that same Graph runtime.
+V2 adds `bash`, `pwsh` and `powershell` ShellNodes to that same Graph runtime.
 
 ### One Job lifecycle
 
@@ -1748,17 +1762,17 @@ All Jobs use one ID namespace and the existing `job_*` lifecycle. Native MCP
 Tasks are another projection of the same underlying Job and use the same ID when
 supported.
 
-Ordinary `bash`, `pwsh` and `batch` calls create a Job, then optimistically
-wait for its normal synchronous result. If execution outlives the response
-window, or the complete result cannot fit the response budget, the **same Job**
-is exposed durably. No node is restarted during handoff.
+Ordinary `bash`, `pwsh`, `powershell` and `batch` calls create a Job, then
+optimistically wait for its normal synchronous result. If execution outlives the
+response window, or the complete result cannot fit the response budget, the
+**same Job** is exposed durably. No node is restarted during handoff.
 
 Only exposed/handed-off Jobs enter the model-visible `job_*` namespace. A Job
 that completes synchronously and returns its ordinary result needs no durable ID.
 
-`job_start` remains the explicit return-immediately convenience for the
-one-shell-node case. There is no `batch_start`: `batch(ops)` already creates
-the Job and can hand that same execution off durably when needed.
+`job_start(ops)` is the explicit return-immediately constructor for the same
+Graph grammar used by `batch(ops)`. There is no `batch_start` and no shell-only
+background schema: `job_start` handles one-node or multi-node Graphs uniformly.
 
 Conceptually:
 
@@ -1815,49 +1829,58 @@ batch(ops=[
 Platform/capability visibility still applies: a shell node is valid only when
 that shell tool is available to the caller.
 
-Do not batch `job_start`, `job_get`, `job_output`, task-control methods or
-nested `batch`. A shell node is itself graph-owned execution; explicit child
-handoff APIs would break graph ownership.
+Graph node dispatch excludes `batch`, `job_start`, all `job_*` controls and
+Task-control methods. A ShellNode is graph-owned execution; explicit child
+handoff APIs would break Job ownership.
 
 ### Shell-node terminal semantics
 
 A shell node is **not terminal merely because execution was handed off** to a
 durable job or MCP Task.
 
-For graph control:
+For Graph control, ShellNodes map process state onto the canonical node outcome
+vocabulary:
 
-- bare `N` / `N.ok` means the process reached terminal completion with shell
-  success (`success=true`, normally exit code 0);
-- `N.err` means non-zero exit, timeout, launch/preparation failure or
-  cancellation;
-- `N.done` means any terminal process state.
+- successful process completion (`success=true`, normally exit code 0) -> `ok`;
+- known non-zero exit, timeout, launch/preparation failure or cancellation ->
+  `fail` with compact process detail;
+- genuinely ambiguous process/side-effect state -> `uncertain`;
+- `N.err` remains the shared **known-error class** (`fail | partial`), not a new
+  primary status;
+- `N.done` means any terminal node state.
 
-The retained node result still carries exit code, success, timeout state,
-stdout/stderr and truncation/paging information.
+The ShellNode retains compact exit/success/timeout/error metadata plus separate
+bounded stdout/stderr streams and their truncation/paging state.
 
-Shell `err` is a process-outcome class, not the native mutation `fail` commit
-guarantee. A shell command may mutate files and then fail, time out or be
-cancelled. V2 must never imply rollback merely because the node followed its
-error branch.
+Because direct `bash` / `pwsh` / `powershell` are the one-ShellNode Job case,
+the same outcome mapping applies to their ordinary tool projection: successful
+exit is MCP success; a known process failure is an MCP error carrying the bounded
+process result/output; ambiguity is `uncertain`. Do not maintain a second rule
+where exit code 1 is Graph-`fail` but direct-shell success.
+
+A ShellNode `fail` is a process outcome, not the native mutation `fail`
+commit guarantee. A shell command may mutate files and then exit non-zero, time
+out or be cancelled. V2 must never imply rollback merely because the node
+followed a known-error branch.
 
 Aggregate summaries may count shell process errors explicitly:
 
 ~~~text
-partial ok=3 err=1 skip=1
-4 err exit=1
+partial ok=3 fail=1 skip=1
+4 fail exit=1
 5 skip condition
 ~~~
 
-If no useful node succeeded, the outer graph may report `fail err=N`. That
-means the graph failed to complete successfully, not that arbitrary shell side
-effects are known absent.
+If no useful node succeeded, the outer Graph reports `fail` with the relevant
+node failure details. That means the Graph failed to complete successfully, not
+that arbitrary shell side effects are known absent.
 
 ### The Job owns durability
 
 The **Job** is the durable unit; the Graph is its immutable executable plan.
 
 Durability is automatic. There is no per-node `durable=true` flag and the model
-does not need to predict whether a one-node shell Job or multi-node batch Job
+does not need to predict whether a one-node shell Job or multi-node Graph Job
 will fit inside the current transport window.
 
 A ShellNode may run for seconds, minutes or hours. Crossing the synchronous
@@ -1880,8 +1903,8 @@ Job
   +-- durable node ledger
 ~~~
 
-For `bash`/`pwsh`, the Graph contains one ShellNode. For `batch`, it contains
-the submitted node graph.
+For direct `bash`/`pwsh`/`powershell`, the Graph contains one ShellNode. For
+`batch` and `job_start`, it contains the submitted `ops` Graph.
 
 If the Job finishes inside the caller/transport window and its result fits,
 return the ordinary tool result. Otherwise expose that same Job through the
@@ -1941,17 +1964,14 @@ restart  create a new durable execution from the retained definition
 `job_get`, Task polling and redelivery all attach to the same execution. There
 is no `job_resume` tool.
 
-For a batch job, terminal node checkpoints remain terminal and pending nodes may
-continue when their dependencies are conclusively satisfied. A claimed/running
-node must reattach to the exact existing execution or become `uncertain`; it is
-never silently relaunched.
+Terminal node checkpoints remain terminal and pending nodes may continue when
+their dependencies are conclusively satisfied. A claimed/running node must
+reattach to the exact existing execution or become `uncertain`; it is never
+silently relaunched.
 
-**Restart is explicit through `job_restart(id)`.** It creates a fresh durable
-job with a new ID while preserving the source job as immutable history:
-
-- shell job -> rerun the retained shell definition from the beginning;
-- batch job -> create a fresh graph generation with every node initially
-  pending.
+**Restart is explicit through `job_restart(id)`.** It creates a fresh Job with a
+new ID from the source Job's retained immutable Graph, with every node initially
+pending, while preserving the source Job as immutable history.
 
 Restart may repeat side effects. A running/cancelling job cannot be restarted:
 
@@ -1972,10 +1992,10 @@ A successful restart returns the new durable ID:
 running <new-id>
 ~~~
 
-For a batch job it may include graph progress:
+For a multi-node Graph it may include graph progress:
 
 ~~~text
-running <new-id> batch 0/12
+running <new-id> graph 0/12
 ~~~
 
 Selective "restart from node N" is deliberately omitted in v2. It requires
@@ -1985,41 +2005,62 @@ dependency invalidation and snapshot semantics that are not justified yet.
 
 Do not add `batch_get`, `batch_cancel`, `batch_output` or `batch_ack`.
 
-Use the existing durable execution controls for both shell and batch jobs:
+Use one durable execution control surface for every exposed Job:
 
 ~~~text
+job_start(ops)
 job_list(limit=64)
 job_get(id)
-job_output(id, node=null, stream="stdout", offset=0, ...)
-job_ack(id, node=null, stream="stdout", offset)
+job_output(id, node=null, stream=null, offset=0, ...)
+job_ack(id, node=null, stream=null, offset)
 job_cancel(id)
 job_restart(id)
 ~~~
 
-The new advertised control schemas should prefer the concise `id` field because
-the tool name already supplies the `job` context. Compatibility may continue to
-accept legacy `job_id` at the deserialization boundary.
+`job_start(ops)` uses the exact same Graph grammar, validation and Graph-node
+registry as `batch(ops)`:
+
+- `batch(ops)`: create the Job and optimistically wait;
+- `job_start(ops)`: create the Job and expose its durable ID immediately.
+
+Neither tool may appear as a Graph node, so there are no nested Jobs/Graphs.
+
+`job_start` has a stronger creation-order invariant because it promises an
+immediately durable handle:
+
+~~~text
+preflight complete Graph
+→ reserve/commit durable Job identity + replay state
+→ expose Job
+→ allow root nodes to start
+~~~
+
+If the `job_start` response is lost after creation, `job_list` can recover that
+same Job; the graph is never hidden behind a lost receipt and never recreated
+merely to obtain another ID.
+
+`batch` uses the same preflight/Graph compiler but may remain a lightweight
+optimistically synchronous Job until it needs durable exposure. If handoff is
+needed, promote/expose that **same Job** and preserve all node checkpoints.
+
+The advertised control schemas use concise `id`; compatibility may continue to
+accept legacy `job_id` at deserialization.
 
 Semantics:
 
-- `job_list`: read-only discovery/recovery of recent exposed durable
-  executions;
-- `job_get`: pure compact status snapshot and reattachment to the same run;
-- `job_output`: pure pageable retained output/result read;
+- `job_start`: side-effecting/replay-protected durable Job creation;
+- `job_list`: read-only discovery/recovery of recent exposed Jobs;
+- `job_get`: pure compact status snapshot and reattachment to the same Job;
+- `job_output`: pure pageable retained node output/result read;
 - `job_ack`: idempotently advance cleanup watermarks after safe receipt;
-- `job_cancel`: idempotently request cancellation;
-- `job_restart`: explicitly create a fresh execution from a retained immutable
-  definition.
+- `job_cancel`: idempotently request Job cancellation;
+- `job_restart`: explicitly create a fresh Job from a retained immutable Graph.
 
-`job_restart` is the only new lifecycle tool. It is generic:
-
-- for a shell job, rerun the same retained command/dir/stdin/timeout/`writes`
-  definition as a new job;
-- for a batch job, create a fresh graph run/generation from node 1.
-
-Restart requires the source job to be terminal and retained. It returns a new
-job ID, preserves the old job as history, may repeat side effects, and is
-replay-protected so duplicate delivery returns the same restarted job.
+`job_restart` is fully generic because every Job retains one immutable Graph.
+Restart requires the source Job to be terminal and retained, creates a new Job
+with every node initially pending, preserves the old Job as history, may repeat
+side effects, and is replay-protected so duplicate delivery returns the same
+restarted Job.
 
 Native MCP Tasks map onto the same durable owner rather than creating another
 state machine: Task get/poll is the same underlying status operation and Task
@@ -2028,39 +2069,74 @@ cancel is the same underlying cancellation intent.
 No control operation mutates or deletes the historical ledger of a terminal
 execution.
 
-### Listing and polling
+### Job lifecycle status versus node outcomes
 
-`job_list(limit=64)` lists both durable kinds in one compact namespace so a
-lost creation/handoff response can be recovered:
+Job lifecycle status is intentionally separate from the canonical Graph-node
+outcome grammar.
+
+Node outcomes remain:
 
 ~~~text
-j1 shell running
-j2 batch running 5/12
-j3 shell ok exit=0
-j4 batch partial 12/12
+ok  unchanged  fail  partial  uncertain  skip
+~~~
+
+plus query modifiers `more` / `incomplete`.
+
+An exposed Job may additionally be in lifecycle states that are not node
+outcomes:
+
+~~~text
+running
+cancelling
+cancelled
+~~~
+
+A terminal one-node Job may surface its node outcome directly
+(`ok/unchanged/fail/partial/uncertain`). A multi-node Job uses the aggregate
+Graph outcome. After an explicit cancellation request has settled, the Job
+lifecycle is `cancelled` while individual nodes retain their exact terminal
+outcomes (for example earlier `ok`, running ShellNode `fail cancelled`, and
+pending `skip cancelled`).
+
+`cancelled` is therefore never a `when` predicate for a Graph node. Dependency
+expressions see only canonical node outcomes; Job lifecycle is observed through
+`job_get`.
+
+### Listing and polling
+
+`job_list(limit=64)` lists all exposed Jobs in one compact namespace so a lost
+creation/handoff response can be recovered. The display label is derived from
+the Graph shape, not from a separate durability kind:
+
+- one ShellNode -> its interpreter name (`bash`, `pwsh`, `powershell`);
+- one NativeToolNode -> its tool name;
+- multiple nodes -> `graph`.
+
+Example:
+
+~~~text
+j1 bash running
+j2 graph running 5/12
+j3 cp ok
+j4 powershell fail exit=1
 ~~~
 
 `job_get(id)` returns **status, not bulk output**, so repeated polling is cheap.
 
-Shell example:
+One-node examples:
 
 ~~~text
-running shell
+running pwsh
+ok cp
+fail powershell exit=1
 ~~~
 
-Terminal shell examples:
+Multi-node example:
 
 ~~~text
-ok shell exit=0
-err shell exit=1
-~~~
-
-Batch example:
-
-~~~text
-running batch 5/12
+running graph 5/12
 1-3 ok
-4 err exit=1
+4 fail exit=1
 5 ok
 6 run
 7-12 pending
@@ -2070,26 +2146,26 @@ Contiguous nodes with identical simple states may be range-compressed. Active
 nodes may append their latest meaningful progress snapshot:
 
 ~~~text
-running batch 5/12
+running graph 5/12
 6 run 412/1000 copy
 ~~~
 
 For arbitrary shell commands, do not invent a percentage:
 
 ~~~text
-running batch 5/12
+running graph 5/12
 6 run
 ~~~
 
 Terminal graph examples:
 
 ~~~text
-ok batch 12/12
+ok graph 12/12
 ~~~
 
 ~~~text
-partial batch 12/12
-4 err exit=1
+partial graph 12/12
+4 fail exit=1
 9 uncertain
 10-12 skip condition
 ~~~
@@ -2100,29 +2176,29 @@ every status poll.
 
 ### Cancellation
 
-`job_cancel(id)` is the one idempotent cancellation primitive for both durable
-kinds.
+`job_cancel(id)` is the one idempotent cancellation primitive for every
+exposed Job.
 
-For a shell job it preserves the current behavior: request termination of the
-contained command tree while retaining already-spooled output.
+Cancellation first persists Job cancellation intent. Once durable, no new
+pending node may start.
 
-For a batch job, cancellation first persists graph cancellation intent. Once
-that intent is durable, no new pending node may start.
-
-Pending graph nodes become:
+Pending nodes become:
 
 ~~~text
 skip cancelled
 ~~~
 
-Running shell child trees receive termination requests. Already-started native
-mutations are allowed to reach their existing safe terminal semantics rather
-than being interrupted at an unsafe publication point.
+Running ShellNode process trees receive termination requests. Already-started
+native mutations are allowed to reach their existing safe terminal semantics
+rather than being interrupted at an unsafe publication point.
 
-While children settle:
+For a one-ShellNode Job this naturally reduces to terminating its one contained
+process tree while preserving already-spooled output.
+
+While a multi-node Graph settles:
 
 ~~~text
-cancelling batch 11/12
+cancelling graph 11/12
 6 run
 7-12 skip cancelled
 ~~~
@@ -2130,7 +2206,7 @@ cancelling batch 11/12
 When all nodes are terminal:
 
 ~~~text
-cancelled batch 12/12
+cancelled graph 12/12
 ~~~
 
 Repeating `job_cancel` never creates another action. Cancelling an already
@@ -2149,6 +2225,41 @@ their retained outcomes.
 
 Request/transport durability is mandatory and fully resumable: a disconnect,
 hosted request timeout or lost response never restarts work.
+
+Exposed Job metadata/checkpoints are persistent across dotlink process restart
+for the Job retention window. The protected durable ledger retains at least:
+
+~~~text
+Job id
+immutable Graph definition
+node pending/claimed/running/terminal checkpoints
+dependency/skip decisions
+cancellation intent
+terminal outcome metadata
+retained stream/result descriptors
+creation/update/retention timestamps
+restart ancestry where applicable
+~~~
+
+The ledger stores the authority/interpreter fingerprint needed to detect stale
+ownership, but never treats that historical fingerprint as authority for new
+work.
+
+Payload bytes may remain in the existing protected spool/storage mechanism; the
+persistent ledger owns/references them so restart cleanup cannot mistake a live
+retained Job for an orphan. Physical cleanup and retention remain bounded.
+
+The retained Graph definition is **sensitive state**: tool arguments may contain
+shell commands, stdin, patches, file contents or credentials supplied explicitly
+by the caller. Persist exact definitions only for Jobs whose durable semantics
+require them, under dotlink's private protected state tree with owner-only
+permissions/handles appropriate to the platform. Never emit the retained Graph
+or raw stdin/command into routine logs, telemetry or status output. Delete it
+with the Job at retention expiry/explicit cleanup.
+
+This retained definition exists to resume/control/restart that Job; it is not a
+new source of authority and must remain subject to the same protected-path/state
+guarding as existing job spools.
 
 A full dotlink process crash is stricter. If the exact in-flight child can be
 proven and reattached safely, continue it. Otherwise mark the claimed/running
@@ -2172,42 +2283,55 @@ never shorten the command timeout or trigger a new execution attempt.
 
 ### Output, results and acknowledgement
 
-Reuse the existing `job_output` / `job_ack` machinery instead of inventing
-batch-specific output tools.
+Reuse one `job_output` / `job_ack` lifecycle for every Job rather than
+inventing graph-specific output tools.
 
-Advertised v2 shape:
+Advertised target shape:
 
 ~~~text
-job_output(id, node=null, stream="stdout", offset=0,
+job_output(id, node=null, stream=null, offset=0,
            max_output_bytes=null, encoding="text")
 
-job_ack(id, node=null, stream="stdout", offset)
+job_ack(id, node=null, stream=null, offset)
 ~~~
 
-The optional `node` coordinate selects one batch node:
+Node selection is structural:
 
-- standalone shell job: `node` is omitted;
-- batch shell node: `node=N`, `stream=stdout|stderr|result`;
-- batch native node: `node=N`, `stream=result`.
+- one-node Job: `node` may be omitted and means node 1;
+- multi-node Job: `node=N` is required.
 
-For a batch job, omitting `node` from `job_output`/`job_ack` is invalid rather
-than guessing which node the model meant. Acknowledging a node stream/result may
-release retained bytes but never erases the node's terminal checkpoint/status
-from the graph ledger.
+Available streams depend on that node:
 
-`result` is the retained serialized node result/control payload. Large native
-results therefore use the same durable paging/ack lifecycle as shell streams
-without being copied into every `job_get` response.
+- ShellNode: `stdout | stderr | result`;
+- NativeToolNode: `result`.
 
-For compatibility, existing shell-job calls without `node` retain their current
-stdout/stderr semantics.
+When `stream` is omitted, infer the natural primary stream:
+
+- ShellNode -> `stdout`;
+- NativeToolNode -> `result`.
+
+An explicit invalid stream/node combination fails rather than guessing.
+
+`result` is the retained serialized node result/control payload. For a
+NativeToolNode it is the tool result. For a ShellNode it is compact terminal
+metadata (exit/success/timeout/error/context/truncation counters as applicable),
+**not another copy of stdout/stderr**; those bytes live only in their dedicated
+streams.
+
+Large native results therefore use the same durable paging/ack lifecycle as
+shell streams without being copied into every `job_get` response or duplicated
+inside shell metadata.
+
+Acknowledging a node stream/result may release retained bytes but never erases
+the node's terminal checkpoint/status or immutable Graph definition from the Job
+ledger while the Job itself remains retained.
 
 `job_output` remains a pure replayable read and never advances cleanup.
-`job_ack` advances the cleanup watermark for exactly one
-job/node/stream after the caller safely receives it.
+`job_ack` advances the cleanup watermark for exactly one Job/node/stream after
+the caller safely receives it.
 
-The graph ledger stores stream/result identity and bounded metadata, not
-unbounded payload copies. Existing shell stdout/stderr spooling is reused.
+The Job ledger stores stream/result identity and bounded metadata, not unbounded
+payload copies. Existing shell stdout/stderr spooling is reused.
 
 A completed graph's compact ordinary result may inline node results that fit the
 aggregate budget. Larger retained outputs stay available through `job_output`
@@ -2225,8 +2349,8 @@ Top-level progress remains terminal nodes / total nodes:
 4/12 5 ok
 ~~~
 
-While a shell node runs, the batch may emit the same completed-node fraction
-with a terse node/phase message. Arbitrary shell commands have no honest
+While a ShellNode runs, the Job may emit the same completed-node fraction with
+a terse node/phase message. Arbitrary shell commands have no honest
 percentage, so do not invent a child total.
 
 ### Shell write hints inside v2 graphs
@@ -2244,10 +2368,10 @@ parallelism when scopes are disjoint.
 
 ### V2 implementation boundary
 
-Do not enable shell nodes merely by marking `bash`/`pwsh` batchable. V2
-requires the canonical Job/Graph/Node runtime, process-terminal shell-node
-semantics, replay reattachment, cancellation, bounded output retention and the
-corresponding tests as one coherent feature.
+Do not enable ShellNodes merely by flipping a registry bit. V2 requires the
+canonical Job/Graph/Node runtime, exact interpreter binding, process-terminal
+ShellNode semantics, replay reattachment, cancellation, bounded output retention
+and the corresponding tests as one coherent feature.
 
 ## Binary tools
 
@@ -2315,6 +2439,13 @@ filesystem/
   ordering
   render
   mutation
+
+execution/
+  job
+  graph
+  node
+  shell
+  retained_output
 
 tools/
   ls
@@ -2411,11 +2542,36 @@ islands.
 All three new lifecycle tools are side-effecting and therefore require tunnel
 request replay protection.
 
+### Shared execution layer
+
+The Job/Graph runtime is a shared execution substrate, not a wrapper around the
+public tool router.
+
+Key rules:
+
+- public `bash` / `pwsh` / `powershell` construct one-ShellNode Jobs;
+- `batch(ops)` and `job_start(ops)` compile the same Graph grammar;
+- Graph validation resolves each node through one central Graph-node registry;
+- node arguments are validated against the already registered tool schema;
+- Graph execution dispatches through an **internal node adapter/shared tool
+  implementation**, not by recursively calling the public MCP tool handler;
+- therefore a ShellNode runs a process directly under its parent Job and never
+  creates a nested Job;
+- NativeToolNodes reuse the same underlying filesystem implementations as direct
+  calls, with only node lifecycle/checkpoint/result retention added;
+- Graph control tools (`batch`, `job_start`, `job_*`, Task control) are never
+  themselves Graph nodes.
+
+The shared registry should carry at least tool name, Graph-node eligibility,
+version gate, capability requirements, replay/side-effect classification and
+node adapter. Schema/visibility metadata must remain single-sourced with
+`TOOL_SPECS` or its successor rather than copied into the Graph engine.
+
 ## Shell naming + write hints — v1
 
 Native filesystem mutations expose their target paths directly in ordinary
-arguments. Arbitrary shell commands do not, so Bash and modern PowerShell
-(`pwsh`) gain one optional **advisory scheduling hint**:
+arguments. Arbitrary shell commands do not, so every advertised shell
+interpreter gains the same optional **advisory scheduling hint**:
 
 ~~~text
 bash(command, dir=".", stdin=null, timeout_secs=null,
@@ -2423,25 +2579,36 @@ bash(command, dir=".", stdin=null, timeout_secs=null,
 
 pwsh(command, dir=".", stdin=null, timeout_secs=null,
      max_output_bytes=null, writes=null)
+
+powershell(command, dir=".", stdin=null, timeout_secs=null,
+           max_output_bytes=null, writes=null)
 ~~~
 
-The same hint should be accepted by explicit background shell launch
-(`job_start`) so runtimes do not lose scheduling information merely because a
-command is started durably.
+The same arguments naturally carry through when a shell node appears inside
+`batch(ops)` or `job_start(ops)`, so scheduling information is not lost when the
+same operation is graph-owned or immediately durable.
 
-### `pwsh` naming
+### Interpreter identity and capability exposure
 
-Advertise the modern PowerShell tool and ShellNode as `pwsh`, matching the
-modern PowerShell executable name and keeping the model-facing shell vocabulary
-compact alongside `bash`.
+The three shell tools are distinct first-class capabilities:
 
-`pwsh` means modern PowerShell semantics. The implementation should prepare/use
-the modern `pwsh` executable where the capability is available; it must not
-silently run legacy Windows PowerShell (`powershell.exe`) under the `pwsh` name.
+~~~text
+bash         Bash
+pwsh         modern PowerShell (PowerShell 6/7+, `pwsh` / `pwsh.exe`)
+powershell   Windows PowerShell (`powershell.exe`, typically 5.1)
+~~~
 
-During migration, legacy model/tool requests named `powershell` may be accepted
-only at the wire/deserialization compatibility boundary and normalized to
-`pwsh`. New tool discovery never advertises `powershell`.
+There is **no aliasing or fallback between them**. `pwsh` never silently invokes
+`powershell.exe`, and `powershell` never silently invokes `pwsh.exe`.
+
+Tool discovery is capability-derived: advertise only interpreters that dotlink
+has actually discovered/prepared and is authorized to execute. A Windows host
+may therefore expose both `pwsh` and `powershell`, only one, or neither. On
+platforms where Windows PowerShell is unavailable, `powershell` simply does not
+appear.
+
+This makes interpreter selection explicit and lets the model choose the command
+language/runtime that matches the task instead of making dotlink guess.
 
 ### `writes` semantics
 
@@ -2544,10 +2711,33 @@ Tool visibility remains permission-aware.
 | `cp` | read source + write destination |
 | `mv` | mutation authority for source + destination |
 | `rm` | mutation/write authority |
+| `bash`, `pwsh`, `powershell` | shell authority + exact prepared interpreter |
+| `batch`, `job_start` | every referenced node must be visible/authorized |
+| `job_list`, `job_get`, `job_output`, `job_ack`, `job_cancel` | ownership of the exposed Job |
+| `job_restart` | Job ownership + current authority for the entire retained Graph |
 
 The final implementation should determine whether `TOOL_SPECS` needs a more
 precise capability representation for mixed-source/destination operations,
 rather than weakening policy semantics to fit the current enum.
+
+Graph creation preflights every node against the current effective tool
+visibility, schema and capability rules before the first node starts. Conditional
+branches do not bypass authorization merely because they may later be skipped.
+
+A running Job is bound to the prepared execution-authority generation captured
+for that Job. An incompatible policy/launcher/interpreter change must follow the
+existing fail-closed job-revocation semantics: do not start new pending nodes
+under stale authority, and never widen an existing Job because configuration
+became more permissive.
+
+`job_restart(id)` is a **new execution** and therefore revalidates the retained
+immutable Graph against current authority and current prepared interpreter/tool
+availability before any new side effect starts. The old Job's authority is not a
+capability token for the restart.
+
+Status/output/cancellation of an already-owned exposed Job must remain possible
+as needed for observation and safe shutdown even when new execution authority is
+no longer available; they must never confer authority to start new work.
 
 If the effective policy cannot execute a tool at all, do not advertise it.
 
@@ -2646,17 +2836,19 @@ bash(command, dir=".", stdin=null, timeout_secs=null,
      max_output_bytes=null, writes=null)
 pwsh(command, dir=".", stdin=null, timeout_secs=null,
      max_output_bytes=null, writes=null)
+powershell(command, dir=".", stdin=null, timeout_secs=null,
+           max_output_bytes=null, writes=null)
 
 # shared durable execution control
-job_start(command, dir=".", stdin=null, timeout_secs=null, writes=null)
+job_start(ops)
 job_list(limit=64)
 job_get(id)
-job_output(id, node=null, stream="stdout", offset=0, ...)
-job_ack(id, node=null, stream="stdout", offset)
+job_output(id, node=null, stream=null, offset=0, ...)
+job_ack(id, node=null, stream=null, offset)
 job_cancel(id)
 job_restart(id)
 
-# v2: bash/pwsh may also appear as ShellNodes in multi-node Graphs
+# v2: bash/pwsh/powershell may also appear as ShellNodes in multi-node Graphs
 ~~~
 
 The surface is intentionally asymmetric where safety requires it:
@@ -2741,9 +2933,6 @@ legacy multi-file edit objects or temporary singular edit
 
 legacy job control `job_id`
   → id
-
-legacy shell tool `powershell`
-  → pwsh
 ~~~
 
 Old recursive `ls` fields may temporarily be accepted by a compatibility
@@ -2765,9 +2954,10 @@ plan is activated:
 4. simplify `read`/`edit` model-facing schemas with compatibility adapters;
 5. add `cp`, `mv`, `rm` through the shared mutation layer;
 6. generalize the existing job execution layer into the lightweight canonical
-   `Job -> Graph -> Node` runtime, then add native-only `batch(ops)` on it;
-7. route `bash`/`pwsh` through the same one-ShellNode Job path and enable those
-   ShellNodes in v2 graphs without nested child Jobs;
+   `Job -> Graph -> Node` runtime, then add native-node `batch(ops)` and
+   `job_start(ops)` together on the same parser/registry;
+7. route `bash`/`pwsh`/`powershell` through the same one-ShellNode Job path and
+   enable those ShellNodes in v2 Graphs without nested child Jobs;
 8. measure exact serialized schema bytes, tokenizer estimates and representative
    result token costs;
 9. run the full cross-platform, Nix, replay, mutation and CI validation matrix.
@@ -2777,7 +2967,7 @@ designed against Unix, macOS and Windows rename/delete behavior.
 
 ## Acceptance criteria
 
-### V1 core + shell write hints
+### V1 core + native Job/Graph runtime + shell write hints
 
 The v1 implementation is complete only when all of the following hold:
 
@@ -2818,14 +3008,20 @@ The v1 implementation is complete only when all of the following hold:
 - compatibility aliases are absent from advertised schemas.
 - exact serialized schema bytes, a representative token estimate and
   representative output-token costs are measured and recorded.
-- bare batch dependencies require complete success; `more`/`incomplete`
-  children require explicit predicates and cannot silently unlock later
-  mutations.
-- condition-selected batch skips are non-errors; aggregate summaries expose
+- bare Graph dependencies require complete success; `more`/`incomplete` nodes
+  require explicit predicates and cannot silently unlock later mutations.
+- condition-selected Graph skips are non-errors; aggregate summaries expose
   query modifiers without duplicating exceptional nodes.
-- Bash/modern PowerShell (`pwsh`) and `job_start` accept optional advisory
-  `writes` scopes;
-  omission means unknown and `[]` means expected no writes.
+- `batch(ops)` and `job_start(ops)` share one native-node Graph parser/registry;
+  `batch` waits optimistically while `job_start` exposes the Job immediately.
+- `job_start` commits durable Job identity/exposure/replay state after complete
+  Graph preflight and before any root node starts; a lost receipt is recoverable
+  through `job_list` without duplicate creation/execution.
+- Graph control/job/task tools cannot appear as nodes.
+- `bash`, `pwsh`, and `powershell` expose the same optional advisory `writes`
+  scopes; omission means unknown and `[]` means expected no writes.
+- `pwsh` and `powershell` are distinct interpreter capabilities with no aliasing
+  or silent fallback; discovery advertises only prepared/authorized interpreters.
 - `writes` never changes authorization, sandbox policy or native mutation
   correctness semantics.
 - the public edit field remains `edits`, not an opaque abbreviation.
@@ -2841,13 +3037,14 @@ The v2 extension is complete only when:
 
 - every exposed execution is one Job owning one immutable Graph; ShellNodes are
   contained node runners, never child Jobs;
-- direct `bash` and `pwsh` use the same one-ShellNode Job/Graph runtime as shell
-  nodes inside `batch`;
-- `bash` and `pwsh` are valid Graph nodes when their capability is visible;
+- direct `bash`, `pwsh`, and `powershell` use the same one-ShellNode Job/Graph
+  runtime as shell nodes inside multi-node Graphs;
+- all three are distinct ShellNodes, advertised independently only when their
+  exact prepared interpreters are available; no PowerShell alias/fallback exists;
 - shell node success/error follows actual process terminal state, never
   job/task handoff;
-- non-zero exit, timeout, launch failure and cancellation take the shell
-  `.err` branch while retaining raw process result details;
+- non-zero exit, timeout, launch failure and cancellation map to canonical
+  ShellNode `fail`, satisfy the `.err` predicate, and retain raw process details;
 - shell errors never imply rollback or absence of arbitrary shell side effects;
 - the outer Job is the sole durable owner of its Graph and running ShellNodes,
   and its scheduler continues after transport handoff without active polling;
@@ -2855,23 +3052,29 @@ The v2 extension is complete only when:
   terminal predecessors are never rerun;
 - redelivery/recovery never duplicates an already-started process; ambiguous
   in-flight state becomes `uncertain` rather than being relaunched;
-- one durable job model controls both shell and batch executions in one ID namespace;
-- `job_list` includes both `shell` and `batch` kinds in one durable ID namespace;
+- one durable Job model controls every exposed Graph in one ID namespace;
+- the v1 `batch(ops)` / `job_start(ops)` Graph parser, registry, preflight and
+  creation-order guarantees remain unchanged when ShellNodes are enabled;
+- `job_list` labels Jobs from Graph shape/tool identity rather than a separate
+  durability kind;
 - `job_get(id)` provides compact status polling and automatic resume/reattach;
-- `job_output`/`job_ack` reuse one paging/cleanup lifecycle with optional batch
-  node selection and retained `result` streams;
+- `job_output`/`job_ack` reuse one paging/cleanup lifecycle: one-node Jobs may
+  omit `node`, multi-node Jobs require it, and nodes expose retained `result`
+  plus ShellNode stdout/stderr;
 - `job_cancel(id)` is idempotent and durably freezes new graph-node starts before
   terminating/settling running work;
-- generic replay-protected `job_restart(id)` creates a fresh durable execution
-  from a retained shell/batch definition and never mutates or resets history in place;
-- `job_output`/`job_ack` support optional batch `node` coordinates and a retained
-  `result` stream without changing standalone shell-job behavior;
+- generic replay-protected `job_restart(id)` creates a fresh Job from the
+  retained immutable Graph, never mutates or resets history in place, and
+  revalidates the whole Graph against current authority/interpreter availability
+  before any new node starts;
+- `job_output`/`job_ack` support structural node selection and retained `result`
+  streams without special durability kinds;
 - cancellation, bounded output spooling/paging and deterministic rendering work
   through the graph owner;
 - `writes` may improve scheduling but never becomes authority or a transactional
   guarantee;
-- v2 durability/replay/cancellation/output tests pass across supported
-  transports/platforms.
+- v2 durability/replay/cancellation/output, lost-receipt, authority-revalidation
+  and exact-interpreter tests pass across supported transports/platforms.
 
 ## Decisions
 
@@ -2915,22 +3118,23 @@ The v2 extension is complete only when:
     `current phase` when it is open-ended.
 21. Result data is never available only through progress notifications; final
     results and explicit paging remain authoritative.
-22. `batch` is a planned first-class orchestration tool using compact
-    `ops=[tool,args,when?]` nodes and backward-only status dependencies.
-23. Batch graph structure may express sequence, parallel roots/fan-out, joins
-    and status-based decisions, but never output dataflow, loops or a general
+22. One canonical `ops=[tool,args,when?]` Graph grammar powers both
+    `batch(ops)` and `job_start(ops)`; their only semantic difference is
+    optimistic waiting versus immediate durable exposure.
+23. Graph structure may express sequence, parallel roots/fan-out, joins and
+    status-based decisions, but never output dataflow, loops or a general
     workflow language.
-24. Batch arguments stay structured; only the tiny `when` dependency
+24. Graph node arguments stay structured; only the tiny `when` dependency
     expression is textual, avoiding a second quoting/escaping language.
 25. `more` and `incomplete` are orthogonal query modifiers, not peer primary
     terminal outcomes.
-26. Bare batch dependencies require complete success; paged/incomplete results
+26. Bare Graph dependencies require complete success; paged/incomplete results
     never silently unlock dependent mutations.
 27. `patch` is strict-only, `cp` copies complete named objects, and `grep`
     uses one symmetric context field to keep the advertised surface smaller.
 28. Semantic batching stays inside domain tools where it improves the hot path:
-    `edit` batches independent replacements within one file; generic `batch`
-    remains for heterogeneous operations.
+    `edit` batches independent replacements within one file; the generic Graph
+    runtime remains for heterogeneous operations.
 29. `edit` has one advertised shape for both one and many replacements; do not
     add a singular shorthand that would make the schema polymorphic.
 30. Keep the descriptive `edits` field name. Abbreviating it to `v` saves
@@ -2941,10 +3145,11 @@ The v2 extension is complete only when:
     footprint is otherwise opaque; the hint is advisory, never authority.
 32. The canonical execution architecture is `Job -> Graph -> Node`: every Job
     owns exactly one immutable Graph, and nodes are never nested child Jobs.
-33. `bash` and `pwsh` are one-ShellNode Job constructors; `batch` is the
-    multi-node Graph constructor. All use the same execution/durability engine.
-34. V2 enables `bash`/`pwsh` as Graph nodes with process-terminal semantics;
-    ShellNodes never escape as independent child Jobs/Tasks.
+33. `bash`, `pwsh`, and `powershell` are one-ShellNode Job constructors;
+    `batch(ops)` is the optimistic Graph constructor and `job_start(ops)` is the
+    immediate durable Graph constructor. All use the same execution engine.
+34. V2 enables `bash`/`pwsh`/`powershell` as ShellNodes with process-terminal
+    semantics; ShellNodes never escape as independent child Jobs/Tasks.
 35. Durability is automatic at the Job level: long ShellNodes continue after
     transport handoff, and terminal predecessors are checkpointed before they
     unlock dependents.
@@ -2958,11 +3163,14 @@ The v2 extension is complete only when:
 38. A claimed/running node that cannot be safely reattached after process loss
     becomes `uncertain`; `.err` excludes `uncertain`, which must be handled
     explicitly.
-39. Shell-node `N`/`N.ok` means process success; `N.err` means known non-zero
-    exit, timeout, launch failure or cancellation. Shell error never implies
-    rollback of arbitrary filesystem side effects.
-40. The advertised modern PowerShell tool/node is `pwsh`; legacy `powershell`
-    is compatibility-only and never advertised.
+39. Shell-node process success maps to `ok`; known non-zero exit, timeout,
+    launch failure or cancellation maps to `fail` and therefore satisfies
+    `N.err`. Shell failure never implies rollback of arbitrary filesystem side
+    effects.
+40. `pwsh` and `powershell` are both first-class, distinct interpreter
+    capabilities: modern PowerShell versus Windows PowerShell. Neither aliases
+    or falls back to the other, and only actually available interpreters are
+    advertised.
 
 ## References
 
