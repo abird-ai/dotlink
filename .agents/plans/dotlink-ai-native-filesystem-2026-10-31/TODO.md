@@ -200,16 +200,38 @@ Status: **design sealed** for v1 plus the specified v2 durable shell-node extens
   terminal process state.
 - [ ] Keep raw exit/success/timeout/stdout/stderr details in the node result;
   shell error must never imply rollback of shell side effects.
-- [ ] Make the outer batch graph the durable execution owner when the graph
-  outlives a synchronous transport window; child shell executions never escape
-  as independent user-visible jobs/tasks.
-- [ ] Persist/retain per-node pending/running/terminal state and deterministic
-  replay identity; redelivery reattaches to the same running child or fails
-  explicitly rather than restarting it.
+- [ ] Make the outer batch graph the durable execution owner automatically when
+  the graph outlives a synchronous transport window; no per-node durability flag
+  and no child shell execution escapes as an independent user-visible job/task.
+- [ ] Keep the graph scheduler running after handoff so dependents continue when
+  long shell nodes terminate even without active client polling.
+- [ ] Persist/retain per-node `pending/claimed/running/terminal` state and
+  deterministic replay identity.
+- [ ] Persist `claimed` before shell launch and bind the child to a deterministic
+  graph+node runner identity; ambiguous launch state must fail closed, never
+  relaunch.
+- [ ] Checkpoint every terminal node before unlocking dependents; later failures
+  or lost responses must never re-execute terminal predecessors.
+- [ ] Redelivery reattaches to the same running child or marks it `uncertain`
+  rather than restarting it.
+- [ ] Preserve terminal checkpoints across dotlink restart; if an exact in-flight
+  child cannot be safely reattached, mark that node uncertain rather than
+  rerunning the graph.
 - [ ] Reuse bounded shell spooling for child stdout/stderr and deterministic
   aggregate result budgeting/paging.
-- [ ] Batch cancellation prevents pending starts, terminates running shell trees,
-  and preserves safe native-mutation terminal semantics.
+- [ ] Add compact durable controls: read-only `batch_get(id)`, idempotent
+  `batch_cancel(id)`, and replay-protected `batch_restart(id)`.
+- [ ] Make `batch_get` a cheap status snapshot only; it must not repeatedly dump
+  retained bulk node output while polling.
+- [ ] Define resume as automatic reattachment to the same run/checkpoint ledger;
+  do not add a redundant `batch_resume` tool.
+- [ ] Make restart create a fresh run/generation from node 1 while retaining the
+  old run as history; running/cancelling runs must be cancelled/terminal first.
+- [ ] Batch cancellation persists intent before action, prevents pending starts,
+  marks them `skip cancelled`, terminates running shell trees, and preserves
+  safe native-mutation terminal semantics.
+- [ ] Repeated cancellation is idempotent; cancelling a terminal run is a no-op
+  returning its terminal state.
 - [ ] Forward compact batch progress while shell nodes run without inventing a
   shell percentage.
 - [ ] Allow `writes` hints to reduce known scheduling conflicts inside the graph;
@@ -269,7 +291,14 @@ Status: **design sealed** for v1 plus the specified v2 durable shell-node extens
 - [ ] V2 shell-node graph tests for exit-0 success, non-zero error branch,
   timeout, launch failure, cancellation, joins and downstream skips.
 - [ ] V2 durability/replay tests proving transport handoff does not mark a shell
-  node terminal and redelivery never starts a duplicate process.
+  node terminal, the scheduler continues after handoff, terminal predecessors
+  never rerun, and redelivery never starts a duplicate process.
+- [ ] Crash/restart failure-injection around `claimed -> running -> terminal`
+  proving ambiguous in-flight shell state becomes `uncertain` rather than being
+  relaunched.
+- [ ] Durable control tests for compact polling, idempotent cancel, cancel races,
+  automatic resume, restart generation/history retention, and replay-safe
+  restart delivery.
 - [ ] V2 output-spool tests proving large shell output remains bounded/pageable
   under one durable batch owner.
 - [ ] Edit tests for multiple independent substitutions, multiline tuples,

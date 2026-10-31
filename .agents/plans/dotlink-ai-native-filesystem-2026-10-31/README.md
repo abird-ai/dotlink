@@ -1396,7 +1396,7 @@ N.skip
 Two compact classes are also available:
 
 ~~~text
-N.err     fail | partial | uncertain
+N.err     known error: fail | partial
 N.done    any terminal state
 ~~~
 
@@ -1413,6 +1413,10 @@ Examples:
 All referenced operations must reach terminal state before the expression is
 evaluated. `|` is a boolean branch, not a timing race. This keeps execution
 deterministic and replayable.
+
+`uncertain` is deliberately **not** included in `.err`. Recovery/compensation
+logic must opt into `N.uncertain` explicitly because the prior operation may
+already have produced side effects.
 
 ### Sequence, parallelism, joins and decisions
 
@@ -1767,15 +1771,24 @@ effects are known absent.
 
 Once shell nodes are supported, the **batch graph** is the durable unit.
 
-A child shell process must never escape the graph as an independently owned
-user-visible job/task merely because it outlives the current request window.
+Durability is automatic. There is no per-node `durable=true` flag and the model
+does not need to predict whether a command will fit inside the current transport
+window.
+
+A shell node may run for seconds, minutes or hours. Crossing the synchronous
+response window hands off the **same graph execution**; it never restarts the
+graph and never re-executes already terminal predecessors.
+
+The graph scheduler continues after handoff even when nobody is actively
+polling. When a long shell node reaches terminal state, newly satisfied
+dependents may start under the same durable graph owner.
 
 ~~~text
 batch request
     |
     +-- native node
     +-- shell child process -- bounded stdout/stderr spool
-    +-- graph ledger
+    +-- durable graph ledger
     v
 complete synchronously
 or
@@ -1783,46 +1796,233 @@ durable batch Task/compatibility handle
 ~~~
 
 If the graph finishes inside the caller/transport window and its result fits,
-return the normal batch result. Otherwise expose that same graph execution
-through the durable execution layer: native MCP Task when available, compatible
-durable handle otherwise.
+return the normal batch result. Otherwise expose that same execution through the
+durable layer: native MCP Task when available, compatible durable handle
+otherwise.
+
+The compact compatibility receipt is:
+
+~~~text
+running <id> 3/12
+~~~
+
+The durable run id is opaque. Where native MCP Tasks are available, use the same
+underlying durable run identity rather than inventing a second execution.
 
 The durable owner retains:
 
-- graph definition and semantic request identity;
-- per-node pending/running/terminal state;
-- deterministic per-node replay identity;
-- shell child process identity/lifecycle;
+- immutable graph definition and semantic request identity;
+- per-node state and deterministic replay identity;
+- shell child execution identity/lifecycle;
 - bounded shell stdout/stderr spool state;
 - native child results and paging cursors;
 - dependency/skip decisions;
 - aggregate result/progress state.
 
-Redelivery/polling attaches to that same graph and any already-started child. It
-must never launch a duplicate process.
+### Durable node checkpoints
 
-### Replay and recovery
+Each node follows a fail-closed durable state machine:
 
-A running shell node on replay/recovery must reattach to its existing durable
-execution owner or become explicitly unrecoverable/uncertain; it is never
-silently restarted.
+~~~text
+pending
+  -> claimed
+  -> running
+  -> terminal
+~~~
+
+`claimed` is persisted before execution may start. It means this graph/node
+owns exactly one execution attempt.
+
+A shell child uses a deterministic internal runner identity derived from graph
+run identity + node coordinate. Duplicate dispatch inside the live durable
+session resolves to that same runner rather than creating another process.
+
+A terminal node is checkpointed **before** its result can unlock dependents.
+Once terminal, that node is never re-executed because a later node failed, the
+final response was lost, or the graph was polled/reconnected.
+
+### Resume versus restart
+
+There are exactly two high-level meanings:
+
+~~~text
+resume   continue this execution from its durable ledger
+restart  create a new execution from node 1
+~~~
+
+**Resume is the default and automatic behavior.** Transport timeout, request
+loss, reconnect, polling and redelivery all attach to the same run. There is no
+separate `batch_resume` tool.
+
+If a server/runtime restart occurs, terminal checkpoints are preserved. Pending
+nodes may continue when their dependencies are conclusively satisfied. A
+claimed/running node must reattach to the exact existing execution or become
+`uncertain`; it is never silently relaunched.
+
+Completed nodes therefore remain completed even if a later long-running shell
+node becomes uncertain.
+
+**Restart is explicit.** Restart creates a fresh run/generation with the same
+immutable graph definition and every node initially pending. The old run remains
+queryable history. Restart may repeat all side effects and is never triggered by
+ordinary replay/recovery.
+
+A running/cancelling run cannot be restarted concurrently:
+
+~~~text
+fail running; cancel first
+~~~
+
+After the prior run is terminal, restart is permitted even after `ok`,
+`fail`, `partial`, `cancelled` or `uncertain`; the explicit restart action
+is the acknowledgement that side effects may occur again.
+
+Restart itself is replay-protected so duplicate delivery of the same restart
+request returns the same new run rather than creating multiple generations.
+
+A successful restart returns the new run identity, for example:
+
+~~~text
+running <new-id> 0/12
+~~~
+
+Selective "restart from node N" is deliberately omitted in v2. It requires
+dependency invalidation and snapshot semantics that are not justified yet.
+
+### Durable control surface
+
+Keep graph creation and graph control separate:
+
+~~~text
+batch(ops)           create/run a graph
+batch_get(id)        compact status snapshot; also reattaches/resumes
+batch_cancel(id)     idempotently request cancellation
+batch_restart(id)    create a fresh run from the same graph
+~~~
+
+`batch_get` is pure/read-only. `batch_cancel` is idempotent. `batch_restart`
+is side-effecting and replay-protected.
+
+Native MCP Tasks map onto the same durable owner rather than creating a second
+state machine: task polling is equivalent to `batch_get`, and task cancellation
+is equivalent to `batch_cancel`.
+
+No control operation mutates or deletes the historical ledger of a terminal
+run.
+
+### Polling status
+
+`batch_get(id)` returns **status, not bulk node output**, so repeated polling is
+cheap.
+
+Example:
+
+~~~text
+running 5/12
+1-3 ok
+4 err exit=1
+5 ok
+6 run
+7-12 pending
+~~~
+
+Contiguous nodes with identical simple states may be range-compressed. Active
+nodes may append their latest meaningful progress snapshot:
+
+~~~text
+running 5/12
+6 run 412/1000 copy
+~~~
+
+For arbitrary shell commands, do not invent a percentage:
+
+~~~text
+running 5/12
+6 run
+~~~
+
+Terminal examples:
+
+~~~text
+ok 12/12
+~~~
+
+~~~text
+partial 12/12
+4 err exit=1
+9 uncertain
+10-12 skip condition
+~~~
+
+Status polling never acknowledges, consumes or deletes retained results/output.
+Potentially large node output remains on the durable result/output surface and
+is not repeated on every status poll.
+
+### Cancellation
+
+`batch_cancel(id)` first persists a cancellation intent, then acts on it. Once
+that intent is durable, no new pending node may start.
+
+Pending nodes become:
+
+~~~text
+skip cancelled
+~~~
+
+Running shell process trees receive termination requests. Already-started native
+mutations are allowed to reach their existing safe terminal semantics rather
+than being interrupted at an unsafe publication point.
+
+While running children settle:
+
+~~~text
+cancelling 11/12
+6 run
+7-12 skip cancelled
+~~~
+
+When all nodes are terminal:
+
+~~~text
+cancelled 12/12
+~~~
+
+Cancellation is idempotent. Repeating it never creates a new action. Cancelling
+an already terminal run returns an unchanged/terminal status, for example:
+
+~~~text
+unchanged ok
+unchanged cancelled
+~~~
+
+Cancellation does not imply rollback. Shell or native operations that already
+produced externally visible side effects remain visible and are represented by
+their retained node outcomes.
+
+### Process-restart boundary
+
+Request/transport durability is mandatory and fully resumable: a disconnect,
+hosted request timeout or lost response never restarts work.
+
+A full dotlink process crash is stricter. If the exact in-flight child can be
+proven and reattached safely, continue it. Otherwise mark the claimed/running
+node `uncertain` and do not relaunch it automatically.
+
+Independent graph branches whose dependencies remain conclusively satisfied may
+continue. Nodes depending on an uncertain predecessor proceed only when their
+explicit `when` expression handles `N.uncertain`.
+
+A later implementation may strengthen OS-level child reattachment across
+process restarts, but v2 never trades possible duplicate side effects for
+automatic convenience.
 
 The complete graph request, including command, `dir`, `stdin`, timeout/output
 limits, `writes` hints and dependency expressions, participates in the outer
 semantic request identity.
 
-### Cancellation
-
-Cancelling the durable batch:
-
-- prevents pending nodes from starting;
-- requests termination of running shell process trees;
-- lets already-started native mutations reach their existing safe terminal
-  semantics rather than blindly interrupting publication;
-- records terminal graph state explicitly.
-
-Shell cancellation does not imply rollback of shell side effects. The node
-follows the shell error path with cancellation retained in its result.
+The shell command's execution timeout remains its process lifetime. Transport
+response windows only decide when the graph hands off to durable mode; they
+never shorten the command timeout or trigger a new execution attempt.
 
 ### Output and paging
 
@@ -2253,6 +2453,11 @@ bash(command, dir=".", stdin=null, timeout_secs=null,
 powershell(command, dir=".", stdin=null, timeout_secs=null,
            max_output_bytes=null, writes=null)
 
+# v2 durable graph control
+batch_get(id)
+batch_cancel(id)
+batch_restart(id)
+
 # v2: bash/powershell may also appear as graph-owned batch nodes
 ~~~
 
@@ -2434,8 +2639,17 @@ The v2 extension is complete only when:
 - non-zero exit, timeout, launch failure and cancellation take the shell
   `.err` branch while retaining raw process result details;
 - shell errors never imply rollback or absence of arbitrary shell side effects;
-- the outer batch is the durable owner of running shell children;
-- redelivery/recovery never duplicates an already-started process;
+- the outer batch is the durable owner of running shell children and continues
+  scheduling after transport handoff without active polling;
+- nodes use durable `pending -> claimed -> running -> terminal` checkpoints;
+  terminal predecessors are never rerun;
+- redelivery/recovery never duplicates an already-started process; ambiguous
+  in-flight state becomes `uncertain` rather than being relaunched;
+- `batch_get(id)` provides compact status polling and automatic resume/reattach;
+- `batch_cancel(id)` is idempotent and durably freezes new node starts before
+  terminating/settling running work;
+- `batch_restart(id)` explicitly creates a fresh generation from node 1 and
+  never mutates/reset the historical run in place;
 - cancellation, bounded output spooling/paging and deterministic rendering work
   through the graph owner;
 - `writes` may improve scheduling but never becomes authority or a transactional
@@ -2513,9 +2727,20 @@ The v2 extension is complete only when:
     graph success follows actual process completion, child shell executions never
     escape as independent jobs/tasks, and replay/cancellation retain one graph
     identity.
-33. Shell-node `N`/`N.ok` means process success; `N.err` means non-zero exit,
-    timeout, launch failure or cancellation. Shell error never implies rollback
-    of arbitrary filesystem side effects.
+33. V2 durability is automatic and graph-level: long shell nodes continue after
+    transport handoff, and terminal predecessors are checkpointed before they
+    unlock dependents.
+34. Resume means reattach to the same durable run; restart means create a new
+    run/generation from node 1. Only explicit restart may intentionally
+    re-execute terminal nodes.
+35. `batch_get` polls compact status, `batch_cancel` is idempotent, and
+    `batch_restart` is replay-protected and preserves the prior run as history.
+36. A claimed/running node that cannot be safely reattached after process loss
+    becomes `uncertain`; `.err` excludes `uncertain`, which must be handled
+    explicitly.
+37. Shell-node `N`/`N.ok` means process success; `N.err` means known
+    non-zero exit, timeout, launch failure or cancellation. Shell error never
+    implies rollback of arbitrary filesystem side effects.
 
 ## References
 
