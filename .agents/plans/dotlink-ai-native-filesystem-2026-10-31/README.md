@@ -6,7 +6,7 @@ Co-authors: ChatGPT (GPT-5.6 Sol)
 
 Owner: @pvl
 
-Status: **design sealed**; implementation intentionally not started.
+Status: **design sealed** for v1 plus the specified v2 durable shell-node extension; implementation intentionally not started.
 
 Implementation should follow this specification as written. A model-facing surface or
 semantic change discovered during implementation must explicitly reopen/update DL-150
@@ -16,8 +16,8 @@ Base: `84cd9b7` (`release: dotlink v0.14.3`)
 
 ## Seal boundary
 
-No model-facing design questions remain open for the v1 implementation in this
-plan.
+No model-facing design questions remain open for the v1 implementation or the
+specified v2 shell-node extension in this plan.
 
 Implementation may refactor internals, improve performance, tighten validation,
 or choose platform-specific mechanisms while preserving the sealed public
@@ -28,7 +28,8 @@ coordination policy requires an explicit DL-150 design update before code lands.
 Deliberately deferred rather than forgotten:
 
 - line/range-level collaborative locking or automatic merge/rebase;
-- runtime revision tokens or fail-fast coordination metadata;
+- runtime revision tokens or fail-fast coordination metadata beyond the v1 shell
+  `writes` scheduling hint;
 - `mkdir`, `touch`, `chmod`, `chown`, symlink/hardlink creation;
 - cross-device `mv` implemented as copy+delete;
 - output-value/dataflow expressions, loops or nested workflows in `batch`;
@@ -81,9 +82,11 @@ useful when shell authority is deliberately withheld.
 10. **Compatibility is a wire-boundary concern.** Transitional aliases may be
     accepted while deserializing old requests, but never appear in the new
     advertised schema.
-11. **Coordination stays below the model surface.** External runtimes may schedule
-    conservatively from existing path arguments, while dotlink's mutation layer
-    remains the correctness authority.
+11. **Native coordination stays below the model surface.** External runtimes may
+    schedule native tools conservatively from existing path arguments while
+    dotlink's mutation layer remains the correctness authority. Shell is the one
+    deliberate exception: optional advisory `writes` scopes expose an otherwise
+    opaque expected mutation footprint.
 
 ## Target surface
 
@@ -93,7 +96,7 @@ text          read    write   edit    patch
 lifecycle     cp      mv      rm
 binary        bread   bwrite  bedit
 orchestration batch
-shell         bash    powershell      # separate capability, not required
+shell         bash    powershell      # separate capability; optional writes hint
 ~~~
 
 The model-facing decision boundary should be nearly mechanical:
@@ -111,6 +114,7 @@ The model-facing decision boundary should be nearly mechanical:
 | rename an object | `mv` |
 | remove objects | `rm` |
 | inspect/create/mutate arbitrary bytes | `bread` / `bwrite` / `bedit` |
+| run an arbitrary command | `bash` / `powershell` |
 | run a predetermined dependency graph | `batch` |
 
 ## Shared vocabulary
@@ -1632,7 +1636,7 @@ ledger remain authoritative.
 
 ### Batchable tools
 
-Initially batch the deterministic native filesystem surface:
+V1 batches the deterministic native filesystem surface:
 
 ~~~text
 ls find grep
@@ -1641,12 +1645,14 @@ cp mv rm
 bread bwrite bedit
 ~~~
 
-Do not batch `batch`, shell/powershell, jobs or task-control methods in the
-first design. Those already have independent execution, durability and timeout
-semantics.
+V1 does not batch shell, jobs or task-control methods.
 
-A central tool-spec property declares batchability so visibility, validation
-and tests cannot drift.
+V2 adds `bash` and `powershell` as graph-owned shell nodes under the durable
+shell-node design specified below. It still excludes `job_start`, job/task
+control methods and nested `batch`.
+
+A central tool-spec property declares batchability/version gating so visibility,
+validation and tests cannot drift.
 
 ### Validation and schema reuse
 
@@ -1698,6 +1704,170 @@ the work more efficiently and atomically:
 
 Use `batch` for heterogeneous predetermined execution graphs where reducing
 model/tool round trips materially helps.
+
+## Batch v2 — durable shell nodes
+
+V1 `batch(ops)` remains deliberately restricted to native deterministic tools.
+V2 extends the same graph grammar with `bash` and `powershell` nodes without
+introducing another orchestration syntax.
+
+Example:
+
+~~~text
+batch(ops=[
+  ["edit", {"path":"src/x.rs","edits":[["old","new"]]}],
+  ["bash", {"command":"cargo fmt","writes":["src"]}],
+  ["bash", {"command":"cargo test"}, "2"],
+  ["rm", {"paths":["tmp"]}, "3"],
+  ["read", {"path":"failure.log"}, "3.err"]
+])
+~~~
+
+Platform/capability visibility still applies: a shell node is valid only when
+that shell tool is available to the caller.
+
+Do not batch `job_start`, `job_get`, `job_output`, task-control methods or
+nested `batch`. A shell node is itself graph-owned execution; explicit child
+handoff APIs would break graph ownership.
+
+### Shell-node terminal semantics
+
+A shell node is **not terminal merely because execution was handed off** to a
+durable job or MCP Task.
+
+For graph control:
+
+- bare `N` / `N.ok` means the process reached terminal completion with shell
+  success (`success=true`, normally exit code 0);
+- `N.err` means non-zero exit, timeout, launch/preparation failure or
+  cancellation;
+- `N.done` means any terminal process state.
+
+The retained node result still carries exit code, success, timeout state,
+stdout/stderr and truncation/paging information.
+
+Shell `err` is a process-outcome class, not the native mutation `fail` commit
+guarantee. A shell command may mutate files and then fail, time out or be
+cancelled. V2 must never imply rollback merely because the node followed its
+error branch.
+
+Aggregate summaries may count shell process errors explicitly:
+
+~~~text
+partial ok=3 err=1 skip=1
+4 err exit=1
+5 skip condition
+~~~
+
+If no useful node succeeded, the outer graph may report `fail err=N`. That
+means the graph failed to complete successfully, not that arbitrary shell side
+effects are known absent.
+
+### The batch owns durability
+
+Once shell nodes are supported, the **batch graph** is the durable unit.
+
+A child shell process must never escape the graph as an independently owned
+user-visible job/task merely because it outlives the current request window.
+
+~~~text
+batch request
+    |
+    +-- native node
+    +-- shell child process -- bounded stdout/stderr spool
+    +-- graph ledger
+    v
+complete synchronously
+or
+durable batch Task/compatibility handle
+~~~
+
+If the graph finishes inside the caller/transport window and its result fits,
+return the normal batch result. Otherwise expose that same graph execution
+through the durable execution layer: native MCP Task when available, compatible
+durable handle otherwise.
+
+The durable owner retains:
+
+- graph definition and semantic request identity;
+- per-node pending/running/terminal state;
+- deterministic per-node replay identity;
+- shell child process identity/lifecycle;
+- bounded shell stdout/stderr spool state;
+- native child results and paging cursors;
+- dependency/skip decisions;
+- aggregate result/progress state.
+
+Redelivery/polling attaches to that same graph and any already-started child. It
+must never launch a duplicate process.
+
+### Replay and recovery
+
+A running shell node on replay/recovery must reattach to its existing durable
+execution owner or become explicitly unrecoverable/uncertain; it is never
+silently restarted.
+
+The complete graph request, including command, `dir`, `stdin`, timeout/output
+limits, `writes` hints and dependency expressions, participates in the outer
+semantic request identity.
+
+### Cancellation
+
+Cancelling the durable batch:
+
+- prevents pending nodes from starting;
+- requests termination of running shell process trees;
+- lets already-started native mutations reach their existing safe terminal
+  semantics rather than blindly interrupting publication;
+- records terminal graph state explicitly.
+
+Shell cancellation does not imply rollback of shell side effects. The node
+follows the shell error path with cancellation retained in its result.
+
+### Output and paging
+
+Reuse the existing bounded shell spool/paging machinery. Do not copy full
+stdout/stderr into the graph ledger.
+
+A completed graph result contains compact node results fitting the aggregate
+budget. Oversized shell streams stay pageable through the durable execution
+surface with stable stream identity and offsets.
+
+Output allocation/rendering must be deterministic and independent of parallel
+completion order.
+
+### Progress
+
+Top-level progress remains terminal nodes / total nodes:
+
+~~~text
+3/12 5 run
+4/12 5 ok
+~~~
+
+While a shell node runs, the batch may emit the same completed-node fraction
+with a terse node/phase message. Arbitrary shell commands have no honest
+percentage, so do not invent a child total.
+
+### Shell write hints inside v2 graphs
+
+The scheduler may use `writes` to avoid known overlap between simultaneously
+runnable shell/native mutation nodes.
+
+This remains an optimization, not a correctness boundary. A missing/inaccurate
+hint does not become authority and V2 does not claim transactional safety for
+arbitrary shell writes.
+
+For conservative scheduling, an omitted shell footprint may be treated as
+conflicting with other mutating nodes. A provided footprint can allow more
+parallelism when scopes are disjoint.
+
+### V2 implementation boundary
+
+Do not enable shell nodes merely by marking `bash`/`powershell` batchable. V2
+requires durable graph ownership, process-terminal graph semantics, replay
+reattachment, cancellation, bounded output retention and the corresponding tests
+as one coherent feature.
 
 ## Binary tools
 
@@ -1861,14 +2031,74 @@ islands.
 All three new lifecycle tools are side-effecting and therefore require tunnel
 request replay protection.
 
+## Shell write hints — v1
+
+Native filesystem mutations expose their target paths directly in ordinary
+arguments. Arbitrary shell commands do not, so Bash and PowerShell gain one
+optional **advisory scheduling hint**:
+
+~~~text
+bash(command, dir=".", stdin=null, timeout_secs=null,
+     max_output_bytes=null, writes=null)
+
+powershell(command, dir=".", stdin=null, timeout_secs=null,
+           max_output_bytes=null, writes=null)
+~~~
+
+The same hint should be accepted by explicit background shell launch
+(`job_start`) so runtimes do not lose scheduling information merely because a
+command is started durably.
+
+### `writes` semantics
+
+`writes` is omitted/null or an array of path scopes:
+
+~~~text
+writes=["src/foo.rs", "Cargo.lock"]
+writes=["src"]
+writes=[]
+~~~
+
+- omitted/null means the command's write footprint is **unknown**;
+- `[]` means the caller expects no filesystem writes;
+- a non-empty array is the caller's conservative expected write footprint;
+- relative entries resolve from the command's effective `dir`;
+- absolute entries remain absolute;
+- no globs, shell expansion, environment interpolation or destination inference;
+- a scope covers the named path and, conservatively, descendants beneath it;
+- `"."` therefore means the whole working-directory subtree;
+- create, modify, delete and rename all count as writes; a rename should list
+  both source and destination scopes when known.
+
+The name is deliberately `writes`, not `mutates`: it is short, familiar and
+states the scheduling question directly.
+
+### Hint, never authority
+
+`writes` is not a security declaration, sandbox policy, mutation lock or
+correctness proof. dotlink does not assume an arbitrary command stayed inside
+the declared scopes. As an ordinary tool argument it is still bound by the
+request's existing semantic replay hash; it does not create a separate replay
+identity or authorization rule.
+
+A runtime such as aw may use it to avoid **known** contention. Omitted
+footprints should be scheduled conservatively when contention matters. A wrong
+or incomplete hint can reduce scheduling quality and may allow shell-level
+contention; it never grants additional filesystem authority.
+
+Do not add line/range hints, read footprints, scheduler IDs or revision tokens
+to the v1 shell schema.
+
 ## Concurrency and external runtime coordination
 
-The v1 model-facing surface adds **no** line/range lock hints, revision tokens,
-scheduler IDs or coordination flags.
+The native v1 model-facing filesystem surface adds **no** line/range lock hints,
+revision tokens, scheduler IDs or coordination flags. Shell's optional
+`writes` field is the one deliberate path-level scheduling hint because shell
+commands otherwise hide their mutation footprint.
 
-dotlink remains the correctness authority. Existing mutation coordination,
-snapshot verification, staging and atomic publication must keep concurrent
-writers safe even when an external runtime schedules poorly.
+For native tools, dotlink remains the correctness authority. Existing mutation
+coordination, snapshot verification, staging and atomic publication must keep
+concurrent native writers safe even when an external runtime schedules poorly.
 
 An orchestration runtime such as aw already has enough information for a
 conservative path-level scheduler from normal tool arguments:
@@ -1893,12 +2123,16 @@ byte/line ranges still construct whole-file replacement images from snapshots;
 allowing simultaneous commits safely would require merge/rebase semantics, not
 merely finer locks.
 
-Do not add model-facing strict revision preconditions or fail-fast lock controls
-in v1 either. If measured high-concurrency workloads later show a need, add
-machine/runtime-only coordination metadata below the AI schema, for example
-opaque revisions, resolved mutation ranges or fail-fast admission. Such metadata
-must remain advisory/optimizing; hard safety continues to come from dotlink's
-mutation layer.
+Do not add model-facing strict revision preconditions, line/range locks or
+fail-fast lock controls in v1. If measured high-concurrency workloads later show
+a need, add machine/runtime-only coordination metadata below the AI schema, for
+example opaque revisions, resolved mutation ranges or fail-fast admission. Such
+metadata must remain advisory/optimizing; hard native-mutation safety continues
+to come from dotlink's mutation layer.
+
+Arbitrary shell writes are inherently outside the native transactional mutation
+model. `writes` improves scheduling visibility but does not make shell effects
+atomic, verified or rollback-safe.
 
 The design preference is to coalesce compatible same-file work into one
 `edit(path, edits)` call when a runtime can do so safely, rather than creating a
@@ -2013,6 +2247,13 @@ bwrite(...)
 bedit(...)
 
 batch(ops)
+
+bash(command, dir=".", stdin=null, timeout_secs=null,
+     max_output_bytes=null, writes=null)
+powershell(command, dir=".", stdin=null, timeout_secs=null,
+           max_output_bytes=null, writes=null)
+
+# v2: bash/powershell may also appear as graph-owned batch nodes
 ~~~
 
 The surface is intentionally asymmetric where safety requires it:
@@ -2125,7 +2366,9 @@ designed against Unix, macOS and Windows rename/delete behavior.
 
 ## Acceptance criteria
 
-The implementation is complete only when all of the following hold:
+### V1 core + shell write hints
+
+The v1 implementation is complete only when all of the following hold:
 
 - `ls` is immediate-directory-only.
 - `find` owns recursive pathname/metadata discovery.
@@ -2169,11 +2412,36 @@ The implementation is complete only when all of the following hold:
   mutations.
 - condition-selected batch skips are non-errors; aggregate summaries expose
   query modifiers without duplicating exceptional nodes.
+- Bash/PowerShell (and `job_start`) accept optional advisory `writes` scopes;
+  omission means unknown and `[]` means expected no writes.
+- `writes` never changes authorization, sandbox policy or native mutation
+  correctness semantics.
 - the public edit field remains `edits`, not an opaque abbreviation.
-- no model-facing coordination hints/revisions/range locks are required for v1;
-  external runtimes can schedule conservatively from existing path arguments.
+- native v1 tools need no model-facing coordination hints/revisions/range locks;
+  shell exposes only advisory `writes` path scopes because its footprint is
+  otherwise opaque.
 - existing correctness/security invariants remain covered on Linux, macOS,
   Windows and Nix CI.
+
+### V2 durable shell-node extension
+
+The v2 extension is complete only when:
+
+- `bash` and `powershell` are valid graph-owned batch nodes when their capability
+  is visible;
+- shell node success/error follows actual process terminal state, never
+  job/task handoff;
+- non-zero exit, timeout, launch failure and cancellation take the shell
+  `.err` branch while retaining raw process result details;
+- shell errors never imply rollback or absence of arbitrary shell side effects;
+- the outer batch is the durable owner of running shell children;
+- redelivery/recovery never duplicates an already-started process;
+- cancellation, bounded output spooling/paging and deterministic rendering work
+  through the graph owner;
+- `writes` may improve scheduling but never becomes authority or a transactional
+  guarantee;
+- v2 durability/replay/cancellation/output tests pass across supported
+  transports/platforms.
 
 ## Decisions
 
@@ -2238,9 +2506,16 @@ The implementation is complete only when all of the following hold:
 30. Keep the descriptive `edits` field name. Abbreviating it to `v` saves
     negligible bytes while losing semantic clarity; the compact inner tuples
     capture the meaningful token savings.
-31. V1 adds no line/range locks, revision tokens or coordination knobs to the AI
-    schema. Path-level scheduling from existing arguments is sufficient as an
-    optimization while dotlink enforces correctness.
+31. Native v1 tools add no line/range locks, revision tokens or coordination
+    knobs. Shell alone gains optional path-scope `writes` because its filesystem
+    footprint is otherwise opaque; the hint is advisory, never authority.
+32. V2 adds `bash`/`powershell` batch nodes only with durable graph ownership:
+    graph success follows actual process completion, child shell executions never
+    escape as independent jobs/tasks, and replay/cancellation retain one graph
+    identity.
+33. Shell-node `N`/`N.ok` means process success; `N.err` means non-zero exit,
+    timeout, launch failure or cancellation. Shell error never implies rollback
+    of arbitrary filesystem side effects.
 
 ## References
 

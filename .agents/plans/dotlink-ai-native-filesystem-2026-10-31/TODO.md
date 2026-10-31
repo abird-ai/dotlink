@@ -2,7 +2,7 @@
 
 Base: `84cd9b7`
 
-Status: **design sealed**; implementation intentionally not started.
+Status: **design sealed** for v1 plus the specified v2 durable shell-node extension; implementation intentionally not started.
 
 ## Committed
 
@@ -44,6 +44,11 @@ Status: **design sealed**; implementation intentionally not started.
 - [x] Made `edit(path,edits)` batch independent exact substitutions against one
   original snapshot with overlap rejection and one atomic publication.
 - [x] Kept one advertised shape for one or many edits.
+
+### `ebb5b84` — sealed v1 AI-native filesystem design
+
+- [x] Sealed the v1 public surface, token/result grammar, concurrency boundary
+  and deferred-feature list before implementation.
 
 ## Uncommitted
 
@@ -173,7 +178,46 @@ Status: **design sealed**; implementation intentionally not started.
 - [ ] Enforce hard operation-count, parallel-width, aggregate byte/work and
   result ceilings.
 
-### Phase 8 — compatibility, measurements and docs
+### Phase 8 — shell write hints
+
+- [ ] Add optional `writes` path scopes to Bash and PowerShell shell arguments;
+  omission means unknown, `[]` means expected no writes.
+- [ ] Resolve relative hint paths from effective shell `dir`; use no globs,
+  shell expansion or environment interpolation.
+- [ ] Treat scopes as advisory scheduling metadata only; never as authorization,
+  sandbox policy, replay identity or a correctness proof.
+- [ ] Carry the same hint through `job_start` so explicit durable shell launch
+  does not discard scheduler information.
+- [ ] Document create/modify/delete/rename semantics and conservative subtree
+  scope behavior.
+
+### Phase 9 — batch v2 durable shell nodes
+
+- [ ] Add `bash` and `powershell` as v2 batchable nodes; keep `job_start`,
+  job/task controls and nested batch excluded.
+- [ ] Make bare shell dependency / `.ok` mean actual terminal process success,
+  `.err` mean non-zero/timeout/launch-failure/cancellation, and `.done` any
+  terminal process state.
+- [ ] Keep raw exit/success/timeout/stdout/stderr details in the node result;
+  shell error must never imply rollback of shell side effects.
+- [ ] Make the outer batch graph the durable execution owner when the graph
+  outlives a synchronous transport window; child shell executions never escape
+  as independent user-visible jobs/tasks.
+- [ ] Persist/retain per-node pending/running/terminal state and deterministic
+  replay identity; redelivery reattaches to the same running child or fails
+  explicitly rather than restarting it.
+- [ ] Reuse bounded shell spooling for child stdout/stderr and deterministic
+  aggregate result budgeting/paging.
+- [ ] Batch cancellation prevents pending starts, terminates running shell trees,
+  and preserves safe native-mutation terminal semantics.
+- [ ] Forward compact batch progress while shell nodes run without inventing a
+  shell percentage.
+- [ ] Allow `writes` hints to reduce known scheduling conflicts inside the graph;
+  unknown hints may be treated conservatively and never become authority.
+- [ ] Do not enable shell nodes by a batchable bit alone; durability, replay,
+  cancellation and output retention ship as one coherent v2 feature.
+
+### Phase 10 — compatibility, measurements and docs
 
 - [ ] Keep compatibility strictly at wire/deserialization boundaries.
 - [ ] Measure exact serialized advertised-tool schema bytes before/after,
@@ -210,6 +254,10 @@ Status: **design sealed**; implementation intentionally not started.
   final page and `more + incomplete` combined state.
 - [ ] Progress tests for fixed-total, unknown-total and phase-only updates,
   asserting cumulative/monotonic semantics.
+- [ ] Shell `writes` schema/normalization tests: omitted vs empty, relative
+  resolution, subtree scopes and no glob/shell expansion.
+- [ ] Tests proving shell `writes` does not change authorization/sandboxing and
+  inaccurate hints cannot grant access.
 - [ ] Batch graph tests for complete-success default sequencing, multiple roots,
   fan-out, joins, modifier/status branches, condition skips and backward-reference
   validation.
@@ -218,6 +266,12 @@ Status: **design sealed**; implementation intentionally not started.
   after response loss/redelivery.
 - [ ] Batch aggregate-result-budget tests proving pageable children return
   deterministic native `more` cursors independent of completion order.
+- [ ] V2 shell-node graph tests for exit-0 success, non-zero error branch,
+  timeout, launch failure, cancellation, joins and downstream skips.
+- [ ] V2 durability/replay tests proving transport handoff does not mark a shell
+  node terminal and redelivery never starts a duplicate process.
+- [ ] V2 output-spool tests proving large shell output remains bounded/pageable
+  under one durable batch owner.
 - [ ] Edit tests for multiple independent substitutions, multiline tuples,
   `all`, ambiguity, duplicate/overlapping ranges, order-independence and one
   atomic publication.
