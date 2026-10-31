@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-10-31
+
+### Changed
+
+- The top-level README is concise again: user-facing setup, transport, permission, logging and release facts stay there, while detailed tool, replay, sandbox and mutation contracts remain in the architecture/security/configuration docs.
+- Nix release packages keep their exact build-pinned Bubblewrap authority, while hermetic test/clippy derivations no longer inherit production launcher authority. Nix tests receive an explicit private XDG test home, and CI emits full Nix build logs on failure.
+
+### Fixed
+
+- Native portability is restored across macOS and Windows, including Apple `stat` metadata handling, canonical path logging/tests, legal Windows filename fixtures and platform-specific shell-policy expectations.
+- Windows mutators now reserve lexical target names before canonical resolution, then retain the existing resolved-target locks through commit. This closes the `ReplaceFileW` name-resolution window without adding directory-wide serialization or changing the zero-cost Unix path.
+- Windows durable-job shutdown now tolerates the bounded delete-on-close window for just-closed session handles while preserving immediate cleanup on Unix and surfacing persistent cleanup failures. Hermetic shell tests no longer depend on Python, setuid chmod support or Bubblewrap being installed when probing capability.
+
 ## [0.14.2] - 2026-10-31
 
 ### Fixed
