@@ -3905,12 +3905,12 @@ mod tests {
                 .is_some_and(|text| text.contains("don't re-run")),
             "{receipt}"
         );
-        assert!(receipt["elapsed_ms"].is_u64(), "{receipt}");
         // The response clock the caller anchors its turn on: a plausible UTC
         // epoch, never zero and never in the future.
         let ts = receipt["ts"].as_u64().expect("receipt carries ts");
         assert!(ts > 1_600_000_000, "{receipt}");
         assert!(receipt["stdout_bytes"].is_u64(), "{receipt}");
+        assert!(receipt["timeout_secs"].is_u64(), "{receipt}");
         // No duplicated pointer keys: the instructions field is the only place
         // the follow-up tool names appear.
         for absent in ["poll", "output", "ack", "cancel"] {
@@ -3983,7 +3983,6 @@ mod tests {
                 .is_some_and(|text| text.contains("don't re-run")),
             "{receipt}"
         );
-        assert!(receipt["elapsed_ms"].is_u64(), "{receipt}");
         assert!(receipt["stdout_bytes"].is_u64(), "{receipt}");
         // No duplicated pointer keys: the instructions field is the only place
         // the follow-up tool names appear.

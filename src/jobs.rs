@@ -1520,7 +1520,7 @@ impl JobManager {
             entry.cancel.cancel();
             entry.updated_at = chrono::Utc::now().to_rfc3339();
         }
-        Ok(render_status_locked(&self.inner, entry).to_string())
+        Ok(render_status_locked(entry).to_string())
     }
 
     /// Lifecycle stage only; tool payloads expose the single normalized
@@ -1549,7 +1549,7 @@ impl JobManager {
             let entry = state
                 .available(id)
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-            let payload = render_status_locked(&self.inner, entry);
+            let payload = render_status_locked(entry);
             // Read exactly the prefix the reply reports, so the tail can never
             // be newer than the byte counts next to it.
             let stdout_stored = stored_bytes_in(&payload, "stdout");
@@ -1596,11 +1596,10 @@ impl JobManager {
             "jobs": jobs.into_iter().take(limit).map(|entry| serde_json::json!({
                 "job_id": entry.id,
                 "status": entry.status(),
-                "created_at": entry.created_at,
                 "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             })).collect::<Vec<_>>(),
-            "spool_used_bytes": self.inner.spool_used_bytes.load(Ordering::Relaxed),
-            "spool_limit_bytes": self.inner.spool_limit_bytes.load(Ordering::Relaxed),
+            "spool_used": self.inner.spool_used_bytes.load(Ordering::Relaxed),
+            "spool_limit": self.inner.spool_limit_bytes.load(Ordering::Relaxed),
         })
         .to_string()
     }
@@ -1620,12 +1619,12 @@ impl JobManager {
                     .get_mut(id)
                     .expect("job validated before exposure capacity reservation");
                 commit_exposure(entry, JobDisposition::Compatibility);
-                Ok(compatibility_receipt(&self.inner, entry))
+                Ok(compatibility_receipt(entry))
             }
             JobDisposition::Compatibility => Ok(compatibility_receipt(
-                &self.inner,
                 state.jobs.get(id).expect("job validated above"),
             )),
+            #[allow(unreachable_patterns)]
             JobDisposition::Synchronous | JobDisposition::NativeTask => Err(JobError::Internal(
                 anyhow!("job {id} already committed a different response representation"),
             )),
@@ -1708,7 +1707,7 @@ impl JobManager {
             .jobs
             .get(id)
             .expect("job remains present after response disposition");
-        Ok(handoff_from_entry(&self.inner, entry, self.retention()))
+        Ok(handoff_from_entry(entry, self.retention()))
     }
 
     pub(crate) fn replay_handoff(&self, id: &str) -> JobResult<Option<JobHandoff>> {
@@ -1720,11 +1719,7 @@ impl JobManager {
         if entry.disposition == JobDisposition::Pending {
             return Ok(None);
         }
-        Ok(Some(handoff_from_entry(
-            &self.inner,
-            entry,
-            self.retention(),
-        )))
+        Ok(Some(handoff_from_entry(entry, self.retention())))
     }
 
     pub(crate) fn ensure_native_task(&self, id: &str) -> JobResult<()> {
@@ -2577,7 +2572,7 @@ impl OutputPageRender<'_> {
             complete,
             truncated: self.truncated,
             released: self.released,
-            encoding: if self.base64 { "base64" } else { "utf8_lossy" },
+            encoding: if self.base64 { "base64" } else { "text" },
             data,
         })
         .context("cannot serialize job output page")
@@ -2609,7 +2604,7 @@ fn unacked_bytes(entry: &JobEntry) -> u64 {
 fn render_ack_receipt(entry: &JobEntry) -> String {
     let stream = |consumed: u64, released: bool| {
         serde_json::json!({
-            "acknowledged_bytes": consumed,
+            "ack_bytes": consumed,
             "released": released,
         })
     };
@@ -2627,7 +2622,7 @@ fn render_ack_receipt(entry: &JobEntry) -> String {
     payload.to_string()
 }
 
-fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
+fn render_status_locked(entry: &JobEntry) -> Value {
     let completion = entry.completion.as_ref();
     let stdout_stored = retained_bytes(entry, JobStream::Stdout);
     let stderr_stored = retained_bytes(entry, JobStream::Stderr);
@@ -2637,23 +2632,20 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
         "status": entry.status(),
         "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         "timeout_secs": entry.timeout_secs,
-        "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
-        "spool_used_bytes": inner.spool_used_bytes.load(Ordering::Relaxed),
-        "spool_session_limit_bytes": inner.spool_limit_bytes.load(Ordering::Relaxed),
-        "cancel_requested": entry.cancel.is_cancelled(),
+        "cancelling": entry.cancel.is_cancelled(),
         "exit_code": completion.and_then(|value| value.exit_code),
         "success": completion.map(|value| value.success),
         "error": completion.and_then(|value| value.error.as_deref()),
         "stdout": {
             "stored_bytes": stdout_stored,
-            "acknowledged_bytes": entry.stdout_consumed,
+            "ack_bytes": entry.stdout_consumed,
             "total_bytes": completion.map(|value| value.stdout.total_bytes),
             "truncated": completion.is_some_and(|value| value.stdout.truncated),
             "released": entry.stdout_released,
         },
         "stderr": {
             "stored_bytes": stderr_stored,
-            "acknowledged_bytes": entry.stderr_consumed,
+            "ack_bytes": entry.stderr_consumed,
             "total_bytes": completion.map(|value| value.stderr.total_bytes),
             "truncated": completion.is_some_and(|value| value.stderr.truncated),
             "released": entry.stderr_released,
@@ -2767,16 +2759,10 @@ fn commit_exposure(entry: &mut JobEntry, disposition: JobDisposition) {
     entry.expiration_pending = false;
 }
 
-fn handoff_from_entry(
-    inner: &JobManagerInner,
-    entry: &JobEntry,
-    retention: Duration,
-) -> JobHandoff {
+fn handoff_from_entry(entry: &JobEntry, retention: Duration) -> JobHandoff {
     match entry.disposition {
         JobDisposition::Synchronous => JobHandoff::Synchronous,
-        JobDisposition::Compatibility => {
-            JobHandoff::Compatibility(compatibility_receipt(inner, entry))
-        }
+        JobDisposition::Compatibility => JobHandoff::Compatibility(compatibility_receipt(entry)),
         JobDisposition::NativeTask => JobHandoff::NativeTask(task_from_entry(entry, retention)),
         JobDisposition::Pending => unreachable!("pending job has no committed response"),
     }
@@ -2803,7 +2789,7 @@ fn task_retention_anchor(entry: &JobEntry) -> Option<Instant> {
     }
 }
 
-fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolResult {
+fn compatibility_receipt(entry: &JobEntry) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
             // One short field carries the follow-up. The rest of the payload is
@@ -2816,12 +2802,9 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
             "job_id": entry.id,
             "status": entry.status(),
             "async": true,
-            "elapsed_ms": u64::try_from(entry.created.elapsed().as_millis()).unwrap_or(u64::MAX),
             "stdout_bytes": entry.stdout_retained,
             "stderr_bytes": entry.stderr_retained,
             "timeout_secs": entry.timeout_secs,
-            "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
-            "spool_session_limit_bytes": inner.spool_limit_bytes.load(Ordering::Relaxed),
         })
         .to_string(),
     )])
@@ -3942,8 +3925,8 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(released["stdout"]["acknowledged_bytes"], 5);
-        assert_eq!(released["stderr"]["acknowledged_bytes"], 3);
+        assert_eq!(released["stdout"]["ack_bytes"], 5);
+        assert_eq!(released["stderr"]["ack_bytes"], 3);
         assert!(!job.stdout_path.exists() && !job.stderr_path.exists());
         assert!(
             manager
@@ -3978,7 +3961,7 @@ mod tests {
         )
         .unwrap();
         // Cleanup never needs the caller to know an offset.
-        assert_eq!(status["stdout"]["acknowledged_bytes"], 5);
+        assert_eq!(status["stdout"]["ack_bytes"], 5);
         assert_eq!(status["stdout"]["released"], true);
         assert_eq!(status["unacked_bytes"], 0);
     }
@@ -4097,7 +4080,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(ack["stdout"]["acknowledged_bytes"], 6);
+        assert_eq!(ack["stdout"]["ack_bytes"], 6);
         assert!(!job.stdout_path.exists() && !job.stderr_path.exists());
     }
 
@@ -4208,7 +4191,7 @@ mod tests {
         );
         let status: serde_json::Value =
             serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
-        assert_eq!(status["stdout"]["acknowledged_bytes"], 0);
+        assert_eq!(status["stdout"]["ack_bytes"], 0);
         assert!(job.stdout_path.exists());
 
         let ack: serde_json::Value = serde_json::from_str(
@@ -4217,7 +4200,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(ack["stdout"]["acknowledged_bytes"], 5);
+        assert_eq!(ack["stdout"]["ack_bytes"], 5);
         assert!(!job.stdout_path.exists());
     }
 
@@ -6095,7 +6078,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(first["stdout"]["acknowledged_bytes"], 8);
+        assert_eq!(first["stdout"]["ack_bytes"], 8);
         assert_eq!(first["stdout"]["released"], true);
         let compacted: serde_json::Value =
             serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
@@ -6146,7 +6129,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(replay["stdout"]["acknowledged_bytes"], 8);
+        assert_eq!(replay["stdout"]["ack_bytes"], 8);
         let retained: serde_json::Value =
             serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
         assert_eq!(retained["stdout"]["stored_bytes"], 4);
