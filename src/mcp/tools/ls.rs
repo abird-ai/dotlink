@@ -37,6 +37,7 @@ impl Default for ListArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ListArgs {
     /// Directory path. Relative paths resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]
@@ -97,7 +98,9 @@ pub(crate) enum ListSort {
 struct FsEntry {
     path: String,
     kind: &'static str,
-    size: u64,
+    /// Set for files only: a directory's own inode size reads like content size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
     /// Ordering input only; never serialized.
     #[serde(skip)]
     mtime: Option<std::time::SystemTime>,
@@ -202,7 +205,7 @@ impl LocalMachine {
                             entry: FsEntry {
                                 path: self.config.access.relative_display(&entry.path),
                                 kind: entry.kind,
-                                size: entry.size,
+                                size: (entry.kind == "file").then_some(entry.size),
                                 mtime: entry.mtime,
                             },
                             sort: args.sort,
@@ -224,20 +227,19 @@ impl LocalMachine {
         // The profile byte ceiling bounds the reply itself, not only the entry
         // count. The renderer is the exact handler shape so the measured and
         // returned JSON cannot drift.
+        let causes = progress.causes();
         let render = |entries: &[FsEntry], truncated: bool| {
-            serde_json::json!({
-                "entries": entries, "truncated": truncated,
-                "scan_incomplete": progress.scan_incomplete(),
-                "incomplete_reason": progress.incomplete_reason(),
-                "incomplete_reasons": progress.incomplete_reasons(),
-            })
+            super::with_incomplete(
+                serde_json::json!({"entries": entries, "truncated": truncated}),
+                &causes,
+            )
             .to_string()
         };
         let (output, truncated) = trim_to_result_budget(
             output,
             self.config.max_output_bytes,
             result_budget,
-            truncated || progress.scan_incomplete(),
+            truncated || !causes.is_empty(),
             render,
         );
         Ok((output, truncated, progress))
@@ -252,13 +254,10 @@ impl LocalMachine {
     ) -> CallToolResult {
         match self.list_impl(args).await {
             Ok((entries, truncated, progress)) => ok_text(
-                serde_json::json!({
-                    "entries": entries,
-                    "truncated": truncated,
-                    "scan_incomplete": progress.scan_incomplete(),
-                    "incomplete_reason": progress.incomplete_reason(),
-                    "incomplete_reasons": progress.incomplete_reasons(),
-                })
+                super::with_incomplete(
+                    serde_json::json!({"entries": entries, "truncated": truncated}),
+                    &progress.causes(),
+                )
                 .to_string(),
             ),
             Err(error) => tool_error(error),
@@ -269,7 +268,7 @@ impl LocalMachine {
 #[tool_router(router = "discovery_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "List files and directories. `depth` defaults to 1, to the pattern's path-segment count, or unbounded when it contains `**`; an explicit `depth` wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Reply: {entries:[{path,kind,size}],truncated,scan_incomplete,incomplete_reason,incomplete_reasons}; causes are directory_budget/traversal_error, `incomplete_reason` keeping the first for compatibility. Ordering holds only among scanned entries; narrow path/pattern. Reply respects `max_output_bytes`.",
+        description = "List files and directories. `depth` defaults to 1, to the pattern's path-segment count, or unbounded when it contains `**`; an explicit `depth` wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Reply: {entries:[{path,kind,size}],truncated}; `size` is set for files, and a walk that could not finish adds `incomplete` with its causes (directory_budget/traversal_error/ignore_rules). Ordering holds only among scanned entries; narrow path/pattern. Reply respects `max_output_bytes`.",
         annotations(
             title = "List files",
             read_only_hint = true,
@@ -287,16 +286,13 @@ impl LocalMachine {
             .list_impl_with_result_budget(args, self.request_result_budget(&context))
             .await
         {
-            Ok((entries, truncated, progress)) => {
-                let payload = serde_json::json!({
-                    "entries": entries,
-                    "truncated": truncated,
-                    "scan_incomplete": progress.scan_incomplete(),
-                    "incomplete_reason": progress.incomplete_reason(),
-                    "incomplete_reasons": progress.incomplete_reasons(),
-                });
-                ok_text(payload.to_string())
-            }
+            Ok((entries, truncated, progress)) => ok_text(
+                super::with_incomplete(
+                    serde_json::json!({"entries": entries, "truncated": truncated}),
+                    &progress.causes(),
+                )
+                .to_string(),
+            ),
             Err(error) => tool_error(error),
         }
     }
@@ -332,9 +328,8 @@ mod tests {
         let reply = serde_json::to_value(reply).unwrap();
         let payload: serde_json::Value =
             serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(payload["scan_incomplete"], false);
-        assert_eq!(payload["incomplete_reason"], serde_json::Value::Null);
-        assert_eq!(payload["incomplete_reasons"], serde_json::json!([]));
+        // A complete walk omits the field entirely.
+        assert!(payload.get("incomplete").is_none(), "{payload}");
 
         // Default depth 1: this directory only.
         let (entries, truncated, _) = machine
@@ -414,9 +409,7 @@ mod tests {
             .unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         if unreadable {
-            assert!(progress.scan_incomplete());
-            assert_eq!(progress.incomplete_reason(), Some("traversal_error"));
-            assert_eq!(progress.incomplete_reasons(), ["traversal_error"]);
+            assert_eq!(progress.causes(), ["traversal_error"]);
         }
     }
 
@@ -587,13 +580,10 @@ mod tests {
             .list_impl_with_result_budget(ListArgs::default(), Some(budget))
             .await
             .unwrap();
-        let text = serde_json::json!({
-            "entries": entries,
-            "truncated": truncated,
-            "scan_incomplete": progress.scan_incomplete(),
-            "incomplete_reason": progress.incomplete_reason(),
-            "incomplete_reasons": progress.incomplete_reasons(),
-        })
+        let text = crate::mcp::tools::with_incomplete(
+            serde_json::json!({"entries": entries, "truncated": truncated}),
+            &progress.causes(),
+        )
         .to_string();
         assert!(truncated);
         assert!(crate::mcp::serialized_text_tool_result_len(&text) <= budget);

@@ -86,6 +86,7 @@ pub(crate) enum GrepOutputMode {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GrepArgs {
     /// Regular expression, or literal text when `literal` is set. Maximum {grep_pattern} characters.
     #[schemars(length(max = MAX_GREP_PATTERN))]
@@ -594,18 +595,15 @@ impl LocalMachine {
         });
         let work_incomplete = stop == Some(StopReason::WorkBudget)
             || (stop.is_none() && discovery_stop == Some(StopReason::WorkBudget));
-        let mut incomplete_reasons = Vec::new();
+        let mut causes = Vec::new();
         if work_incomplete {
-            incomplete_reasons.push("content_budget");
+            causes.push("content_budget");
         }
-        incomplete_reasons.extend(progress.incomplete_reasons());
+        causes.extend(progress.causes());
         if unreadable_files {
-            incomplete_reasons.push("unreadable_files");
+            causes.push("unreadable_files");
         }
-        let scan_incomplete = !incomplete_reasons.is_empty();
-        // Keep the established priority for clients that only understand the
-        // singular field; the array retains every concurrent cause.
-        let incomplete_reason = incomplete_reasons.first().copied();
+        let reply = |value: serde_json::Value| super::with_incomplete(value, &causes);
         if progress.incomplete && !work_incomplete {
             stop = Some(StopReason::ScanBudget);
         } else if stop.is_none() {
@@ -668,38 +666,23 @@ impl LocalMachine {
             }
             GrepOutputMode::Files => {
                 let render = |files: &[String], truncated: bool| {
-                    serde_json::json!({
-                        "files": files, "truncated": truncated,
-                        "scan_incomplete": scan_incomplete,
-                        "incomplete_reason": incomplete_reason,
-                        "incomplete_reasons": incomplete_reasons,
-                    })
-                    .to_string()
+                    reply(serde_json::json!({"files": files, "truncated": truncated})).to_string()
                 };
                 let (files, truncated) =
                     trim_to_result_budget(files, ceiling, result_budget, stop.is_some(), render);
-                Ok(serde_json::json!({
-                    "files": files, "truncated": truncated,
-                    "scan_incomplete": scan_incomplete,
-                    "incomplete_reason": incomplete_reason,
-                    "incomplete_reasons": incomplete_reasons,
-                })
-                .to_string())
+                Ok(reply(serde_json::json!({"files": files, "truncated": truncated})).to_string())
             }
             GrepOutputMode::Count => {
                 let render = |counts: &[(String, usize)], truncated: bool| {
                     let page_total = counts.iter().map(|(_, count)| count).sum::<usize>();
-                    serde_json::json!({
+                    reply(serde_json::json!({
                         "counts": counts
                             .iter()
                             .map(|(path, count)| serde_json::json!({"path": path, "count": count}))
                             .collect::<Vec<_>>(),
                         "page_total": page_total,
                         "truncated": truncated,
-                        "scan_incomplete": scan_incomplete,
-                        "incomplete_reason": incomplete_reason,
-                        "incomplete_reasons": incomplete_reasons,
-                    })
+                    }))
                     .to_string()
                 };
                 let (counts, truncated) =
@@ -892,7 +875,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 text. `path` is a directory (recursive) or a single file; for a file, `glob`/`gitignore`/`skip_hidden` do not apply. `pattern` is regex unless `literal`; `glob` uses the `ls` grammar. `output_mode`: content (matches with context), files, count (per-file; `page_total` is page-scoped). Paging: `offset`/`limit` (limit <={grep_hits}); `after`/`before` take up to {grep_context} lines per side and a narrower request is reported; `gitignore`/`skip_hidden` are opt-in. Budgets per call: {walk_visits} entries visited, {grep_scan} read across <={grep_files} candidates; narrow `path`/`glob` for complete results. Incomplete replies carry text markers or JSON `scan_incomplete`, `incomplete_reason` (first cause) and `incomplete_reasons` (all: directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Replies obey the output byte ceiling and contain whole lines only. Skipped: files over {grep_file}, binary control bytes, invalid UTF-8, symlinks.",
+        description = "Search UTF-8 text. `path` is a directory (recursive) or a single file; for a file, `glob`/`gitignore`/`skip_hidden` do not apply. `pattern` is regex unless `literal`; `glob` uses the `ls` grammar. `output_mode`: content (matches with context), files, count (per-file; `page_total` is page-scoped). Paging: `offset`/`limit` (limit <={grep_hits}); `after`/`before` take up to {grep_context} lines per side and a narrower request is reported; `gitignore`/`skip_hidden` are opt-in. Budgets per call: {walk_visits} entries visited, {grep_scan} read across <={grep_files} candidates; narrow `path`/`glob` for complete results. A reply that could not finish carries text markers or JSON `incomplete` with every cause (directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files); a complete one omits the field. Replies obey the output byte ceiling and contain whole lines only. Skipped: files over {grep_file}, binary control bytes, invalid UTF-8, symlinks.",
         annotations(
             title = "Search files",
             read_only_hint = true,
@@ -1211,12 +1194,7 @@ mod tests {
                 }
                 GrepOutputMode::Files | GrepOutputMode::Count => {
                     let value: Value = serde_json::from_str(&output).unwrap();
-                    assert_eq!(value["scan_incomplete"], true);
-                    assert_eq!(value["incomplete_reason"], "content_budget");
-                    assert_eq!(
-                        value["incomplete_reasons"],
-                        serde_json::json!(["content_budget"])
-                    );
+                    assert_eq!(value["incomplete"], serde_json::json!(["content_budget"]));
                     assert_eq!(value["truncated"], true);
                     assert!(!output.contains("b.txt"), "{output}");
                 }
@@ -1227,12 +1205,7 @@ mod tests {
         let value: Value =
             serde_json::from_str(&machine.grep_impl_with_budget(args, 1024, 1).await.unwrap())
                 .unwrap();
-        assert_eq!(value["scan_incomplete"], true);
-        assert_eq!(value["incomplete_reason"], "content_budget");
-        assert_eq!(
-            value["incomplete_reasons"],
-            serde_json::json!(["content_budget"])
-        );
+        assert_eq!(value["incomplete"], serde_json::json!(["content_budget"]));
         assert_eq!(value["files"], serde_json::json!(["a.txt"]));
     }
 
@@ -1427,8 +1400,7 @@ mod tests {
             ])
         );
         assert_eq!(files["truncated"], Value::Bool(false));
-        assert_eq!(files["incomplete_reason"], Value::Null);
-        assert_eq!(files["incomplete_reasons"], serde_json::json!([]));
+        assert!(files.get("incomplete").is_none(), "{files}");
 
         let mut args = grep_args("needle");
         args.output_mode = GrepOutputMode::Files;
@@ -1445,8 +1417,7 @@ mod tests {
         args.output_mode = GrepOutputMode::Count;
         let counts: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
         assert_eq!(counts["page_total"], serde_json::json!(6));
-        assert_eq!(counts["incomplete_reason"], Value::Null);
-        assert_eq!(counts["incomplete_reasons"], serde_json::json!([]));
+        assert!(counts.get("incomplete").is_none(), "{counts}");
         assert_eq!(
             counts["counts"][2],
             serde_json::json!({"path": "src/lib.rs", "count": 2})
@@ -1727,12 +1698,7 @@ mod walk_tests {
         let content = machine.grep_impl(args).await.unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         if actually_unreadable {
-            assert_eq!(files["incomplete_reason"], "traversal_error");
-            assert_eq!(
-                files["incomplete_reasons"],
-                serde_json::json!(["traversal_error"])
-            );
-            assert_eq!(files["scan_incomplete"], true);
+            assert_eq!(files["incomplete"], serde_json::json!(["traversal_error"]));
             assert!(content.contains("unreadable entries; search results incomplete"));
         }
 
@@ -1745,12 +1711,7 @@ mod walk_tests {
         let files: Value = serde_json::from_str(&machine.grep_impl(args).await.unwrap()).unwrap();
         std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o600)).unwrap();
         if unreadable_file {
-            assert_eq!(files["scan_incomplete"], true);
-            assert_eq!(files["incomplete_reason"], "unreadable_files");
-            assert_eq!(
-                files["incomplete_reasons"],
-                serde_json::json!(["unreadable_files"])
-            );
+            assert_eq!(files["incomplete"], serde_json::json!(["unreadable_files"]));
         }
     }
 
@@ -1775,10 +1736,8 @@ mod walk_tests {
         let content = machine.grep_impl(args).await.unwrap();
         std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o600)).unwrap();
         if unreadable {
-            assert_eq!(files["scan_incomplete"], true);
-            assert_eq!(files["incomplete_reason"], "ignore_rules");
             assert_eq!(
-                files["incomplete_reasons"],
+                files["incomplete"],
                 serde_json::json!(["ignore_rules", "unreadable_files"])
             );
             assert!(
@@ -1812,12 +1771,7 @@ mod walk_tests {
             files["files"],
             serde_json::json!(["build/out.rs", "src.rs"])
         );
-        assert_eq!(files["scan_incomplete"], true);
-        assert_eq!(files["incomplete_reason"], "ignore_rules");
-        assert_eq!(
-            files["incomplete_reasons"],
-            serde_json::json!(["ignore_rules"])
-        );
+        assert_eq!(files["incomplete"], serde_json::json!(["ignore_rules"]));
 
         let mut args = grep_args("needle");
         args.output_mode = GrepOutputMode::Files;
@@ -1829,9 +1783,8 @@ mod walk_tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(concurrent["incomplete_reason"], "content_budget");
         assert_eq!(
-            concurrent["incomplete_reasons"],
+            concurrent["incomplete"],
             serde_json::json!(["content_budget", "ignore_rules"])
         );
     }

@@ -26,12 +26,14 @@ const MAX_AMBIGUOUS_LINES: usize = 10;
 /// Older requests with a top-level default path are upgraded only while
 /// deserializing; the planner never carries both representations.
 #[derive(Debug, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EditArgs {
     /// Ordered edits. Multiple entries for the same path see prior edits.
     edits: Vec<EditOp>,
 }
 
 #[derive(Debug, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EditOp {
     /// Required path for this operation. Relative paths use the launch directory.
     path: String,
@@ -47,6 +49,7 @@ pub(super) struct EditOp {
 /// Compatibility belongs solely at the wire boundary. The schema advertises
 /// only EditArgs/EditOp, so new clients cannot inherit an ambiguous default.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyEditArgs {
     #[serde(default)]
     path: Option<String>,
@@ -55,6 +58,7 @@ struct LegacyEditArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyEditOp {
     #[serde(default)]
     path: Option<String>,
@@ -410,6 +414,31 @@ mod tests {
             new_text: new_text.to_owned(),
             replace_all: false,
         }
+    }
+
+    /// `EditArgs` deserializes through the legacy wire structs, so their strict
+    /// fields are the ones that make a typo an error rather than a silent no-op.
+    #[test]
+    fn edit_wire_rejects_unknown_fields_at_both_levels() {
+        let top = serde_json::from_value::<EditArgs>(serde_json::json!({
+            "edits": [{"path": "a.txt", "old_text": "x", "new_text": "y"}],
+            "extra": 1
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(top.contains("unknown field `extra`"), "{top}");
+        let op = serde_json::from_value::<EditArgs>(serde_json::json!({
+            "edits": [{"path": "a.txt", "old_text": "x", "new_text": "y", "replac_all": true}]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(op.contains("unknown field `replac_all`"), "{op}");
+        // The legacy top-level default path is still accepted.
+        serde_json::from_value::<EditArgs>(serde_json::json!({
+            "path": "a.txt",
+            "edits": [{"old_text": "x", "new_text": "y"}]
+        }))
+        .expect("legacy default path remains valid");
     }
 
     #[test]

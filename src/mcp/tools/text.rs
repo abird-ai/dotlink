@@ -24,6 +24,7 @@ pub(crate) const DEFAULT_READ_LINES: usize = 4 * 1024;
 pub(crate) const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ReadArgs {
     /// UTF-8 text file path. Relative paths resolve from the directory where dotlink was launched.
     path: String,
@@ -46,6 +47,7 @@ pub(super) struct ReadArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct WriteArgs {
     /// File path. Relative paths resolve from the directory where dotlink was launched.
     path: String,

@@ -148,6 +148,25 @@ pub(crate) async fn await_with_heartbeat<F: Future>(
     }
 }
 
+/// Every mutating tool takes a payload the profile caps. Say so where the model
+/// reads the tool, exactly as `read` advertises its own ceiling.
+pub(crate) fn with_write_limit(tool: &mut rmcp::model::Tool, max_write_bytes: usize) {
+    if !matches!(
+        tool.name.as_ref(),
+        "write" | "bwrite" | "edit" | "patch" | "bedit"
+    ) {
+        return;
+    }
+    let Some(description) = tool.description.as_deref() else {
+        return;
+    };
+    if description.contains("Payload cap") {
+        return;
+    }
+    let clause = format!(" Payload cap: {}.", human_bytes(max_write_bytes as u64));
+    tool.description = Some(format!("{description}{clause}").into());
+}
+
 /// Human-readable byte ceiling for a tool description. Powers of two only, so
 /// the text never drifts from the enforced number.
 pub(crate) fn human_bytes(bytes: u64) -> String {
@@ -473,37 +492,30 @@ pub(crate) struct WalkProgress {
 }
 
 impl WalkProgress {
-    pub fn scan_incomplete(&self) -> bool {
-        self.incomplete || self.traversal_incomplete || self.ignore_incomplete
-    }
-
-    /// Every independent cause in compatibility-priority order. New causes can
-    /// be appended without changing the legacy singular reason.
-    pub fn incomplete_reasons(&self) -> Vec<&'static str> {
-        let mut reasons = Vec::with_capacity(3);
+    /// Every independent cause in a fixed order; empty when the walk completed.
+    /// One name carries the answer, so a complete reply says nothing at all
+    /// instead of shipping `null`/`[]`/`false` on every call.
+    pub fn causes(&self) -> Vec<&'static str> {
+        let mut causes = Vec::with_capacity(3);
         if self.incomplete {
-            reasons.push("directory_budget");
+            causes.push("directory_budget");
         }
         if self.traversal_incomplete {
-            reasons.push("traversal_error");
+            causes.push("traversal_error");
         }
         if self.ignore_incomplete {
-            reasons.push("ignore_rules");
+            causes.push("ignore_rules");
         }
-        reasons
+        causes
     }
+}
 
-    pub fn incomplete_reason(&self) -> Option<&'static str> {
-        if self.incomplete {
-            Some("directory_budget")
-        } else if self.traversal_incomplete {
-            Some("traversal_error")
-        } else if self.ignore_incomplete {
-            Some("ignore_rules")
-        } else {
-            None
-        }
+/// Attach a discovery reply's causes, and only when there are any.
+pub(crate) fn with_incomplete(mut value: serde_json::Value, causes: &[&str]) -> serde_json::Value {
+    if !causes.is_empty() {
+        value["incomplete"] = serde_json::json!(causes);
     }
+    value
 }
 
 /// Text tools accept UTF-8 without binary control bytes. Keep this predicate
@@ -1698,6 +1710,70 @@ mod tests {
         }
     }
 
+    /// A mutating tool is capped by the profile, so the cap is stated where the
+    /// model reads the tool — the same treatment `read` gives its byte ceiling.
+    #[test]
+    fn mutating_tools_advertise_their_payload_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let limit = 8192;
+        let machine =
+            test_support::test_machine_with(temp.path().canonicalize().unwrap(), |config| {
+                config.max_write_bytes = limit;
+            });
+        let tokens = super::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
+        let expected = format!("Payload cap: {}", super::human_bytes(limit as u64));
+        for tool in crate::mcp::LocalMachine::all_tools().list_all() {
+            let described = machine.describe_tool(tool, &tokens);
+            let text = described.description.as_deref().unwrap_or_default();
+            let mutating = matches!(
+                described.name.as_ref(),
+                "write" | "bwrite" | "edit" | "patch" | "bedit"
+            );
+            assert_eq!(
+                text.contains(&expected),
+                mutating,
+                "{}: {text}",
+                described.name
+            );
+        }
+    }
+
+    /// Every advertised object schema must name the fields it accepts, so a typo
+    /// is an error instead of a silently ignored argument. `schemars` emits
+    /// `additionalProperties: false` exactly when the struct denies unknown ones.
+    #[test]
+    fn every_advertised_object_schema_rejects_unknown_fields() {
+        fn check(tool: &str, value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if object.contains_key("properties") {
+                        assert_eq!(
+                            object
+                                .get("additionalProperties")
+                                .and_then(serde_json::Value::as_bool),
+                            Some(false),
+                            "{tool} advertises an open object schema: {value}"
+                        );
+                    }
+                    for child in object.values() {
+                        check(tool, child);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for child in values {
+                        check(tool, child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for tool in crate::mcp::LocalMachine::all_tools().list_all() {
+            for child in tool.input_schema.values() {
+                check(&tool.name, child);
+            }
+        }
+    }
+
     #[test]
     fn human_units_stay_exact() {
         assert_eq!(super::human_bytes(64 * 1024 * 1024), "64 MiB");
@@ -1755,12 +1831,16 @@ mod tests {
             traversal_incomplete: true,
             ignore_incomplete: true,
         };
-        assert!(progress.scan_incomplete());
-        assert_eq!(progress.incomplete_reason(), Some("directory_budget"));
         assert_eq!(
-            progress.incomplete_reasons(),
+            progress.causes(),
             ["directory_budget", "traversal_error", "ignore_rules"]
         );
+        // A complete walk says nothing rather than three falsy fields.
+        let complete = WalkProgress {
+            visited: 1,
+            ..WalkProgress::default()
+        };
+        assert!(complete.causes().is_empty());
     }
 
     #[tokio::test]

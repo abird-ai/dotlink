@@ -27,6 +27,7 @@ pub(crate) const MAX_PATCH_HUNKS: usize = 64;
 const MAX_AMBIGUOUS_LINES: usize = 10;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PatchArgs {
     /// Base directory for the patch's relative paths. Relative paths resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]

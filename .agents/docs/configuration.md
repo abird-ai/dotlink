@@ -142,9 +142,8 @@ For OpenAI Tunnel setup, either create/manage the tunnel yourself at <https://pl
 Relative permission paths resolve from the launch directory. `default_allow=true` adds read access to that directory; `--no-default-allow` suppresses it for one run. A saved profile may deliberately have `default_allow=false` and no filesystem grants: `--allow-read=<dir>` or `--allow-rw=/` can supply the effective capability for one run. Persisted structure is validated independently of runtime admission; a launch that still has no usable grant (or enables shell without readable access) fails explicitly after CLI/deny composition.
 
 grep has a per-request work limit: up to 100,000 directory entries, 32 MiB
-of file-content I/O, and 4096 candidate files. Incomplete JSON results include
-`scan_incomplete`, compatibility `incomplete_reason`, and `incomplete_reasons`
-with every simultaneous cause.
+of file-content I/O, and 4096 candidate files. An incomplete JSON result adds
+one `incomplete` array with every simultaneous cause; a complete one omits it.
 The shared `ls`/`grep` walker reports `traversal_error` when a requested
 descendant cannot be listed or inspected; grep reports `unreadable_files` when
 an observed candidate disappears or becomes unreadable after discovery. Concurrent
@@ -154,8 +153,8 @@ If `gitignore=true`, the walk also budgets at most 256 non-absent ignore-file re
 exceeding 64 KiB or 1024 lines causes an explicit error, never a silently
 incomplete matcher. A missing ignore file is distinct from one that exists but
 cannot be read (including an explicit permission deny): when rules cannot be
-applied, JSON results include `ignore_rules` in `incomplete_reasons`, while
-text results warn that matches may be included or omitted.
+applied, JSON results include `ignore_rules` in `incomplete`, while text results
+warn that matches may be included or omitted.
 `read` independently limits actual source I/O to 32 MiB while skipping to its
 selected line window; buffered prefetch cannot cross that ceiling.
 Text tools reject binary controls and invalid UTF-8; use bread/bwrite/bedit

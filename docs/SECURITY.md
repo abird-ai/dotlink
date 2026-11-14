@@ -117,7 +117,7 @@ reserves room for its truncation marker before accepting a hit, so it ends with
 whole hit lines only; a page that stops on the per-file cap says so in the
 marker, and an offset past the last hit answers with an explicit marker. The candidate bound
 limits collected results; the shared walker visits at most 100,000 directory
-entries per request. On a partial walk, `scan_incomplete` distinguishes sorted
+entries per request. On a partial walk, `incomplete` distinguishes sorted
 results from a globally exhaustive search; narrow path/glob before paging.
 
 Native filesystem mutators (`write`, `bwrite`, `edit`, `patch`, `bedit`) first

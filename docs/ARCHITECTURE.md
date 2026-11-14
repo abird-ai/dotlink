@@ -284,8 +284,8 @@ A transport error cancels the remaining active transports.
 Filesystem discovery builds one `WalkProgress` that records entry budget,
 unreadable descendants/metadata, and missing ignore rules. Both `ls` and `grep`
 derive completeness from this result; `grep` additionally records unreadable
-content candidates. JSON keeps the singular compatibility reason and an ordered
-`incomplete_reasons` array so concurrent causes are not lost. Permission denies
+content candidates. JSON adds one ordered `incomplete` array only when a cause exists, so
+concurrent causes are kept without a falsy trio on every reply. Permission denies
 and explicit ignore/hidden filters are intentional exclusions, never mistaken
 for traversal failures. Paged reads place their 32 MiB skipped-input limiter
 under the buffer, so prefetch counts while selected-window bytes remain usable.

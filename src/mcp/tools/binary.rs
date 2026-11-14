@@ -87,6 +87,7 @@ enum BinaryEncoding {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BreadArgs {
     /// Binary file path.
     path: String,
@@ -105,6 +106,7 @@ pub(super) struct BreadArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BwriteArgs {
     /// File path.
     path: String,
@@ -118,6 +120,7 @@ pub(super) struct BwriteArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BeditArgs {
     /// Existing binary file path.
     path: String,
@@ -132,6 +135,7 @@ pub(super) struct BeditArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct BeditRange {
     /// Zero-based byte offset in the original file.
     offset: usize,

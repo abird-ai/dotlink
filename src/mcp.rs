@@ -2561,6 +2561,7 @@ impl LocalMachine {
         tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
         tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
         tools::jobs::with_job_limits(&mut tool, self.config.max_output_bytes);
+        tools::with_write_limit(&mut tool, self.config.max_write_bytes);
         tools::substitute_description_tokens(&mut tool, tokens);
         tool
     }
