@@ -346,8 +346,15 @@ impl LocalMachine {
     async fn bwrite_impl(&self, args: BwriteArgs) -> Result<String> {
         let bytes = decode_binary_owned(args.data, args.encoding, self.config.max_write_bytes)?;
         let reply = super::mutation::compact_text_receipt(
-            format!("wrote {} bytes to {}", bytes.len(), args.path),
-            format!("wrote {} bytes (path omitted)", bytes.len()),
+            format!(
+                "wrote {} to {}",
+                super::plural(bytes.len(), "byte"),
+                args.path
+            ),
+            format!(
+                "wrote {} (path omitted)",
+                super::plural(bytes.len(), "byte")
+            ),
             self.config.max_output_bytes,
         )?;
         let lexical = self.config.access.lexical_target(&args.path)?;

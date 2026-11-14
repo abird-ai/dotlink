@@ -1292,7 +1292,7 @@ mod tests {
         let content = machine.grep_impl(args).await.unwrap();
         assert_eq!(
             content,
-            "file.txt:2: context1\nfile.txt:3: hit2\nfile.txt:4: context3\n… truncated at 1 hits"
+            "file.txt:2: context1\nfile.txt:3: hit2\nfile.txt:4: context3\n… truncated at 1 hit"
         );
     }
 
@@ -1910,7 +1910,7 @@ mod walk_tests {
         args.offset = Some(50);
         args.limit = Some(1);
         let content = machine.grep_impl(args).await.unwrap();
-        assert_eq!(content, "many.txt:51: hit 50\n… truncated at 1 hits");
+        assert_eq!(content, "many.txt:51: hit 50\n… truncated at 1 hit");
     }
 
     #[tokio::test]
@@ -2073,7 +2073,7 @@ mod walk_tests {
         });
         let content = machine.grep_impl(grep_args("hit")).await.unwrap();
         assert!(content.contains("truncated at 1024 bytes"), "{content}");
-        assert!(!content.contains("truncated at 1 hits"), "{content}");
+        assert!(!content.contains("truncated at 1 hit"), "{content}");
     }
 
     #[cfg(unix)]

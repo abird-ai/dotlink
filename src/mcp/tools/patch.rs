@@ -494,10 +494,7 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
             }
             if let Some(path) = directive.strip_prefix("Update File:") {
                 if ops.len() == MAX_PATCH_FILES {
-                    bail!(
-                        "patch: {} files, above the {MAX_PATCH_FILES} file limit",
-                        ops.len() + 1
-                    );
+                    bail!("patch: more than {MAX_PATCH_FILES} files");
                 }
                 let path = path.trim();
                 if path.is_empty() {
@@ -511,10 +508,7 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
             }
             if let Some(path) = directive.strip_prefix("Add File:") {
                 if ops.len() == MAX_PATCH_FILES {
-                    bail!(
-                        "patch: {} files, above the {MAX_PATCH_FILES} file limit",
-                        ops.len() + 1
-                    );
+                    bail!("patch: more than {MAX_PATCH_FILES} files");
                 }
                 let path = path.trim();
                 if path.is_empty() {
@@ -547,7 +541,7 @@ fn parse_patch(text: &str) -> Result<Vec<PatchOp<'_>>> {
             }
             hunks += 1;
             if hunks > MAX_PATCH_HUNKS {
-                bail!("patch: {hunks} hunks, above the {MAX_PATCH_HUNKS} hunk limit");
+                bail!("patch: more than {MAX_PATCH_HUNKS} hunks");
             }
             list.push(PatchHunk {
                 anchor: parse_patch_anchor(rest),
@@ -1959,7 +1953,7 @@ mod tests {
         }
         patch.push_str("*** UNKNOWN INVALID DIRECTIVE\n");
         let error = parse_patch(&patch).unwrap_err().to_string();
-        assert!(error.contains("file limit"), "{error}");
+        assert!(error.contains("more than 32 files"), "{error}");
     }
 
     #[test]
@@ -2584,7 +2578,7 @@ mod tests {
         }
         patch.push_str("*** End Patch\n");
         let error = parse_patch(&patch).unwrap_err().to_string();
-        assert!(error.contains("hunk limit"), "{error}");
+        assert!(error.contains("more than 64 hunks"), "{error}");
 
         let mut patch = String::from("*** Begin Patch\n");
         for index in 0..=MAX_PATCH_FILES {
@@ -2592,7 +2586,7 @@ mod tests {
         }
         patch.push_str("*** End Patch\n");
         let error = parse_patch(&patch).unwrap_err().to_string();
-        assert!(error.contains("file limit"), "{error}");
+        assert!(error.contains("more than 32 files"), "{error}");
 
         assert_eq!(
             parse_patch(

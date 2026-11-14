@@ -395,8 +395,15 @@ impl LocalMachine {
             );
         }
         let reply = compact_text_receipt(
-            format!("wrote {} bytes to {}", args.content.len(), args.path),
-            format!("wrote {} bytes (path omitted)", args.content.len()),
+            format!(
+                "wrote {} to {}",
+                super::plural(args.content.len(), "byte"),
+                args.path
+            ),
+            format!(
+                "wrote {} (path omitted)",
+                super::plural(args.content.len(), "byte")
+            ),
             self.config.max_output_bytes,
         )?;
         let lexical = self.config.access.lexical_target(&args.path)?;

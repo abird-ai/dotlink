@@ -1381,16 +1381,25 @@ pub(crate) fn marker_lines(last: usize) -> String {
     format!("… truncated at line {last}")
 }
 
+/// `1 hit`, `3 hits`: a count in model-facing text brings its own unit, so the
+/// unit follows the number instead of always being plural.
+pub(crate) fn plural(count: usize, unit: &str) -> String {
+    match count {
+        1 => format!("1 {unit}"),
+        count => format!("{count} {unit}s"),
+    }
+}
+
 pub(crate) fn marker_hits(hits: usize) -> String {
-    format!("… truncated at {hits} hits")
+    format!("… truncated at {}", plural(hits, "hit"))
 }
 
 pub(crate) fn marker_files(files: usize) -> String {
-    format!("… truncated at {files} files")
+    format!("… truncated at {}", plural(files, "file"))
 }
 
 pub(crate) fn marker_bytes(bytes: usize) -> String {
-    format!("… truncated at {bytes} bytes")
+    format!("… truncated at {}", plural(bytes, "byte"))
 }
 
 /// Retain the globally best K entries in bounded memory. The heap's root is
