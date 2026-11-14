@@ -268,7 +268,7 @@ impl LocalMachine {
 #[tool_router(router = "discovery_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "List files and directories. `depth` defaults to 1, to the pattern's path-segment count, or unbounded when it contains `**`; an explicit `depth` wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Reply: {entries:[{path,kind,size}],truncated}; `size` is set for files, and a walk that could not finish adds `incomplete` with its causes (directory_budget/traversal_error/ignore_rules). Ordering holds only among scanned entries; narrow path/pattern. Reply respects `max_output_bytes`.",
+        description = "List files and directories. `depth` defaults to 1, to the pattern's path-segment count, or unbounded when it contains `**`; an explicit `depth` wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Reply: {entries:[{path,kind,size}],truncated}; `size` is set for files, and a walk that could not finish adds `incomplete` with its causes (directory_budget/traversal_error). Ordering holds only among scanned entries; narrow path/pattern. Reply respects `max_output_bytes`.",
         annotations(
             title = "List files",
             read_only_hint = true,

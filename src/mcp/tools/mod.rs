@@ -510,10 +510,14 @@ impl WalkProgress {
     }
 }
 
-/// Attach a discovery reply's causes, and only when there are any.
+/// Attach a discovery reply's causes, and only when there are any. Every caller
+/// builds an object reply, so a non-object simply keeps its shape instead of
+/// panicking on the index.
 pub(crate) fn with_incomplete(mut value: serde_json::Value, causes: &[&str]) -> serde_json::Value {
-    if !causes.is_empty() {
-        value["incomplete"] = serde_json::json!(causes);
+    if !causes.is_empty()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("incomplete".to_owned(), serde_json::json!(causes));
     }
     value
 }
@@ -1743,34 +1747,37 @@ mod tests {
     /// `additionalProperties: false` exactly when the struct denies unknown ones.
     #[test]
     fn every_advertised_object_schema_rejects_unknown_fields() {
-        fn check(tool: &str, value: &serde_json::Value) {
+        fn check_object(tool: &str, object: &serde_json::Map<String, serde_json::Value>) {
+            if object.contains_key("properties") {
+                assert_eq!(
+                    object
+                        .get("additionalProperties")
+                        .and_then(serde_json::Value::as_bool),
+                    Some(false),
+                    "{tool} advertises an open object schema"
+                );
+            }
+            for child in object.values() {
+                check_value(tool, child);
+            }
+        }
+
+        fn check_value(tool: &str, value: &serde_json::Value) {
             match value {
-                serde_json::Value::Object(object) => {
-                    if object.contains_key("properties") {
-                        assert_eq!(
-                            object
-                                .get("additionalProperties")
-                                .and_then(serde_json::Value::as_bool),
-                            Some(false),
-                            "{tool} advertises an open object schema: {value}"
-                        );
-                    }
-                    for child in object.values() {
-                        check(tool, child);
-                    }
-                }
+                serde_json::Value::Object(object) => check_object(tool, object),
                 serde_json::Value::Array(values) => {
                     for child in values {
-                        check(tool, child);
+                        check_value(tool, child);
                     }
                 }
                 _ => {}
             }
         }
+
         for tool in crate::mcp::LocalMachine::all_tools().list_all() {
-            for child in tool.input_schema.values() {
-                check(&tool.name, child);
-            }
+            // The args object is the schema that matters most: check it first,
+            // then every nested definition.
+            check_object(&tool.name, &tool.input_schema);
         }
     }
 
