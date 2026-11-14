@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **`job_ack` no longer needs selectors.** `job_ack(job_id)` acknowledges both streams and releases everything retained, so cleanup is one call with one argument; an explicit `offset` (`job_output`'s `next_offset`) still acts as a high-water mark and needs its `stream`. Job payloads now state what cleanup is owed instead of offering a menu: the follow-up reads `job_ack to clean it up, or job_cancel to stop it`, `job_get` reports `unacked_bytes`, and `job_ack`'s description leads with the fact that a job holds its spool until it is acked or retention expires.
+- **`job_ack` no longer needs selectors.** `job_ack(job_id)` acknowledges both streams and releases everything retained, so cleanup is one call with one argument; an explicit `offset` (`job_output`'s `next_offset`) still acts as a high-water mark and needs its `stream`. Job payloads now state what cleanup is owed instead of offering a menu: the follow-up reads `job_ack to clean it up, or job_cancel to stop it`, `job_get` reports `unacked_bytes`, and `job_ack`'s description leads with the fact that a job holds its spool until it is acked or retention expires. The acknowledgement itself answers with a receipt — `ts`, `job_id`, `status`, per-stream `acknowledged_bytes`/`released`, `unacked_bytes` and any remaining obligation — instead of repeating the whole status payload (≈200 characters instead of ≈900; `job_get` still carries the full state).
 
 ### Added
 

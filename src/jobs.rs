@@ -2221,7 +2221,7 @@ impl JobManager {
         }
         entry.output_cleanup_requested = true;
         maybe_release_output(entry);
-        Ok(render_status_locked(&self.inner, entry).to_string())
+        Ok(render_ack_receipt(entry))
     }
 
     pub(crate) fn detailed_task(&self, id: &str) -> JobResult<DetailedTask> {
@@ -2584,16 +2584,53 @@ impl OutputPageRender<'_> {
     }
 }
 
+/// Retained bytes on one stream: fixed once the job is terminal, measured while
+/// it still runs.
+fn retained_bytes(entry: &JobEntry, stream: JobStream) -> u64 {
+    match (entry.completion.as_ref(), stream) {
+        (Some(_), JobStream::Stdout) => entry.stdout_retained,
+        (Some(_), JobStream::Stderr) => entry.stderr_retained,
+        (None, stream) => stored_len(stream_path(entry, stream), None),
+    }
+}
+
+/// Bytes retained but not yet acknowledged, summed over both streams.
+fn unacked_bytes(entry: &JobEntry) -> u64 {
+    retained_bytes(entry, JobStream::Stdout)
+        .saturating_sub(entry.stdout_consumed)
+        .saturating_add(
+            retained_bytes(entry, JobStream::Stderr).saturating_sub(entry.stderr_consumed),
+        )
+}
+
+/// The receipt `job_ack` returns: what each stream now admits to, whether its
+/// spool is gone, and what is still held. Everything else a caller might want is
+/// the status payload's job, so an acknowledgement stays cheap to read.
+fn render_ack_receipt(entry: &JobEntry) -> String {
+    let stream = |consumed: u64, released: bool| {
+        serde_json::json!({
+            "acknowledged_bytes": consumed,
+            "released": released,
+        })
+    };
+    let mut payload = serde_json::json!({
+        "ts": crate::mcp::now_unix(),
+        "job_id": entry.id,
+        "status": entry.status(),
+        "stdout": stream(entry.stdout_consumed, entry.stdout_released),
+        "stderr": stream(entry.stderr_consumed, entry.stderr_released),
+        "unacked_bytes": unacked_bytes(entry),
+    });
+    if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_ack")) {
+        payload["next"] = serde_json::Value::String(next);
+    }
+    payload.to_string()
+}
+
 fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
     let completion = entry.completion.as_ref();
-    let stdout_stored = completion.map_or_else(
-        || stored_len(&entry.stdout_path, None),
-        |_| entry.stdout_retained,
-    );
-    let stderr_stored = completion.map_or_else(
-        || stored_len(&entry.stderr_path, None),
-        |_| entry.stderr_retained,
-    );
+    let stdout_stored = retained_bytes(entry, JobStream::Stdout);
+    let stderr_stored = retained_bytes(entry, JobStream::Stderr);
     let mut payload = serde_json::json!({
         "ts": crate::mcp::now_unix(),
         "job_id": entry.id,
@@ -2622,10 +2659,7 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
             "released": entry.stderr_released,
         },
     });
-    let held = stdout_stored
-        .saturating_sub(entry.stdout_consumed)
-        .saturating_add(stderr_stored.saturating_sub(entry.stderr_consumed));
-    payload["unacked_bytes"] = serde_json::Value::from(held);
+    payload["unacked_bytes"] = serde_json::Value::from(unacked_bytes(entry));
     if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_get")) {
         payload["next"] = serde_json::Value::String(next);
     }
@@ -4540,8 +4574,11 @@ mod tests {
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
         assert_eq!(status["stdout"]["released"], true);
         assert_eq!(status["stderr"]["released"], false);
+        // Retained bytes are the status payload's job, not the ack receipt's.
+        let retained: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
         assert_eq!(
-            status["stdout"]["stored_bytes"], 0,
+            retained["stdout"]["stored_bytes"], 0,
             "a successfully deleted stream must report zero retained bytes even while sibling cleanup is retryable"
         );
         let released_page: serde_json::Value = serde_json::from_str(
@@ -6058,9 +6095,11 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(first["stdout"]["stored_bytes"], 4);
         assert_eq!(first["stdout"]["acknowledged_bytes"], 8);
         assert_eq!(first["stdout"]["released"], true);
+        let compacted: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert_eq!(compacted["stdout"]["stored_bytes"], 4);
         assert_eq!(fs::metadata(&job.stdout_path).unwrap().len(), 4);
         let released_page: serde_json::Value = serde_json::from_str(
             &manager
@@ -6107,8 +6146,10 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(replay["stdout"]["stored_bytes"], 4);
         assert_eq!(replay["stdout"]["acknowledged_bytes"], 8);
+        let retained: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert_eq!(retained["stdout"]["stored_bytes"], 4);
         let tail: serde_json::Value = serde_json::from_str(
             &manager
                 .output_page(
