@@ -108,6 +108,16 @@ struct LogState {
     full_commands: AtomicBool,
 }
 
+/// Visible prefix before a message: `[{timestamp}] {level:<4} {scope:<10} `.
+/// Continuation lines align under it instead of repeating it, and the test below
+/// keeps the two spellings in step.
+fn message_prefix(timestamp: &str, level: &str, scope: &str) -> String {
+    format!("[{timestamp}] {level:<4} {scope:<10} ")
+}
+
+/// Visible width of [`message_prefix`].
+const MESSAGE_COLUMN: usize = 31;
+
 #[derive(Clone, Debug)]
 pub struct LogConfig {
     state: Arc<LogState>,
@@ -315,23 +325,38 @@ impl LogConfig {
         self.line("REQ", transport, &message, "35");
     }
 
-    /// One progress marker on the request stream: the wait reported, and whether
-    /// the client's token took that notification.
-    pub fn heartbeat_tick(&self, tool: &str, tick: u64, delivered: bool) {
-        if !self.developer_enabled() {
-            return;
-        }
-        let outcome = if delivered { "ok" } else { "dropped" };
-        self.line("REQ", tool, &format!("· hb={tick} {outcome}"), "35");
-    }
-
-    /// One summary per call that blocked long enough to report progress:
-    /// delivered ticks out of attempted ones.
-    pub fn heartbeat_done(&self, tool: &str, attempted: u64, delivered: u64) {
+    /// One tick, as a continuation of the call's own line: a dot the peer took,
+    /// a cross it dropped. No timestamp or scope, so a long wait reads as one
+    /// entry instead of a stack of records. The counted line at the end is the
+    /// authoritative one; these marks are the shape of the wait.
+    pub fn progress_mark(&self, delivered: bool) {
         if !self.activity_enabled() {
             return;
         }
-        self.line("TOOL", tool, &format!("· hb={delivered}/{attempted}"), "36");
+        self.continuation(if delivered { "·" } else { "×" }, "2");
+    }
+
+    /// What the wait reported, on the call's own line: one entry, only for calls
+    /// that actually ticked. The counted line carries the scope because the
+    /// marks above it do not.
+    pub fn progress_done(&self, tool: &str, attempted: u64, delivered: u64) {
+        if !self.activity_enabled() {
+            return;
+        }
+        let dropped = attempted.saturating_sub(delivered);
+        let message = match dropped {
+            0 => format!("progress {delivered}/{attempted} ticks"),
+            _ => format!("progress {delivered}/{attempted} ticks, {dropped} dropped"),
+        };
+        self.line("TOOL", tool, &message, "36");
+    }
+
+    /// A message-aligned continuation of the line above it, with no timestamp or
+    /// scope of its own. One `eprintln!` per line, so concurrent calls cannot
+    /// splice into each other.
+    fn continuation(&self, message: &str, color_code: &str) {
+        let message = self.style(color_code, message);
+        eprintln!("{:width$}{message}", "", width = MESSAGE_COLUMN);
     }
 
     /// One notification the transport accepted, so progress delivery is provable
@@ -364,7 +389,11 @@ impl LogConfig {
                 "\x1b[2m[{timestamp}]\x1b[0m \x1b[{color_code}m{level:<4}\x1b[0m \x1b[1m{scope:<10}\x1b[0m {message}"
             );
         } else {
-            eprintln!("[{timestamp}] {level:<4} {scope:<10} {message}");
+            eprintln!(
+                "{}{}",
+                message_prefix(&timestamp.to_string(), level, &scope),
+                message
+            );
         }
     }
 }
@@ -734,6 +763,15 @@ pub fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Continuation lines are written with `MESSAGE_COLUMN` spaces, so the prefix
+    /// `line()` writes must stay exactly that wide.
+    #[test]
+    fn continuations_align_under_the_message_column() {
+        let prefix = message_prefix("12:00:00.000", "TOOL", "bash");
+        assert_eq!(prefix.chars().count(), MESSAGE_COLUMN, "{prefix:?}");
+        assert!(prefix.ends_with(' '), "{prefix:?}");
+    }
 
     #[test]
     fn jsonrpc_identifiers_are_bounded_and_sanitized_for_every_transport() {

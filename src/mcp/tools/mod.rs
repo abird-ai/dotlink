@@ -98,7 +98,7 @@ impl ProgressHeartbeat {
         if delivered {
             self.delivered.fetch_add(1, Ordering::Relaxed);
         }
-        self.log.heartbeat_tick(&self.tool, tick, delivered);
+        self.log.progress_mark(delivered);
     }
 }
 
@@ -111,7 +111,7 @@ impl Drop for ProgressHeartbeat {
         if attempted == 0 {
             return;
         }
-        self.log.heartbeat_done(
+        self.log.progress_done(
             &self.tool,
             attempted,
             self.delivered.load(Ordering::Relaxed),

@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Heartbeats are observable. A call that reported progress ends with one `TOOL · hb=<delivered>/<attempted>` line (`-v`), each tick logs `REQ · hb=<n> ok|dropped` (`-vv`), and the OpenAI transport logs every notification it posts at `REQ`. Previously only a failed post logged anything, so "the client sent no progress token" and "ticks were delivered" looked identical.
+- Heartbeats are observable and quiet. A call that reported progress leaves one message-aligned `·` per delivered tick under its own log entry (`×` when a tick is dropped), closed by a single `progress <n>/<n> ticks` line; the OpenAI transport logs every notification it posts at `REQ` (`-vv`). A call whose client sent no progress token leaves none of it, so "no token" and "delivered" are finally distinguishable — previously only a failed post logged anything.
 
 ## [0.17.0] - 2026-11-14
 
