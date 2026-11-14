@@ -2942,6 +2942,13 @@ impl TunnelClient {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return false;
         }
+        let method = response
+            .resp_json
+            .as_ref()
+            .and_then(|json| json.get("method"))
+            .and_then(Value::as_str)
+            .unwrap_or("notification")
+            .to_owned();
         let body = match serialize_tunnel_response(&response) {
             Ok(body) => body,
             Err(error) => {
@@ -2951,7 +2958,10 @@ impl TunnelClient {
             }
         };
         match self.post_once(command, body, deadline).await {
-            Ok(PostOutcome::Delivered) => true,
+            Ok(PostOutcome::Delivered) => {
+                self.log.notification("openai", &method);
+                true
+            }
             Ok(PostOutcome::Undeliverable | PostOutcome::Cancelled) => false,
             Ok(PostOutcome::Retry(error)) | Ok(PostOutcome::Fatal(error)) | Err(error) => {
                 warn!(request_id = %command.request_id_label(), "dropping intermediate tunnel notification after send failure");

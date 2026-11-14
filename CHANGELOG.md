@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-11-14
+
+### Changed
+
+- **`job_ack` no longer needs an offset.** Omit `offset` and everything currently retained on the stream is released, so cleanup is one call with one argument; an explicit offset (`job_output`'s `next_offset`) still acts as a high-water mark. Job payloads now state what cleanup is owed instead of offering a menu: the follow-up reads `job_ack to clean it up, or job_cancel to stop it`, `job_get` reports `unacked_bytes`, and `job_ack`'s description leads with the fact that a job holds its spool until it is acked or retention expires.
+
+### Added
+
+- Heartbeats are observable. A call that reported progress ends with one `TOOL · hb=<delivered>/<attempted>` line (`-v`), each tick logs `REQ · hb=<n> ok|dropped` (`-vv`), and the OpenAI transport logs every notification it posts at `REQ`. Previously only a failed post logged anything, so "the client sent no progress token" and "ticks were delivered" looked identical.
+
 ## [0.17.0] - 2026-11-14
 
 ### Changed
@@ -692,7 +702,8 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/abird-ai/dotlink/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/abird-ai/dotlink/compare/v0.16.7...v0.17.0
 [0.16.7]: https://github.com/abird-ai/dotlink/compare/v0.16.6...v0.16.7
 [0.16.6]: https://github.com/abird-ai/dotlink/compare/v0.16.5...v0.16.6

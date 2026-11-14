@@ -166,8 +166,9 @@ struct JobAckArgs {
     /// stdout or stderr. Defaults to stdout.
     #[serde(default)]
     stream: OutputStream,
-    /// Highest byte offset safely received by the caller.
-    offset: u64,
+    /// Highest byte offset safely received, normally `job_output`'s `next_offset`. Omit to release everything currently retained on `stream`.
+    #[serde(default)]
+    offset: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -304,7 +305,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Acknowledge `job_output`'s `next_offset` for the same `stream` once received: the only operation that advances cleanup, releasing both terminal streams once fully acknowledged. It is a high-water mark, so an acknowledged offset also releases output skipped by a tail read. A native task keeps only the exact prefix `tasks/get` replays. Unacked output holds the session spool budget until retention ({retention}).",
+        description = "Ack a job so its spool is released: a job holds its output until you ack it, or until retention ({retention}) expires. Omit `offset` to release everything currently retained on `stream`; an explicit offset (normally `job_output`'s `next_offset`) is a high-water mark, so it also releases output skipped by a tail read. A native task keeps only the exact prefix `tasks/get` replays.",
         annotations(
             title = "Acknowledge shell job output",
             read_only_hint = false,

@@ -2056,7 +2056,11 @@ impl LocalMachine {
                 .is_some_and(|capabilities| capabilities.supports_tasks()),
             self.request_job_key(context),
             self.request_result_budget(context),
-            ProgressHeartbeat::for_request(context),
+            ProgressHeartbeat::for_request(
+                context,
+                self.config.log.clone(),
+                request.name.to_string(),
+            ),
         )
         .await
     }
@@ -2673,8 +2677,12 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_shell(args, false, ProgressHeartbeat::for_request(&context))
-            .await
+        self.run_shell(
+            args,
+            false,
+            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "bash"),
+        )
+        .await
     }
 
     #[tool(
@@ -2692,8 +2700,12 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_shell(args, true, ProgressHeartbeat::for_request(&context))
-            .await
+        self.run_shell(
+            args,
+            true,
+            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "powershell"),
+        )
+        .await
     }
 }
 
@@ -4121,7 +4133,7 @@ mod tests {
         let acknowledged: Value = serde_json::from_str(
             &machine
                 .jobs
-                .acknowledge_output(&task_id, crate::jobs::JobStream::Stdout, stdout_end)
+                .acknowledge_output(&task_id, crate::jobs::JobStream::Stdout, Some(stdout_end))
                 .unwrap(),
         )
         .unwrap();

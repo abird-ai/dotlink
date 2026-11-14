@@ -315,6 +315,39 @@ impl LogConfig {
         self.line("REQ", transport, &message, "35");
     }
 
+    /// One progress marker on the request stream: the wait reported, and whether
+    /// the client's token took that notification.
+    pub fn heartbeat_tick(&self, tool: &str, tick: u64, delivered: bool) {
+        if !self.developer_enabled() {
+            return;
+        }
+        let outcome = if delivered { "ok" } else { "dropped" };
+        self.line("REQ", tool, &format!("· hb={tick} {outcome}"), "35");
+    }
+
+    /// One summary per call that blocked long enough to report progress:
+    /// delivered ticks out of attempted ones.
+    pub fn heartbeat_done(&self, tool: &str, attempted: u64, delivered: u64) {
+        if !self.activity_enabled() {
+            return;
+        }
+        self.line("TOOL", tool, &format!("· hb={delivered}/{attempted}"), "36");
+    }
+
+    /// One notification the transport accepted, so progress delivery is provable
+    /// without a failure to look at.
+    pub fn notification(&self, transport: &str, method: &str) {
+        if !self.developer_enabled() {
+            return;
+        }
+        let method = if self.highlight_fields() {
+            format!("\x1b[35m{method}\x1b[0m")
+        } else {
+            method.to_owned()
+        };
+        self.line("REQ", transport, &format!("← {method}"), "35");
+    }
+
     pub fn style(&self, code: &str, text: impl AsRef<str>) -> String {
         if self.color {
             format!("\x1b[{code}m{}\x1b[0m", text.as_ref())

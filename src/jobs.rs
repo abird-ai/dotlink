@@ -84,13 +84,11 @@ const JOB_WAIT_POLL: Duration = Duration::from_millis(200);
 /// also lets a payload skip the call its reader has just made.
 const JOB_FOLLOW_UP_CLAUSES: &[(&str, &str)] = &[
     ("job_get", "job_get=status"),
-    ("job_output", "job_output(offset)=remaining output"),
-    ("job_ack", "job_ack(highest read)=free spool"),
-    ("job_cancel", "job_cancel=stop"),
+    ("job_output", "job_output=remaining output"),
 ];
 
 /// A receipt always has something to say: `already_used` skips at most one
-/// clause, so a shorter table fails the build instead of a render.
+/// clause, and every stage owes at least one call.
 const _: () = assert!(JOB_FOLLOW_UP_CLAUSES.len() >= 2);
 
 /// The one prohibition that belongs wherever a handle is handed back.
@@ -132,18 +130,34 @@ impl JobFollowUp {
             (true, false) => false,
         }
     }
+
+    /// What the caller still owes this job: output is released only by an
+    /// acknowledgement, and a running job can be stopped instead.
+    fn obligation(self) -> Option<&'static str> {
+        match (self.finished, self.unacked) {
+            (false, _) => Some("job_ack to clean it up, or job_cancel to stop it"),
+            (true, true) => Some("job_ack to clean it up"),
+            (true, false) => None,
+        }
+    }
 }
 
 /// One follow-up sentence for this stage, dropping the tool whose result the
 /// caller is already reading: a `job_get` payload must not tell the caller to
 /// call `job_get`.
 pub(crate) fn job_follow_up(state: JobFollowUp, already_used: Option<&str>) -> Option<String> {
-    let clauses: Vec<&str> = JOB_FOLLOW_UP_CLAUSES
+    let mut parts: Vec<&str> = JOB_FOLLOW_UP_CLAUSES
         .iter()
         .filter(|(tool, _)| state.wants(tool) && Some(*tool) != already_used)
         .map(|(_, clause)| *clause)
         .collect();
-    if clauses.is_empty() {
+    // The obligation closes the sentence, unless the reader has just done it.
+    if let Some(obligation) = state.obligation()
+        && !matches!(already_used, Some("job_ack" | "job_cancel"))
+    {
+        parts.push(obligation);
+    }
+    if parts.is_empty() {
         return None;
     }
     let lead = if state.finished {
@@ -151,7 +165,7 @@ pub(crate) fn job_follow_up(state: JobFollowUp, already_used: Option<&str>) -> O
     } else {
         "call "
     };
-    Some(format!("{lead}{}", clauses.join(", ")))
+    Some(format!("{lead}{}", parts.join(", ")))
 }
 
 /// The chain a just-handed-back handle advertises: a running job's clauses, so
@@ -2174,11 +2188,13 @@ impl JobManager {
 
     /// Explicit, idempotent acknowledgement. Reads stay pure/replayable; only
     /// this control-plane operation advances deletion watermarks.
+    /// `offset` is the caller's high-water mark; `None` releases everything
+    /// currently retained on that stream, so cleanup never needs arithmetic.
     pub(crate) fn acknowledge_output(
         &self,
         id: &str,
         stream: JobStream,
-        offset: u64,
+        offset: Option<u64>,
     ) -> JobResult<String> {
         sweep_expired(&self.inner);
         let mut state = self.inner.state.lock().expect("job manager lock");
@@ -2192,6 +2208,7 @@ impl JobManager {
                 JobStream::Stderr => completion.stderr.stored_bytes,
             },
         );
+        let offset = offset.unwrap_or(stored);
         if offset > stored {
             return Err(JobError::Internal(anyhow!(
                 "job {id} {} acknowledgement {offset} is beyond stored output ({stored} bytes)",
@@ -2605,6 +2622,10 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
             "released": entry.stderr_released,
         },
     });
+    let held = stdout_stored
+        .saturating_sub(entry.stdout_consumed)
+        .saturating_add(stderr_stored.saturating_sub(entry.stderr_consumed));
+    payload["unacked_bytes"] = serde_json::Value::from(held);
     if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_get")) {
         payload["next"] = serde_json::Value::String(next);
     }
@@ -3350,14 +3371,14 @@ mod tests {
         let all = shell_job_follow_up(None);
         assert_eq!(
             all,
-            "call job_get=status, job_output(offset)=remaining output, job_ack(highest read)=free spool, job_cancel=stop",
+            "call job_get=status, job_output=remaining output, job_ack to clean it up, or job_cancel to stop it",
             "{all}"
         );
         // A payload from one job tool never tells the caller to call it again.
         let from_status = shell_job_follow_up(Some("job_get"));
         assert_eq!(
             from_status,
-            "call job_output(offset)=remaining output, job_ack(highest read)=free spool, job_cancel=stop",
+            "call job_output=remaining output, job_ack to clean it up, or job_cancel to stop it",
             "{from_status}"
         );
         assert!(!from_status.contains("job_get"), "{from_status}");
@@ -3367,7 +3388,7 @@ mod tests {
     fn finished_job_follow_up_asks_for_the_ack_and_drops_cancel() {
         assert_eq!(
             job_follow_up(JobFollowUp::RUNNING, Some("job_get")).unwrap(),
-            "call job_output(offset)=remaining output, job_ack(highest read)=free spool, job_cancel=stop"
+            "call job_output=remaining output, job_ack to clean it up, or job_cancel to stop it"
         );
         let held = JobFollowUp {
             finished: true,
@@ -3375,7 +3396,7 @@ mod tests {
         };
         assert_eq!(
             job_follow_up(held, Some("job_get")).unwrap(),
-            "output complete: job_output(offset)=remaining output, job_ack(highest read)=free spool"
+            "output complete: job_output=remaining output, job_ack to clean it up"
         );
         let released = JobFollowUp {
             finished: true,
@@ -3879,11 +3900,11 @@ mod tests {
         // cleanup watermarks.
         assert!(job.stdout_path.exists() && job.stderr_path.exists());
         manager
-            .acknowledge_output(&job.id, JobStream::Stdout, 5)
+            .acknowledge_output(&job.id, JobStream::Stdout, Some(5))
             .unwrap();
         let released: serde_json::Value = serde_json::from_str(
             &manager
-                .acknowledge_output(&job.id, JobStream::Stderr, 3)
+                .acknowledge_output(&job.id, JobStream::Stderr, Some(3))
                 .unwrap(),
         )
         .unwrap();
@@ -3896,6 +3917,71 @@ mod tests {
                 .unwrap()
                 .contains("\"released\":true")
         );
+    }
+
+    #[test]
+    fn acknowledging_without_an_offset_releases_everything_retained() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        fs::write(&job.stdout_path, b"hello").unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: 5,
+                    stored_bytes: 5,
+                    truncated: false,
+                },
+                StreamSummary::default(),
+            ),
+        );
+        let status: serde_json::Value = serde_json::from_str(
+            &manager
+                .acknowledge_output(&job.id, JobStream::Stdout, None)
+                .unwrap(),
+        )
+        .unwrap();
+        // Cleanup never needs the caller to know an offset.
+        assert_eq!(status["stdout"]["acknowledged_bytes"], 5);
+        assert_eq!(status["stdout"]["released"], true);
+        assert_eq!(status["unacked_bytes"], 0);
+    }
+
+    #[test]
+    fn unacked_bytes_reports_what_the_spool_still_holds() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        fs::write(&job.stdout_path, b"hello").unwrap();
+        fs::write(&job.stderr_path, b"err").unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: 5,
+                    stored_bytes: 5,
+                    truncated: false,
+                },
+                StreamSummary {
+                    total_bytes: 3,
+                    stored_bytes: 3,
+                    truncated: false,
+                },
+            ),
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert_eq!(status["unacked_bytes"], 8);
+        let status: serde_json::Value = serde_json::from_str(
+            &manager
+                .acknowledge_output(&job.id, JobStream::Stdout, Some(5))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["unacked_bytes"], 3);
     }
 
     #[test]
@@ -3922,7 +4008,7 @@ mod tests {
         assert_eq!(first["data"], "one");
         assert_eq!(first["complete"], false);
         manager
-            .acknowledge_output(&job.id, JobStream::Stdout, 3)
+            .acknowledge_output(&job.id, JobStream::Stdout, Some(3))
             .unwrap();
 
         use std::io::Write as _;
@@ -3973,7 +4059,7 @@ mod tests {
         );
         let ack: serde_json::Value = serde_json::from_str(
             &manager
-                .acknowledge_output(&job.id, JobStream::Stdout, 6)
+                .acknowledge_output(&job.id, JobStream::Stdout, Some(6))
                 .unwrap(),
         )
         .unwrap();
@@ -4093,7 +4179,7 @@ mod tests {
 
         let ack: serde_json::Value = serde_json::from_str(
             &manager
-                .acknowledge_output(&job.id, JobStream::Stdout, 5)
+                .acknowledge_output(&job.id, JobStream::Stdout, Some(5))
                 .unwrap(),
         )
         .unwrap();
@@ -4355,10 +4441,10 @@ mod tests {
             );
             manager.expose_compatibility(&job.id).unwrap();
             manager
-                .acknowledge_output(&job.id, JobStream::Stdout, 1)
+                .acknowledge_output(&job.id, JobStream::Stdout, Some(1))
                 .unwrap();
             manager
-                .acknowledge_output(&job.id, JobStream::Stderr, 0)
+                .acknowledge_output(&job.id, JobStream::Stderr, Some(0))
                 .unwrap();
         }
         let extra = manager.create_for_test(30).unwrap();
@@ -4446,10 +4532,10 @@ mod tests {
         fs::remove_file(&job.stderr_path).unwrap();
         fs::create_dir(&job.stderr_path).unwrap();
         manager
-            .acknowledge_output(&job.id, JobStream::Stdout, 1)
+            .acknowledge_output(&job.id, JobStream::Stdout, Some(1))
             .unwrap();
         let status = manager
-            .acknowledge_output(&job.id, JobStream::Stderr, 0)
+            .acknowledge_output(&job.id, JobStream::Stderr, Some(0))
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
         assert_eq!(status["stdout"]["released"], true);
@@ -5541,10 +5627,10 @@ mod tests {
 
         let reclaimable = reclaimable.unwrap();
         manager
-            .acknowledge_output(&reclaimable, JobStream::Stdout, 1)
+            .acknowledge_output(&reclaimable, JobStream::Stdout, Some(1))
             .unwrap();
         manager
-            .acknowledge_output(&reclaimable, JobStream::Stderr, 0)
+            .acknowledge_output(&reclaimable, JobStream::Stderr, Some(0))
             .unwrap();
         let duplicate = manager
             .spawn(
@@ -5782,7 +5868,7 @@ mod tests {
         );
         manager.expose_compatibility(&job.id).unwrap();
         manager
-            .acknowledge_output(&job.id, JobStream::Stdout, 0)
+            .acknowledge_output(&job.id, JobStream::Stdout, Some(0))
             .unwrap();
 
         assert_eq!(job.spool_account.charged(), 0);
@@ -5812,7 +5898,7 @@ mod tests {
             state.jobs.get_mut(&job.id).unwrap().readers += 1;
         }
         manager
-            .acknowledge_output(&job.id, JobStream::Stdout, 5)
+            .acknowledge_output(&job.id, JobStream::Stdout, Some(5))
             .unwrap();
         assert!(job.stdout_path.exists(), "reader lease must defer deletion");
         release_reader(&manager.inner, &job.id);
@@ -5968,7 +6054,7 @@ mod tests {
 
         let first: serde_json::Value = serde_json::from_str(
             &manager
-                .acknowledge_output(&job.id, JobStream::Stdout, 8)
+                .acknowledge_output(&job.id, JobStream::Stdout, Some(8))
                 .unwrap(),
         )
         .unwrap();
@@ -6017,7 +6103,7 @@ mod tests {
         // invalid offset. Current retained bytes remain the compacted Task prefix.
         let replay: serde_json::Value = serde_json::from_str(
             &manager
-                .acknowledge_output(&job.id, JobStream::Stdout, 8)
+                .acknowledge_output(&job.id, JobStream::Stdout, Some(8))
                 .unwrap(),
         )
         .unwrap();
@@ -6128,7 +6214,7 @@ mod tests {
             Err(JobError::Unknown(_))
         ));
         assert!(matches!(
-            manager.acknowledge_output(&job.id, JobStream::Stdout, 1),
+            manager.acknowledge_output(&job.id, JobStream::Stdout, Some(1)),
             Err(JobError::Unknown(_))
         ));
         assert!(matches!(manager.cancel(&job.id), Err(JobError::Unknown(_))));

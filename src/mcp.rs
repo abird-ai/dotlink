@@ -2760,7 +2760,11 @@ impl rmcp::ServerHandler for LocalMachine {
         // counters on one progress token.
         let heartbeat = match is_shell_tool(&request.name) {
             true => None,
-            false => crate::mcp::tools::ProgressHeartbeat::for_request(&context),
+            false => crate::mcp::tools::ProgressHeartbeat::for_request(
+                &context,
+                self.config.log.clone(),
+                request.name.to_string(),
+            ),
         };
         crate::mcp::tools::await_with_heartbeat(
             heartbeat,

@@ -40,13 +40,18 @@ pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1
 /// reports on. Delivery is bounded per tick, with no detached task or queue.
 const PROGRESS_SEND_BUDGET: Duration = Duration::from_millis(100);
 
-async fn deliver_heartbeat_bounded<F: Future<Output = ()>>(deadline: Option<Instant>, delivery: F) {
+/// Reports are advisory: a stalled peer must never delay the operation. The
+/// outcome is returned so a tick can say whether it landed or was cut off.
+async fn deliver_heartbeat_bounded<F: Future>(
+    deadline: Option<Instant>,
+    delivery: F,
+) -> Option<F::Output> {
     let bound = Instant::now() + PROGRESS_SEND_BUDGET;
     let send_deadline = deadline.map_or(bound, |deadline| deadline.min(bound));
     tokio::select! {
         biased;
-        () = sleep_until(send_deadline) => {}
-        () = delivery => {}
+        () = sleep_until(send_deadline) => None,
+        output = delivery => Some(output),
     }
 }
 
@@ -57,26 +62,60 @@ pub(crate) struct ProgressHeartbeat {
     peer: Peer<RoleServer>,
     token: ProgressToken,
     ticks: AtomicU64,
+    delivered: AtomicU64,
+    log: crate::logging::LogConfig,
+    tool: String,
 }
 
 impl ProgressHeartbeat {
-    pub(crate) fn for_request(context: &RequestContext<RoleServer>) -> Option<Self> {
+    /// One sink per call that carried a progress token; the caller's tool name
+    /// and log are captured here so ticks and the summary report themselves.
+    pub(crate) fn for_request(
+        context: &RequestContext<RoleServer>,
+        log: crate::logging::LogConfig,
+        tool: impl Into<String>,
+    ) -> Option<Self> {
         let token = context.meta.get_progress_token()?;
         Some(Self {
             peer: context.peer.clone(),
             token,
             ticks: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
+            log,
+            tool: tool.into(),
         })
     }
 
     /// Monotonic progress counter with no total and no message.
     pub(crate) async fn report(&self, deadline: Option<Instant>) {
-        let progress = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        let param = ProgressNotificationParam::new(self.token.clone(), progress as f64);
-        deliver_heartbeat_bounded(deadline, async {
-            let _ = self.peer.notify_progress(param).await;
+        let tick = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        let param = ProgressNotificationParam::new(self.token.clone(), tick as f64);
+        let delivered = deliver_heartbeat_bounded(deadline, async {
+            self.peer.notify_progress(param).await.is_ok()
         })
-        .await;
+        .await
+        .unwrap_or(false);
+        if delivered {
+            self.delivered.fetch_add(1, Ordering::Relaxed);
+        }
+        self.log.heartbeat_tick(&self.tool, tick, delivered);
+    }
+}
+
+/// The call is over: report how many ticks it needed and how many landed. This
+/// is the only line a silent wait cannot produce, so a deployment can tell "no
+/// progress token" (no line at all) from "ticks delivered" (`hb=n/n`).
+impl Drop for ProgressHeartbeat {
+    fn drop(&mut self) {
+        let attempted = self.ticks.load(Ordering::Relaxed);
+        if attempted == 0 {
+            return;
+        }
+        self.log.heartbeat_done(
+            &self.tool,
+            attempted,
+            self.delivered.load(Ordering::Relaxed),
+        );
     }
 }
 
