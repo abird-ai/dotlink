@@ -228,6 +228,7 @@ Every profile-enabled transport starts automatically.
 --stdio / --http             add a local transport for one run
 --no-stdio                   suppress profile stdio
 --no-http                    suppress profile HTTP and ngrok
+--no-tunnel                  suppress the profile OpenAI tunnel, without opening its credentials
 --ngrok                      enable ngrok for effective HTTP
 --no-ngrok                   suppress profile ngrok
 --ngrok-domain=DOMAIN        override/pin the ngrok hostname

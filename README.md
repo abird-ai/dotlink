@@ -456,6 +456,7 @@ TRANSPORTS
 --no-stdio                      suppress profile stdio for this run
 --http                          add HTTP MCP for this run
 --no-http                       suppress profile HTTP + ngrok for this run
+--no-tunnel                     suppress profile OpenAI tunnel for this run
 --http-bind <ADDR>              override HTTP listen address
 
 REMOTE HTTP & OAUTH

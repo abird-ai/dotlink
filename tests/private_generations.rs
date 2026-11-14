@@ -78,8 +78,17 @@ fn run_to_post_credential_failure(
     config_dir: &std::path::Path,
     profile: &std::path::Path,
 ) -> std::process::Output {
+    run_with_flags_to_post_credential_failure(config_dir, profile, &[])
+}
+
+fn run_with_flags_to_post_credential_failure(
+    config_dir: &std::path::Path,
+    profile: &std::path::Path,
+    flags: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-default-allow")
+        .args(flags)
         .env("DOTLINK_CONFIG_FILE", profile)
         .env("XDG_CONFIG_HOME", config_dir)
         .env_remove("DOTLINK_API_KEY")
@@ -530,6 +539,30 @@ fn writable_sandbox_parent_anchors_control_plane_paths() {
         !state_home.join("abird/dotlink/jobs").exists(),
         "idle runtime must keep the per-job spool hierarchy lazy"
     );
+}
+
+#[test]
+fn no_tunnel_refuses_the_profile_tunnel_before_opening_its_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("xdg");
+    let private = home.join("abird/dotlink");
+    fs::create_dir_all(&private).unwrap();
+    let config = private.join("config.jsonc");
+    let revision = "11223344556677889900aabbccddeeff";
+    fs::write(
+        &config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":true,"stdio":true}},"tunnel_id":"tunnel_0123456789abcdef0123456789abcdef","runtime_key_revision":"{revision}"}}"#
+        ),
+    )
+    .unwrap();
+    // Unreadable as a credential for every user, so any read would be visible.
+    fs::create_dir(private.join(format!("runtime.{revision}.key"))).unwrap();
+
+    // `--no-tunnel` must decide before credential resolution: the run reaches
+    // the same post-credential policy failure as a profile with the tunnel off.
+    let refused = run_with_flags_to_post_credential_failure(&home, &config, &["--no-tunnel"]);
+    assert_post_credential_policy_failure(&refused);
 }
 
 #[test]

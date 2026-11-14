@@ -811,26 +811,69 @@ fn load_profile_for_edit(profile: Option<&str>) -> Result<ProfileEditSnapshot> {
     ))
 }
 
+/// Whether this run may start the profile's OpenAI tunnel.
+///
+/// Resolved before any credential is opened, so `Disabled` is a real policy
+/// boundary: a local run cannot join a tunnel it was told to ignore, and the
+/// dormant Runtime key stays untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TunnelStart {
+    Profile,
+    Disabled,
+}
+
+impl TunnelStart {
+    fn requested(self) -> bool {
+        self == Self::Profile
+    }
+}
+
 pub async fn load_or_setup(
     force_setup: bool,
     profile: Option<&str>,
     color: bool,
+    tunnel: TunnelStart,
+) -> Result<Option<SetupResult>> {
+    let mut loaded = load_or_setup_with(force_setup, profile, color, tunnel).await?;
+    // Interactive setup never runs under `Disabled` (it conflicts with `--setup`),
+    // but one tail keeps every return path honest.
+    if !tunnel.requested()
+        && let Some(setup) = loaded.as_mut()
+    {
+        setup.config.transports.openai = false;
+    }
+    Ok(loaded)
+}
+
+async fn load_or_setup_with(
+    force_setup: bool,
+    profile: Option<&str>,
+    color: bool,
+    tunnel: TunnelStart,
 ) -> Result<Option<SetupResult>> {
     validate_profile(profile)?;
+    let tunnel_requested = tunnel.requested();
 
     if !force_setup {
         if let Some(mut config) = read_profile_config(profile)? {
             // Resolve an active explicit file once. Its secret and verified
             // protected target travel together through override application.
             // Dormant OpenAI profiles do not open the saved or explicit key.
-            let explicit_connection = profile.is_none()
+            let explicit_connection = tunnel_requested
+                && profile.is_none()
                 && env_first(&["DOTLINK_ID", "CONTROL_PLANE_TUNNEL_ID"]).is_some();
-            let mut runtime_source = if config.transports.openai || explicit_connection {
-                credentials::from_env("DOTLINK_API_KEY_FILE")?
-            } else {
-                None
-            };
+            let mut runtime_source =
+                if (config.transports.openai && tunnel_requested) || explicit_connection {
+                    credentials::from_env("DOTLINK_API_KEY_FILE")?
+                } else {
+                    None
+                };
             apply_env_overrides(&mut config, profile.is_none(), runtime_source.as_ref())?;
+            // The flag outranks the profile and the environment: nothing below
+            // this point may open a tunnel credential or require a tunnel id.
+            if !tunnel_requested {
+                config.transports.openai = false;
+            }
             if config.transports.openai && config.runtime_api_key.trim().is_empty() {
                 runtime_source = try_read_saved_runtime_key(&config, profile)?;
                 config.runtime_api_key = runtime_source
@@ -848,7 +891,8 @@ pub async fn load_or_setup(
             }));
         }
 
-        if profile.is_none()
+        if tunnel_requested
+            && profile.is_none()
             && let Some((config, runtime_source)) = config_from_env()?
         {
             let protected_paths =

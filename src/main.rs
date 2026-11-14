@@ -108,7 +108,8 @@ struct Args {
             "allow_public_no_auth",
             "ephemeral_url",
             "http_ephemeral_url",
-            "ngrok_ephemeral_url"
+            "ngrok_ephemeral_url",
+            "no_tunnel"
         ]
     )]
     #[arg(help_heading = "Setup & profiles")]
@@ -138,6 +139,11 @@ struct Args {
     #[arg(long, conflicts_with = "http")]
     #[arg(help_heading = "Transports")]
     no_http: bool,
+
+    /// Disable the OpenAI tunnel even if enabled in the selected profile, without opening its credentials.
+    #[arg(long)]
+    #[arg(help_heading = "Transports")]
+    no_tunnel: bool,
 
     /// Override the configured HTTP listen address for this run.
     #[arg(long, value_name = "ADDR")]
@@ -1222,7 +1228,13 @@ fn oauth_profile_target(name: &str) -> Option<&str> {
 /// ordinary command failures.
 async fn run_one_shot(args: &Args, launch_dir: &Path, setup_color: bool) -> Result<()> {
     if args.setup {
-        load_or_setup(true, selected_profile(args).as_deref(), setup_color).await?;
+        load_or_setup(
+            true,
+            selected_profile(args).as_deref(),
+            setup_color,
+            setup::TunnelStart::Profile,
+        )
+        .await?;
     } else if args.print_id {
         let tunnel_id = setup::configured_tunnel_id(selected_profile(args).as_deref())?
             .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
@@ -1349,8 +1361,13 @@ async fn plan_runtime(
     setup_color: bool,
     openai_state: &transports::openai::ProcessState,
 ) -> Result<Option<RuntimePlan>> {
-    let Some(mut setup) =
-        load_or_setup(false, selected_profile(args).as_deref(), setup_color).await?
+    let Some(mut setup) = load_or_setup(
+        false,
+        selected_profile(args).as_deref(),
+        setup_color,
+        tunnel_start(args),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1745,6 +1762,14 @@ struct EffectiveLocalTransports {
     ngrok_domain: Option<String>,
     http_ephemeral_url: bool,
     ngrok_ephemeral_url: bool,
+}
+
+/// CLI intent for the OpenAI tunnel; `--no-tunnel` refuses it for this run.
+fn tunnel_start(args: &Args) -> setup::TunnelStart {
+    match args.no_tunnel {
+        true => setup::TunnelStart::Disabled,
+        false => setup::TunnelStart::Profile,
+    }
 }
 
 fn resolve_local_transports(
@@ -3573,6 +3598,17 @@ mod tests {
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(effective.http_ephemeral_url);
         assert!(!effective.ngrok_ephemeral_url);
+    }
+
+    #[test]
+    fn no_tunnel_refuses_the_profile_tunnel_for_this_run() {
+        let args = Args::try_parse_from(["dotlink", "--no-tunnel", "--stdio"]).unwrap();
+        assert!(args.no_tunnel);
+        assert_eq!(tunnel_start(&args), setup::TunnelStart::Disabled);
+        let plain = Args::try_parse_from(["dotlink"]).unwrap();
+        assert_eq!(tunnel_start(&plain), setup::TunnelStart::Profile);
+        // Interactive setup cannot express a one-run refusal.
+        assert!(Args::try_parse_from(["dotlink", "--setup", "--no-tunnel"]).is_err());
     }
 
     #[test]

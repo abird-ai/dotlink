@@ -305,7 +305,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Ack a job so its spool is released: a job holds its output until you ack it, or until retention ({retention}) expires. `job_ack(job_id)` acknowledges both streams and releases everything retained; an explicit `offset` (normally `job_output`'s `next_offset`) needs its `stream` and is a high-water mark, so it also releases output skipped by a tail read. A native task keeps only the exact prefix `tasks/get` replays.",
+        description = "Ack a job so its spool is released: a job holds its output until you ack it, or until retention ({retention}) expires. `job_ack(job_id)` acknowledges both streams and releases everything retained; an explicit `offset` (normally `job_output`'s `next_offset`) needs its `stream` and is a high-water mark, so it also releases output skipped by a tail read. The reply is the acknowledgement (per-stream `acknowledged_bytes`/`released`, `unacked_bytes`), not the job's state — `job_get` has that. A native task keeps only the exact prefix `tasks/get` replays.",
         annotations(
             title = "Acknowledge shell job output",
             read_only_hint = false,
