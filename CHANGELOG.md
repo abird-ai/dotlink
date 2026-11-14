@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **`job_ack` no longer needs an offset.** Omit `offset` and everything currently retained on the stream is released, so cleanup is one call with one argument; an explicit offset (`job_output`'s `next_offset`) still acts as a high-water mark. Job payloads now state what cleanup is owed instead of offering a menu: the follow-up reads `job_ack to clean it up, or job_cancel to stop it`, `job_get` reports `unacked_bytes`, and `job_ack`'s description leads with the fact that a job holds its spool until it is acked or retention expires.
+- **`job_ack` no longer needs selectors.** `job_ack(job_id)` acknowledges both streams and releases everything retained, so cleanup is one call with one argument; an explicit `offset` (`job_output`'s `next_offset`) still acts as a high-water mark and needs its `stream`. Job payloads now state what cleanup is owed instead of offering a menu: the follow-up reads `job_ack to clean it up, or job_cancel to stop it`, `job_get` reports `unacked_bytes`, and `job_ack`'s description leads with the fact that a job holds its spool until it is acked or retention expires.
 
 ### Added
 

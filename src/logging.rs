@@ -118,6 +118,12 @@ fn message_prefix(timestamp: &str, level: &str, scope: &str) -> String {
 /// Visible width of [`message_prefix`].
 const MESSAGE_COLUMN: usize = 31;
 
+/// The non-color line: continuation lines are written separately, so the one
+/// place that composes the prefix is also the one place that can move it.
+fn plain_line(timestamp: &str, level: &str, scope: &str, message: &str) -> String {
+    format!("{}{message}", message_prefix(timestamp, level, scope))
+}
+
 #[derive(Clone, Debug)]
 pub struct LogConfig {
     state: Arc<LogState>,
@@ -390,9 +396,8 @@ impl LogConfig {
             );
         } else {
             eprintln!(
-                "{}{}",
-                message_prefix(&timestamp.to_string(), level, &scope),
-                message
+                "{}",
+                plain_line(&timestamp.to_string(), level, &scope, message)
             );
         }
     }
@@ -768,9 +773,13 @@ mod tests {
     /// `line()` writes must stay exactly that wide.
     #[test]
     fn continuations_align_under_the_message_column() {
-        let prefix = message_prefix("12:00:00.000", "TOOL", "bash");
-        assert_eq!(prefix.chars().count(), MESSAGE_COLUMN, "{prefix:?}");
-        assert!(prefix.ends_with(' '), "{prefix:?}");
+        let line = plain_line("12:00:00.000", "TOOL", "bash", "→ c=\"true\"");
+        assert_eq!(
+            line.chars().count() - "→ c=\"true\"".chars().count(),
+            MESSAGE_COLUMN,
+            "{line:?}"
+        );
+        assert!(line[..MESSAGE_COLUMN].ends_with(' '), "{line:?}");
     }
 
     #[test]

@@ -163,10 +163,10 @@ struct JobOutputArgs {
 struct JobAckArgs {
     /// Job id from a shell call that returned a handle.
     job_id: String,
-    /// stdout or stderr. Defaults to stdout.
+    /// stdout, stderr, or omitted to acknowledge both.
     #[serde(default)]
-    stream: OutputStream,
-    /// Highest byte offset safely received, normally `job_output`'s `next_offset`. Omit to release everything currently retained on `stream`.
+    stream: Option<OutputStream>,
+    /// Highest byte offset safely received, normally `job_output`'s `next_offset`. Omit to release everything currently retained; an explicit offset needs `stream`.
     #[serde(default)]
     offset: Option<u64>,
 }
@@ -305,7 +305,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Ack a job so its spool is released: a job holds its output until you ack it, or until retention ({retention}) expires. Omit `offset` to release everything currently retained on `stream`; an explicit offset (normally `job_output`'s `next_offset`) is a high-water mark, so it also releases output skipped by a tail read. A native task keeps only the exact prefix `tasks/get` replays.",
+        description = "Ack a job so its spool is released: a job holds its output until you ack it, or until retention ({retention}) expires. `job_ack(job_id)` acknowledges both streams and releases everything retained; an explicit `offset` (normally `job_output`'s `next_offset`) needs its `stream` and is a high-water mark, so it also releases output skipped by a tail read. A native task keeps only the exact prefix `tasks/get` replays.",
         annotations(
             title = "Acknowledge shell job output",
             read_only_hint = false,
@@ -315,13 +315,27 @@ impl LocalMachine {
         )
     )]
     async fn job_ack(&self, Parameters(args): Parameters<JobAckArgs>) -> CallToolResult {
-        match self
-            .jobs
-            .acknowledge_output(&args.job_id, args.stream.into(), args.offset)
-        {
-            Ok(status) => ok_text(status),
-            Err(error) => tool_error(error),
+        // One stream owns one high-water mark; with no stream the whole job is
+        // acknowledged, which is the cleanup case the description names.
+        let streams = match (args.stream, args.offset.is_some()) {
+            (Some(stream), _) => vec![stream.into()],
+            (None, false) => vec![
+                crate::jobs::JobStream::Stdout,
+                crate::jobs::JobStream::Stderr,
+            ],
+            (None, true) => return tool_error("pass `stream` with an explicit `offset`"),
+        };
+        let mut status = String::new();
+        for stream in streams {
+            match self
+                .jobs
+                .acknowledge_output(&args.job_id, stream, args.offset)
+            {
+                Ok(acked) => status = acked,
+                Err(error) => return tool_error(error),
+            }
         }
+        ok_text(status)
     }
 
     #[tool(
@@ -449,7 +463,76 @@ mod wait_tests {
 
 #[cfg(test)]
 mod wire_tests {
-    use super::{JobGetArgs, JobOutputArgs};
+    use super::{JobAckArgs, JobGetArgs, JobOutputArgs};
+
+    #[tokio::test]
+    async fn ack_without_a_stream_releases_the_whole_job() {
+        use crate::jobs::{JobCompletion, StreamSummary};
+        let temp = tempfile::tempdir().unwrap();
+        let machine =
+            crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
+        let job = machine.jobs.create_for_test(30).unwrap();
+        std::fs::write(&job.stdout_path, b"out").unwrap();
+        std::fs::write(&job.stderr_path, b"err").unwrap();
+        let stream = |bytes: u64| StreamSummary {
+            total_bytes: bytes,
+            stored_bytes: bytes,
+            truncated: false,
+        };
+        machine.jobs.finish(
+            &job.id,
+            JobCompletion::completed(Some(0), true, stream(3), stream(3)),
+        );
+
+        // One call, no arguments beyond the id: both streams acknowledged.
+        let acked = machine
+            .job_ack(rmcp::handler::server::wrapper::Parameters(JobAckArgs {
+                job_id: job.id.clone(),
+                stream: None,
+                offset: None,
+            }))
+            .await;
+        let status: serde_json::Value = serde_json::from_str(
+            acked
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .map(|text| text.text.as_str())
+                .expect("ack returns the status payload"),
+        )
+        .unwrap();
+        assert_eq!(status["unacked_bytes"], 0, "{status}");
+        assert_eq!(status["stdout"]["released"], true, "{status}");
+        assert_eq!(status["stderr"]["released"], true, "{status}");
+    }
+
+    #[test]
+    fn ack_without_a_stream_acknowledges_the_whole_job() {
+        let whole: super::JobAckArgs =
+            serde_json::from_value(serde_json::json!({"job_id": "job-1"})).unwrap();
+        assert!(whole.stream.is_none() && whole.offset.is_none());
+        let one: super::JobAckArgs = serde_json::from_value(serde_json::json!({
+            "job_id": "job-1",
+            "stream": "stderr",
+            "offset": 12
+        }))
+        .unwrap();
+        assert!(one.stream.is_some() && one.offset == Some(12));
+        // The schema says the same thing the handler enforces.
+        let ack = crate::mcp::LocalMachine::all_tools()
+            .get("job_ack")
+            .unwrap()
+            .input_schema
+            .clone();
+        assert_eq!(ack["required"], serde_json::json!(["job_id"]));
+        let stream = &ack["properties"]["stream"];
+        assert!(
+            stream["anyOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|variant| variant["type"] == "null")),
+            "{stream}"
+        );
+    }
 
     #[test]
     fn wait_is_accepted_on_both_waiting_tools_and_typos_still_fail() {
