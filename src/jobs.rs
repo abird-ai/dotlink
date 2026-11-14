@@ -135,7 +135,7 @@ impl JobFollowUp {
     /// acknowledgement, and a running job can be stopped instead.
     fn obligation(self) -> Option<&'static str> {
         match (self.finished, self.unacked) {
-            (false, _) => Some("job_ack to clean it up, or job_cancel to stop it"),
+            (false, _) => Some("job_ack to clean it up when done, or job_cancel to stop it"),
             (true, true) => Some("job_ack to clean it up"),
             (true, false) => None,
         }
@@ -2572,7 +2572,7 @@ impl OutputPageRender<'_> {
             complete,
             truncated: self.truncated,
             released: self.released,
-            encoding: if self.base64 { "base64" } else { "text" },
+            encoding: if self.base64 { "base64" } else { "utf8_lossy" },
             data,
         })
         .context("cannot serialize job output page")
@@ -3388,14 +3388,14 @@ mod tests {
         let all = shell_job_follow_up(None);
         assert_eq!(
             all,
-            "call job_get=status, job_output=remaining output, job_ack to clean it up, or job_cancel to stop it",
+            "call job_get=status, job_output=remaining output, job_ack to clean it up when done, or job_cancel to stop it",
             "{all}"
         );
         // A payload from one job tool never tells the caller to call it again.
         let from_status = shell_job_follow_up(Some("job_get"));
         assert_eq!(
             from_status,
-            "call job_output=remaining output, job_ack to clean it up, or job_cancel to stop it",
+            "call job_output=remaining output, job_ack to clean it up when done, or job_cancel to stop it",
             "{from_status}"
         );
         assert!(!from_status.contains("job_get"), "{from_status}");
@@ -3405,7 +3405,7 @@ mod tests {
     fn finished_job_follow_up_asks_for_the_ack_and_drops_cancel() {
         assert_eq!(
             job_follow_up(JobFollowUp::RUNNING, Some("job_get")).unwrap(),
-            "call job_output=remaining output, job_ack to clean it up, or job_cancel to stop it"
+            "call job_output=remaining output, job_ack to clean it up when done, or job_cancel to stop it"
         );
         let held = JobFollowUp {
             finished: true,

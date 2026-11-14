@@ -125,8 +125,9 @@ fn resolve_wait(wait_secs: Option<u64>, budget: Option<Duration>) -> Duration {
 struct JobGetArgs {
     /// Job id from a shell call that returned a handle.
     job_id: String,
-    /// Wait up to this many seconds for the job to finish; 0 answers now. Defaults to 90 where the transport supplies a response window and is always clamped to what remains of it (90 is also the ceiling without one).
+    /// Wait up to this many seconds for the job to finish; 0 answers now. Defaults to {job_wait} where the transport supplies a response window and is always clamped to what remains of it ({job_wait} is also the ceiling without one).
     #[serde(default)]
+    #[schemars(range(max = crate::limits::DEFAULT_JOB_WAIT_SECS))]
     wait_secs: Option<u64>,
     /// Trailing lines of *each* stream (stdout and stderr) to include in this reply; a stream with nothing in it is omitted. Defaults to {job_tail}, at most {job_tail_max}; 0 returns status only. The end of a build answers "how is it going" and "why did it fail" without paging.
     #[serde(default)]
@@ -153,8 +154,9 @@ struct JobOutputArgs {
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
     #[serde(default)]
     encoding: OutputEncoding,
-    /// Wait up to this many seconds for output past `offset` or for the job to finish; 0 pages now. Defaults to 90 where the transport supplies a response window and is always clamped to what remains of it (90 is also the ceiling without one).
+    /// Wait up to this many seconds for output past `offset` or for the job to finish; 0 pages now. Defaults to {job_wait} where the transport supplies a response window and is always clamped to what remains of it ({job_wait} is also the ceiling without one).
     #[serde(default)]
+    #[schemars(range(max = crate::limits::DEFAULT_JOB_WAIT_SECS))]
     wait_secs: Option<u64>,
 }
 
@@ -174,15 +176,16 @@ struct JobAckArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobListArgs {
-    /// Maximum recent exposed jobs to return. Defaults to 64, capped at 256.
+    /// Maximum recent exposed jobs to return. Defaults to {job_list} and is capped at {job_list_max}.
     #[serde(default)]
+    #[schemars(range(max = crate::limits::MAX_JOB_LIST))]
     limit: Option<usize>,
 }
 
 #[tool_router(router = "jobs_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "List recent durable jobs exposed in this runtime, not scoped to a conversation, so entries may belong to another client of the same bridge. Useful after a lost creation response: stable ids, status/phase, elapsed, session spool usage.",
+        description = "List recent durable jobs exposed in this runtime, not scoped to a conversation, so entries may belong to another client of the same bridge. Useful after a lost creation response: stable ids, status, elapsed, session spool usage.",
         annotations(
             title = "List shell jobs",
             read_only_hint = true,
@@ -192,7 +195,13 @@ impl LocalMachine {
         )
     )]
     async fn job_list(&self, Parameters(args): Parameters<JobListArgs>) -> CallToolResult {
-        ok_text(self.jobs.list(args.limit.unwrap_or(64).clamp(1, 256)))
+        ok_text(
+            self.jobs.list(
+                args.limit
+                    .unwrap_or(crate::limits::DEFAULT_JOB_LIST)
+                    .clamp(1, crate::limits::MAX_JOB_LIST),
+            ),
+        )
     }
 
     #[tool(
@@ -305,7 +314,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Ack a job so its spool is released: a job holds its output until you ack it, or until retention ({retention}) expires. `job_ack(job_id)` acknowledges both streams and releases everything retained; an explicit `offset` (normally `job_output`'s `next_offset`) needs its `stream` and is a high-water mark, so it also releases output skipped by a tail read. The reply is the acknowledgement (per-stream `acknowledged_bytes`/`released`, `unacked_bytes`), not the job's state — `job_get` has that. A native task keeps only the exact prefix `tasks/get` replays.",
+        description = "Ack a job so its spool is released: a job holds its output until you ack it, or until retention ({retention}) expires. `job_ack(job_id)` acknowledges both streams and releases everything retained; an explicit `offset` (normally `job_output`'s `next_offset`) needs its `stream` and is a high-water mark, so it also releases output skipped by a tail read. The reply is the acknowledgement (per-stream `ack_bytes`/`released`, `unacked_bytes`), not the job's state — `job_get` has that. A native task keeps only the exact prefix `tasks/get` replays.",
         annotations(
             title = "Acknowledge shell job output",
             read_only_hint = false,

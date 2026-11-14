@@ -23,10 +23,16 @@ const _: () = assert!(
     OPENAI_TUNNEL_SYNC_HOLD.as_secs() + OPENAI_TUNNEL_DELIVERY_RESERVE.as_secs()
         < OPENAI_TUNNEL_REQUEST_DEADLINE.as_secs()
 );
+/// How many recent jobs `job_list` returns when the caller does not ask.
+pub(crate) const DEFAULT_JOB_LIST: usize = 64;
+/// Ceiling for `job_list.limit`, and the shape of the advertised bound.
+pub(crate) const MAX_JOB_LIST: usize = 256;
+
 /// Default bounded wait for one `job_get`/`job_output` poll. The transport
 /// clamps it to the caller's remaining response budget, so a wait never outlives
 /// the response it is attached to.
-pub(crate) const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(90);
+pub(crate) const DEFAULT_JOB_WAIT_SECS: u64 = 90;
+pub(crate) const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(DEFAULT_JOB_WAIT_SECS);
 
 /// Turn horizon for one user/model turn: the guidance asks a caller to stop and
 /// hand back around here. Advisory only — dotlink never infers a turn boundary,

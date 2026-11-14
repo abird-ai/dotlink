@@ -190,6 +190,12 @@ pub(crate) fn description_tokens(job_retention_secs: u64) -> Vec<(&'static str, 
             "{job_tail}",
             crate::limits::DEFAULT_JOB_TAIL_LINES.to_string(),
         ),
+        ("{job_list}", crate::limits::DEFAULT_JOB_LIST.to_string()),
+        ("{job_list_max}", crate::limits::MAX_JOB_LIST.to_string()),
+        (
+            "{job_wait}",
+            crate::limits::DEFAULT_JOB_WAIT_SECS.to_string(),
+        ),
         (
             "{job_tail_max}",
             crate::limits::MAX_JOB_TAIL_LINES.to_string(),
