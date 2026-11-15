@@ -2995,6 +2995,12 @@ impl TunnelClient {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return false;
         }
+        let response_method = response
+            .resp_json
+            .as_ref()
+            .and_then(|value| value.get("method"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let body = match serialize_tunnel_response(&response) {
             Ok(body) => body,
             Err(error) => {
@@ -3004,7 +3010,13 @@ impl TunnelClient {
             }
         };
         match self.post_once(command, body, deadline).await {
-            Ok(PostOutcome::Delivered) => true,
+            Ok(PostOutcome::Delivered) => {
+                self.log.notification(
+                    "openai",
+                    response_method.as_deref().unwrap_or("notification"),
+                );
+                true
+            }
             Ok(PostOutcome::Undeliverable | PostOutcome::Cancelled) => false,
             Ok(PostOutcome::Retry(error)) | Ok(PostOutcome::Fatal(error)) | Err(error) => {
                 warn!(request_id = %command.request_id_label(), "dropping intermediate tunnel notification after send failure");
@@ -3206,7 +3218,10 @@ fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
 const OUTSTANDING_BATCHES: usize = 3;
 
 fn shell_timeout_within(window: Duration, reserve: Duration) -> u64 {
-    window.saturating_sub(reserve).as_secs()
+    window
+        .saturating_sub(reserve)
+        .min(crate::limits::OPENAI_TUNNEL_SYNC_HOLD)
+        .as_secs()
 }
 
 /// Tell the local MCP server how long this response may wait and which durable
@@ -3230,6 +3245,7 @@ fn annotate_response_context(
     }
     let name = jsonrpc.pointer("/params/name").and_then(Value::as_str);
     let shell = tools_call && name.is_some_and(crate::mcp::is_shell_tool);
+    let waits_on_job = tools_call && matches!(name, Some("jobs_get" | "jobs_read"));
     let durable_shell = shell || (tools_call && name == Some("batch"));
     // Missing and null metadata are both valid MCP representations. Normalize
     // either to an object before adding authenticated transport constraints.
@@ -3263,10 +3279,12 @@ fn annotate_response_context(
             Value::String(request_key.to_owned()),
         );
     }
-    if !shell {
+    if !shell && !waits_on_job {
         return Ok(None);
     }
-    let budget = window.saturating_sub(reserve);
+    let budget = window
+        .saturating_sub(reserve)
+        .min(crate::limits::OPENAI_TUNNEL_SYNC_HOLD);
     let millis = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
     meta.insert(
         crate::mcp::SYNC_BUDGET_META_KEY.to_owned(),
@@ -7597,7 +7615,7 @@ name"
         let window = Duration::from_secs(120);
         let reserve = TunnelTuning::default().delivery_reserve;
         assert_eq!(reserve, crate::limits::OPENAI_TUNNEL_DELIVERY_RESERVE);
-        assert_eq!(shell_timeout_within(window, reserve), 115);
+        assert_eq!(shell_timeout_within(window, reserve), 90);
         assert_eq!(shell_timeout_within(Duration::from_secs(3), reserve), 0);
         let mut subsecond = json!({
             "jsonrpc":"2.0","id":9,"method":"tools/call",
@@ -7641,10 +7659,10 @@ name"
         });
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(115))
+            Ok(Some(90))
         );
         assert_eq!(call.pointer("/params/arguments/timeout_secs"), None);
-        assert_eq!(sync_meta(&call), Some(115_000));
+        assert_eq!(sync_meta(&call), Some(90_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
         let meta = call["params"]["_meta"].as_object().unwrap();
         assert!(!meta.contains_key("io.abird.dotlink/futureField"));
@@ -7669,13 +7687,13 @@ name"
             let mut call = shell(json!({"command":"true","timeout_secs":value}));
             assert_eq!(
                 annotate_response_context(&mut call, window, reserve, "request", "token"),
-                Ok(Some(115))
+                Ok(Some(90))
             );
             assert_eq!(
                 call.pointer("/params/arguments/timeout_secs"),
                 Some(&json!(value))
             );
-            assert_eq!(sync_meta(&call), Some(115_000));
+            assert_eq!(sync_meta(&call), Some(90_000));
         }
 
         // Invalid argument types are also left untouched for schema validation;
@@ -7683,13 +7701,13 @@ name"
         let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(115))
+            Ok(Some(90))
         );
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!("600"))
         );
-        assert_eq!(sync_meta(&call), Some(115_000));
+        assert_eq!(sync_meta(&call), Some(90_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
 
         // Explicit background jobs carry request identity but no synchronous
@@ -7710,6 +7728,28 @@ name"
             Some("job-request".to_owned())
         );
         assert_eq!(sync_meta(&background_batch), None);
+
+        // Finite Job long polls need a bounded, authenticated response wait
+        // even though they are not constructors and never acquire a replay key.
+        for tool in ["jobs_get", "jobs_read"] {
+            let mut call = json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": tool, "arguments": {"ref": "j:fixture", "wait_ms": 30000},
+                    "_meta": {"io.abird.dotlink/syncBudgetMs": 999999999_u64}}
+            });
+            assert_eq!(
+                annotate_response_context(
+                    &mut call,
+                    Duration::from_secs(12),
+                    reserve,
+                    "request",
+                    "token"
+                ),
+                Ok(Some(7))
+            );
+            assert_eq!(sync_meta(&call), Some(7_000));
+            assert_eq!(request_meta(&call), None);
+        }
 
         // Every tools/call gets the serialized result budget, while only
         // durable shell calls get request identity / synchronous-window metadata.
@@ -7734,6 +7774,83 @@ name"
             Ok(None)
         );
         assert_eq!(call, original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_status_wait_emits_progress_from_the_outer_call_boundary() {
+        if crate::mcp::resolve_executable("bash").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let start = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"bash","arguments":{"command":"sleep 3","background":true}}
+        });
+        let started = mcp.dispatch(&BTreeMap::new(), &start).await.unwrap();
+        assert_eq!(started.status, 200, "{started:?}");
+        let text = started
+            .messages
+            .iter()
+            .find_map(|m| m.pointer("/result/content/0/text").and_then(Value::as_str))
+            .expect("background Job receipt");
+        let reference = text.split_whitespace().next().unwrap().to_owned();
+        assert!(reference.starts_with("j:"), "{text}");
+
+        let mut observed_revision = None;
+        for _ in 0..15 {
+            let get = json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"jobs_get","arguments":{"ref":reference}}
+            });
+            let status = mcp.dispatch(&BTreeMap::new(), &get).await.unwrap();
+            let text = status
+                .messages
+                .iter()
+                .find_map(|m| m.pointer("/result/content/0/text").and_then(Value::as_str))
+                .expect("Job status");
+            if text.contains(" running ") {
+                observed_revision = text
+                    .split_ascii_whitespace()
+                    .find_map(|word| word.strip_prefix("rev="))
+                    .and_then(|value| value.parse::<u64>().ok());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let revision = observed_revision.expect("background Process reached running state");
+        let poll = json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{
+                "name":"jobs_get",
+                "arguments":{"ref":reference,"rev":revision,"wait_ms":1800},
+                "_meta":{"progressToken":"poll-beat"}
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(64);
+        let task =
+            tokio::spawn(async move { mcp.dispatch_stream(&BTreeMap::new(), &poll, tx).await });
+        let first = tokio::time::timeout(Duration::from_millis(900), rx.recv())
+            .await
+            .expect("waiting job_get should emit progress while blocked")
+            .expect("progress stream closed");
+        assert_eq!(first["method"], "notifications/progress", "{first}");
+        assert_eq!(first["params"]["progressToken"], "poll-beat");
+        assert!(
+            !task.is_finished(),
+            "status wait finished before first heartbeat"
+        );
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.status, 200, "{result:?}");
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.pointer("/result/content/0/text").is_some())
+        );
     }
 
     #[tokio::test]

@@ -67,3 +67,10 @@ If ChatGPT cannot find the tunnel, verify:
 - Developer mode is enabled;
 - the tunnel belongs to the current ChatGPT workspace;
 - the Runtime API key has **Tunnels Read + Use**.
+
+If the tools are listed but never called, the obstacle is ChatGPT-side routing,
+not a dotlink failure: whether a conversation invokes a connected MCP tool or
+routes the work through its own execution session depends on the model and
+workspace policy. No dotlink profile, tunnel, or permission setting forces
+either route. Confirm the tools are enabled for that conversation, then ask
+explicitly (for example "use the abird dotlink `read` tool on ./file").

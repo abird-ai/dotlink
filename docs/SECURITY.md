@@ -19,7 +19,7 @@ The NixOS module runs dotlink as the explicitly selected Unix user (non-root str
 
 ## Profiles and permission precedence
 
-Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v10 is the current profile format. Known compatible older schemas are migrated forward in memory (v9 → v10 is additive); newer schemas and older schemas without an explicit migration path are rejected rather than guessed. A migrated profile is written as the current schema the next time it is edited or saved.
+Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v12 is the current profile format. Explicit migrations handle v9 → v10 → v11 → v12 before strict field validation; newer and unsupported older versions fail closed. A migrated profile is written as the current schema the next time it is edited or saved.
 
 Saved profiles express defaults, not mandatory grants. A grant-free profile is
 valid; runtime admission checks minimum effective capabilities after composing
@@ -262,7 +262,7 @@ Wayland/X11 forwarding remain separate permissions.
 
 When shell is enabled, onboarding can autodiscover existing package/build caches and ask whether each cache should be shared with the sandbox as none, read-only, or read+write.
 
-Supported cache families currently include Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build caches, Maven, Gradle, sccache, and ccache.
+Supported cache families currently include Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build caches, Maven, Gradle, sccache, ccache, and the abird tool cache (`~/.cache/abird`).
 
 Cache grants are **shell-only**. They do not add the host cache path to the MCP filesystem allow-list, so `read`, `write`, `ls`, and related MCP tools cannot use cache sharing to inspect the user's home directory.
 
@@ -374,7 +374,7 @@ The Runtime key is stored separately for each profile:
 ~/.config/abird/dotlink/runtime.work.key
 ~~~
 
-Canonical JSONC config files are `config.jsonc` or `config.<profile>.jsonc`. On Unix dotlink-owned config/key files are mode 0600 and the owned `~/.config/abird/dotlink` directory is mode 0700. `DOTLINK_CONFIG` may place JSONC elsewhere without chmod'ing its parent; Runtime keys still remain in the owned XDG directory.
+Canonical JSONC config files are `config.jsonc` or `config.<profile>.jsonc`. On Unix dotlink-owned config/key files are mode 0600 and the owned `~/.config/abird/dotlink` directory is mode 0700. `DOTLINK_CONFIG_FILE` may place JSONC elsewhere without chmod'ing its parent (`DOTLINK_CONFIG` is a deprecated alias); Runtime keys still remain in the owned XDG directory. An explicit config path is never silently replaced by a profiled sibling.
 
 The Admin key used to create a tunnel is never persisted. A profile with OpenAI disabled does not require a runtime key.
 

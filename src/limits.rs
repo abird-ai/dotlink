@@ -11,6 +11,15 @@ use std::time::Duration;
 pub(crate) const OPENAI_TUNNEL_REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 /// Space held back from the hosted deadline so a terminal response can be sent.
 pub(crate) const OPENAI_TUNNEL_DELIVERY_RESERVE: Duration = Duration::from_secs(5);
+/// Cap the shell's synchronous hold independently of the client's window: the
+/// inbound queue hop is not observable by the executor, so the last seconds of
+/// a 120 s hosted turn are not reliable for delivering a result. Execution
+/// continues as one durable Job after this hold; its timeout is unchanged.
+pub(crate) const OPENAI_TUNNEL_SYNC_HOLD: Duration = Duration::from_secs(90);
+const _: () = assert!(
+    OPENAI_TUNNEL_SYNC_HOLD.as_secs() + OPENAI_TUNNEL_DELIVERY_RESERVE.as_secs()
+        < OPENAI_TUNNEL_REQUEST_DEADLINE.as_secs()
+);
 /// OpenAI Secure MCP Tunnel's serialized request/response message ceiling.
 pub(crate) const OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Reserve between the complete embedded MCP message and the hosted tunnel

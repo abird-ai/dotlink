@@ -143,6 +143,7 @@ const SCOPE_MCP: &str = "mcp:access";
 const SCOPE_OFFLINE: &str = "offline_access";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OAuthConfig {
     #[serde(default)]
     pub enabled: bool,

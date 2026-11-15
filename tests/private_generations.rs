@@ -16,7 +16,7 @@ fn trusted_bubblewrap_available() -> bool {
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--stdio")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("cfg"))
         .env("XDG_STATE_HOME", temp.path().join("state"))
@@ -46,7 +46,7 @@ fn run_with_profile(
 ) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--list-tools")
-        .env("DOTLINK_CONFIG", profile)
+        .env("DOTLINK_CONFIG_FILE", profile)
         .env("XDG_CONFIG_HOME", config_dir)
         .env_remove("DOTLINK_API_KEY")
         .env_remove("DOTLINK_API_KEY_FILE")
@@ -63,7 +63,7 @@ fn run_execution_with_profile(
 ) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-stdio")
-        .env("DOTLINK_CONFIG", profile)
+        .env("DOTLINK_CONFIG_FILE", profile)
         .env("XDG_CONFIG_HOME", config_dir)
         .env_remove("DOTLINK_API_KEY")
         .env_remove("DOTLINK_API_KEY_FILE")
@@ -78,9 +78,18 @@ fn run_to_post_credential_failure(
     config_dir: &std::path::Path,
     profile: &std::path::Path,
 ) -> std::process::Output {
+    run_with_flags_to_post_credential_failure(config_dir, profile, &[])
+}
+
+fn run_with_flags_to_post_credential_failure(
+    config_dir: &std::path::Path,
+    profile: &std::path::Path,
+    flags: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-default-allow")
-        .env("DOTLINK_CONFIG", profile)
+        .args(flags)
+        .env("DOTLINK_CONFIG_FILE", profile)
         .env("XDG_CONFIG_HOME", config_dir)
         .env_remove("DOTLINK_API_KEY")
         .env_remove("DOTLINK_API_KEY_FILE")
@@ -176,7 +185,7 @@ fn dormant_key_selector_survives_profile_cli_mutations() {
             .arg(&path)
             .env("XDG_CONFIG_HOME", &config_home)
             .env("XDG_STATE_HOME", temp.path().join("state"))
-            .env_remove("DOTLINK_CONFIG")
+            .env_remove("DOTLINK_CONFIG_FILE")
             .env_remove("DOTLINK_API_KEY")
             .output()
             .unwrap();
@@ -208,7 +217,7 @@ fn profile_cli(config_home: &std::path::Path, args: &[&str]) -> std::process::Ou
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", config_home.join("state"))
-        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_CONFIG_FILE")
         .env_remove("DOTLINK_API_KEY")
         .env_remove("DOTLINK_API_KEY_FILE")
         .env_remove("DOTLINK_ID")
@@ -289,7 +298,7 @@ fn unusable_selected_keys_fail_execution_but_not_management_or_replacement() {
             .arg(&allowed)
             .env("XDG_CONFIG_HOME", &home)
             .env("XDG_STATE_HOME", home.join("state"))
-            .env_remove("DOTLINK_CONFIG")
+            .env_remove("DOTLINK_CONFIG_FILE")
             .env_remove("DOTLINK_API_KEY")
             .env_remove("DOTLINK_API_KEY_FILE")
             .output()
@@ -304,7 +313,7 @@ fn unusable_selected_keys_fail_execution_but_not_management_or_replacement() {
             .arg(&allowed)
             .env("XDG_CONFIG_HOME", &home)
             .env("XDG_STATE_HOME", home.join("state"))
-            .env_remove("DOTLINK_CONFIG")
+            .env_remove("DOTLINK_CONFIG_FILE")
             .env_remove("DOTLINK_API_KEY")
             .env_remove("DOTLINK_API_KEY_FILE")
             .output()
@@ -370,7 +379,7 @@ fn unrelated_profile_edits_do_not_retire_running_process_credentials() {
         .args(["profile", "allow", "default", "read"])
         .arg(&extra)
         .env("XDG_CONFIG_HOME", &home)
-        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_CONFIG_FILE")
         .env_remove("DOTLINK_API_KEY")
         .output()
         .unwrap();
@@ -414,7 +423,7 @@ fn standard_config_inside_broad_writable_home_starts_with_private_state_anchored
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
-        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_CONFIG_FILE")
         .env_remove("DOTLINK_API_KEY")
         .stdin(std::process::Stdio::null())
         .output()
@@ -466,7 +475,7 @@ fn writable_sandbox_parent_anchors_control_plane_paths() {
 
     let inspection = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--list-tools")
-        .env("DOTLINK_CONFIG", &custom_config)
+        .env("DOTLINK_CONFIG_FILE", &custom_config)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", root)
@@ -496,7 +505,7 @@ fn writable_sandbox_parent_anchors_control_plane_paths() {
     // this one-shot integration process exit normally.
     let runtime = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--stdio")
-        .env("DOTLINK_CONFIG", &custom_config)
+        .env("DOTLINK_CONFIG_FILE", &custom_config)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", root)
@@ -530,6 +539,50 @@ fn writable_sandbox_parent_anchors_control_plane_paths() {
         !state_home.join("abird/dotlink/jobs").exists(),
         "idle runtime must keep the per-job spool hierarchy lazy"
     );
+}
+
+#[test]
+fn no_tunnel_refuses_the_profile_tunnel_before_opening_its_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("xdg");
+    let private = home.join("abird/dotlink");
+    fs::create_dir_all(&private).unwrap();
+    let config = private.join("config.jsonc");
+    let revision = "11223344556677889900aabbccddeeff";
+    fs::write(
+        &config,
+        format!(
+            r#"{{"version":10,"transports":{{"openai":true,"stdio":true}},"tunnel_id":"tunnel_0123456789abcdef0123456789abcdef","runtime_key_revision":"{revision}"}}"#
+        ),
+    )
+    .unwrap();
+    // Unreadable as a credential for every user, so any read would be visible.
+    fs::create_dir(private.join(format!("runtime.{revision}.key"))).unwrap();
+
+    // `--no-tunnel` must decide before credential resolution: the run reaches
+    // the same post-credential policy failure as a profile with the tunnel off.
+    let refused = run_with_flags_to_post_credential_failure(&home, &config, &["--no-tunnel"]);
+    assert_post_credential_policy_failure(&refused);
+
+    // A refused transport ignores an incomplete env connection and an invalid
+    // explicit key file: neither is relevant to the requested local run.
+    let refused = Command::new(env!("CARGO_BIN_EXE_dotlink"))
+        .args(["--no-default-allow", "--stdio", "--no-tunnel"])
+        .env("DOTLINK_CONFIG_FILE", &config)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("DOTLINK_ID", "tunnel_0123456789abcdef0123456789abcdef")
+        .env_remove("DOTLINK_API_KEY")
+        .env_remove("CONTROL_PLANE_API_KEY")
+        .env("DOTLINK_BASE_URL", "not-a-url")
+        .env("CONTROL_PLANE_BASE_URL", "also-not-a-url")
+        .env("DOTLINK_ORGANIZATION_ID", "unused-dormant-org")
+        .env(
+            "DOTLINK_API_KEY_FILE",
+            temp.path().join("missing-private-key"),
+        )
+        .output()
+        .unwrap();
+    assert_post_credential_policy_failure(&refused);
 }
 
 #[test]
@@ -571,7 +624,7 @@ fn inactive_openai_does_not_open_unreadable_dormant_credentials() {
     fs::create_dir(&invalid_explicit).unwrap();
     let dormant_explicit = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-default-allow")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", &home)
         .env("DOTLINK_API_KEY_FILE", &invalid_explicit)
         .env("NGROK_AUTHTOKEN_FILE", &invalid_explicit)
@@ -585,7 +638,7 @@ fn inactive_openai_does_not_open_unreadable_dormant_credentials() {
 
     let pure_listing = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--list-tools")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", &home)
         .env("DOTLINK_API_KEY_FILE", &invalid_explicit)
         .env("NGROK_AUTHTOKEN_FILE", &invalid_explicit)
@@ -604,7 +657,7 @@ fn inactive_openai_does_not_open_unreadable_dormant_credentials() {
     // policy error proves normal startup accepted the override.
     let activated = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-default-allow")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", &home)
         .env("DOTLINK_ID", "tunnel_0123456789abcdef0123456789abcdef")
         .env("DOTLINK_API_KEY", "synthetic-override-key")
@@ -641,7 +694,7 @@ fn explicit_env_credentials_supersede_missing_persisted_runtime_keys() {
     // been resolved, but before the OpenAI transport can use the network.
     let overridden = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-default-allow")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", &home)
         .env("DOTLINK_ID", id)
         .env("DOTLINK_API_KEY", "synthetic-override-key")
@@ -656,7 +709,7 @@ fn explicit_env_credentials_supersede_missing_persisted_runtime_keys() {
     fs::write(&override_file, "synthetic-file-key\n").unwrap();
     let overridden_file = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-default-allow")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", &home)
         .env("DOTLINK_API_KEY_FILE", &override_file)
         .env("DOTLINK_API_KEY", "lower-priority-plaintext-key")
@@ -687,7 +740,7 @@ fn print_id_inspects_config_without_requiring_saved_runtime_credentials() {
     let inspect = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--print-id")
         .env("XDG_CONFIG_HOME", &config_home)
-        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_CONFIG_FILE")
         .env_remove("DOTLINK_API_KEY")
         .env_remove("DOTLINK_API_KEY_FILE")
         .env_remove("DOTLINK_ID")
@@ -711,7 +764,7 @@ fn print_id_inspects_config_without_requiring_saved_runtime_credentials() {
         .arg("--print-id")
         .env("XDG_CONFIG_HOME", &config_home)
         .env("DOTLINK_ID", env_id)
-        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_CONFIG_FILE")
         .env_remove("DOTLINK_API_KEY")
         .output()
         .unwrap();
@@ -731,7 +784,7 @@ fn tool_listing_needs_neither_runtime_keys_nor_host_agent() {
     )).unwrap();
     let listed = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--list-tools")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("DOTLINK_SSH_AGENT_SOCKET", root.join("no-such-agent"))
         .env_remove("DOTLINK_API_KEY")
@@ -749,7 +802,7 @@ fn tool_listing_needs_neither_runtime_keys_nor_host_agent() {
     // Execution without an override still enforces the selected key first.
     let missing_key = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-stdio")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("DOTLINK_SSH_AGENT_SOCKET", root.join("no-such-agent"))
         .env_remove("DOTLINK_API_KEY")
@@ -770,7 +823,7 @@ fn tool_listing_needs_neither_runtime_keys_nor_host_agent() {
     // proves runtime startup independently enforces the requested host agent.
     let missing_agent = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .arg("--no-stdio")
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("DOTLINK_SSH_AGENT_SOCKET", root.join("no-such-agent"))
         .env("DOTLINK_ID", "tunnel_0123456789abcdef0123456789abcdef")

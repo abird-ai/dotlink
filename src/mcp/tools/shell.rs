@@ -5,10 +5,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -16,12 +13,9 @@ use anyhow::{Context, Result};
 use rmcp::{
     ErrorData as McpError,
     handler::server::wrapper::Parameters,
-    model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CreateTaskResult,
-        ProgressNotificationParam, ProgressToken, Tool,
-    },
+    model::{CallToolRequestParams, CallToolResponse, CallToolResult, CreateTaskResult, Tool},
     schemars,
-    service::{Peer, RequestContext, RoleServer},
+    service::{RequestContext, RoleServer},
     tool, tool_router,
 };
 use serde::Deserialize;
@@ -35,7 +29,9 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken as DrainStop, task::AbortOnDropHandle};
 
-use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
+use super::{
+    LocalMachine, ProgressHeartbeat, await_with_heartbeat, dot, ok_text, resolve_capped, tool_error,
+};
 #[cfg(target_os = "linux")]
 use crate::mcp::{
     AccessPolicy, ShellGuards, guard_identities, validate_host_mount_policy, validate_shell_guards,
@@ -141,68 +137,8 @@ impl ShellCallArgs {
     }
 }
 
-/// Shell progress is a bare heartbeat: the caller cannot know how much of an
-/// arbitrary command is done, so no percentages or messages are reported.
-#[cfg(not(test))]
-const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const SHELL_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Progress is advisory; a stalled transport must never stall command timeout
-/// enforcement or child reaping. No detached heartbeat tasks or queues.
-const PROGRESS_SEND_BUDGET: Duration = Duration::from_millis(100);
-
 /// Salvage window for partial output after a killed child.
 const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
-
-/// Cancellation drops a pending notification; no progress worker outlives its
-/// command and no transport backpressure can cross the command's deadline.
-async fn deliver_heartbeat_bounded<F: std::future::Future<Output = ()>>(
-    command_deadline: Instant,
-    delivery: F,
-) {
-    let send_deadline = command_deadline.min(Instant::now() + PROGRESS_SEND_BUDGET);
-    tokio::select! {
-        biased;
-        () = sleep_until(send_deadline) => {}
-        () = delivery => {}
-    }
-}
-
-/// Heartbeat sink for one `tools/call` that carried a progress token.
-struct ProgressHeartbeat {
-    peer: Peer<RoleServer>,
-    token: ProgressToken,
-    ticks: AtomicU64,
-}
-
-impl ProgressHeartbeat {
-    fn for_request(context: &RequestContext<RoleServer>) -> Option<Self> {
-        let token = context.meta.get_progress_token()?;
-        Some(Self {
-            peer: context.peer.clone(),
-            token,
-            ticks: AtomicU64::new(0),
-        })
-    }
-
-    /// Monotonic progress counter with no total and no message.
-    async fn report(&self, command_deadline: Instant) {
-        let progress = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        let param = ProgressNotificationParam::new(self.token.clone(), progress as f64);
-        deliver_heartbeat_bounded(command_deadline, async {
-            let _ = self.peer.notify_progress(param).await;
-        })
-        .await;
-    }
-}
-
-async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
-    match heartbeat {
-        Some(_) => tokio::time::sleep(SHELL_HEARTBEAT_INTERVAL).await,
-        None => std::future::pending().await,
-    }
-}
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
@@ -2069,24 +2005,9 @@ impl LocalMachine {
             Ok(started) => started,
             Err(error) => return Ok(tool_error(error)),
         };
-        let wait = self.jobs.wait_until(&started.id, None);
-        tokio::pin!(wait);
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut wait => {
-                    result.map_err(crate::jobs::JobError::into_mcp)?;
-                    break;
-                }
-                () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
-                    if let Some(heartbeat) = heartbeat.as_ref() {
-                        heartbeat
-                            .report(Instant::now() + Duration::from_secs(self.config.max_shell_timeout_secs))
-                            .await;
-                    }
-                }
-            }
-        }
+        await_with_heartbeat(heartbeat, None, self.jobs.wait_until(&started.id, None))
+            .await
+            .map_err(crate::jobs::JobError::into_mcp)?;
         let result = self
             .jobs
             .tool_result(&started.id, None)
@@ -2301,7 +2222,11 @@ impl LocalMachine {
                 .is_some_and(|capabilities| capabilities.supports_tasks()),
             self.request_job_key(context),
             self.request_result_budget(context),
-            ProgressHeartbeat::for_request(context),
+            ProgressHeartbeat::for_request(
+                context,
+                self.config.log.clone(),
+                request.name.to_string(),
+            ),
         )
         .await
     }
@@ -2435,22 +2360,13 @@ impl LocalMachine {
 
         let deadline = sync_budget_millis
             .and_then(|millis| Instant::now().checked_add(Duration::from_millis(millis)));
-        let wait = self.jobs.wait_until(&started.id, deadline);
-        tokio::pin!(wait);
-        let outcome = loop {
-            tokio::select! {
-                biased;
-                result = &mut wait => break result.map_err(crate::jobs::JobError::into_mcp)?,
-                () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
-                    if let Some(heartbeat) = heartbeat.as_ref() {
-                        let report_deadline = deadline.unwrap_or_else(|| {
-                            Instant::now() + Duration::from_secs(self.config.max_shell_timeout_secs)
-                        });
-                        heartbeat.report(report_deadline).await;
-                    }
-                }
-            }
-        };
+        let outcome = await_with_heartbeat(
+            heartbeat,
+            deadline,
+            self.jobs.wait_until(&started.id, deadline),
+        )
+        .await
+        .map_err(crate::jobs::JobError::into_mcp)?;
         match outcome {
             JobWait::Terminal => {
                 if let Some(result) = self
@@ -3228,7 +3144,7 @@ impl LocalMachine {
         self.run_shell_to_completion(
             args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Bash,
-            ProgressHeartbeat::for_request(&context),
+            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "bash"),
         )
         .await
     }
@@ -3251,7 +3167,7 @@ impl LocalMachine {
         self.run_shell_to_completion(
             args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Pwsh,
-            ProgressHeartbeat::for_request(&context),
+            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "pwsh"),
         )
         .await
     }
@@ -3274,7 +3190,7 @@ impl LocalMachine {
         self.run_shell_to_completion(
             args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Powershell,
-            ProgressHeartbeat::for_request(&context),
+            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "powershell"),
         )
         .await
     }
@@ -4160,6 +4076,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_delivery_never_crosses_the_command_deadline() {
+        use std::sync::atomic::Ordering;
         let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delivery_polled = polled.clone();
         let delivery = async move {
@@ -4167,7 +4084,12 @@ mod tests {
             std::future::pending::<()>().await;
         };
 
-        deliver_heartbeat_bounded(Instant::now() - Duration::from_secs(1), delivery).await;
+        let delivered = super::super::deliver_heartbeat_bounded(
+            Some(Instant::now() - Duration::from_secs(1)),
+            delivery,
+        )
+        .await;
+        assert!(delivered.is_none());
         assert!(
             !polled.load(Ordering::Relaxed),
             "an expired command deadline must win before delivery is polled"

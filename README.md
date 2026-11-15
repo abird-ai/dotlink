@@ -371,9 +371,9 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 ~/.config/abird/dotlink/runtime.work.key
 ~~~
 
-`DOTLINK_CONFIG` may move the JSONC file, but Runtime keys always stay in dotlink's private XDG directory above. The active config and credential directory are control-plane state and are not exposed through dotlink's MCP/filesystem/shell surface.
+`DOTLINK_CONFIG_FILE` may select an explicit JSONC file (`DOTLINK_CONFIG` remains a deprecated alias), but Runtime keys always stay in dotlink's private XDG directory above. The active config and credential directory are control-plane state and are not exposed through dotlink's MCP/filesystem/shell surface. An explicit config file is used verbatim, never replaced by a profile-suffixed sibling.
 
-When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
+When OpenAI transport is disabled for a profile, that profile does not require a runtime key. To run against files locally without joining a configured tunnel, use `dotlink --stdio --no-tunnel`; this one-run override is resolved before reading OpenAI credentials and does not change the saved profile.
 
 Shell execution is durable: if a `bash`/`powershell` call cannot return its complete result inside the tunnel response window, the same execution continues behind a job/task handle instead of being restarted. The shell tool surface includes explicit background start, status, output paging, acknowledgement, and cancellation controls. See [Architecture](docs/ARCHITECTURE.md) for the transport and replay model.
 
@@ -456,6 +456,7 @@ TRANSPORTS
 --no-stdio                      suppress profile stdio for this run
 --http                          add HTTP MCP for this run
 --no-http                       suppress profile HTTP + ngrok for this run
+--no-tunnel                     suppress profile OpenAI tunnel before credential loading
 --http-bind <ADDR>              override HTTP listen address
 
 REMOTE HTTP & OAUTH
@@ -509,12 +510,13 @@ DEVELOPER CACHES (discovered paths; bare flag = ro, =rw enables writes)
 --allow-cache-uv[=ro|rw]               --allow-cache-go-mod[=ro|rw]
 --allow-cache-go-build[=ro|rw]         --allow-cache-maven[=ro|rw]
 --allow-cache-gradle[=ro|rw]           --allow-cache-sccache[=ro|rw]
---allow-cache-ccache[=ro|rw]
+--allow-cache-ccache[=ro|rw]           --allow-cache-abird[=ro|rw]
 
 OUTPUT & DIAGNOSTICS
 --list-tools                    show tools exposed by the effective policy
 --print-id                      print configured tunnel ID (no Runtime key needed)
 -s, --serialize                 execute MCP tools one at a time (opt-in)
+--no-serialize                  override a saved/environment serialization preference
 -q, --quiet                     suppress TOOL activity
 -v, --verbose                   -v TOOL; -vv TOOL + REQ
 --color <auto|always|never>     control colors in help and human output
@@ -561,7 +563,7 @@ For agent-backed Git commit signing, configure `gpg.format=ssh`,
 `key::ssh-ed25519 AAAA...` (the public key text). A signing-key path
 under `~/.ssh` is not automatically mounted.
 
-All 13 cache families already supported by setup also have matching
+All 14 cache families already supported by setup also have matching
 `--allow-cache-<kind>[=ro|rw]` flags. Each finds the existing host cache
 using the same discovery rules as onboarding. Bare flags share **read-only**;
 `=rw` explicitly permits modifications to the host cache. An explicitly

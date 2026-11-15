@@ -7,6 +7,7 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }: let
   inherit (lib) mkOption types;
@@ -20,12 +21,9 @@
     workingDirectoryDefault,
     packageDefault,
     extraPackagesDefault,
+    extraGroupsDefault,
     environmentDefault,
-    verbosityDefault,
-    serializeDefault,
-    hostAccessDefault,
     sshAgentSocketDefault,
-    cacheAccessDefault,
   }: {
     enable = mkOption {
       type = types.bool;
@@ -72,7 +70,9 @@
       description = ''
         Optional declarative profile JSON (excluding secrets). Null reuses the
         user's existing dotlink config. Mutually exclusive with configFile.
-        Declarative settings are placed read-only in the Nix store.
+        Rendered to the Nix store and copied into the unit's private runtime
+        directory at each start, so the active config never overlaps the
+        sandbox's runtime mounts.
       '';
     };
     configFile = mkOption {
@@ -80,8 +80,12 @@
       default = null;
       example = "/etc/dotlink/config.jsonc";
       description = ''
-        Optional explicit JSONC file used as DOTLINK_CONFIG. Null reuses the
-        selected user's XDG default. Mutually exclusive with settings.
+        Optional explicit JSONC config file, passed as DOTLINK_CONFIG_FILE and
+        used verbatim; `profile` then selects only the private state slot. Null
+        reuses the selected user's XDG default. Mutually exclusive with
+        settings. A file under `/nix/store`, `/etc` or `/run` is copied into the
+        unit's runtime directory at start, because the store is an implicit
+        shell runtime mount.
       '';
     };
     credentials = {
@@ -104,39 +108,6 @@
         '';
       };
     };
-    hostAccess = {
-      nixDaemon = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.nixDaemon;
-        description = "Expose the host Nix daemon socket to sandboxed shell tools.";
-      };
-      nixConfig = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.nixConfig;
-        description = "Share the user's Nix configuration read-only inside the shell sandbox.";
-      };
-      sshAgent = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.sshAgent;
-        description = "Expose the SSH agent socket, not private SSH keys, inside the shell sandbox.";
-      };
-      gitConfig = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.gitConfig;
-        description = "Share the user's Git global/XDG config read-only in the shell sandbox.";
-      };
-      kvm = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.kvm;
-        description = "Grant the sandbox access to /dev/kvm for hardware-accelerated virtualization.";
-      };
-      gpu = mkOption {
-        type = types.listOf (types.enum ["amd" "nvidia"]);
-        default = hostAccessDefault.gpu;
-        example = ["amd" "nvidia"];
-        description = "GPU vendors whose character devices and read-only driver resources are exposed to sandboxed shell commands.";
-      };
-    };
     sshAgentSocket = mkOption {
       type = types.nullOr types.str;
       default = sshAgentSocketDefault;
@@ -150,32 +121,21 @@
         than silently selecting a different agent.
       '';
     };
-    cacheAccess = mkOption {
-      type = types.attrsOf (types.enum ["ro" "rw"]);
-      default = cacheAccessDefault;
-      example = {
-        "cargo-registry" = "rw";
-        "go-mod" = "ro";
-      };
-      description = "Detected shell-only developer caches by CLI flag suffix; ro or rw. A configured cache whose directory is absent on the host is skipped with a warning instead of failing service startup.";
-    };
-    serialize = mkOption {
-      type = types.bool;
-      default = serializeDefault;
-      description = "Run MCP tool calls sequentially instead of concurrently.";
-    };
-    logging.verbosity = mkOption {
-      type = types.enum ["lifecycle" "tools" "requests"];
-      default = verbosityDefault;
-      description = ''
-        Lifecycle status only, tool activity (-v), or MCP request diagnostics
-        (-vv). Tool logging may contain paths and command fragments.
-      '';
-    };
     extraPackages = mkOption {
       type = types.listOf types.package;
       default = extraPackagesDefault;
       description = "Extra executables made available to dotlink's service and shell tools.";
+    };
+    extraGroups = mkOption {
+      type = types.listOf types.str;
+      default = extraGroupsDefault;
+      example = ["kvm" "render" "video"];
+      description = ''
+        Additional supplementary groups for the unit. Groups implied by
+        `settings.permissions` are added automatically; declare them here too
+        when the grants live in the selected user's saved profile, because the
+        module cannot read that file.
+      '';
     };
     environment = mkOption {
       type = types.attrsOf types.str;
@@ -196,19 +156,9 @@
     workingDirectoryDefault = null;
     packageDefault = modulePackage;
     extraPackagesDefault = [];
+    extraGroupsDefault = [];
     environmentDefault = {};
-    verbosityDefault = "lifecycle";
-    serializeDefault = false;
-    hostAccessDefault = {
-      nixDaemon = false;
-      nixConfig = false;
-      sshAgent = false;
-      gitConfig = false;
-      kvm = false;
-      gpu = [];
-    };
     sshAgentSocketDefault = null;
-    cacheAccessDefault = {};
   };
 
   optionsForInstance = commonOptions {
@@ -218,12 +168,9 @@
     workingDirectoryDefault = cfg.workingDirectory;
     packageDefault = cfg.package;
     extraPackagesDefault = cfg.extraPackages;
+    extraGroupsDefault = cfg.extraGroups;
     environmentDefault = cfg.environment;
-    verbosityDefault = cfg.logging.verbosity;
-    serializeDefault = cfg.serialize;
-    hostAccessDefault = cfg.hostAccess;
     sshAgentSocketDefault = cfg.sshAgentSocket;
-    cacheAccessDefault = cfg.cacheAccess;
   };
 
   instances = {default = cfg;} // cfg.instances;
@@ -232,25 +179,20 @@
     if name == "default"
     then "dotlink"
     else "dotlink-${name}";
-  validName = name: builtins.match "[A-Za-z0-9_-]+" name != null;
-  validProfile = profile: profile == null || validName profile;
-  cacheKeys = [
-    "cargo-registry"
-    "cargo-git"
-    "npm"
-    "pnpm"
-    "yarn"
-    "pip"
-    "uv"
-    "go-mod"
-    "go-build"
-    "maven"
-    "gradle"
-    "sccache"
-    "ccache"
-  ];
-
-  hasConfig = instance: instance.settings != null || instance.configFile != null;
+  # Same profile grammar as setup::validate_profile: 1..64 ASCII bytes and
+  # case-insensitive "default" reservation. Instance names become profiles.
+  validName = name:
+    builtins.match "[A-Za-z0-9_-]+" name
+    != null
+    && lib.stringLength name <= 64
+    && lib.toLower name != "default";
+  # Keep in sync with `setup::config_version()`. The module supplies the version
+  # so `settings` never restates it and an older dotlink fails closed instead of
+  # guessing at a newer file.
+  schemaVersion = 12;
+  # Exact "default" is a module-only alias for the unnamed profile.
+  # The runtime deliberately rejects it as a named --profile selector.
+  validProfile = profile: profile == null || profile == "default" || validName profile;
   # Nix store files are public: reject the common credential-shaped keys,
   # including nested keys. Users must provide secrets with LoadCredential.
   containsSecretKey = value:
@@ -291,40 +233,44 @@
 
   makeService = name: instance: let
     profile = effectiveProfile name instance;
-    # DOTLINK_CONFIG is a *base* path. With --profile NAME, the loader
-    # selects its sibling config.NAME.jsonc, which keeps credentials and
-    # OAuth state independent for named declarative instances too.
-    configPath =
-      if instance.settings != null
-      then "${pkgs.writeTextDir
-        (
-          if profile == null
-          then "config.jsonc"
-          else "config.${profile}.jsonc"
+    # The explicit config file is read verbatim. DOTLINK_PROFILE selects only
+    # the private credential/OAuth namespace for a named service.
+    # A rendered config, or one under an immutable system path, cannot be the
+    # active config: /nix/store is an implicit shell runtime bind while the
+    # active config is a protected path, so the sandbox guard rejects that
+    # overlap. Copy it into the unit's private runtime directory at each start
+    # rather than relaxing the guard or symlinking it.
+    declarative = instance.settings != null;
+    immutableConfig =
+      instance.configFile
+      != null
+      && (
+        # Every runtime bind root the shell guard would reject, plus /run for
+        # another unit's staged config: none of them can be the active file.
+        lib.hasPrefix "/nix/" instance.configFile
+        || lib.hasPrefix "/etc/" instance.configFile
+        || lib.hasPrefix "/run/" instance.configFile
+      );
+    staged = declarative || immutableConfig;
+    runtimeDirectory = named name;
+    configSource =
+      if declarative
+      then
+        pkgs.writeText "dotlink-${name}.jsonc" (
+          builtins.toJSON (instance.settings // {version = schemaVersion;})
         )
-        (builtins.toJSON (instance.settings // {version = 10;}))}/config.jsonc"
       else instance.configFile;
-    hostEnabled =
-      instance.hostAccess.nixDaemon
-      || instance.hostAccess.nixConfig
-      || instance.hostAccess.sshAgent
-      || instance.hostAccess.gitConfig
-      || instance.hostAccess.kvm
-      || instance.hostAccess.gpu != [];
-    args =
-      ["--no-stdio" "--color=never"]
-      ++ lib.optionals (hostEnabled || instance.cacheAccess != {}) ["--allow-shell"]
-      ++ lib.optionals instance.hostAccess.nixDaemon ["--allow-nix-daemon"]
-      ++ lib.optionals instance.hostAccess.nixConfig ["--allow-nix-config"]
-      ++ lib.optionals instance.hostAccess.sshAgent ["--allow-ssh-agent"]
-      ++ lib.optionals instance.hostAccess.gitConfig ["--allow-git-config"]
-      ++ lib.optionals instance.hostAccess.kvm ["--allow-kvm"]
-      ++ map (vendor: "--allow-gpu=${vendor}") instance.hostAccess.gpu
-      ++ lib.mapAttrsToList (name: mode: "--allow-cache-${name}=${mode}") instance.cacheAccess
-      ++ lib.optionals instance.serialize ["--serialize"]
-      ++ lib.optionals (profile != null) ["--profile=${profile}"]
-      ++ lib.optionals (instance.logging.verbosity == "tools") ["-v"]
-      ++ lib.optionals (instance.logging.verbosity == "requests") ["-vv"];
+    configPath =
+      if staged
+      then "/run/${runtimeDirectory}/config.jsonc"
+      else instance.configFile;
+    derivedGroups = lib.unique (
+      lib.optionals (permissions.allow_kvm or false) ["kvm"]
+      ++ lib.optionals (permissions.allow_gpu or [] != []) ["render" "video"]
+      ++ instance.extraGroups
+    );
+    permissions = instance.settings.permissions or {};
+    nixEnabled = permissions.allow_nix_daemon or false || permissions.allow_nix_config or false;
     credentials =
       lib.optionals (instance.credentials.runtimeApiKeyFile != null)
       ["dotlink-api-key:${instance.credentials.runtimeApiKeyFile}"]
@@ -333,11 +279,19 @@
     serviceEnv =
       instance.environment
       // {DOTLINK_SUPERVISOR = "systemd";}
+      # A service has no terminal; the module never relies on TTY detection.
+      // {DOTLINK_COLOR = "never";}
+      # A service has no stdin either, so a selected profile cannot serve the
+      # stdio transport. This is a deployment fact, not a user preference.
+      // {DOTLINK_STDIO = "0";}
+      // lib.optionalAttrs (profile != null) {
+        DOTLINK_PROFILE = profile;
+      }
       // lib.optionalAttrs (instance.sshAgentSocket != null) {
         DOTLINK_SSH_AGENT_SOCKET = instance.sshAgentSocket;
       }
       // lib.optionalAttrs (configPath != null) {
-        DOTLINK_CONFIG = toString configPath;
+        DOTLINK_CONFIG_FILE = toString configPath;
       }
       // lib.optionalAttrs (instance.credentials.runtimeApiKeyFile != null) {
         DOTLINK_API_KEY_FILE = "%d/dotlink-api-key";
@@ -355,9 +309,9 @@
     startLimitIntervalSec = 0;
     path =
       instance.extraPackages
-      ++ lib.optionals (instance.hostAccess.nixDaemon || instance.hostAccess.nixConfig) [pkgs.nix]
-      ++ lib.optionals (instance.hostAccess.gitConfig || instance.hostAccess.sshAgent) [pkgs.git]
-      ++ lib.optionals instance.hostAccess.sshAgent [pkgs.openssh];
+      ++ lib.optionals nixEnabled [pkgs.nix]
+      ++ lib.optionals (permissions.allow_git_config or false) [pkgs.git]
+      ++ lib.optionals (permissions.allow_ssh_agent or false) [pkgs.git pkgs.openssh];
     environment = serviceEnv;
     serviceConfig =
       {
@@ -365,7 +319,7 @@
         User = instance.user;
         SetLoginEnvironment = true;
         WorkingDirectory = instance.workingDirectory;
-        ExecStart = "${lib.getExe instance.package} ${lib.concatStringsSep " " args}";
+        ExecStart = lib.getExe instance.package;
         # Exit 2 (usage) and 78 (CONFIG) need the operator. Exit 6
         # (NOTCONFIGURED) means first-run setup has not run yet: it is a clean
         # stop, so an unprovisioned host never fails its own switch.
@@ -389,11 +343,15 @@
         UMask = "0077";
       }
       // lib.optionalAttrs (instance.group != null) {Group = instance.group;}
-      // lib.optionalAttrs (instance.hostAccess.kvm || instance.hostAccess.gpu != []) {
-        SupplementaryGroups = lib.unique (
-          lib.optionals instance.hostAccess.kvm ["kvm"]
-          ++ lib.optionals (instance.hostAccess.gpu != []) ["render" "video"]
-        );
+      // lib.optionalAttrs (derivedGroups != []) {SupplementaryGroups = derivedGroups;}
+      // lib.optionalAttrs staged {
+        RuntimeDirectory = runtimeDirectory;
+        RuntimeDirectoryMode = "0700";
+        # Failure to stage the exact selected config must abort startup:
+        # ignoring it could run a previously staged policy after revocation.
+        ExecStartPre = "${pkgs.coreutils}/bin/install -m 0400 ${
+          utils.escapeSystemdExecArg (toString configSource)
+        } /run/${runtimeDirectory}/config.jsonc";
       }
       // lib.optionalAttrs (credentials != []) {LoadCredential = credentials;};
   };
@@ -452,36 +410,88 @@ in {
         active)
       ++ (lib.mapAttrsToList (name: instance: {
           assertion = validProfile instance.profile;
-          message = "dotlink ${name}: profile names may contain only letters, digits, '-' or '_'.";
+          message = "dotlink ${name}: profile must contain 1–64 ASCII letters, digits, '-' or '_'; only lowercase 'default' aliases the unnamed profile.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
-          assertion = !hasConfig instance || instance.profile == null;
-          message = "dotlink ${name}: profile cannot be combined with managed settings/configFile; use a separate instance instead.";
+          assertion = !(instance.environment ? DOTLINK_PROFILE);
+          message = "dotlink ${name}: set the typed profile option, not environment.DOTLINK_PROFILE; the latter bypasses private-state namespace collision checks.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
           assertion =
             instance.settings
             == null
+            || !(instance.settings.transports.stdio or false);
+          message = "dotlink ${name}: a systemd service has no stdin, so settings.transports.stdio must stay disabled.";
+        })
+        active)
+      ++ (
+        let
+          transportOf = instance: instance.settings.transports or {};
+          # Conservative, host-independent admission: two declarative HTTP
+          # listeners on the same TCP port may overlap (including IPv4/IPv6
+          # wildcard and v4-mapped binds). Distinct ports keep the rule simple;
+          # externally supplied profiles/configFile cannot be inspected here.
+          normalizedPort = bind: let
+            raw =
+              if bind == null
+              then "127.0.0.1:3000"
+              else toString bind;
+            match = builtins.match ".*:([0-9]+)" raw;
+          in
+            if match == null
+            then raw
+            else let
+              digits = builtins.elemAt match 0;
+              canonical = builtins.match "0*([0-9]+)" digits;
+            in
+              # TCP port zero asks the OS for an ephemeral port, so two
+              # independent listeners cannot collide on a fixed port.
+              if builtins.elemAt canonical 0 == "0"
+              then null
+              else builtins.elemAt canonical 0;
+          ports = lib.filter (port: port != null) (
+            lib.mapAttrsToList (
+              _: instance:
+                if (transportOf instance).http or false
+                then normalizedPort ((transportOf instance).http_bind or null)
+                else null
+            )
+            active
+          );
+          tunnels = lib.filter (tunnel: tunnel != null) (
+            lib.mapAttrsToList (
+              _: instance:
+                if (transportOf instance).openai or false
+                then instance.settings.tunnel_id or null
+                else null
+            )
+            active
+          );
+        in [
+          {
+            assertion = lib.length ports == lib.length (lib.unique ports);
+            message = "dotlink declarative HTTP instances must use distinct nonzero TCP ports; wildcard and interface-specific binds can overlap. Profile/configFile port conflicts remain subject to runtime bind checks.";
+          }
+          {
+            assertion = lib.length tunnels == lib.length (lib.unique tunnels);
+            message = "dotlink instances must not share one settings.tunnel_id: one tunnel is used twice.";
+          }
+        ]
+      )
+      ++ (lib.mapAttrsToList (name: instance: {
+          assertion =
+            instance.settings
+            == null
             || !(instance.settings ? version)
-            || instance.settings.version == 10;
-          message = "dotlink ${name}: declarative settings must use current schema version 10.";
+            || instance.settings.version == schemaVersion;
+          message = "dotlink ${name}: declarative settings must use the current schema version ${toString schemaVersion} (omit version and the module supplies it).";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
           assertion = instance.sshAgentSocket == null || lib.hasPrefix "/" instance.sshAgentSocket;
           message = "dotlink ${name}: sshAgentSocket must be an absolute Unix socket path.";
-        })
-        active)
-      ++ (lib.mapAttrsToList (name: instance: {
-          assertion = builtins.length (lib.unique instance.hostAccess.gpu) == builtins.length instance.hostAccess.gpu;
-          message = "dotlink ${name}: hostAccess.gpu must not contain duplicate vendors.";
-        })
-        active)
-      ++ (lib.mapAttrsToList (name: instance: {
-          assertion = lib.all (key: lib.elem key cacheKeys) (builtins.attrNames instance.cacheAccess);
-          message = "dotlink ${name}: cacheAccess contains an unsupported cache name.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
@@ -494,7 +504,28 @@ in {
           assertion =
             !(cfg.instances ? default)
             && lib.all validName (builtins.attrNames cfg.instances);
-          message = "dotlink instance names must be unique, non-'default', and contain only letters, digits, '-' or '_'.";
+          message = "dotlink instance names must be unique, contain 1–64 ASCII letters, digits, '-' or '_', and cannot be any casing of 'default'.";
+        }
+        {
+          # One user plus one profile is one private state slot: credentials,
+          # OAuth grants and the default config path are shared, so two
+          # "independent" services would silently own the same secrets.
+          assertion = let
+            slots =
+              lib.mapAttrsToList (
+                name: instance: "${instance.user}:${
+                  let
+                    slot = effectiveProfile name instance;
+                  in
+                    if slot == null
+                    then "default"
+                    else slot
+                }"
+              )
+              active;
+          in
+            lib.length slots == lib.length (lib.unique slots);
+          message = "dotlink instances must not share one user and profile: they would share credentials and OAuth state; give each instance a distinct profile.";
         }
       ];
 

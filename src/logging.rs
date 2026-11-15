@@ -22,6 +22,27 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
+    /// `DOTLINK_COLOR=auto|always|never`, for services and drop-ins.
+    ///
+    /// An unrecognized value is an error rather than a silent fall back to
+    /// `auto`: a typo must not look like colour detection that is simply off.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let raw = match std::env::var("DOTLINK_COLOR") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("DOTLINK_COLOR must be valid UTF-8")
+            }
+        };
+        match raw.trim() {
+            "" => Ok(None),
+            "auto" => Ok(Some(Self::Auto)),
+            "always" => Ok(Some(Self::Always)),
+            "never" => Ok(Some(Self::Never)),
+            other => anyhow::bail!("DOTLINK_COLOR must be auto, always or never, not {other:?}"),
+        }
+    }
+
     pub fn stdout_enabled(self) -> bool {
         match self {
             Self::Auto => io::stdout().is_terminal(),
@@ -91,6 +112,22 @@ struct LogState {
     full_commands: AtomicBool,
 }
 
+/// Visible prefix before a message: `[{timestamp}] {level:<4} {scope:<10} `.
+/// Continuation lines align under it instead of repeating it, and the test below
+/// keeps the two spellings in step.
+fn message_prefix(timestamp: &str, level: &str, scope: &str) -> String {
+    format!("[{timestamp}] {level:<4} {scope:<10} ")
+}
+
+/// Visible width of [`message_prefix`].
+const MESSAGE_COLUMN: usize = 31;
+
+/// The non-color line: continuation lines are written separately, so the one
+/// place that composes the prefix is also the one place that can move it.
+fn plain_line(timestamp: &str, level: &str, scope: &str, message: &str) -> String {
+    format!("{}{message}", message_prefix(timestamp, level, scope))
+}
+
 #[derive(Clone, Debug)]
 pub struct LogConfig {
     state: Arc<LogState>,
@@ -115,6 +152,14 @@ impl LogConfig {
             }),
             color,
         }
+    }
+
+    /// Adopt a level resolved from the saved profile. Only called while no CLI
+    /// flag or environment value has set one, so it never overrides the caller.
+    pub fn set_verbosity(&self, verbose: u8) {
+        self.state
+            .verbosity
+            .store(verbose.min(2), Ordering::Relaxed);
     }
 
     pub fn color_enabled(&self) -> bool {
@@ -290,6 +335,54 @@ impl LogConfig {
         self.line("REQ", transport, &message, "35");
     }
 
+    /// One tick, as a continuation of the call's own line: a dot the peer took,
+    /// a cross it dropped. No timestamp or scope, so a long wait reads as one
+    /// entry instead of a stack of records. The counted line at the end is the
+    /// authoritative one; these marks are the shape of the wait.
+    pub fn progress_mark(&self, delivered: bool) {
+        if !self.activity_enabled() {
+            return;
+        }
+        self.continuation(if delivered { "·" } else { "×" }, "2");
+    }
+
+    /// What the wait reported, on the call's own line: one entry, only for calls
+    /// that actually ticked. The counted line carries the scope because the
+    /// marks above it do not.
+    pub fn progress_done(&self, tool: &str, attempted: u64, delivered: u64) {
+        if !self.activity_enabled() {
+            return;
+        }
+        let dropped = attempted.saturating_sub(delivered);
+        let message = match dropped {
+            0 => format!("progress {delivered}/{attempted} ticks"),
+            _ => format!("progress {delivered}/{attempted} ticks, {dropped} dropped"),
+        };
+        self.line("TOOL", tool, &message, "36");
+    }
+
+    /// A message-aligned continuation of the line above it, with no timestamp or
+    /// scope of its own. One `eprintln!` per line, so concurrent calls cannot
+    /// splice into each other.
+    fn continuation(&self, message: &str, color_code: &str) {
+        let message = self.style(color_code, message);
+        eprintln!("{:width$}{message}", "", width = MESSAGE_COLUMN);
+    }
+
+    /// One notification the transport accepted, so progress delivery is provable
+    /// without a failure to look at.
+    pub fn notification(&self, transport: &str, method: &str) {
+        if !self.developer_enabled() {
+            return;
+        }
+        let method = if self.highlight_fields() {
+            format!("\x1b[35m{method}\x1b[0m")
+        } else {
+            method.to_owned()
+        };
+        self.line("REQ", transport, &format!("← {method}"), "35");
+    }
+
     pub fn style(&self, code: &str, text: impl AsRef<str>) -> String {
         if self.color {
             format!("\x1b[{code}m{}\x1b[0m", text.as_ref())
@@ -306,7 +399,10 @@ impl LogConfig {
                 "\x1b[2m[{timestamp}]\x1b[0m \x1b[{color_code}m{level:<4}\x1b[0m \x1b[1m{scope:<10}\x1b[0m {message}"
             );
         } else {
-            eprintln!("[{timestamp}] {level:<4} {scope:<10} {message}");
+            eprintln!(
+                "{}",
+                plain_line(&timestamp.to_string(), level, &scope, message)
+            );
         }
     }
 }
@@ -676,6 +772,19 @@ pub fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Continuation lines are written with `MESSAGE_COLUMN` spaces, so the prefix
+    /// `line()` writes must stay exactly that wide.
+    #[test]
+    fn continuations_align_under_the_message_column() {
+        let line = plain_line("12:00:00.000", "TOOL", "bash", "→ c=\"true\"");
+        assert_eq!(
+            line.chars().count() - "→ c=\"true\"".chars().count(),
+            MESSAGE_COLUMN,
+            "{line:?}"
+        );
+        assert!(line[..MESSAGE_COLUMN].ends_with(' '), "{line:?}");
+    }
 
     #[test]
     fn jsonrpc_identifiers_are_bounded_and_sanitized_for_every_transport() {

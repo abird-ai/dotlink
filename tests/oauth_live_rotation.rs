@@ -184,7 +184,7 @@ async fn rotation_is_observed_by_live_http_without_accepting_old_password() {
 
     let process = Command::new(env!("CARGO_BIN_EXE_dotlink"))
         .current_dir(root)
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_STATE_HOME", root.join("state"))
         .env("HOME", root)

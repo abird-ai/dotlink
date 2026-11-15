@@ -8,6 +8,10 @@ Repo: `/home/pvl/spaces/abird/src/dotlink`
 > Canonical cross-repo design authority remains AW
 > `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`.
 > Source/tests/executed evidence outrank prose.
+>
+> Later operational convergence with the 0.17.1 release branch is tracked in
+> [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
+> It preserves this unified-runtime implementation and is not a release/tag.
 
 ## Final implementation state
 

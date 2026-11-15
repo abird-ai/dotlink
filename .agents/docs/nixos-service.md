@@ -76,26 +76,44 @@ services.dotlink = {
   };
 
   extraPackages = with pkgs; [ git ripgrep fd ];
-  logging.verbosity = "tools";
+    logging.verbosity = "tools";
+  };
 };
 ```
 
-A read-only JSON document with schema version 10 is generated in the Nix store
-and passed to dotlink through `DOTLINK_CONFIG`. This *only* overrides the
+A read-only JSON document with schema version 12 is generated in the Nix store
+and passed to dotlink through `DOTLINK_CONFIG_FILE`. This *only* overrides the
 profile JSON; unless explicitly overridden, dotlink still loads the selected
 user's own saved `runtime.key` and OAuth state. The schema is dotlink's
 existing JSONC schema, not a second independently maintained config format.
 Never include keys, passwords, or tokens inside `settings`, as Nix store
 objects are not secret.
 
-Alternatively, set `configFile = "/path/to/config.jsonc";` to select an
-external **base** JSONC file without generating a file in the Nix store.
-`settings` and `configFile` are mutually exclusive. They also cannot be
-combined with an explicit `profile`, because named-profile selection changes
-the JSONC filename. For a named instance, dotlink selects the sibling
-`config.<instance>.jsonc` file from that base path. Generated `settings`
-automatically create the correctly named sibling in the Nix store, so each
-instance retains independent saved keys and OAuth state.
+Alternatively, set `configFile = "/path/to/config.jsonc";` to use an external
+JSONC file. `settings` and `configFile` are mutually exclusive, and the value is
+used verbatim: naming a file means that file is read.
+
+Rendered `settings` (and any `configFile` under `/nix/store`, `/etc` or `/run`)
+are copied into the unit's private runtime directory at each start, because the
+store is an implicit shell runtime mount while the active config is a protected
+path. `DOTLINK_CONFIG_FILE` therefore names `/run/dotlink/config.jsonc` (or
+`/run/dotlink-<instance>/config.jsonc`), never the store source. A failed
+staging copy aborts startup rather than running an old or incomplete config.
+
+The module conservatively rejects multiple declarative HTTP listeners on the
+same **nonzero TCP port**, including wildcard/interface combinations; port 0
+requests a unique ephemeral OS-selected port. It cannot inspect external
+`configFile` contents or private saved profiles, so those bind conflicts are
+reported by the runtime instead.
+
+`profile` is orthogonal: it selects the private state slot (saved keys, OAuth
+grants) and only suffixes the *default* config path, so two services on one host
+stay independent without touching how their config files are located.
+Use the typed `profile` option, not `environment.DOTLINK_PROFILE`: the module
+rejects raw selectors so its per-user/profile collision checks cannot be
+bypassed. Profile names have 1–64 ASCII letters, digits, `-` or `_`;
+`default` (lowercase) selects the unnamed profile, while other case
+variants are reserved. Additional instance names follow the same grammar.
 
 ## Optional credential overrides
 
@@ -140,16 +158,18 @@ services.dotlink = {
   enable = true;
   user = "alice";
   workingDirectory = "/home/alice/projects";
-  hostAccess = {
-    nixDaemon = true;
+  settings.permissions = {
+    allow_nix_daemon = true;
     nixConfig = true;
     gitConfig = true;
     sshAgent = true;
   };
   # GCR is discovered automatically from the service user's UID.
   # sshAgentSocket = "/run/user/1000/gcr/ssh"; # optional override
-  cacheAccess."cargo-registry" = "rw";
-  cacheAccess."cargo-git" = "ro";
+  settings.caches = [
+    {kind = "cargo-registry"; mode = "rw";}
+    {kind = "cargo-git"; mode = "ro";}
+  ];
 };
 ```
 
@@ -188,12 +208,12 @@ signing works best when `user.signingkey` contains a `key::ssh-ed25519 ...`
 
 The Nix daemon grants controlled Unix-socket access, independent of shell
 network permission. `NIX_REMOTE=daemon` is configured internally, and the
-user's XDG nix.conf is shared read-only only when `hostAccess.nixConfig` is
+user's XDG nix.conf is shared read-only only when `settings.permissions.allow_nix_config` is
 true. Git similarly maps only the user's existing `~/.gitconfig` and
 `$XDG_CONFIG_HOME/git/config`; `includeIf` targets and `.ssh` are not
 implicitly mounted. These config files may contain credentials—review before
-enabling. Each enabled `cacheAccess` key maps to a matching discovered
-`--allow-cache-<kind>=ro|rw` flag; all 13 known families are accepted.
+enabling. Each enabled `settings.caches` entry maps to a matching discovered
+`--allow-cache-<kind>=ro|rw` flag; all 14 known families are accepted.
 
 ## KVM and GPU acceleration
 
@@ -205,18 +225,23 @@ services.dotlink = {
   enable = true;
   user = "alice";
   workingDirectory = "/home/alice/projects";
-  hostAccess = {
-    kvm = true;
-    gpu = [ "amd" "nvidia" ];
+  settings = {
+    permissions = {
+      allow_kvm = true;
+      allow_gpu = [ "amd" "nvidia" ];
+    };
   };
   # Optional: install selected tools into this service's PATH.
   # extraPackages = with pkgs; [ vulkan-tools qemu ];
 };
 ```
 
-The module grants `SupplementaryGroups = [ "kvm" "render" "video" ];`
-when all three capabilities are enabled. A KVM-only service receives just
-`kvm`; GPU access adds `render` and `video`. Only this systemd unit receives
+The module grants `SupplementaryGroups` from `settings.permissions`: `kvm` for
+`allow_kvm`, `render` and `video` for `allow_gpu`, plus anything listed in
+`extraGroups`. A service that reuses a user profile has no `settings` for the
+module to read, so it must declare the groups it needs with `extraGroups` and
+the executables with `extraPackages` — profile grants alone cannot widen the
+unit's groups or `PATH`. Only this systemd unit receives
 these additional groups; dotlink does not change the user's global groups.
 The selected user and active NixOS graphics stack must support the device
 nodes. Additional `DevicePolicy` or `DeviceAllow` restrictions configured
@@ -344,12 +369,12 @@ systemctl status dotlink-work
 journalctl -u dotlink-work -f
 ```
 
-`services.dotlink.serialize = true;` optionally passes `--serialize` to execute
-one MCP tool call at a time. The default is `false` on Linux, allowing
+`settings.serialize = true;` executes one MCP
+tool call at a time. The default is `false` on Linux, allowing
 independent shell and file operations concurrently. Named instances can
 override the setting. See the README for the non-Linux fallback.
 
-`logging.verbosity` controls activity detail:
+`settings.logging.verbosity` controls activity detail:
 
 | Setting | Contents |
 | --- | --- |
@@ -357,8 +382,11 @@ override the setting. See the README for the non-Linux fallback.
 | `"tools"` | Above + tool names, paths / command summaries, outcomes and timings |
 | `"requests"` | Above + MCP request diagnostics |
 
-These map to normal CLI output, `-v`, and `-vv`. `RUST_LOG` is separately
-configurable using `environment.RUST_LOG`. Logs may include filesystem paths,
+These map to normal CLI output, `-v`, and `-vv`. The module states the level
+once: inside the profile when it renders one (`settings`), otherwise as
+`DOTLINK_VERBOSITY`. Either way a drop-in can override it without touching the
+unit's command line. `RUST_LOG` is separately configurable using
+`environment.RUST_LOG`. Logs may include filesystem paths,
 tunnel IDs, public MCP URLs and bounded request metadata. Bulk payloads such as
 file contents, patches, stdin and grep patterns are represented only by size.
 With `logging.verbosity = "tools"`, shell commands are recorded as an escaped

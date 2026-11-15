@@ -107,7 +107,8 @@ struct Args {
             "allow_public_no_auth",
             "ephemeral_url",
             "http_ephemeral_url",
-            "ngrok_ephemeral_url"
+            "ngrok_ephemeral_url",
+            "no_tunnel"
         ]
     )]
     #[arg(help_heading = "Setup & profiles")]
@@ -137,6 +138,11 @@ struct Args {
     #[arg(long, conflicts_with = "http")]
     #[arg(help_heading = "Transports")]
     no_http: bool,
+
+    /// Disable the OpenAI tunnel even if enabled in the selected profile, without opening its credentials.
+    #[arg(long)]
+    #[arg(help_heading = "Transports")]
+    no_tunnel: bool,
 
     /// Override the configured HTTP listen address for this run.
     #[arg(long, value_name = "ADDR")]
@@ -358,9 +364,14 @@ struct Args {
     print_id: bool,
 
     /// Execute one MCP tool call at a time instead of allowing concurrent calls.
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, conflicts_with = "no_serialize")]
     #[arg(help_heading = "Output & diagnostics")]
     serialize: bool,
+
+    /// Allow concurrent MCP tool calls even when the selected profile sets `serialize`.
+    #[arg(long, conflicts_with = "serialize")]
+    #[arg(help_heading = "Output & diagnostics")]
+    no_serialize: bool,
 
     /// Suppress TOOL activity even when verbosity enables it.
     #[arg(short = 'q', long)]
@@ -373,9 +384,9 @@ struct Args {
     verbose: u8,
 
     /// Control ANSI colors in human-facing output, including help.
-    #[arg(long, value_enum, default_value_t = ColorMode::Auto, global = true)]
+    #[arg(long, value_enum, global = true)]
     #[arg(help_heading = "Output & diagnostics")]
-    color: ColorMode,
+    color: Option<ColorMode>,
 
     /// List the MCP tools exposed under the effective policy and exit.
     #[arg(long)]
@@ -436,6 +447,10 @@ struct CacheFlags {
     /// Share discovered ccache cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
     allow_cache_ccache: Option<CacheMode>,
+
+    /// Share the discovered abird cache; bare flag means read-only, =rw enables writes.
+    #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
+    allow_cache_abird: Option<CacheMode>,
 }
 
 impl CacheFlags {
@@ -479,6 +494,9 @@ impl CacheFlags {
         }
         if let Some(mode) = self.allow_cache_ccache {
             selected.push((CacheKind::Ccache, mode));
+        }
+        if let Some(mode) = self.allow_cache_abird {
+            selected.push((CacheKind::Abird, mode));
         }
         selected
     }
@@ -950,12 +968,95 @@ fn main() -> ExitCode {
     recovery.exit_code()
 }
 
+/// Logging verbosity may also come from the environment, using the same
+/// vocabulary the NixOS module exposes: `lifecycle`, `tools` (-v) or `requests`
+/// (-vv). Precedence matches every other setting here: CLI flag > `DOTLINK_*`
+/// environment > saved profile > built-in default. Verbosity has no profile
+/// field yet, so the environment sits directly above the default; an operator
+/// can therefore set a level through a systemd drop-in without pinning
+/// `ExecStart` to a store path.
+const VERBOSITY_ENV: &str = "DOTLINK_VERBOSITY";
+
+fn resolve_verbosity(
+    cli_verbose: u8,
+    cli_quiet: bool,
+    env_value: Option<&str>,
+) -> Result<(u8, bool)> {
+    if cli_verbose > 0 || cli_quiet {
+        return Ok((cli_verbose, cli_quiet));
+    }
+    let Some(raw) = env_value else {
+        return Ok((0, false));
+    };
+    if raw.trim().is_empty() {
+        return Ok((0, false));
+    }
+    let level = setup::LogVerbosity::parse(raw).ok_or_else(|| {
+        anyhow!("{VERBOSITY_ENV} must be lifecycle, tools or requests, not {raw:?}")
+    })?;
+    Ok((level.as_verbose(), false))
+}
+
+/// Selected profile: explicit CLI flag, then `DOTLINK_PROFILE`, else the
+/// default profile. The module sets the environment form so a drop-in can
+/// switch profiles without touching `ExecStart`.
+fn selected_profile(args: &Args) -> Result<Option<String>> {
+    if let Some(profile) = &args.profile {
+        return Ok(Some(profile.clone()));
+    }
+    let Some(profile) = std::env::var_os("DOTLINK_PROFILE") else {
+        return Ok(None);
+    };
+    let profile = profile
+        .into_string()
+        .map_err(|_| anyhow!("DOTLINK_PROFILE must be valid UTF-8"))?;
+    Ok((!profile.trim().is_empty()).then_some(profile))
+}
+
+/// Serialization is enabled by a CLI flag, the environment or the profile, and
+/// an explicit `--no-serialize` revokes the latter two. Bare `--serialize` can
+/// only enable, so it never disables a configured value.
+fn resolve_serialize(cli_enable: bool, cli_disable: bool, configured: bool) -> bool {
+    if cli_disable {
+        false
+    } else if cli_enable {
+        true
+    } else {
+        configured
+    }
+}
+
 async fn run_main(supervisor: &Supervisor) -> Result<()> {
-    let args = parse_args();
+    let mut args = parse_args();
+    // One effective profile identity for configuration, credentials, Job
+    // namespace and authenticated AW bridge target.
+    args.profile = selected_profile(&args).map_err(recovery::config_failure)?;
     let launch_dir = std::env::current_dir()?;
 
-    let log = LogConfig::new(args.verbose, args.quiet, args.color);
-    let setup_color = args.color.stdout_enabled();
+    let verbosity_env = if args.verbose > 0 || args.quiet {
+        None
+    } else {
+        match std::env::var(VERBOSITY_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(recovery::config_failure(anyhow!(
+                    "{VERBOSITY_ENV} must be valid UTF-8"
+                )));
+            }
+        }
+    };
+    let (verbose, quiet) = resolve_verbosity(args.verbose, args.quiet, verbosity_env.as_deref())
+        .map_err(recovery::config_failure)?;
+    // Option<> distinguishes explicit --color auto from an omitted flag.
+    let color = match args.color {
+        Some(color) => color,
+        None => ColorMode::from_env()
+            .map_err(recovery::config_failure)?
+            .unwrap_or_default(),
+    };
+    let log = LogConfig::new(verbose, quiet, color);
+    let setup_color = color.stdout_enabled();
     let default_filter = "dotlink=warn";
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_filter))
@@ -1154,7 +1255,13 @@ fn oauth_profile_target(name: &str) -> Option<&str> {
 /// ordinary command failures.
 async fn run_one_shot(args: &Args, launch_dir: &Path, setup_color: bool) -> Result<()> {
     if args.setup {
-        load_or_setup(true, args.profile.as_deref(), setup_color).await?;
+        load_or_setup(
+            true,
+            args.profile.as_deref(),
+            setup_color,
+            setup::RuntimeOverrides::default(),
+        )
+        .await?;
     } else if args.print_id {
         let tunnel_id = setup::configured_tunnel_id(args.profile.as_deref())?
             .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
@@ -1249,6 +1356,7 @@ fn runtime_authority_intent(
     let execution = crate::mcp::sha256(&serde_json::to_vec(&execution)?);
     let job_session = crate::mcp::sha256(&serde_json::to_vec(&serde_json::json!({
         "execution": hex::encode(execution),
+        "profile": args.profile.as_deref().unwrap_or("default"),
         // Hidden OpenAI request keys are namespace-scoped. A logical tunnel
         // change must retire the old JobManager even when machine authority is
         // otherwise identical.
@@ -1285,11 +1393,32 @@ async fn plan_runtime(
     setup_color: bool,
     openai_state: &transports::openai::ProcessState,
 ) -> Result<Option<RuntimePlan>> {
-    let Some(mut setup) = load_or_setup(false, args.profile.as_deref(), setup_color).await? else {
+    let Some(mut setup) = load_or_setup(
+        false,
+        args.profile.as_deref(),
+        setup_color,
+        runtime_overrides(args),
+    )
+    .await?
+    else {
         return Ok(None);
     };
 
+    // Nothing above the profile set a level: adopt the saved one. CLI flags and
+    // DOTLINK_VERBOSITY were already resolved into the logger.
+    if args.verbose == 0
+        && !args.quiet
+        && std::env::var(VERBOSITY_ENV)
+            .ok()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        log.set_verbosity(setup.config.logging.verbosity.as_verbose());
+    }
+
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
+    // Validate the environment cache list here: its only consumer is the
+    // sandboxed shell, but a typo must fail closed even when that shell is off.
+    setup::env_cache_requests()?;
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
 
@@ -1403,21 +1532,31 @@ async fn prepare_runtime(
     #[cfg(target_os = "linux")]
     hardware::add_to_shell(&mut host_shell, policy.allow_kvm, &policy.allow_gpu)?;
     if policy.allow_shell && policy.sandbox_shell {
-        let mut caches = setup.config.caches.clone();
-        for override_cache in cache_grants_for_cli(&args.cache_flags.requested()).await? {
+        // Saved grants with an explicit path are used as written. Path-less
+        // saved grants are requests for discovery, so they join the environment
+        // and CLI layers and are resolved together, later layers winning.
+        let (mut caches, requests) = setup::merge_cache_layers(
+            &setup.config.caches,
+            &setup::env_cache_requests()?,
+            &args.cache_flags.requested(),
+        );
+        for override_cache in cache_grants_for_cli(&requests).await? {
             caches.retain(|saved| saved.kind != override_cache.kind);
             caches.push(override_cache);
         }
         for cache in &caches {
-            if !cache.path.is_dir() {
+            let Some(source) = cache.path.as_ref() else {
+                continue;
+            };
+            if !source.is_dir() {
                 continue;
             }
-            let target = cache.sandbox_path()?;
+            let target = cache.sandbox_path(source)?;
             if let Some((name, value)) = cache.shell_env(&target) {
                 shell_env.insert(name, value);
             }
             cache_mounts.push(SandboxCacheMount {
-                source: cache.path.clone(),
+                source: source.clone(),
                 target,
                 writable: cache.mode.writable(),
             });
@@ -1440,7 +1579,7 @@ async fn prepare_runtime(
         #[cfg(target_os = "linux")]
         host_shell,
         log: log.clone(),
-        serialize: args.serialize,
+        serialize: resolve_serialize(args.serialize, args.no_serialize, setup.config.serialize),
         allow_shell: policy.allow_shell,
         sandbox_shell: policy.sandbox_shell,
         allow_network: policy.allow_network,
@@ -1511,10 +1650,9 @@ async fn prepare_runtime(
         .and_then(|value| value.into_string().ok())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "local-machine".to_owned());
-    let bridge_profile = args.profile.as_deref().unwrap_or("default");
     job_manager.bind_remote_target(crate::remote_start::BridgeTarget::new(
         bridge_host,
-        bridge_profile,
+        args.profile.as_deref().unwrap_or("default"),
     )?)?;
     let machine = LocalMachine::from_prepared(prepared, job_manager, authority)?;
     Ok((transports, machine))
@@ -1669,6 +1807,15 @@ struct EffectiveLocalTransports {
     ngrok_domain: Option<String>,
     http_ephemeral_url: bool,
     ngrok_ephemeral_url: bool,
+}
+
+/// One source of truth for explicit CLI refusals before environment loading.
+fn runtime_overrides(args: &Args) -> setup::RuntimeOverrides {
+    setup::RuntimeOverrides {
+        no_tunnel: args.no_tunnel,
+        stdio_cli: args.stdio || args.no_stdio,
+        serialize_cli: args.serialize || args.no_serialize,
+    }
 }
 
 fn resolve_local_transports(
@@ -2156,6 +2303,13 @@ mod tests {
             http: None,
         };
         let baseline = runtime_authority_intent(&args, &setup, &policy, &transports).unwrap();
+        // Two profiles with identical filesystem grants still own independent
+        // remote Start/credential namespaces; a restart must not reuse Jobs.
+        let mut alternate = Args::try_parse_from(["dotlink"]).unwrap();
+        alternate.profile = Some("work".to_owned());
+        let work = runtime_authority_intent(&alternate, &setup, &policy, &transports).unwrap();
+        assert_eq!(baseline.execution, work.execution);
+        assert_ne!(baseline.job_session, work.job_session);
 
         let mut retention_config = setup.config.clone();
         retention_config.job_retention_secs += 60;
@@ -3308,11 +3462,11 @@ mod tests {
     fn profile_and_setup_can_be_combined() {
         let args = Args::try_parse_from(["dotlink", "--setup", "-p", "work"]).unwrap();
         assert!(args.setup);
-        assert_eq!(args.profile.as_deref(), Some("work"));
+        assert_eq!(selected_profile(&args).unwrap().as_deref(), Some("work"));
 
         let args = Args::try_parse_from(["dotlink", "-S", "-p", "work"]).unwrap();
         assert!(args.setup);
-        assert_eq!(args.profile.as_deref(), Some("work"));
+        assert_eq!(selected_profile(&args).unwrap().as_deref(), Some("work"));
     }
 
     #[test]
@@ -3403,6 +3557,61 @@ mod tests {
     }
 
     #[test]
+    fn serialize_negative_flag_revokes_profile_and_env() {
+        assert!(!resolve_serialize(false, false, false));
+        assert!(resolve_serialize(false, false, true));
+        assert!(resolve_serialize(true, false, false));
+        // The negative flag wins over a configured value, which is what lets a
+        // one-run override undo `DOTLINK_SERIALIZE=1` or a saved profile.
+        assert!(!resolve_serialize(false, true, true));
+        assert!(Args::try_parse_from(["dotlink", "--serialize", "--no-serialize"]).is_err());
+    }
+
+    #[test]
+    fn verbosity_env_supplies_a_default_and_cli_wins() {
+        assert_eq!(resolve_verbosity(0, false, None).unwrap(), (0, false));
+        assert_eq!(
+            resolve_verbosity(0, false, Some("lifecycle")).unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, false, Some("tools")).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, false, Some("requests")).unwrap(),
+            (2, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, false, Some(" requests ")).unwrap(),
+            (2, false),
+            "surrounding whitespace is tolerated"
+        );
+        assert_eq!(resolve_verbosity(0, false, Some("")).unwrap(), (0, false));
+        // Explicit CLI flags always win over the environment.
+        assert_eq!(
+            resolve_verbosity(1, false, Some("requests")).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            resolve_verbosity(2, false, Some("tools")).unwrap(),
+            (2, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, true, Some("requests")).unwrap(),
+            (0, true)
+        );
+        // An unknown value fails closed and names what is accepted, so a typo
+        // cannot look like logging that is quietly off.
+        let error = resolve_verbosity(0, false, Some("debug"))
+            .unwrap_err()
+            .to_string();
+        for expected in ["lifecycle", "tools", "requests"] {
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn logging_flags_have_distinct_cli_meanings() {
         let quiet = Args::try_parse_from(["dotlink", "-q"]).unwrap();
         assert!(quiet.quiet);
@@ -3419,7 +3628,7 @@ mod tests {
         let both = Args::try_parse_from(["dotlink", "--quiet", "-vv", "--color=never"]).unwrap();
         assert!(both.quiet);
         assert_eq!(both.verbose, 2);
-        assert_eq!(both.color, ColorMode::Never);
+        assert_eq!(both.color, Some(ColorMode::Never));
     }
 
     #[test]
@@ -3485,6 +3694,21 @@ mod tests {
         let effective = resolve_local_transports(&args, &defaults).unwrap();
         assert!(effective.http_ephemeral_url);
         assert!(!effective.ngrok_ephemeral_url);
+    }
+
+    #[test]
+    fn no_tunnel_refuses_the_profile_tunnel_for_this_run() {
+        let args = Args::try_parse_from(["dotlink", "--no-tunnel", "--stdio"]).unwrap();
+        assert!(args.no_tunnel);
+        assert!(runtime_overrides(&args).no_tunnel);
+        assert!(runtime_overrides(&args).stdio_cli);
+        let plain = Args::try_parse_from(["dotlink"]).unwrap();
+        assert_eq!(
+            runtime_overrides(&plain),
+            setup::RuntimeOverrides::default()
+        );
+        // Interactive setup cannot express a one-run refusal.
+        assert!(Args::try_parse_from(["dotlink", "--setup", "--no-tunnel"]).is_err());
     }
 
     #[test]
@@ -3569,7 +3793,7 @@ mod tests {
         assert!(Args::try_parse_from(["dotlink", "--setup", "profile", "list"]).is_err());
 
         let args = Args::try_parse_from(["dotlink", "profile", "list", "--color=never"]).unwrap();
-        assert_eq!(args.color, ColorMode::Never);
+        assert_eq!(args.color, Some(ColorMode::Never));
     }
 
     #[tokio::test]

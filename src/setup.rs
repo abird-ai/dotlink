@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
     net::SocketAddr,
@@ -27,6 +28,7 @@ const DEFAULT_MAX_OUTPUT_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 const DEFAULT_MAX_FILE_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     #[serde(default = "default_true")]
     pub openai: bool,
@@ -78,6 +80,7 @@ impl TransportConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionConfig {
     /// Read the directory where dotlink is launched unless disabled.
     #[serde(default = "default_true")]
@@ -180,27 +183,94 @@ impl Default for PermissionConfig {
     }
 }
 
+/// Logging verbosity a saved profile may carry.
+///
+/// Uses the same three words as the CLI flags and the NixOS module:
+/// `lifecycle` (quiet), `tools` (-v) or `requests` (-vv).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogVerbosity {
+    #[default]
+    Lifecycle,
+    Tools,
+    Requests,
+}
+
+impl LogVerbosity {
+    /// CLI verbosity count this level maps to.
+    pub fn as_verbose(self) -> u8 {
+        match self {
+            Self::Lifecycle => 0,
+            Self::Tools => 1,
+            Self::Requests => 2,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "lifecycle" => Some(Self::Lifecycle),
+            "tools" => Some(Self::Tools),
+            "requests" => Some(Self::Requests),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub verbosity: LogVerbosity,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheKind {
+    #[serde(alias = "cargo-registry")]
     CargoRegistry,
+    #[serde(alias = "cargo-git")]
     CargoGit,
     Npm,
     Pnpm,
     Yarn,
     Pip,
     Uv,
+    #[serde(alias = "go-mod")]
     GoMod,
+    #[serde(alias = "go-build")]
     GoBuild,
     Maven,
     Gradle,
     Sccache,
     Ccache,
+    Abird,
 }
 
 impl CacheKind {
+    /// Parse the kebab/snake name used by `--allow-cache-<name>` and
+    /// `DOTLINK_CACHES`.
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value.trim().replace('_', "-").as_str() {
+            "cargo-registry" => Some(Self::CargoRegistry),
+            "cargo-git" => Some(Self::CargoGit),
+            "npm" => Some(Self::Npm),
+            "pnpm" => Some(Self::Pnpm),
+            "yarn" => Some(Self::Yarn),
+            "pip" => Some(Self::Pip),
+            "uv" => Some(Self::Uv),
+            "go-mod" => Some(Self::GoMod),
+            "go-build" => Some(Self::GoBuild),
+            "maven" => Some(Self::Maven),
+            "gradle" => Some(Self::Gradle),
+            "sccache" => Some(Self::Sccache),
+            "ccache" => Some(Self::Ccache),
+            "abird" => Some(Self::Abird),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::CargoRegistry,
         Self::CargoGit,
         Self::Npm,
@@ -214,6 +284,7 @@ impl CacheKind {
         Self::Gradle,
         Self::Sccache,
         Self::Ccache,
+        Self::Abird,
     ];
 
     #[cfg(test)]
@@ -232,6 +303,7 @@ impl CacheKind {
             Self::Gradle => "gradle",
             Self::Sccache => "sccache",
             Self::Ccache => "ccache",
+            Self::Abird => "abird",
         }
     }
 
@@ -250,6 +322,7 @@ impl CacheKind {
             Self::Gradle => "Gradle",
             Self::Sccache => "sccache",
             Self::Ccache => "ccache",
+            Self::Abird => "abird",
         }
     }
 
@@ -268,6 +341,7 @@ impl CacheKind {
             Self::Gradle => "/tmp/home/.gradle/caches",
             Self::Sccache => "/tmp/home/.cache/sccache",
             Self::Ccache => "/tmp/home/.cache/ccache",
+            Self::Abird => "/tmp/home/.cache/abird",
         })
     }
 }
@@ -275,8 +349,10 @@ impl CacheKind {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
+    #[serde(alias = "ro", alias = "read-only")]
     #[value(name = "ro", alias = "read-only")]
     ReadOnly,
+    #[serde(alias = "rw", alias = "read-write")]
     #[value(name = "rw", alias = "read-write")]
     ReadWrite,
 }
@@ -295,9 +371,15 @@ impl CacheMode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CacheGrant {
     pub kind: CacheKind,
-    pub path: PathBuf,
+    /// Explicit cache directory. `None` asks dotlink to discover the standard
+    /// location for this kind, exactly like `--allow-cache-<name>` and
+    /// `DOTLINK_CACHES` do, so a config file can express a cache without
+    /// hard-coding a path that only the host knows.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     pub mode: CacheMode,
 }
 
@@ -325,10 +407,10 @@ fn sandbox_parent(sandbox_path: &Path) -> String {
 }
 
 impl CacheGrant {
-    pub fn sandbox_path(&self) -> Result<PathBuf> {
+    pub fn sandbox_path(&self, source: &Path) -> Result<PathBuf> {
         let home = home_dir()?;
         let home = fs::canonicalize(&home).unwrap_or(home);
-        let path = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let path = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
         if let Ok(relative) = path.strip_prefix(&home) {
             return Ok(sandbox_join(relative));
         }
@@ -353,7 +435,9 @@ impl CacheGrant {
             }
             CacheKind::Sccache => Some(("SCCACHE_DIR".to_owned(), value)),
             CacheKind::Ccache => Some(("CCACHE_DIR".to_owned(), value)),
-            CacheKind::Maven => None,
+            // Sandbox HOME is /tmp/home, so `$HOME/.cache/abird` already
+            // resolves to the mount; abird has no cache env override to set.
+            CacheKind::Abird | CacheKind::Maven => None,
         }
     }
 }
@@ -365,6 +449,7 @@ struct DiscoveredCache {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub version: u32,
 
@@ -395,6 +480,12 @@ pub struct AppConfig {
     pub organization_id: Option<String>,
     #[serde(default = "default_base_url")]
     pub base_url: String,
+
+    /// Serialize MCP tool calls instead of running them concurrently.
+    #[serde(default)]
+    pub serialize: bool,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 
     #[serde(default = "default_shell_timeout")]
     pub max_shell_timeout_secs: u64,
@@ -457,7 +548,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    10
+    12
 }
 
 fn default_true() -> bool {
@@ -534,6 +625,8 @@ fn default_app_config() -> AppConfig {
         owner_password_revision: None,
         organization_id: None,
         base_url: default_base_url(),
+        serialize: false,
+        logging: LoggingConfig::default(),
         max_shell_timeout_secs: default_shell_timeout(),
         max_output_bytes: default_output_bytes(),
         max_read_bytes: default_file_bytes(),
@@ -544,32 +637,63 @@ fn default_app_config() -> AppConfig {
     }
 }
 
-fn migrate_config(mut config: AppConfig) -> Result<AppConfig> {
+/// Decode a config file oldest-first: migrate the raw value, then decode strictly.
+///
+/// Strict decoding turns a typo into an error instead of a silently ignored
+/// setting. Running it *after* migration is what lets a profile written for an
+/// older schema keep loading once a later schema retires a field.
+fn load_config(text: &str) -> Result<AppConfig> {
+    let mut value: serde_json::Value = parse_jsonc(text)?;
+    migrate_value(&mut value)?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn migrate_value(value: &mut serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("profile config must be a JSON object"))?;
+    let from = object
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("profile config is missing its schema version"))?;
+    let from = u32::try_from(from)
+        .map_err(|_| anyhow!("profile config schema version is out of range: {from}"))?;
     let current = config_version();
-    if config.version > current {
+    if from > current {
         bail!(
-            "profile uses newer schema version {}; this dotlink supports version {}. Upgrade dotlink instead of overwriting the profile",
-            config.version,
-            current
+            "profile uses newer schema version {from}; this dotlink supports version {current}. Upgrade dotlink instead of overwriting the profile"
         );
     }
 
-    while config.version < current {
-        match config.version {
-            // v10 added only additive/defaulted fields: oauth (disabled by default)
-            // and transports.ngrok_domain (None by default). Existing v9 values
-            // retain the same meaning under v10 unless the new public-ingress
-            // safety validation requires the user to configure OAuth explicitly.
-            9 => config.version = 10,
-            version => {
-                bail!(
-                    "profile uses schema version {version}; no automatic migration path to version {current} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one"
-                );
-            }
-        }
+    let mut version = from;
+    while version < current {
+        migration_step(version, object)?;
+        version += 1;
     }
+    object.insert("version".to_owned(), serde_json::Value::from(current));
+    Ok(())
+}
 
-    Ok(config)
+/// One schema step, applied to the raw value before the strict decode.
+///
+/// A field a later schema removed is retired here, next to the version that
+/// dropped it, so an older profile has it removed before decoding. Every step
+/// so far is additive, so there is nothing to retire yet.
+fn migration_step(
+    from: u32,
+    _value: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    match from {
+        // v10 added only additive/defaulted fields: oauth (disabled by default)
+        // and transports.ngrok_domain (None by default).
+        // v11 adds serialize (false) and logging.verbosity (lifecycle).
+        // v12 makes a cache entry's `path` optional so discovery can supply it.
+        9..=11 => Ok(()),
+        version => bail!(
+            "profile uses schema version {version}; no automatic migration path to version {} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one",
+            config_version()
+        ),
+    }
 }
 
 fn read_profile_config_migrated(profile: Option<&str>) -> Result<Option<AppConfig>> {
@@ -582,10 +706,8 @@ fn read_profile_config_migrated(profile: Option<&str>) -> Result<Option<AppConfi
     else {
         return Ok(None);
     };
-    let config: AppConfig =
-        parse_jsonc(&text).with_context(|| format!("failed to parse {}", path.display()))?;
     let config =
-        migrate_config(config).with_context(|| format!("failed to migrate {}", path.display()))?;
+        load_config(&text).with_context(|| format!("failed to load {}", path.display()))?;
     Ok(Some(config))
 }
 
@@ -645,11 +767,15 @@ pub(crate) fn configured_tunnel_id(profile: Option<&str>) -> Result<Option<Strin
 /// checking transport readiness, or creating any private runtime state.
 pub(crate) fn inspection_permissions(profile: Option<&str>) -> Result<PermissionConfig> {
     validate_profile(profile)?;
-    match read_profile_config(profile)? {
-        Some(config) => Ok(config.permissions),
+    let mut permissions = match read_profile_config(profile)? {
+        Some(config) => config.permissions,
         None if profile.is_some() => bail!("selected profile does not exist"),
-        None => Ok(default_app_config().permissions),
-    }
+        None => default_app_config().permissions,
+    };
+    // Same effective permission layer as normal startup; inspection must stay
+    // free of credentials, cache discovery and transport side effects.
+    apply_permission_env_overrides(&mut permissions)?;
+    Ok(permissions)
 }
 
 struct ProfileEditSnapshot {
@@ -697,26 +823,67 @@ fn load_profile_for_edit(profile: Option<&str>) -> Result<ProfileEditSnapshot> {
     ))
 }
 
+/// Explicit CLI transport/serialization choices are resolved before reading
+/// lower-priority environment settings or opening credentials.
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeOverrides {
+    pub no_tunnel: bool,
+    pub stdio_cli: bool,
+    pub serialize_cli: bool,
+}
+
 pub async fn load_or_setup(
     force_setup: bool,
     profile: Option<&str>,
     color: bool,
+    overrides: RuntimeOverrides,
+) -> Result<Option<SetupResult>> {
+    let mut loaded = load_or_setup_with(force_setup, profile, color, overrides).await?;
+    // Interactive setup never runs under --no-tunnel (it conflicts with --setup),
+    // but keep the final selection explicit on every return path.
+    if overrides.no_tunnel
+        && let Some(setup) = loaded.as_mut()
+    {
+        setup.config.transports.openai = false;
+    }
+    Ok(loaded)
+}
+
+async fn load_or_setup_with(
+    force_setup: bool,
+    profile: Option<&str>,
+    color: bool,
+    overrides: RuntimeOverrides,
 ) -> Result<Option<SetupResult>> {
     validate_profile(profile)?;
+    let tunnel_requested = !overrides.no_tunnel;
 
     if !force_setup {
         if let Some(mut config) = read_profile_config(profile)? {
+            // A one-run refusal is authoritative before any lower-priority
+            // OpenAI environment setting or private key is consulted.
+            if overrides.no_tunnel {
+                config.transports.openai = false;
+            }
             // Resolve an active explicit file once. Its secret and verified
             // protected target travel together through override application.
             // Dormant OpenAI profiles do not open the saved or explicit key.
-            let explicit_connection = profile.is_none()
+            let explicit_connection = tunnel_requested
+                && profile.is_none()
                 && env_first(&["DOTLINK_ID", "CONTROL_PLANE_TUNNEL_ID"]).is_some();
-            let mut runtime_source = if config.transports.openai || explicit_connection {
-                credentials::from_env("DOTLINK_API_KEY_FILE")?
-            } else {
-                None
-            };
-            apply_env_overrides(&mut config, profile.is_none(), runtime_source.as_ref())?;
+            let mut runtime_source =
+                if (config.transports.openai && tunnel_requested) || explicit_connection {
+                    credentials::from_env("DOTLINK_API_KEY_FILE")?
+                } else {
+                    None
+                };
+            apply_env_overrides(
+                &mut config,
+                tunnel_requested && profile.is_none(),
+                runtime_source.as_ref(),
+                overrides,
+            )?;
             if config.transports.openai && config.runtime_api_key.trim().is_empty() {
                 runtime_source = try_read_saved_runtime_key(&config, profile)?;
                 config.runtime_api_key = runtime_source
@@ -734,7 +901,8 @@ pub async fn load_or_setup(
             }));
         }
 
-        if profile.is_none()
+        if tunnel_requested
+            && profile.is_none()
             && let Some((config, runtime_source)) = config_from_env()?
         {
             let protected_paths =
@@ -804,15 +972,71 @@ fn config_from_env() -> Result<Option<(AppConfig, Option<credentials::Credential
     config.transports.openai = true;
     config.tunnel_id = Some(tunnel_id);
     config.runtime_api_key = runtime_api_key;
-    apply_env_overrides(&mut config, false, runtime_source.as_ref())?;
+    apply_env_overrides(
+        &mut config,
+        false,
+        runtime_source.as_ref(),
+        RuntimeOverrides::default(),
+    )?;
     validate_config(&config)?;
     Ok(Some((config, runtime_source)))
+}
+
+/// Parse a boolean environment value. Accepts the same spellings an operator
+/// is likely to type in a systemd drop-in.
+fn parse_env_flag(name: &str, raw: &str) -> Result<Option<bool>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        other => bail!("{name} must be a boolean (1/0, true/false), not {other:?}"),
+    }
+}
+
+fn env_flag(name: &str) -> Result<Option<bool>> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(None);
+    };
+    parse_env_flag(name, &raw.to_string_lossy())
+}
+
+/// `DOTLINK_CACHES=cargo-registry:rw,go-mod:ro` as CLI-equivalent requests.
+///
+/// Returned in order so a caller can let a later layer override an earlier one
+/// for the same cache kind. Resolution to concrete paths is async and lives
+/// next to the `--allow-cache-*` resolver.
+pub fn env_cache_requests() -> Result<Vec<(CacheKind, CacheMode)>> {
+    let Some(raw) = env::var_os("DOTLINK_CACHES") else {
+        return Ok(Vec::new());
+    };
+    parse_cache_requests(&raw.to_string_lossy())
+}
+
+fn parse_cache_requests(raw: &str) -> Result<Vec<(CacheKind, CacheMode)>> {
+    let mut requests = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (name, mode) = match entry.split_once(':') {
+            Some((name, mode)) => (name, mode),
+            None => (entry, "ro"),
+        };
+        let kind = CacheKind::from_name(name)
+            .ok_or_else(|| anyhow!("DOTLINK_CACHES has unknown cache kind {name:?}"))?;
+        let mode = match mode.trim().to_ascii_lowercase().as_str() {
+            "ro" => CacheMode::ReadOnly,
+            "rw" => CacheMode::ReadWrite,
+            other => bail!("DOTLINK_CACHES mode must be ro or rw, not {other:?}"),
+        };
+        requests.retain(|(existing, _)| *existing != kind);
+        requests.push((kind, mode));
+    }
+    Ok(requests)
 }
 
 fn apply_env_overrides(
     config: &mut AppConfig,
     include_secret_connection: bool,
     runtime_source: Option<&credentials::CredentialSource>,
+    overrides: RuntimeOverrides,
 ) -> Result<()> {
     if include_secret_connection
         && let Some((tunnel_id, runtime_api_key)) = secret_env_connection(runtime_source)?
@@ -822,21 +1046,80 @@ fn apply_env_overrides(
         config.runtime_api_key = runtime_api_key;
     }
 
-    if let Some(base_url) = env_first(&["DOTLINK_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
-        config.base_url = base_url;
-    }
-    if let Some(value) = env_first(&[
-        "DOTLINK_ORGANIZATION_ID",
-        "CONTROL_PLANE_ORGANIZATION_ID",
-        "OPENAI_ORGANIZATION",
-    ]) {
-        config.organization_id = Some(value);
+    // Connection-only overrides are meaningful only after the effective
+    // tunnel selection. Disabled OpenAI settings must not break local work.
+    if config.transports.openai {
+        if let Some(base_url) = env_first(&["DOTLINK_BASE_URL", "CONTROL_PLANE_BASE_URL"]) {
+            config.base_url = base_url;
+        }
+        if let Some(value) = env_first(&[
+            "DOTLINK_ORGANIZATION_ID",
+            "CONTROL_PLANE_ORGANIZATION_ID",
+            "OPENAI_ORGANIZATION",
+        ]) {
+            config.organization_id = Some(value);
+        }
     }
     // An explicit file-based key overrides both plaintext key variables while
     // leaving the saved/explicit tunnel ID untouched. The source was opened
     // once by the caller and also carries the path that must be protected.
     if let Some(source) = runtime_source {
         config.runtime_api_key = source.secret().to_owned();
+    }
+
+    // Non-secret settings follow the same order as everything else: explicit
+    // CLI flags are applied later (and win), these environment values override
+    // the saved profile, and the profile overrides the built-in default.
+    if !overrides.serialize_cli
+        && let Some(enabled) = env_flag("DOTLINK_SERIALIZE")?
+    {
+        config.serialize = enabled;
+    }
+    if !overrides.stdio_cli
+        && let Some(stdio) = env_flag("DOTLINK_STDIO")?
+    {
+        config.transports.stdio = stdio;
+    }
+    apply_permission_env_overrides(&mut config.permissions)?;
+    Ok(())
+}
+
+fn apply_permission_env_overrides(permissions: &mut PermissionConfig) -> Result<()> {
+    for (name, apply) in [
+        ("DOTLINK_ALLOW_SHELL", 0usize),
+        ("DOTLINK_ALLOW_NETWORK", 1),
+        ("DOTLINK_ALLOW_NIX_DAEMON", 2),
+        ("DOTLINK_ALLOW_NIX_CONFIG", 3),
+        ("DOTLINK_ALLOW_SSH_AGENT", 4),
+        ("DOTLINK_ALLOW_GIT_CONFIG", 5),
+        ("DOTLINK_ALLOW_KVM", 6),
+    ] {
+        let Some(enabled) = env_flag(name)? else {
+            continue;
+        };
+        match apply {
+            0 => permissions.allow_shell = enabled,
+            1 => permissions.allow_network = enabled,
+            2 => permissions.allow_nix_daemon = enabled,
+            3 => permissions.allow_nix_config = enabled,
+            4 => permissions.allow_ssh_agent = enabled,
+            5 => permissions.allow_git_config = enabled,
+            _ => permissions.allow_kvm = enabled,
+        }
+    }
+    if let Some(vendors) = env_first(&["DOTLINK_ALLOW_GPU"]) {
+        let mut parsed = Vec::new();
+        for vendor in vendors.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let vendor = match vendor.trim() {
+                "amd" => GpuVendor::Amd,
+                "nvidia" => GpuVendor::Nvidia,
+                other => bail!("DOTLINK_ALLOW_GPU has unknown vendor {other:?}; use amd or nvidia"),
+            };
+            if !parsed.contains(&vendor) {
+                parsed.push(vendor);
+            }
+        }
+        permissions.allow_gpu = parsed;
     }
     Ok(())
 }
@@ -1008,6 +1291,8 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
         .unwrap_or_else(|| xdg_cache.join("ccache"));
     add_cache_candidate(&mut found, CacheKind::Ccache, ccache, &home);
 
+    add_cache_candidate(&mut found, CacheKind::Abird, xdg_cache.join("abird"), &home);
+
     found
         .into_iter()
         .map(|(kind, path)| DiscoveredCache { kind, path })
@@ -1020,6 +1305,37 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
 /// family whose directory does not exist is skipped with a warning rather
 /// than failing startup, matching the fact that caches appear and disappear
 /// with the service user's activity.
+/// Merge saved cache grants with the environment and CLI layers.
+///
+/// A saved grant with an explicit path owns that path: a later layer may change
+/// its mode but never silently moves the mount to a discovered directory.
+/// Path-less saved grants are discovery requests, so they compete with the later
+/// layers for their kind and the last layer wins.
+pub(crate) fn merge_cache_layers(
+    saved: &[CacheGrant],
+    environment: &[(CacheKind, CacheMode)],
+    cli: &[(CacheKind, CacheMode)],
+) -> (Vec<CacheGrant>, Vec<(CacheKind, CacheMode)>) {
+    let mut explicit: Vec<CacheGrant> = saved
+        .iter()
+        .filter(|grant| grant.path.is_some())
+        .cloned()
+        .collect();
+    let mut requests: Vec<(CacheKind, CacheMode)> = saved
+        .iter()
+        .filter(|grant| grant.path.is_none())
+        .map(|grant| (grant.kind, grant.mode))
+        .collect();
+    for (kind, mode) in environment.iter().chain(cli) {
+        requests.retain(|(existing, _)| existing != kind);
+        match explicit.iter_mut().find(|grant| grant.kind == *kind) {
+            Some(grant) => grant.mode = *mode,
+            None => requests.push((*kind, *mode)),
+        }
+    }
+    (explicit, requests)
+}
+
 pub async fn cache_grants_for_cli(requests: &[(CacheKind, CacheMode)]) -> Result<Vec<CacheGrant>> {
     if requests.is_empty() {
         return Ok(Vec::new());
@@ -1048,7 +1364,7 @@ fn cache_grants_from_discovery(
                 .find(|found| found.kind == *kind)
                 .map(|source| CacheGrant {
                     kind: *kind,
-                    path: source.path.clone(),
+                    path: Some(source.path.clone()),
                     mode: *mode,
                 })
         })
@@ -1118,7 +1434,9 @@ async fn setup_developer_caches(
         candidates.insert(cache.kind, cache.path);
     }
     for cache in existing {
-        candidates.insert(cache.kind, cache.path.clone());
+        if let Some(path) = cache.path.as_ref() {
+            candidates.insert(cache.kind, path.clone());
+        }
     }
 
     if candidates.is_empty() {
@@ -1169,7 +1487,7 @@ async fn setup_developer_caches(
         if let Some(mode) = prompt_cache_mode(&cache, existing_mode, color)? {
             grants.push(CacheGrant {
                 kind: cache.kind,
-                path: cache.path,
+                path: Some(cache.path),
                 mode,
             });
         }
@@ -1788,7 +2106,10 @@ async fn interactive_setup(
                 "      {:<18} {:<10} {}",
                 cache.kind.label(),
                 cache.mode.label(),
-                cache.path.display()
+                cache.path.as_ref().map_or_else(
+                    || "(discovered)".to_owned(),
+                    |path| path.display().to_string()
+                )
             );
         }
     }
@@ -2280,6 +2601,7 @@ fn save_config_locked(
     profile: Option<&str>,
     owner_changed: bool,
 ) -> Result<()> {
+    ensure_manageable_profile("profile saving")?;
     let previous = read_profile_config(profile)?;
     // Permit repair of any unusable selected key while preserving the atomic
     // commit point for the new immutable credential generation. Management
@@ -2522,16 +2844,93 @@ fn ensure_dotlink_config_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Canonical name of the config-file override.
+///
+/// An explicit file is used verbatim: naming a file means that file is read.
+/// `DOTLINK_PROFILE` then selects only the private state slot (credentials,
+/// OAuth grants), and `profiled_path` suffixes the *default* path alone.
+pub(crate) const CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG_FILE";
+/// Accepted for compatibility; superseded by [`CONFIG_FILE_ENV`].
+const LEGACY_CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG";
+
+/// Resolve the config-file override from both names.
+///
+/// The canonical name wins outright. The legacy alias is still honoured so an
+/// existing deployment keeps working, and the caller learns it is deprecated —
+/// a comment alone would leave it silently permanent.
+fn resolve_config_override(
+    canonical: Option<OsString>,
+    legacy: Option<OsString>,
+) -> (Option<PathBuf>, bool) {
+    // An empty variable is absent, not a path: systemd and shells both export
+    // empty strings easily, and an empty override would silently redirect the
+    // whole profile lookup.
+    let set = |value: Option<OsString>| value.filter(|path| !path.is_empty());
+    if let Some(path) = set(canonical) {
+        return (Some(PathBuf::from(path)), false);
+    }
+    match set(legacy) {
+        Some(path) => (Some(PathBuf::from(path)), true),
+        None => (None, false),
+    }
+}
+
+fn config_file_override() -> Option<PathBuf> {
+    let (path, used_legacy) = resolve_config_override(
+        env::var_os(CONFIG_FILE_ENV),
+        env::var_os(LEGACY_CONFIG_FILE_ENV),
+    );
+    if used_legacy {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "{LEGACY_CONFIG_FILE_ENV} is a deprecated alias for {CONFIG_FILE_ENV}; rename the environment variable"
+            );
+        });
+    }
+    path
+}
+
 fn config_parent_is_dotlink_owned() -> bool {
-    env::var_os("DOTLINK_CONFIG").is_none()
+    config_file_override().is_none()
 }
 
 fn config_path(profile: Option<&str>) -> Result<PathBuf> {
-    let base = match env::var_os("DOTLINK_CONFIG") {
-        Some(path) => PathBuf::from(path),
-        None => dotlink_config_dir()?.join("config.jsonc"),
+    resolve_config_path(config_file_override().as_deref(), profile)
+}
+
+/// An explicit file is used verbatim; only the default path is profiled.
+///
+/// A suffixed sibling next to an explicit file means the two readings disagree
+/// (before 0.16.1 the profile won), so refuse to guess instead of silently
+/// reading a different config than the one that was named.
+fn resolve_config_path(explicit: Option<&Path>, profile: Option<&str>) -> Result<PathBuf> {
+    let Some(base) = explicit else {
+        return profiled_path(&dotlink_config_dir()?.join("config.jsonc"), profile);
     };
-    profiled_path(&base, profile)
+    if let Some(profile) = profile {
+        let sibling = profiled_path(base, Some(profile))?;
+        if sibling.exists() {
+            bail!(
+                "both {} and {} exist; an explicit config file is read verbatim, so remove one of them",
+                base.display(),
+                sibling.display()
+            );
+        }
+    }
+    Ok(base.to_path_buf())
+}
+
+/// A profile dotlink owns lives under its private config directory. An explicit
+/// config file belongs to the operator, so management refuses rather than
+/// rewriting or deleting a deployment's active config.
+fn ensure_manageable_profile(action: &str) -> Result<()> {
+    if config_file_override().is_some() {
+        bail!(
+            "{action} is unavailable while an explicit config file is set ({CONFIG_FILE_ENV}); edit that file directly"
+        );
+    }
+    Ok(())
 }
 
 fn credential_path(profile: Option<&str>) -> Result<PathBuf> {
@@ -2553,7 +2952,7 @@ fn control_plane_paths(
         .to_path_buf();
 
     // Standard config lives entirely inside dotlink's private directory. A
-    // custom DOTLINK_CONFIG is protected file-by-file, while all Runtime keys
+    // a custom config-file override is protected file-by-file, while Runtime keys
     // remain under the owned XDG directory and can be protected as one unit.
     let mut protected = if protect_config_parent {
         vec![config_parent]
@@ -2727,6 +3126,7 @@ fn delete_profile_artifacts(name: &str, config: &Path, key: &Path) -> Result<()>
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
+    ensure_manageable_profile("profile deletion")?;
     let target = profile_target(name)?;
     let config = config_path(target)?;
     let key = credential_path(target)?;
@@ -3174,11 +3574,13 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
 
     let mut cache_kinds = std::collections::BTreeSet::new();
     for cache in &config.caches {
-        if !cache.path.is_absolute() {
+        if let Some(path) = cache.path.as_ref()
+            && !path.is_absolute()
+        {
             bail!(
                 "cache path for {} must be absolute: {}",
                 cache.kind.label(),
-                cache.path.display()
+                path.display()
             );
         }
         if !cache_kinds.insert(cache.kind) {
@@ -3366,6 +3768,8 @@ mod tests {
             oauth: OAuthConfig::default(),
             permissions: PermissionConfig::default(),
             caches: Vec::new(),
+            serialize: false,
+            logging: LoggingConfig::default(),
             tunnel_id: Some("tunnel_0123456789abcdef0123456789abcdef".to_owned()),
             runtime_api_key: "secret-runtime-key".to_owned(),
             runtime_key_revision: None,
@@ -3614,7 +4018,7 @@ mod tests {
             &detected,
         );
         assert_eq!(granted.len(), 1);
-        assert_eq!(granted[0].path, temp.path());
+        assert_eq!(granted[0].path.as_deref(), Some(temp.path()));
         assert_eq!(granted[0].mode, CacheMode::ReadOnly);
         let writable = cache_grants_from_discovery(
             &[(CacheKind::CargoRegistry, CacheMode::ReadWrite)],
@@ -3685,10 +4089,11 @@ mod tests {
         let home = home_dir().unwrap();
         let cargo = CacheGrant {
             kind: CacheKind::CargoRegistry,
-            path: home.join(".cargo/registry"),
+            path: Some(home.join(".cargo/registry")),
             mode: CacheMode::ReadOnly,
         };
-        let target = cargo.sandbox_path().unwrap();
+        let source = cargo.path.clone().unwrap();
+        let target = cargo.sandbox_path(&source).unwrap();
         assert_eq!(target, PathBuf::from("/tmp/home/.cargo/registry"));
         assert_eq!(
             cargo.shell_env(&target),
@@ -3697,10 +4102,11 @@ mod tests {
 
         let npm = CacheGrant {
             kind: CacheKind::Npm,
-            path: home.join(".npm"),
+            path: Some(home.join(".npm")),
             mode: CacheMode::ReadWrite,
         };
-        let target = npm.sandbox_path().unwrap();
+        let source = npm.path.clone().unwrap();
+        let target = npm.sandbox_path(&source).unwrap();
         assert_eq!(target, PathBuf::from("/tmp/home/.npm"));
         assert_eq!(
             npm.shell_env(&target),
@@ -3715,7 +4121,7 @@ mod tests {
         let mut config = example_config();
         config.caches = vec![CacheGrant {
             kind: CacheKind::Npm,
-            path: PathBuf::from(".npm"),
+            path: Some(PathBuf::from(".npm")),
             mode: CacheMode::ReadOnly,
         }];
         assert!(validate_config(&config).is_err());
@@ -3724,12 +4130,12 @@ mod tests {
         config.caches = vec![
             CacheGrant {
                 kind: CacheKind::Npm,
-                path: home.join(".npm"),
+                path: Some(home.join(".npm")),
                 mode: CacheMode::ReadOnly,
             },
             CacheGrant {
                 kind: CacheKind::Npm,
-                path: home.join(".npm-alt"),
+                path: Some(home.join(".npm-alt")),
                 mode: CacheMode::ReadWrite,
             },
         ];
@@ -4041,7 +4447,163 @@ mod tests {
     }
 
     #[test]
-    fn schema_v9_migrates_to_v10_with_additive_defaults() {
+    fn unknown_config_fields_are_rejected_not_ignored() {
+        // Raw `settings` relies on strictness rather than typed Nix options.
+        // Asserted at the serde layer: the wrapper's message is generic, while
+        // strictness itself lives in the derived Deserialize.
+        let error = serde_json::from_str::<AppConfig>(
+            r#"{ "version": 12, "permissions": { "allow_kvmm": true } }"#,
+        )
+        .map(|_| ())
+        .expect_err("unknown field must be rejected");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn cache_layers_keep_configured_paths_and_let_later_layers_win_the_mode() {
+        let saved = vec![
+            CacheGrant {
+                kind: CacheKind::Npm,
+                path: Some(PathBuf::from("/srv/npm")),
+                mode: CacheMode::ReadOnly,
+            },
+            CacheGrant {
+                kind: CacheKind::Uv,
+                path: None,
+                mode: CacheMode::ReadOnly,
+            },
+        ];
+
+        // A later layer changes the mode of an explicit grant without moving it.
+        let (grants, requests) = merge_cache_layers(
+            &saved,
+            &[(CacheKind::Npm, CacheMode::ReadWrite)],
+            &[(CacheKind::Uv, CacheMode::ReadWrite)],
+        );
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].path.as_deref(), Some(Path::new("/srv/npm")));
+        assert_eq!(grants[0].mode, CacheMode::ReadWrite);
+        // The path-less saved grant is a request, so the CLI layer replaced it.
+        assert_eq!(requests, vec![(CacheKind::Uv, CacheMode::ReadWrite)]);
+
+        // Nothing newer: saved values stand.
+        let (grants, requests) = merge_cache_layers(&saved, &[], &[]);
+        assert_eq!(grants[0].mode, CacheMode::ReadOnly);
+        assert_eq!(requests, vec![(CacheKind::Uv, CacheMode::ReadOnly)]);
+    }
+
+    #[test]
+    fn an_explicit_config_file_refuses_an_ambiguous_profiled_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("config.jsonc");
+        std::fs::write(&base, "{}").unwrap();
+        // Only the named file: verbatim, no guessing.
+        assert_eq!(
+            resolve_config_path(Some(&base), Some("work")).unwrap(),
+            base
+        );
+        // Both readings exist: refuse rather than silently pick one.
+        std::fs::write(dir.path().join("config.work.jsonc"), "{}").unwrap();
+        let error = resolve_config_path(Some(&base), Some("work")).unwrap_err();
+        assert!(error.to_string().contains("both"), "{error}");
+        assert!(error.to_string().contains("config.work.jsonc"), "{error}");
+        // No profile: the explicit file is the only reading.
+        assert_eq!(resolve_config_path(Some(&base), None).unwrap(), base);
+    }
+
+    #[test]
+    fn explicit_config_file_is_used_verbatim_not_profiled() {
+        // A named file stays the file that is read; the profile only selects the
+        // private state slot, so two services cannot share secrets by accident
+        // while still reading exactly the file the module staged for them.
+        let explicit = Path::new("/run/dotlink-work/config.jsonc");
+        assert_eq!(
+            resolve_config_path(Some(explicit), Some("work")).unwrap(),
+            explicit
+        );
+        let implicit = resolve_config_path(None, Some("work")).unwrap();
+        assert_eq!(
+            implicit.file_name().unwrap(),
+            std::ffi::OsStr::new("config.work.jsonc")
+        );
+    }
+
+    #[test]
+    fn cache_grant_may_omit_its_path() {
+        let config = parse_jsonc::<AppConfig>(
+            r#"{ "version": 12, "transports": { "openai": false }, "caches": [ { "kind": "cargo-registry", "mode": "read_write" } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(config.caches.len(), 1);
+        assert!(config.caches[0].path.is_none());
+        validate_config(&config).expect("a discovered cache path is valid");
+    }
+
+    #[test]
+    fn config_file_env_accepts_both_names() {
+        // The alias exists so a deployment that still sets DOTLINK_CONFIG keeps
+        // working; the canonical name is DOTLINK_CONFIG_FILE.
+        assert_eq!(CONFIG_FILE_ENV, "DOTLINK_CONFIG_FILE");
+        assert_eq!(LEGACY_CONFIG_FILE_ENV, "DOTLINK_CONFIG");
+
+        let canonical = OsString::from("/run/dotlink/config.jsonc");
+        let legacy = OsString::from("/etc/dotlink/config.jsonc");
+        // The canonical name wins when a deployment sets both, and only the
+        // legacy name is reported as deprecated.
+        assert_eq!(
+            resolve_config_override(Some(canonical.clone()), Some(legacy.clone())),
+            (Some(PathBuf::from(&canonical)), false)
+        );
+        assert_eq!(
+            resolve_config_override(None, Some(legacy.clone())),
+            (Some(PathBuf::from(&legacy)), true)
+        );
+        assert_eq!(resolve_config_override(None, None), (None, false));
+        // An empty value is absent, so a blank export cannot redirect the profile.
+        assert_eq!(
+            resolve_config_override(Some(OsString::new()), Some(legacy.clone())),
+            (Some(PathBuf::from(&legacy)), true)
+        );
+        assert_eq!(
+            resolve_config_override(Some(OsString::new()), None),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn env_override_parsers_reject_typos_and_default_to_read_only() {
+        assert_eq!(parse_env_flag("X", "1").unwrap(), Some(true));
+        assert_eq!(parse_env_flag("X", " off ").unwrap(), Some(false));
+        assert_eq!(parse_env_flag("X", "").unwrap(), None);
+        let error = parse_env_flag("X", "maybe").unwrap_err().to_string();
+        assert!(error.contains("boolean"), "{error}");
+
+        assert_eq!(
+            LogVerbosity::parse("requests"),
+            Some(LogVerbosity::Requests)
+        );
+        assert_eq!(LogVerbosity::parse(" tools "), Some(LogVerbosity::Tools));
+        assert_eq!(LogVerbosity::parse("debug"), None);
+        assert_eq!(LogVerbosity::Requests.as_verbose(), 2);
+
+        let requests = parse_cache_requests("cargo-registry:rw, go_mod, ccache:RO").unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                (CacheKind::CargoRegistry, CacheMode::ReadWrite),
+                (CacheKind::GoMod, CacheMode::ReadOnly),
+                (CacheKind::Ccache, CacheMode::ReadOnly),
+            ]
+        );
+        // A later entry for the same kind replaces the earlier one.
+        let deduped = parse_cache_requests("npm:rw,npm:ro").unwrap();
+        assert_eq!(deduped, vec![(CacheKind::Npm, CacheMode::ReadOnly)]);
+        assert!(parse_cache_requests("npm:bogus").is_err());
+        assert!(parse_cache_requests("not-a-cache").is_err());
+    }
+
+    #[test]
+    fn schema_v9_migrates_to_current_with_additive_defaults() {
         let v9 = r#"
         {
           "version": 9,
@@ -4059,15 +4621,14 @@ mod tests {
           }
         }
         "#;
-        let parsed = parse_jsonc::<AppConfig>(v9).unwrap();
-        assert_eq!(parsed.version, 9);
-        assert!(parsed.transports.ngrok_domain.is_none());
-        assert!(!parsed.oauth.enabled);
-        assert!(parsed.oauth.public_url.is_none());
-
-        let migrated = migrate_config(parsed).unwrap();
-        assert_eq!(migrated.version, 10);
+        // Decoded after migration, so a v9 profile still loads under strict
+        // field checking and keeps every conservative default.
+        let migrated = load_config(v9).unwrap();
+        assert_eq!(migrated.version, config_version());
         assert!(migrated.transports.stdio);
+        // v11 additive defaults keep a pre-v11 profile conservative.
+        assert!(!migrated.serialize);
+        assert_eq!(migrated.logging.verbosity, LogVerbosity::Lifecycle);
         assert!(migrated.transports.ngrok_domain.is_none());
         assert!(!migrated.oauth.enabled);
         assert_eq!(
@@ -4104,8 +4665,8 @@ mod tests {
         config.runtime_api_key.clear();
         config.oauth = OAuthConfig::default();
 
-        let mut migrated = migrate_config(config).unwrap();
-        assert_eq!(migrated.version, 10);
+        let migrated = load_config(&serialize_jsonc(&config).unwrap()).unwrap();
+        assert_eq!(migrated.version, config_version());
         let error = validate_config_structure(&migrated).unwrap_err();
         assert!(
             error
@@ -4115,24 +4676,27 @@ mod tests {
 
         // Profile management must still be able to move a migrated profile
         // back into a safe state before saving it as the current schema.
+        let mut migrated = migrated;
         apply_profile_bool(&mut migrated, ProfileBool::Http, false).unwrap();
         validate_config_structure(&migrated).unwrap();
     }
 
     #[test]
     fn unknown_older_and_newer_schemas_are_not_guessed() {
-        let mut config = example_config();
-        config.version = 8;
-        let error = migrate_config(config.clone()).err().unwrap();
-        assert!(error.to_string().contains("no automatic migration path"));
+        let too_old = load_config(r#"{ "version": 8 }"#).err().unwrap();
+        assert!(too_old.to_string().contains("no automatic migration path"));
 
-        config.version = 11;
-        let error = migrate_config(config).err().unwrap();
-        assert!(error.to_string().contains("newer schema version 11"));
+        let newer = load_config(r#"{ "version": 13 }"#).err().unwrap();
+        assert!(newer.to_string().contains("newer schema version 13"));
 
-        let missing =
-            parse_jsonc::<AppConfig>(r#"{ "transports": { "openai": false }, "permissions": {} }"#);
-        assert!(missing.is_err());
+        let missing = load_config(r#"{ "transports": { "openai": false }, "permissions": {} }"#);
+        assert!(missing.is_err(), "a missing version is never guessed");
+
+        let unknown = load_config(r#"{ "version": 12, "permissions": { "allow_kvmm": true } }"#);
+        assert!(
+            unknown.err().unwrap().to_string().contains("unknown field"),
+            "strict decoding still rejects a typo after migration"
+        );
     }
 
     #[test]

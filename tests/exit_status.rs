@@ -10,7 +10,7 @@ const EXIT_NOTCONFIGURED: i32 = 6;
 const SUPERVISOR_HINT: &str = "systemd leaves this service stopped";
 const UNCONFIGURED_HINT: &str = "systemd stops this unit cleanly";
 
-/// A command with no saved profile and no `DOTLINK_CONFIG`, so setup is pending.
+/// A command with no saved profile and no `DOTLINK_CONFIG_FILE`, so setup is pending.
 fn unconfigured(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dotlink"));
     command
@@ -19,7 +19,7 @@ fn unconfigured(home: &Path) -> Command {
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CACHE_HOME", home.join("cache"))
-        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_CONFIG_FILE")
         .env_remove("DOTLINK_SUPERVISOR")
         .env_remove("NOTIFY_SOCKET")
         .env_remove("DOTLINK_API_KEY")
@@ -36,7 +36,7 @@ fn dotlink(home: &Path, profile: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dotlink"));
     command
         .current_dir(home)
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_DATA_HOME", home.join("data"))
@@ -88,6 +88,84 @@ fn supervised_configuration_failures_explain_the_stopped_service() {
 }
 
 #[test]
+fn explicit_transport_and_serialization_choices_override_invalid_environment() {
+    let home = tempfile::tempdir().unwrap();
+    let config = r#"{"version":12,"transports":{"openai":false,"stdio":true},"permissions":{"default_allow":true},"serialize":true}"#;
+    for (variable, cli_choices) in [
+        ("DOTLINK_STDIO", ["--no-stdio", "--no-tunnel"]),
+        ("DOTLINK_STDIO", ["--stdio", "--no-tunnel"]),
+        ("DOTLINK_SERIALIZE", ["--no-serialize", "--no-tunnel"]),
+        ("DOTLINK_SERIALIZE", ["--serialize", "--no-tunnel"]),
+    ] {
+        // With an explicit CLI decision, the malformed lower-priority setting
+        // cannot interfere with the predictable post-configuration policy failure.
+        let (status, stderr) = exit(
+            dotlink(home.path(), config)
+                .args(["--no-default-allow"])
+                .args(cli_choices)
+                .env(variable, "bogus"),
+        );
+        assert_eq!(
+            status,
+            Some(EXIT_CONFIG),
+            "{variable} {cli_choices:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("no effective local capability remains"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("must be a boolean"), "{stderr}");
+
+        let (status, stderr) = exit(
+            dotlink(home.path(), config)
+                .arg("--no-default-allow")
+                .arg("--no-tunnel")
+                .env(variable, "bogus"),
+        );
+        assert_eq!(status, Some(EXIT_CONFIG), "{stderr}");
+        assert!(stderr.contains(variable), "{stderr}");
+        assert!(stderr.contains("must be a boolean"), "{stderr}");
+    }
+
+    // Explicitly overriding one setting must not hide errors in unrelated
+    // active settings.
+    let (_, stderr) = exit(
+        dotlink(home.path(), config)
+            .args(["--no-default-allow", "--no-stdio", "--no-tunnel"])
+            .env("DOTLINK_STDIO", "bogus")
+            .env("DOTLINK_SERIALIZE", "bogus"),
+    );
+    assert!(stderr.contains("DOTLINK_SERIALIZE"), "{stderr}");
+}
+
+#[test]
+fn dormant_openai_does_not_apply_invalid_environment_url() {
+    let home = tempfile::tempdir().unwrap();
+    let config = r#"{"version":12,"transports":{"openai":false,"stdio":true},"permissions":{"default_allow":true}}"#;
+    let (status, stderr) = exit(
+        dotlink(home.path(), config)
+            .args(["--no-default-allow"])
+            .env("DOTLINK_BASE_URL", "not-a-url"),
+    );
+    assert_eq!(status, Some(EXIT_CONFIG), "{stderr}");
+    assert!(
+        stderr.contains("no effective local capability remains"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("control-plane base URL"), "{stderr}");
+
+    let active = r#"{"version":12,"transports":{"openai":true,"stdio":true},"permissions":{"default_allow":true},"tunnel_id":"tunnel_0123456789abcdef0123456789abcdef"}"#;
+    // Even with a missing runtime key, a malformed active OpenAI override is
+    // caught rather than ignored.
+    let (_, stderr) = exit(
+        dotlink(home.path(), active)
+            .args(["--no-default-allow"])
+            .env("DOTLINK_BASE_URL", "not-a-url"),
+    );
+    assert!(stderr.contains("control-plane base URL"), "{stderr}");
+}
+
+#[test]
 fn unavailable_listeners_stay_restartable() {
     let home = tempfile::tempdir().unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -97,6 +175,115 @@ fn unavailable_listeners_stay_restartable() {
     assert_eq!(status, Some(1), "{stderr}");
     assert!(stderr.contains("failed to bind HTTP MCP server"));
     assert!(!stderr.contains(SUPERVISOR_HINT));
+}
+
+#[test]
+fn v12_rejects_misspelled_nested_oauth_authority() {
+    let home = tempfile::tempdir().unwrap();
+    let config =
+        r#"{"version":12,"transports":{"openai":false,"http":true},"oauth":{"enabld":true}}"#;
+    let (status, stderr) = exit(dotlink(home.path(), config).arg("--list-tools"));
+    assert_ne!(status, Some(0), "{stderr}");
+    assert!(stderr.contains("unknown field"), "{stderr}");
+    assert!(stderr.contains("enabld"), "{stderr}");
+}
+
+#[test]
+fn permission_environment_changes_tool_inspection_without_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let config =
+        r#"{"version":12,"transports":{"openai":false},"permissions":{"default_allow":true}}"#;
+    let baseline = dotlink(home.path(), config)
+        .arg("--list-tools")
+        .env_remove("DOTLINK_ALLOW_SHELL")
+        .output()
+        .unwrap();
+    assert!(baseline.status.success(), "{baseline:?}");
+    assert!(!String::from_utf8_lossy(&baseline.stdout).contains("• bash"));
+
+    let env = dotlink(home.path(), config)
+        .arg("--list-tools")
+        .env("DOTLINK_ALLOW_SHELL", "1")
+        .output()
+        .unwrap();
+    assert!(env.status.success(), "{env:?}");
+    assert!(String::from_utf8_lossy(&env.stdout).contains("• bash"));
+}
+
+#[test]
+fn explicit_color_and_verbosity_override_bad_lower_priority_env() {
+    let home = tempfile::tempdir().unwrap();
+    let config =
+        r#"{"version":12,"transports":{"openai":false},"permissions":{"default_allow":true}}"#;
+    for color in ["never", "auto"] {
+        let (status, stderr) = exit(
+            dotlink(home.path(), config)
+                .args(["--list-tools", "--color", color, "-v"])
+                .env("DOTLINK_COLOR", "bogus")
+                .env("DOTLINK_VERBOSITY", "bogus"),
+        );
+        assert_eq!(status, Some(0), "color={color} {stderr}");
+    }
+    let (status, stderr) = exit(
+        dotlink(home.path(), config)
+            .arg("--list-tools")
+            .env("DOTLINK_COLOR", "bogus"),
+    );
+    assert_eq!(status, Some(EXIT_CONFIG), "{stderr}");
+    assert!(stderr.contains("DOTLINK_COLOR"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_profile_selector_is_rejected_unless_cli_overrides_it() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+    let home = tempfile::tempdir().unwrap();
+    let config = r#"{"version":12,"transports":{"openai":false},"tunnel_id":"tunnel_0123456789abcdef0123456789abcdef"}"#;
+    let invalid = OsString::from_vec(vec![0xff, 0xfe]);
+    let (status, stderr) = exit(
+        dotlink(home.path(), config)
+            .arg("--print-id")
+            .env("DOTLINK_PROFILE", &invalid),
+    );
+    assert_eq!(status, Some(EXIT_CONFIG), "{stderr}");
+    assert!(stderr.contains("DOTLINK_PROFILE"), "{stderr}");
+    let overridden = dotlink(home.path(), config)
+        .args(["--print-id", "-p", "work"])
+        .env("DOTLINK_PROFILE", invalid)
+        .output()
+        .unwrap();
+    assert!(overridden.status.success(), "{overridden:?}");
+}
+
+#[test]
+fn environment_selected_named_profile_is_loaded_not_default() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("config/abird/dotlink");
+    std::fs::create_dir_all(&root).unwrap();
+    for (profile, id) in [
+        ("config.jsonc", "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        (
+            "config.work.jsonc",
+            "tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    ] {
+        std::fs::write(
+            root.join(profile),
+            format!(r#"{{"version":12,"transports":{{"openai":false}},"tunnel_id":"{id}"}}"#),
+        )
+        .unwrap();
+    }
+    let result = unconfigured(home.path())
+        .args(["--print-id"])
+        .env_remove("DOTLINK_CONFIG")
+        .env("DOTLINK_PROFILE", "work")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout).trim(),
+        "tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
 }
 
 #[test]

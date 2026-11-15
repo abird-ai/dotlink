@@ -2598,110 +2598,124 @@ impl rmcp::ServerHandler for LocalMachine {
         request: CallToolRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let name = request.name.to_string();
-        if crate::remote_start::has_metadata(&context.meta) {
-            let operation = aw_tools::OperationId::from_model_name(&name).ok_or_else(|| {
-                McpError::invalid_params("remote Start targets an unknown operation", None)
-            })?;
-            let class = match operation {
-                aw_tools::OperationId::Fs(tool)
-                    if tool.action() != aw_tools::filesystem::access::Action::Read =>
+        // The outer call owns progress for everything except shell, whose
+        // wait has its own deadline-aware sink. No handler can forget a heartbeat.
+        let heartbeat = (!is_shell_tool(&request.name))
+            .then(|| {
+                tools::ProgressHeartbeat::for_request(
+                    &context,
+                    self.config.log.clone(),
+                    request.name.to_string(),
+                )
+            })
+            .flatten();
+        tools::await_with_heartbeat(heartbeat, None, async {
+            let name = request.name.to_string();
+            if crate::remote_start::has_metadata(&context.meta) {
+                let operation = aw_tools::OperationId::from_model_name(&name).ok_or_else(|| {
+                    McpError::invalid_params("remote Start targets an unknown operation", None)
+                })?;
+                let class = match operation {
+                    aw_tools::OperationId::Fs(tool)
+                        if tool.action() != aw_tools::filesystem::access::Action::Read =>
+                    {
+                        crate::remote_start::StartClass::Submit
+                    }
+                    aw_tools::OperationId::Bash
+                    | aw_tools::OperationId::Pwsh
+                    | aw_tools::OperationId::Powershell
+                    | aw_tools::OperationId::Batch => crate::remote_start::StartClass::Submit,
+                    aw_tools::OperationId::JobsAck
+                    | aw_tools::OperationId::JobsSend
+                    | aw_tools::OperationId::JobsCancel => crate::remote_start::StartClass::Control,
+                    _ => {
+                        return Err(McpError::invalid_params(
+                            "remote Start is not valid for this operation",
+                            None,
+                        ));
+                    }
+                };
+                let arguments = Value::Object(request.arguments.clone().unwrap_or_default());
+                let control_ref = matches!(class, crate::remote_start::StartClass::Control)
+                    .then(|| arguments.get("ref").and_then(Value::as_str))
+                    .flatten();
+                let start = self
+                    .validate_remote_start(&context, operation, class, &arguments, control_ref)
+                    .map_err(|error| {
+                        McpError::invalid_params(format!("remote Start rejected: {error}"), None)
+                    })?
+                    .ok_or_else(|| {
+                        McpError::invalid_params("remote Start metadata disappeared", None)
+                    })?;
+                context.extensions.insert(start);
+            }
+            let result_budget = self.request_result_budget(&context);
+            // Building the router to read the schema is not free, so only do it when
+            // the detail line will actually be printed.
+            let detail = match self.config.log.activity_enabled() {
+                true => self.summarize_tool_call_arguments(&name, request.arguments.as_ref()),
+                false => String::new(),
+            };
+            let started = self.config.log.activity_start(&name, detail);
+
+            let shell_result = match self.handle_shell_call(&request, &context).await {
+                Ok(Some(response)) => Some(Ok(fit_call_tool_response_to_budget(
+                    &name,
+                    response,
+                    result_budget,
+                ))),
+                Ok(None) => None,
+                Err(error) => Some(Err(fit_mcp_error_to_budget(error, result_budget))),
+            };
+            if let Some(result) = shell_result {
+                self.config
+                    .log
+                    .activity_done(&name, started, tool_call_log_outcome(&result));
+                return result;
+            }
+
+            // Shared native filesystem calls and legacy/non-filesystem routes use
+            // the same outer product ordering policy. The shared CapabilitySet owns
+            // native authorization/path/mutation safety; --serialize remains an
+            // explicit product-wide ordering option.
+            let result = if Self::bypass_outer_operation_gate(&name) {
+                self.dispatch_tool_call(request, context, result_budget)
+                    .await
+            } else if self.serialize {
+                let _guard = self.operation_gate.write().await;
+                self.dispatch_tool_call(request, context, result_budget)
+                    .await
+            } else {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
-                    crate::remote_start::StartClass::Submit
+                    self.dispatch_tool_call(request, context, result_budget)
+                        .await
                 }
-                aw_tools::OperationId::Bash
-                | aw_tools::OperationId::Pwsh
-                | aw_tools::OperationId::Powershell
-                | aw_tools::OperationId::Batch => crate::remote_start::StartClass::Submit,
-                aw_tools::OperationId::JobsAck
-                | aw_tools::OperationId::JobsSend
-                | aw_tools::OperationId::JobsCancel => crate::remote_start::StartClass::Control,
-                _ => {
-                    return Err(McpError::invalid_params(
-                        "remote Start is not valid for this operation",
-                        None,
-                    ));
+                #[cfg(windows)]
+                {
+                    // Preserve the conservative Windows topology gate even though
+                    // the shared backend itself is handle-pinned and fail-closed.
+                    if Self::is_concurrent_read_tool(&name) {
+                        let _guard = self.operation_gate.read().await;
+                        self.dispatch_tool_call(request, context, result_budget)
+                            .await
+                    } else {
+                        let _guard = self.operation_gate.write().await;
+                        self.dispatch_tool_call(request, context, result_budget)
+                            .await
+                    }
                 }
             };
-            let arguments = Value::Object(request.arguments.clone().unwrap_or_default());
-            let control_ref = matches!(class, crate::remote_start::StartClass::Control)
-                .then(|| arguments.get("ref").and_then(Value::as_str))
-                .flatten();
-            let start = self
-                .validate_remote_start(&context, operation, class, &arguments, control_ref)
-                .map_err(|error| {
-                    McpError::invalid_params(format!("remote Start rejected: {error}"), None)
-                })?
-                .ok_or_else(|| {
-                    McpError::invalid_params("remote Start metadata disappeared", None)
-                })?;
-            context.extensions.insert(start);
-        }
-        let result_budget = self.request_result_budget(&context);
-        // Building the router to read the schema is not free, so only do it when
-        // the detail line will actually be printed.
-        let detail = match self.config.log.activity_enabled() {
-            true => self.summarize_tool_call_arguments(&name, request.arguments.as_ref()),
-            false => String::new(),
-        };
-        let started = self.config.log.activity_start(&name, detail);
 
-        let shell_result = match self.handle_shell_call(&request, &context).await {
-            Ok(Some(response)) => Some(Ok(fit_call_tool_response_to_budget(
-                &name,
-                response,
-                result_budget,
-            ))),
-            Ok(None) => None,
-            Err(error) => Some(Err(fit_mcp_error_to_budget(error, result_budget))),
-        };
-        if let Some(result) = shell_result {
+            let result = result
+                .map(|response| fit_call_tool_response_to_budget(&name, response, result_budget))
+                .map_err(|error| fit_mcp_error_to_budget(error, result_budget));
             self.config
                 .log
                 .activity_done(&name, started, tool_call_log_outcome(&result));
-            return result;
-        }
-
-        // Shared native filesystem calls and legacy/non-filesystem routes use
-        // the same outer product ordering policy. The shared CapabilitySet owns
-        // native authorization/path/mutation safety; --serialize remains an
-        // explicit product-wide ordering option.
-        let result = if Self::bypass_outer_operation_gate(&name) {
-            self.dispatch_tool_call(request, context, result_budget)
-                .await
-        } else if self.serialize {
-            let _guard = self.operation_gate.write().await;
-            self.dispatch_tool_call(request, context, result_budget)
-                .await
-        } else {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            {
-                self.dispatch_tool_call(request, context, result_budget)
-                    .await
-            }
-            #[cfg(windows)]
-            {
-                // Preserve the conservative Windows topology gate even though
-                // the shared backend itself is handle-pinned and fail-closed.
-                if Self::is_concurrent_read_tool(&name) {
-                    let _guard = self.operation_gate.read().await;
-                    self.dispatch_tool_call(request, context, result_budget)
-                        .await
-                } else {
-                    let _guard = self.operation_gate.write().await;
-                    self.dispatch_tool_call(request, context, result_budget)
-                        .await
-                }
-            }
-        };
-
-        let result = result
-            .map(|response| fit_call_tool_response_to_budget(&name, response, result_budget))
-            .map_err(|error| fit_mcp_error_to_budget(error, result_budget));
-        self.config
-            .log
-            .activity_done(&name, started, tool_call_log_outcome(&result));
-        result
+            result
+        })
+        .await
     }
 }
 

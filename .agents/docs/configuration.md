@@ -1,6 +1,6 @@
 # Configuration reference
 
-Current profile schema: **v10**. Compatible older schemas migrate forward automatically in memory through explicit version-to-version migrations; v9 → v10 is supported because the v10 additions are defaulted and preserve existing meaning. The profile is written as the current schema the next time it is edited or saved. Newer schemas, and older schemas without a defined migration path, are rejected rather than guessed.
+Current profile schema: **v12**. Explicit in-memory migrations support v9 → v10 → v11 → v12. Migrate raw JSON before strict unknown-field decoding; newer or unsupported older versions fail closed. The next successful profile save writes v12.
 
 ## Files
 
@@ -45,7 +45,11 @@ Cache and host remapping cannot bypass protected or denied roots; cache deny-wri
 
 Profiles are JSONC: comments and trailing commas are allowed. OpenAI Runtime keys are stored separately and never serialized into the profile. The optional `runtime_key_revision` and `owner_password_revision` fields are opaque selectors: setup stages immutable credential generations before atomically selecting them with the JSONC rename. A crash before selection keeps the previous key and owner password live; legacy profiles without selectors keep using `runtime[.<profile>].key` and the original OAuth owner hash. After a durable credential rotation, obsolete generations are pruned, retaining the active and immediately preceding secrets; unrelated profile edits do not retire credentials potentially in use by running processes. Failed cleanup warns but never turns an already-committed edit into an error. Legacy profiles continue to load unchanged. A missing, empty, oversized, special or unreadable selected Runtime key fails closed when OpenAI executes, but profile inspection/mutation remains usable and can atomically replace it. Interrupted profile deletion is retryable even when only orphaned generated keys remain. OAuth owner-password hashes, approved DCR clients, and hashed refresh grants are stored in the private OAuth state file rather than JSONC. On Unix dotlink-owned config/state directories are mode `0700` and private files are `0600`.
 
-`DOTLINK_CONFIG` overrides only the JSONC location. Runtime keys and OAuth state remain inside dotlink's owned Abird XDG namespaces.
+`DOTLINK_CONFIG_FILE` overrides only the JSONC location; legacy `DOTLINK_CONFIG` remains a deprecated alias and the canonical variable wins when both are set. Runtime keys and OAuth state remain inside dotlink's owned Abird XDG namespaces. An explicit config path is used verbatim and never silently switched to a profile-suffixed sibling.
+
+Runtime settings resolve in order: explicit CLI, supported `DOTLINK_*` environment, saved profile, then built-in defaults. `DOTLINK_PROFILE` selects the same private Job/credential/AW-bridge namespace as `--profile`; invalid selectors fail rather than silently falling back to default. `--color=auto` is an explicit override like `--color=never`. `--serialize` / `--no-serialize` and `--stdio` / `--no-stdio` each override lower-priority environment values before they are parsed, including malformed values. A malformed setting without an explicit override still fails closed. `--no-tunnel` disables the profile's OpenAI tunnel before Runtime credential selection and skips OpenAI-only environment URL, organization and credential overrides; combine with `--stdio` or `--http` to keep another transport active. A bogus or unreadable dormant key is not opened during such a run.
+
+OpenAI tunnel shell calls have a maximum 90-second synchronous hold, further narrowed by the caller's remaining response window and the delivery reserve; the command's independent execution timeout is never shortened. Authorized Job status/output long-polls also narrow their requested `wait_ms` under the trusted remaining window. Progress heartbeat notifications are sent only when the caller provides an MCP progress token, are limited to 10-second ticks and have bounded delivery, including when a non-shell tool blocks.
 
 Local HTTP and stdio **intentionally have no shared admission budget**: the model/client controls concurrency. The OpenAI tunnel has a separate in-flight bound, and tool-specific file/output/timeout bounds still apply. This is a deliberate operator choice and should not be re-raised as an architectural defect without a concrete separate bug.
 
@@ -87,7 +91,7 @@ For OpenAI Tunnel setup, either create/manage the tunnel yourself at <https://pl
 
 ```jsonc
 {
-  "version": 10,
+  "version": 12,
   "transports": {
     "openai": false,
     "stdio": false,
@@ -317,12 +321,12 @@ missing hardware fails clearly.
 
 ## Developer caches
 
-Autodiscovery covers Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build, Maven, Gradle, sccache, and ccache. It uses environment variables, known existing locations, and non-mutating local queries such as `npm config get cache`, `pip cache dir`, `uv cache dir`, and `go env`.
+Autodiscovery covers Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build, Maven, Gradle, sccache, ccache, and the abird tool cache (`$XDG_CACHE_HOME/abird`). It uses environment variables, known existing locations, and non-mutating local queries such as `npm config get cache`, `pip cache dir`, `uv cache dir`, and `go env`.
 
 Use `--allow-cache-cargo-registry[=ro|rw]`,
 `--allow-cache-cargo-git[=ro|rw]`, `--allow-cache-npm[=ro|rw]`, and analogous
 flags for `pnpm`, `yarn`, `pip`, `uv`, `go-mod`, `go-build`, `maven`, `gradle`,
-`sccache`, and `ccache`. Bare flags default to `ro`; `=rw` opts into writes.
+`sccache`, `ccache`, and `abird`. Bare flags default to `ro`; `=rw` opts into writes.
 Every explicit CLI flag uses the same detected source as onboarding; a
 requested cache whose directory does not exist is skipped with a warning
 rather than failing startup, so a service configured for a cache that has not

@@ -96,7 +96,7 @@ fn shell_commands_inherit_neither_supervisor_variables_nor_credentials() {
         Command::new(env!("CARGO_BIN_EXE_dotlink"))
             .args(["--stdio", "--allow-all", "--no-sandbox"])
             .current_dir(home.path())
-            .env("DOTLINK_CONFIG", &config)
+            .env("DOTLINK_CONFIG_FILE", &config)
             .env("XDG_CONFIG_HOME", home.path().join("config"))
             .env("XDG_STATE_HOME", home.path().join("state"))
             .env("DOTLINK_SUPERVISOR", "systemd")

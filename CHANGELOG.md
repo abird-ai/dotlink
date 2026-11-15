@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- New `abird` shell cache family (`--allow-cache-abird[=ro|rw]`, `DOTLINK_CACHES=abird:rw`): host `$XDG_CACHE_HOME/abird` is mounted at the sandbox's `$HOME/.cache/abird`, so abird model/artifact caches persist across sandboxed shell runs instead of landing in the ephemeral sandbox home. No cache environment variable is set because the sandbox `HOME` already resolves the path.
+
 ## [0.14.3] - 2026-10-31
 
 ### Changed

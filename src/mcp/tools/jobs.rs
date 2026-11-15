@@ -22,6 +22,21 @@ use crate::jobs::{
 const MAX_JOB_LIST_LIMIT: usize = 256;
 const MAX_WAIT_MS: u64 = 30_000;
 
+/// Host-verified transport response windows may only narrow a caller's wait.
+/// This never changes Process/Graph execution or the Job's retained identity.
+fn bounded_wait_ms(requested: u64, transport_remaining: Option<u64>) -> u64 {
+    transport_remaining.map_or(requested, |remaining| requested.min(remaining))
+}
+
+#[cfg(test)]
+#[test]
+fn wait_budget_only_narrows_by_authenticated_transport_remaining() {
+    assert_eq!(bounded_wait_ms(30_000, None), 30_000);
+    assert_eq!(bounded_wait_ms(30_000, Some(7_000)), 7_000);
+    assert_eq!(bounded_wait_ms(30_000, Some(0)), 0);
+    assert_eq!(bounded_wait_ms(0, Some(7_000)), 0);
+}
+
 pub(crate) fn canonicalize_graph_router(
     router: &mut rmcp::handler::server::router::tool::ToolRouter<LocalMachine>,
     capabilities: crate::mcp::Capabilities,
@@ -466,7 +481,11 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn jobs_get(&self, Parameters(args): Parameters<JobsGetArgs>) -> CallToolResult {
+    async fn jobs_get(
+        &self,
+        Parameters(args): Parameters<JobsGetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         let reference = match parse_ref(&args.reference) {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
@@ -475,6 +494,7 @@ impl LocalMachine {
         if wait_ms > MAX_WAIT_MS {
             return tool_error(format!("jobs_get wait_ms exceeds {MAX_WAIT_MS}"));
         }
+        let wait_ms = bounded_wait_ms(wait_ms, self.request_sync_budget_millis(&context));
         match self
             .jobs
             .standalone_get(&reference.id, reference.node, args.rev, wait_ms)
@@ -511,6 +531,10 @@ impl LocalMachine {
         let response_ceiling = self.request_result_budget(&context).unwrap_or(ceiling);
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
+        let wait_ms = bounded_wait_ms(
+            args.wait_ms.unwrap_or(0),
+            self.request_sync_budget_millis(&context),
+        );
         let is_graph = match self.jobs.standalone_is_graph(&reference.id) {
             Ok(value) => value,
             Err(error) => return tool_error(error),
@@ -532,7 +556,7 @@ impl LocalMachine {
                     ceiling,
                     response_ceiling,
                     base64,
-                    args.wait_ms.unwrap_or(0),
+                    wait_ms,
                 )
                 .await
             {
@@ -552,7 +576,7 @@ impl LocalMachine {
                     response_ceiling,
                     base64,
                 },
-                args.wait_ms.unwrap_or(0),
+                wait_ms,
             )
             .await
         {
