@@ -447,10 +447,6 @@ struct CacheFlags {
     /// Share discovered ccache cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
     allow_cache_ccache: Option<CacheMode>,
-
-    /// Share the discovered abird cache; bare flag means read-only, =rw enables writes.
-    #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_abird: Option<CacheMode>,
 }
 
 impl CacheFlags {
@@ -494,9 +490,6 @@ impl CacheFlags {
         }
         if let Some(mode) = self.allow_cache_ccache {
             selected.push((CacheKind::Ccache, mode));
-        }
-        if let Some(mode) = self.allow_cache_abird {
-            selected.push((CacheKind::Abird, mode));
         }
         selected
     }

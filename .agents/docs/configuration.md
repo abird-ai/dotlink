@@ -321,12 +321,12 @@ missing hardware fails clearly.
 
 ## Developer caches
 
-Autodiscovery covers Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build, Maven, Gradle, sccache, ccache, and the abird tool cache (`$XDG_CACHE_HOME/abird`). It uses environment variables, known existing locations, and non-mutating local queries such as `npm config get cache`, `pip cache dir`, `uv cache dir`, and `go env`.
+Autodiscovery covers Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build, Maven, Gradle, sccache, and ccache. It uses environment variables, known existing locations, and non-mutating local queries such as `npm config get cache`, `pip cache dir`, `uv cache dir`, and `go env`.
 
 Use `--allow-cache-cargo-registry[=ro|rw]`,
 `--allow-cache-cargo-git[=ro|rw]`, `--allow-cache-npm[=ro|rw]`, and analogous
 flags for `pnpm`, `yarn`, `pip`, `uv`, `go-mod`, `go-build`, `maven`, `gradle`,
-`sccache`, `ccache`, and `abird`. Bare flags default to `ro`; `=rw` opts into writes.
+`sccache`, and `ccache`. Bare flags default to `ro`; `=rw` opts into writes.
 Every explicit CLI flag uses the same detected source as onboarding; a
 requested cache whose directory does not exist is skipped with a warning
 rather than failing startup, so a service configured for a cache that has not

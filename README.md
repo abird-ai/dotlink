@@ -510,7 +510,7 @@ DEVELOPER CACHES (discovered paths; bare flag = ro, =rw enables writes)
 --allow-cache-uv[=ro|rw]               --allow-cache-go-mod[=ro|rw]
 --allow-cache-go-build[=ro|rw]         --allow-cache-maven[=ro|rw]
 --allow-cache-gradle[=ro|rw]           --allow-cache-sccache[=ro|rw]
---allow-cache-ccache[=ro|rw]           --allow-cache-abird[=ro|rw]
+--allow-cache-ccache[=ro|rw]
 
 OUTPUT & DIAGNOSTICS
 --list-tools                    show tools exposed by the effective policy
@@ -563,7 +563,7 @@ For agent-backed Git commit signing, configure `gpg.format=ssh`,
 `key::ssh-ed25519 AAAA...` (the public key text). A signing-key path
 under `~/.ssh` is not automatically mounted.
 
-All 14 cache families already supported by setup also have matching
+All 13 cache families already supported by setup also have matching
 `--allow-cache-<kind>[=ro|rw]` flags. Each finds the existing host cache
 using the same discovery rules as onboarding. Bare flags share **read-only**;
 `=rw` explicitly permits modifications to the host cache. An explicitly

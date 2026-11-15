@@ -243,7 +243,6 @@ pub enum CacheKind {
     Gradle,
     Sccache,
     Ccache,
-    Abird,
 }
 
 impl CacheKind {
@@ -264,13 +263,12 @@ impl CacheKind {
             "gradle" => Some(Self::Gradle),
             "sccache" => Some(Self::Sccache),
             "ccache" => Some(Self::Ccache),
-            "abird" => Some(Self::Abird),
             _ => None,
         }
     }
 
     #[cfg(test)]
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::CargoRegistry,
         Self::CargoGit,
         Self::Npm,
@@ -284,7 +282,6 @@ impl CacheKind {
         Self::Gradle,
         Self::Sccache,
         Self::Ccache,
-        Self::Abird,
     ];
 
     #[cfg(test)]
@@ -303,7 +300,6 @@ impl CacheKind {
             Self::Gradle => "gradle",
             Self::Sccache => "sccache",
             Self::Ccache => "ccache",
-            Self::Abird => "abird",
         }
     }
 
@@ -322,7 +318,6 @@ impl CacheKind {
             Self::Gradle => "Gradle",
             Self::Sccache => "sccache",
             Self::Ccache => "ccache",
-            Self::Abird => "abird",
         }
     }
 
@@ -341,7 +336,6 @@ impl CacheKind {
             Self::Gradle => "/tmp/home/.gradle/caches",
             Self::Sccache => "/tmp/home/.cache/sccache",
             Self::Ccache => "/tmp/home/.cache/ccache",
-            Self::Abird => "/tmp/home/.cache/abird",
         })
     }
 }
@@ -435,9 +429,7 @@ impl CacheGrant {
             }
             CacheKind::Sccache => Some(("SCCACHE_DIR".to_owned(), value)),
             CacheKind::Ccache => Some(("CCACHE_DIR".to_owned(), value)),
-            // Sandbox HOME is /tmp/home, so `$HOME/.cache/abird` already
-            // resolves to the mount; abird has no cache env override to set.
-            CacheKind::Abird | CacheKind::Maven => None,
+            CacheKind::Maven => None,
         }
     }
 }
@@ -1290,8 +1282,6 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
         .map(PathBuf::from)
         .unwrap_or_else(|| xdg_cache.join("ccache"));
     add_cache_candidate(&mut found, CacheKind::Ccache, ccache, &home);
-
-    add_cache_candidate(&mut found, CacheKind::Abird, xdg_cache.join("abird"), &home);
 
     found
         .into_iter()

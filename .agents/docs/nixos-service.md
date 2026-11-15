@@ -213,7 +213,7 @@ true. Git similarly maps only the user's existing `~/.gitconfig` and
 `$XDG_CONFIG_HOME/git/config`; `includeIf` targets and `.ssh` are not
 implicitly mounted. These config files may contain credentials—review before
 enabling. Each enabled `settings.caches` entry maps to a matching discovered
-`--allow-cache-<kind>=ro|rw` flag; all 14 known families are accepted.
+`--allow-cache-<kind>=ro|rw` flag; all 13 known families are accepted.
 
 ## KVM and GPU acceleration
 
