@@ -1521,15 +1521,11 @@ async fn prepare_runtime(
             let Some(source) = cache.path.as_ref() else {
                 continue;
             };
-            if !source.is_dir() {
-                continue;
-            }
             builtin.push(cache.resolve(source)?);
         }
         // Mounts are keyed by target and the last declaration wins, so a mount
         // can replace a builtin cache on the same target.
         mounts = setup::resolve_mounts(builtin, &setup.config.mounts, &env_mounts, &args.mounts);
-        setup::reject_nested_mount_targets(mounts.iter().map(|mount| mount.target.as_path()))?;
     } else if !setup.config.mounts.is_empty() || !env_mounts.is_empty() || !args.mounts.is_empty() {
         tracing::warn!(
             "shell mounts are inactive: enable the shell and keep the sandbox to mount them"
@@ -2469,6 +2465,64 @@ mod tests {
             before, after,
             "materializing dotlink's own lazy session root must not revoke an unchanged job session"
         );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nested_shell_mounts_are_rejected_where_they_are_prepared() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let child = root.join("child");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&child).unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let error = LocalMachine::prepare_with_job_root(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                mounts: vec![
+                    SandboxMount {
+                        source: child,
+                        target: PathBuf::from("/tmp/home/n/c"),
+                        writable: false,
+                        env: Vec::new(),
+                    },
+                    SandboxMount {
+                        source: parent,
+                        target: PathBuf::from("/tmp/home/n"),
+                        writable: false,
+                        env: Vec::new(),
+                    },
+                ],
+                host_shell: host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                sync_hold: None,
+                job_retention_secs: 60,
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            manager.protected_path(),
+        )
+        .await
+        .expect_err("nested shell mounts must fail closed");
+        assert!(error.to_string().contains("must not nest"), "{error}");
         manager.shutdown().await.unwrap();
     }
 

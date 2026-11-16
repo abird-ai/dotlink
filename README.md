@@ -513,8 +513,8 @@ DEVELOPER CACHES (discovered paths; bare flag = ro, =rw enables writes)
 --allow-cache-ccache[=ro|rw]
 
 SHELL MOUNTS (sandbox-only; mode defaults to ro, :rw enables writes)
---mount SOURCE:TARGET[:ro|rw]   repeatable; last mount wins per target, and a
-                                mount may replace a builtin cache on that target
+--mount SOURCE:TARGET[:ro|rw]           repeatable; last mount wins per target,
+                                         and may replace a builtin cache on it
 
 OUTPUT & DIAGNOSTICS
 --list-tools                    show tools exposed by the effective policy

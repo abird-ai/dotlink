@@ -378,9 +378,9 @@ directory that appears inside the sandboxed shell at an absolute target.
 `--mount SOURCE:TARGET[:ro|rw]` (repeatable; `ro` is the default) and
 `DOTLINK_MOUNTS=SOURCE:TARGET[:ro|rw],...` declare the same thing per run;
 `DOTLINK_MOUNTS` is how a NixOS service declares mounts without a profile
-edit. The one-line forms cannot carry `env`, and `SOURCE`/`TARGET` may not
-contain the `,` or `:` separators those forms use — use the profile list for
-paths that do.
+edit. The one-line forms cannot carry `env`; `DOTLINK_MOUNTS` splits entries
+on `,` and both one-line forms split fields on `:`, so a path containing those
+characters needs the profile list.
 
 **Mounts are keyed by target and the last declaration wins**, in this order:
 builtin developer caches, profile `mounts`, `DOTLINK_MOUNTS`, `--mount`. So a
@@ -392,8 +392,10 @@ cache target), and a later layer replaces the earlier mount's source, mode
 `source` must be an absolute host directory and `target` an absolute sandbox
 path below `/tmp/home`. Targets must not nest: binding a parent would hide a
 child (or need a mountpoint that only exists on the host), so
-`/tmp/home/.cache` together with `/tmp/home/.cache/abird` is rejected — use a
-filesystem grant for the parent instead. A missing source is skipped with a
-warning, deny rules apply exactly as for caches, and mounts are shell-only:
-they never expand MCP read/write roots. Mounts configured while the shell or
-sandbox is disabled are inert and reported once at startup.
+`/tmp/home/.cache` together with `/tmp/home/.cache/abird` is rejected, and so
+is binding a parent over a cache target. To share a whole tree, remove or
+override the cache entries that own the nested targets — mounts cannot unmount
+a builtin cache. A missing source is skipped with a warning, deny rules apply
+exactly as for caches, and mounts are shell-only: they never expand MCP
+read/write roots. Mounts configured while the shell or sandbox is disabled are
+inert and reported once at startup.

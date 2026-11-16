@@ -474,7 +474,9 @@ impl std::str::FromStr for MountGrant {
             .split_once(':')
             .ok_or_else(|| anyhow!("mount {spec:?} must be SOURCE:TARGET[:ro|rw]"))?;
         if target.contains(':') {
-            bail!("mount {spec:?}: a target containing ':' is not supported in a mount spec");
+            bail!(
+                "mount {spec:?}: the one-line form splits on ':', so paths containing ':' need the profile `mounts` list"
+            );
         }
         let grant = Self {
             source: PathBuf::from(source),
@@ -1500,7 +1502,7 @@ pub fn reject_nested_mount_targets<'a>(targets: impl IntoIterator<Item = &'a Pat
             }
             if target.starts_with(other) || other.starts_with(target) {
                 bail!(
-                    "mount targets must not nest: {} and {}; declare one target, or use a filesystem grant for the parent",
+                    "mount targets must not nest: {} and {}; mount one target per tree, or remove the cache entry that owns the other target",
                     target.display(),
                     other.display()
                 );
@@ -4359,6 +4361,16 @@ mod tests {
             Path::new("/tmp/home/.cargo/git"),
         ])
         .unwrap();
+    }
+
+    #[test]
+    fn mount_spec_rejects_extra_colons_with_a_spec_form_hint() {
+        let error = "/srv/a:b:/tmp/home/x"
+            .parse::<MountGrant>()
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("profile `mounts` list"), "{error}");
     }
 
     #[test]

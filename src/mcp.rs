@@ -1851,7 +1851,7 @@ impl LocalMachine {
                 && !access.overlaps_deny_write(&target);
             if !mount_targets.insert(target.clone()) {
                 bail!(
-                    "internal error: duplicate mount sandbox target: {}",
+                    "mount target {} is declared more than once after resolution",
                     target.display()
                 );
             }
@@ -1868,6 +1868,11 @@ impl LocalMachine {
                 pinned,
             });
         }
+        // Enforce one layout per tree here, where the mounts are actually
+        // bound, so no caller can reintroduce order-dependent nesting.
+        crate::setup::reject_nested_mount_targets(
+            prepared_mounts.iter().map(|mount| mount.target.as_path()),
+        )?;
 
         #[cfg(target_os = "linux")]
         if args.allow_shell && args.sandbox_shell {
