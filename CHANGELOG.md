@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-11-16
+
 ### Changed
 
 - Nested shell mount targets are rejected (`mount targets must not nest`). A profile whose caches resolve to nested targets (for example `cargo-registry` at `~/.cargo` plus `cargo-git` at `~/.cargo/git`) used to start with bind-order-dependent shadowing and now fails closed as an operator configuration error: at load time for its `mounts` and cache entries with an explicit path, and when the runtime prepares a discovered cache. The error names the configuration entries that own the clashing targets. Mount declaration mistakes are `CONFIG` exits, never restart loops.
@@ -716,7 +718,8 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.2...HEAD
+[0.17.2]: https://github.com/abird-ai/dotlink/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/abird-ai/dotlink/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/abird-ai/dotlink/compare/v0.16.7...v0.17.0
 [0.16.7]: https://github.com/abird-ai/dotlink/compare/v0.16.6...v0.16.7
