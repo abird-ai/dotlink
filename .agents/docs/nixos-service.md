@@ -217,8 +217,10 @@ profile edit through the service environment:
 — comma-separated `SOURCE:TARGET[:ro|rw]` entries, keyed by target with the
 last declaration winning, so an entry there replaces a builtin cache on that
 target. `env` wiring needs the profile `mounts` list, which the one-line form
-cannot carry. Mounts are inert while the shell sandbox is disabled and are
-reported once at startup.
+cannot carry. A declared mount is required: a missing source, a deny rule, a
+protected path or a fixed host-integration target fails the start as a
+configuration error instead of being skipped. Mounts are inert while the shell
+sandbox is disabled and are reported once at startup.
 
 ## KVM and GPU acceleration
 

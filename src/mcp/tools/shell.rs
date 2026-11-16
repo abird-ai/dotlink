@@ -5222,36 +5222,42 @@ mod tests {
                     target: PathBuf::from("/tmp/home/.cache/read-denied"),
                     writable: true,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
                 SandboxMount {
                     source: read_cache_ancestor,
                     target: PathBuf::from("/tmp/home/.cache/read-ancestor"),
                     writable: true,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
                 SandboxMount {
                     source: read_cache_descendant,
                     target: PathBuf::from("/tmp/home/.cache/read-descendant"),
                     writable: true,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
                 SandboxMount {
                     source: denied_write,
                     target: PathBuf::from("/tmp/home/.cache/write-denied"),
                     writable: true,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
                 SandboxMount {
                     source: write_cache_ancestor,
                     target: PathBuf::from("/tmp/home/.cache/write-ancestor"),
                     writable: true,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
                 SandboxMount {
                     source: write_cache_descendant,
                     target: PathBuf::from("/tmp/home/.cache/write-descendant"),
                     writable: true,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
             ],
             #[cfg(target_os = "linux")]
@@ -5320,6 +5326,7 @@ mod tests {
                 target: PathBuf::from("/tmp/home/.cache/remapped"),
                 writable: false,
                 env: Vec::new(),
+                origin: crate::mounts::MountOrigin::Discovered,
             }],
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
@@ -5371,6 +5378,7 @@ mod tests {
                 target: PathBuf::from("/tmp/home/.cargo/registry"),
                 writable: true,
                 env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
+                origin: crate::mounts::MountOrigin::Discovered,
             }],
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
@@ -5429,6 +5437,7 @@ mod tests {
                 target: PathBuf::from("/tmp/home/.cache/test"),
                 writable: true,
                 env: Vec::new(),
+                origin: crate::mounts::MountOrigin::Discovered,
             }],
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -5565,6 +5574,84 @@ mod tests {
             window[0] == OsStr::new("--setenv")
                 && window[1] == OsStr::new("CARGO_HOME")
                 && window[2] == OsStr::new("/tmp/home/.cargo")
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_explicit_mount_is_bound_with_its_env() {
+        use std::ffi::OsStr;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let cache = root.join("abird-cache");
+        std::fs::create_dir(&cache).unwrap();
+
+        let machine = LocalMachine {
+            config: RuntimeConfig {
+                access: AccessPolicy::from_spec(AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                })
+                .unwrap(),
+                mounts: vec![PreparedMount::for_test_with_env(
+                    cache.clone(),
+                    PathBuf::from("/tmp/home/.cache/abird"),
+                    true,
+                    vec![(
+                        "ABIRD_CACHE_DIR".to_owned(),
+                        "/tmp/home/.cache/abird".to_owned(),
+                    )],
+                )],
+                #[cfg(target_os = "linux")]
+                host_shell: crate::host_services::HostShell::default(),
+                log: LogConfig::default(),
+                allow_shell: true,
+                sandbox_shell: true,
+                allow_network: false,
+                max_shell_timeout_secs: 5,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                sync_hold: None,
+                protected_paths: Vec::new(),
+            },
+            launchers: PreparedLaunchers::for_test(
+                Some(PathBuf::from("/bin/bash")),
+                Some(PathBuf::from("/bin/bwrap")),
+            ),
+            jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
+                crate::limits::DEFAULT_JOB_RETENTION_SECS,
+            ))
+            .unwrap(),
+            operation_gate: Arc::new(RwLock::new(())),
+            transport_context_token: TransportContextToken::from("test-transport-context"),
+            router: std::sync::OnceLock::new(),
+            serialize: false,
+            #[cfg(target_os = "linux")]
+            secure_fs: Arc::new(
+                crate::secure_fs::SecureFs::new(std::slice::from_ref(&root), &[]).unwrap(),
+            ),
+        };
+
+        let command = machine
+            .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
+            .unwrap();
+        let args: Vec<_> = command.as_std().get_args().collect();
+
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--bind-fd")
+                && window[2] == OsStr::new("/tmp/home/.cache/abird")
+        }));
+        assert!(args.windows(3).any(|window| {
+            window[0] == OsStr::new("--setenv")
+                && window[1] == OsStr::new("ABIRD_CACHE_DIR")
+                && window[2] == OsStr::new("/tmp/home/.cache/abird")
         }));
     }
 
@@ -5898,12 +5985,14 @@ mod tests {
                     target: PathBuf::from("/tmp/home/.cargo/registry"),
                     writable: false,
                     env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
                 SandboxMount {
                     source: read_write.clone(),
                     target: PathBuf::from("/tmp/home/.cargo/git"),
                     writable: true,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
                 },
             ],
             #[cfg(target_os = "linux")]

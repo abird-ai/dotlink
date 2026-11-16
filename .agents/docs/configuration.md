@@ -283,9 +283,10 @@ The environment layer covers every setting the NixOS module can express, so a de
 - `DOTLINK_ALLOW_NIX_DAEMON`, `DOTLINK_ALLOW_NIX_CONFIG`, `DOTLINK_ALLOW_SSH_AGENT`, `DOTLINK_ALLOW_GIT_CONFIG`, `DOTLINK_ALLOW_KVM` — boolean
 - `DOTLINK_ALLOW_GPU` — `amd,nvidia`
 - `DOTLINK_CACHES` — `cargo-registry:rw,go-mod:ro`
+- `DOTLINK_MOUNTS` — `/srv/cache:/tmp/home/.cache/srv:rw,...`
 - `DOTLINK_COLOR` — `auto`, `always` or `never` (used when no `--color` is given)
 
-Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` is parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell.
+Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES`, `DOTLINK_MOUNTS` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` and `DOTLINK_MOUNTS` are parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell.
 
 A profile is a named slot; its default config file is `config.jsonc` or `config.<profile>.jsonc`. `settings` and `configFile` author the config file, while `profile` selects the private state slot (saved keys, OAuth grants). An explicit config file is read verbatim — the profile then only suffixes the *default* path. If a suffixed sibling exists beside the explicit file, loading fails and names both, instead of silently reading one of them.
 
@@ -385,9 +386,11 @@ characters needs the profile list.
 **Mounts are keyed by target and the last declaration wins**, in this order:
 builtin developer caches, profile `mounts`, `DOTLINK_MOUNTS`, `--mount`. So a
 mount can repoint a cache at the same sandbox target
-(`--mount /srv/abird:/tmp/home/.cache/abird:rw` overrides the `abird`-style
-cache target), and a later layer replaces the earlier mount's source, mode
-*and* `env` wholesale.
+(`--mount /srv/npm:/tmp/home/.npm:rw` repoints the discovered npm cache), and a
+later layer replaces the earlier mount's source, mode *and* `env` wholesale.
+That also makes the `--allow-cache-*`/`DOTLINK_CACHES` request a bottom-layer
+default: a mount on the same target wins, which is the one place the general
+CLI-over-environment-over-profile order does not apply.
 
 `source` must be an absolute host directory and `target` an absolute sandbox
 path below `/tmp/home`. Targets must not nest: binding a parent would hide a
@@ -395,7 +398,17 @@ child (or need a mountpoint that only exists on the host), so
 `/tmp/home/.cache` together with `/tmp/home/.cache/abird` is rejected, and so
 is binding a parent over a cache target. To share a whole tree, remove or
 override the cache entries that own the nested targets — mounts cannot unmount
-a builtin cache. A missing source is skipped with a warning, deny rules apply
-exactly as for caches, and mounts are shell-only: they never expand MCP
-read/write roots. Mounts configured while the shell or sandbox is disabled are
-inert and reported once at startup.
+a builtin cache. Fixed host-integration targets (the Git/Nix config files,
+device nodes) are conflict-checked: a mount that collides with one is rejected
+instead of being silently shadowed.
+
+A mount's `env` may not repoint what the sandbox owns (`HOME`, `PATH`,
+`TMPDIR`, `USER`, `LANG`, `LC_ALL`, `TERM`) and may not disagree with another
+mount or a host-integration variable; setting the same value twice is allowed.
+
+A declared mount is required: a missing source, a deny rule, a protected path
+or a host-integration conflict fails closed as a configuration error. Only a
+discovered cache is skipped with a warning, because cache directories come and
+go with the user's activity. Deny rules apply exactly as for caches, and mounts
+are shell-only: they never expand MCP read/write roots. Mounts configured while
+the shell or sandbox is disabled are inert and reported once at startup.

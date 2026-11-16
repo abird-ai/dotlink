@@ -19,6 +19,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crate::mounts::SandboxMount;
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::{
     ErrorData as McpError,
@@ -82,25 +83,13 @@ pub struct MachineConfig {
     pub protected_paths: Vec<PathBuf>,
 }
 
-/// One shell-only remapping into the sandbox: host `source` appears at
-/// `target`, read-only or read+write, with the environment that points a tool
-/// family at it. A developer cache is one of these with a predefined
-/// source/target/env derived from its kind; nothing below this struct knows
-/// about caches.
-#[derive(Clone, Debug)]
-pub struct SandboxMount {
-    pub source: PathBuf,
-    pub target: PathBuf,
-    pub writable: bool,
-    pub env: Vec<(String, String)>,
-}
-
 #[derive(Clone, Debug)]
 struct PreparedMount {
     source: PathBuf,
     target: PathBuf,
     writable: bool,
     env: Vec<(String, String)>,
+    origin: crate::mounts::MountOrigin,
     #[cfg(target_os = "linux")]
     pinned: Arc<std::fs::File>,
 }
@@ -162,6 +151,7 @@ impl PreparedMount {
             target,
             writable,
             env,
+            origin: crate::mounts::MountOrigin::Discovered,
             pinned,
         }
     }
@@ -1805,56 +1795,84 @@ impl LocalMachine {
         let mut prepared_mounts = Vec::with_capacity(args.mounts.len());
         let mut mount_targets = BTreeSet::new();
         for mount in args.mounts {
-            if !mount.target.has_root()
-                || !mount.target.starts_with("/tmp/home")
-                || mount
-                    .target
-                    .components()
-                    .any(|component| component == Component::ParentDir)
-            {
-                bail!(
-                    "internal error: mount sandbox target must stay below /tmp/home: {}",
-                    mount.target.display()
-                );
-            }
+            crate::mounts::validate_target(&mount.target)?;
             let target = lexical_normalize(&mount.target);
             let source = match fs::canonicalize(&mount.source).await {
                 Ok(source) => source,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if mount.origin.is_declared() {
+                        return Err(crate::recovery::operator(anyhow!(
+                            "declared mount {} has no source directory",
+                            mount.label()
+                        )));
+                    }
                     tracing::warn!(
-                        "skipping mount {}: source {} does not exist",
-                        mount.target.display(),
-                        mount.source.display()
+                        "skipping cache mount {}: source does not exist",
+                        mount.label()
                     );
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
             if !fs::metadata(&source).await?.is_dir() {
+                if mount.origin.is_declared() {
+                    return Err(crate::recovery::operator(anyhow!(
+                        "declared mount {} is not a directory",
+                        mount.label()
+                    )));
+                }
                 tracing::warn!(
-                    "skipping mount {}: source {} is not a directory",
-                    mount.target.display(),
-                    mount.source.display()
+                    "skipping cache mount {}: source is not a directory",
+                    mount.label()
                 );
                 continue;
             }
-            if access.overlaps_deny_read(&source)
+            let denied = access.overlaps_deny_read(&source)
                 || access.overlaps_deny_read(&target)
                 || protected_paths.iter().any(|protected| {
                     paths_overlap(&source, protected) || paths_overlap(&target, protected)
-                })
-            {
+                });
+            if denied {
+                if mount.origin.is_declared() {
+                    return Err(crate::recovery::operator(anyhow!(
+                        "declared mount {} is disabled by a deny-read rule or a protected path",
+                        mount.label()
+                    )));
+                }
+                tracing::debug!(
+                    "skipping cache mount {}: deny-read rule or protected path",
+                    mount.label()
+                );
                 continue;
             }
             let writable = mount.writable
                 && !access.overlaps_deny_write(&source)
                 && !access.overlaps_deny_write(&target);
+            if mount.writable && !writable {
+                if mount.origin.is_declared() {
+                    tracing::warn!(
+                        "mount {} requested read+write but a deny-write rule makes it read-only",
+                        mount.label()
+                    );
+                } else {
+                    tracing::debug!(
+                        "cache mount {} downgraded to read-only by a deny-write rule",
+                        mount.label()
+                    );
+                }
+            }
             if !mount_targets.insert(target.clone()) {
-                bail!(
+                return Err(crate::recovery::operator(anyhow!(
                     "mount target {} is declared more than once after resolution",
                     target.display()
-                );
+                )));
             }
+            tracing::debug!(
+                "mount {} <- {} ({})",
+                target.display(),
+                source.display(),
+                if writable { "rw" } else { "ro" }
+            );
             #[cfg(target_os = "linux")]
             let pinned = Arc::new(crate::secure_fs::SecureFs::open_canonical_directory(
                 &source,
@@ -1864,15 +1882,42 @@ impl LocalMachine {
                 target,
                 writable,
                 env: mount.env,
+                origin: mount.origin,
                 #[cfg(target_os = "linux")]
                 pinned,
             });
         }
         // Enforce one layout per tree here, where the mounts are actually
         // bound, so no caller can reintroduce order-dependent nesting.
-        crate::setup::reject_nested_mount_targets(
+        crate::mounts::reject_nested_targets(
             prepared_mounts.iter().map(|mount| mount.target.as_path()),
         )?;
+        #[cfg(target_os = "linux")]
+        {
+            let host_targets = args
+                .host_shell
+                .mounts
+                .iter()
+                .map(|mount| mount.target.clone())
+                .collect::<Vec<_>>();
+            let host_env = args
+                .host_shell
+                .environment
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            let mounts = prepared_mounts
+                .iter()
+                .map(|prepared| crate::mounts::SandboxMount {
+                    source: prepared.source.clone(),
+                    target: prepared.target.clone(),
+                    writable: prepared.writable,
+                    env: prepared.env.clone(),
+                    origin: prepared.origin,
+                })
+                .collect::<Vec<_>>();
+            crate::mounts::reject_host_conflicts(&mounts, &host_targets, &host_env)?;
+        }
 
         #[cfg(target_os = "linux")]
         if args.allow_shell && args.sandbox_shell {

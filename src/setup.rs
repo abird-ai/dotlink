@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
     net::SocketAddr,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     credentials,
-    mcp::SandboxMount,
+    mounts::{self, MountOrigin, SandboxMount, sandbox_join, sandbox_parent, validate_target},
     oauth::{self, OAuthConfig},
 };
 
@@ -419,6 +419,7 @@ impl MountGrant {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
+            origin: MountOrigin::Declared,
         }
     }
 
@@ -430,19 +431,7 @@ impl MountGrant {
                 self.source.display()
             );
         }
-        if !self.target.has_root()
-            || !self.target.starts_with("/tmp/home")
-            || self.target == Path::new("/tmp/home")
-            || self
-                .target
-                .components()
-                .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-        {
-            bail!(
-                "target must be an absolute sandbox path below /tmp/home: {}",
-                self.target.display()
-            );
-        }
+        validate_target(&self.target)?;
         for (name, value) in &self.env {
             let mut chars = name.chars();
             let identifier = matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
@@ -489,29 +478,6 @@ impl std::str::FromStr for MountGrant {
     }
 }
 
-/// Cache mounts live inside the Linux sandbox home, a POSIX path, whatever host
-/// build produced them. Joining with the host separator would yield
-/// `/tmp/home\.cargo` on Windows and stop matching the sandbox rule that keeps
-/// every cache target below `/tmp/home`.
-fn sandbox_join(relative: &Path) -> PathBuf {
-    let mut value = String::from("/tmp/home");
-    for component in relative.components() {
-        value.push('/');
-        value.push_str(&component.as_os_str().to_string_lossy());
-    }
-    PathBuf::from(value)
-}
-
-/// Parent of a sandbox path, spelled with the same POSIX separator so
-/// `CARGO_HOME` and `GRADLE_USER_HOME` stay inside the sandbox home.
-fn sandbox_parent(sandbox_path: &Path) -> String {
-    let value = sandbox_path.to_string_lossy();
-    match value.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => parent.to_owned(),
-        _ => value.to_string(),
-    }
-}
-
 impl CacheGrant {
     /// Resolve the predefined, wired sandbox mount this cache describes: the
     /// kind supplies the target below the sandbox home and the tool's cache
@@ -523,6 +489,7 @@ impl CacheGrant {
             target: target.clone(),
             writable: self.mode.writable(),
             env: self.shell_env(&target).into_iter().collect(),
+            origin: MountOrigin::Discovered,
         })
     }
 
@@ -1463,53 +1430,41 @@ fn parse_mount_list(raw: &str) -> Result<Vec<MountGrant>> {
 
 /// Resolve mount layers over the builtin mounts.
 ///
-/// Mounts are keyed by target and the last declaration wins: profile, then
-/// `DOTLINK_MOUNTS`, then `--mount`. Builtins (developer caches) come first, so
-/// a mount that names the same target replaces that cache. A first-seen target
-/// keeps its position, so the assembled list stays deterministic.
+/// Resolve the declared mount layers over the builtin cache mounts.
+///
+/// The slice order is the precedence order, so callers write the policy once
+/// and adding a layer is one line. Everything else (keyed last-wins, nesting
+/// and environment checks) lives in [`mounts::merge_layers`].
 pub fn resolve_mounts(
     builtin: Vec<SandboxMount>,
-    saved: &[MountGrant],
-    environment: &[MountGrant],
-    cli: &[MountGrant],
-) -> Vec<SandboxMount> {
-    let mut mounts = builtin;
-    for grant in saved.iter().chain(environment).chain(cli) {
-        let mount = grant.resolve();
-        match mounts
-            .iter_mut()
-            .find(|existing| existing.target == mount.target)
-        {
-            Some(existing) => *existing = mount,
-            None => mounts.push(mount),
-        }
-    }
-    mounts
+    layers: &[(&'static str, &[MountGrant])],
+) -> Result<Vec<SandboxMount>> {
+    let resolved = layers
+        .iter()
+        .map(|(name, grants)| mounts::MountLayer {
+            name,
+            mounts: grants.iter().map(MountGrant::resolve).collect(),
+        })
+        .collect::<Vec<_>>();
+    mounts::merge_layers(builtin, &resolved)
 }
 
-/// Reject mount targets that contain one another.
-///
-/// Nested targets are order-dependent in a bind namespace: binding a parent
-/// after a child silently hides the child, and binding it before needs a
-/// mountpoint inside the parent that only exists on the host. Fail closed
-/// instead, so one mount list means one layout whatever the order.
-pub fn reject_nested_mount_targets<'a>(targets: impl IntoIterator<Item = &'a Path>) -> Result<()> {
-    let targets = targets.into_iter().collect::<Vec<_>>();
-    for (index, target) in targets.iter().enumerate() {
-        for other in &targets[index + 1..] {
-            if target == other {
-                continue;
-            }
-            if target.starts_with(other) || other.starts_with(target) {
-                bail!(
-                    "mount targets must not nest: {} and {}; mount one target per tree, or remove the cache entry that owns the other target",
-                    target.display(),
-                    other.display()
-                );
-            }
+/// Every sandbox target a saved profile would mount, for early layout checks.
+pub fn declared_sandbox_targets(config: &AppConfig) -> Vec<PathBuf> {
+    let mut targets = config
+        .mounts
+        .iter()
+        .map(|mount| mount.target.clone())
+        .collect::<Vec<_>>();
+    for cache in &config.caches {
+        let Some(path) = cache.path.as_ref() else {
+            continue;
+        };
+        if let Ok(target) = cache.sandbox_path(path) {
+            targets.push(target);
         }
     }
-    Ok(())
+    targets
 }
 
 pub async fn cache_grants_for_cli(requests: &[(CacheKind, MountMode)]) -> Result<Vec<CacheGrant>> {
@@ -2287,6 +2242,18 @@ async fn interactive_setup(
                     |path| path.display().to_string()
                 )
             );
+        }
+
+        if !config.mounts.is_empty() {
+            println!("  • Shared shell mounts:");
+            for mount in &config.mounts {
+                println!(
+                    "      {:<9} {} -> {}",
+                    mount.mode.label(),
+                    mount.source.display(),
+                    mount.target.display()
+                );
+            }
         }
     }
     if config.transports.openai {
@@ -3746,7 +3713,8 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
             .validate()
             .with_context(|| format!("mounts[{index}]"))?;
     }
-    reject_nested_mount_targets(config.mounts.iter().map(|mount| mount.target.as_path()))?;
+    let targets = declared_sandbox_targets(config);
+    mounts::reject_nested_targets(targets.iter().map(PathBuf::as_path))?;
 
     if let Some(tunnel_id) = config.tunnel_id.as_deref() {
         validate_tunnel_id(tunnel_id)?;
@@ -4317,12 +4285,13 @@ mod tests {
                 env: BTreeMap::new(),
             }
         }
-        // A builtin cache mount, then profile, DOTLINK_MOUNTS and CLI layers.
+        // A builtin cache mount, then the declared layers in precedence order.
         let builtin = vec![SandboxMount {
             source: PathBuf::from("/srv/cache"),
             target: PathBuf::from("/tmp/home/a"),
             writable: false,
             env: vec![("CACHE_HOME".to_owned(), "/tmp/home".to_owned())],
+            origin: MountOrigin::Discovered,
         }];
         let saved = vec![
             grant("/srv/a", "/tmp/home/a", MountMode::ReadOnly),
@@ -4331,7 +4300,15 @@ mod tests {
         let environment = vec![grant("/srv/a2", "/tmp/home/a", MountMode::ReadWrite)];
         let cli = vec![grant("/srv/c", "/tmp/home/c", MountMode::ReadWrite)];
 
-        let merged = resolve_mounts(builtin, &saved, &environment, &cli);
+        let merged = resolve_mounts(
+            builtin,
+            &[
+                ("profile", &saved),
+                ("DOTLINK_MOUNTS", &environment),
+                ("--mount", &cli),
+            ],
+        )
+        .unwrap();
         assert_eq!(merged.len(), 3);
         // The mount replaced the builtin cache on the same target, and the
         // later layer replaced the source, mode and env wholesale.
@@ -4343,20 +4320,44 @@ mod tests {
     }
 
     #[test]
+    fn nested_cache_targets_are_rejected_by_config_validation() {
+        let mut config = example_config();
+        let home = home_dir().unwrap();
+        config.caches = vec![
+            CacheGrant {
+                kind: CacheKind::CargoRegistry,
+                path: Some(home.join(".cargo")),
+                mode: MountMode::ReadWrite,
+            },
+            CacheGrant {
+                kind: CacheKind::CargoGit,
+                path: Some(home.join(".cargo/git")),
+                mode: MountMode::ReadWrite,
+            },
+        ];
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("must not nest"), "{error}");
+        assert_eq!(
+            crate::recovery::Recovery::of(&validate_config(&config).unwrap_err()),
+            crate::recovery::Recovery::Operator
+        );
+    }
+
+    #[test]
     fn nested_mount_targets_are_rejected() {
         let targets = [
             Path::new("/tmp/home/n"),
             Path::new("/tmp/home/n/c"),
             Path::new("/tmp/home/other"),
         ];
-        let error = reject_nested_mount_targets(targets)
+        let error = mounts::reject_nested_targets(targets)
             .unwrap_err()
             .to_string();
         assert!(error.contains("must not nest"), "{error}");
         // Siblings and a shared prefix that is not a path component are fine.
-        reject_nested_mount_targets([Path::new("/tmp/home/n"), Path::new("/tmp/home/other")])
+        mounts::reject_nested_targets([Path::new("/tmp/home/n"), Path::new("/tmp/home/other")])
             .unwrap();
-        reject_nested_mount_targets([
+        mounts::reject_nested_targets([
             Path::new("/tmp/home/.cargo/registry"),
             Path::new("/tmp/home/.cargo/git"),
         ])

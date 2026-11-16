@@ -11,6 +11,7 @@ mod jobs;
 mod limits;
 mod logging;
 mod mcp;
+mod mounts;
 mod mutation;
 mod oauth;
 mod private_state;
@@ -1268,6 +1269,9 @@ struct RuntimePlan {
     setup: SetupResult,
     policy: Policy,
     transports: ActiveTransports,
+    /// `DOTLINK_MOUNTS`, parsed once with the rest of the configuration so a
+    /// typo is an operator error instead of a runtime restart loop.
+    env_mounts: Vec<MountGrant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1294,6 +1298,7 @@ fn runtime_authority_intent(
     setup: &SetupResult,
     policy: &Policy,
     transports: &ActiveTransports,
+    env_mounts: &[MountGrant],
 ) -> Result<RuntimeAuthorityIntent> {
     let constraints = transports.constraints();
     let execution = serde_json::json!({
@@ -1312,6 +1317,9 @@ fn runtime_authority_intent(
         "max_write_bytes": setup.config.max_write_bytes,
         "saved_caches": setup.config.caches,
         "cli_caches": args.cache_flags.requested(),
+        "profile_mounts": setup.config.mounts,
+        "environment_mounts": env_mounts,
+        "cli_mounts": args.mounts,
         "protected_paths": setup.protected_paths,
         "transport_constraints": {
             "task_result_budget": constraints.task_result_budget,
@@ -1383,9 +1391,11 @@ async fn plan_runtime(
     }
 
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
-    // Validate the environment cache list here: its only consumer is the
-    // sandboxed shell, but a typo must fail closed even when that shell is off.
+    // Validate the environment cache and mount lists here: their only consumer
+    // is the sandboxed shell, but a typo must fail closed as CONFIG even when
+    // that shell is off.
     setup::env_cache_requests()?;
+    let env_mounts = setup::env_mount_grants()?;
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
 
@@ -1472,6 +1482,7 @@ async fn plan_runtime(
         setup,
         policy,
         transports,
+        env_mounts,
     }))
 }
 
@@ -1486,16 +1497,13 @@ async fn prepare_runtime(
         setup,
         policy,
         mut transports,
+        env_mounts,
     } = plan;
 
     // Startup depends on the host (devices, caches and filesystem state), so
     // its failures restart by default. Resolve/pin machine authority once into a
     // PreparedMachine; the fingerprint and final LocalMachine consume that exact
     // snapshot instead of independently traversing the same pathnames.
-    // Parse the mount environment even when the shell is inert, so a typo in
-    // `DOTLINK_MOUNTS` fails the same way everywhere instead of silently
-    // disappearing under --no-sandbox/--unrestricted.
-    let env_mounts = setup::env_mount_grants()?;
     let mut mounts = Vec::new();
     #[cfg(target_os = "linux")]
     let mut host_shell = host_services::HostShell::prepare(policy.host_access)?;
@@ -1523,13 +1531,21 @@ async fn prepare_runtime(
             };
             builtin.push(cache.resolve(source)?);
         }
-        // Mounts are keyed by target and the last declaration wins, so a mount
-        // can replace a builtin cache on the same target.
-        mounts = setup::resolve_mounts(builtin, &setup.config.mounts, &env_mounts, &args.mounts);
+        // Precedence lives here, once: builtin caches, then the declared layers
+        // in order, keyed by target with the last declaration winning.
+        let layers = [
+            ("profile", setup.config.mounts.as_slice()),
+            ("DOTLINK_MOUNTS", env_mounts.as_slice()),
+            ("--mount", args.mounts.as_slice()),
+        ];
+        mounts = setup::resolve_mounts(builtin, &layers)?;
     } else if !setup.config.mounts.is_empty() || !env_mounts.is_empty() || !args.mounts.is_empty() {
-        tracing::warn!(
-            "shell mounts are inactive: enable the shell and keep the sandbox to mount them"
-        );
+        let hint = if cfg!(target_os = "linux") {
+            "enable the shell and keep the sandbox"
+        } else {
+            "mounts need Linux with Bubblewrap"
+        };
+        tracing::warn!("shell mounts are inactive: {hint}");
     }
 
     let retention = std::time::Duration::from_secs(setup.config.job_retention_secs);
@@ -1647,7 +1663,13 @@ async fn run_runtime(
     let Some(plan) = planned.map_err(recovery::config_failure)? else {
         return Ok(RuntimeOutcome::Exit);
     };
-    let intent = runtime_authority_intent(args, &plan.setup, &plan.policy, &plan.transports)?;
+    let intent = runtime_authority_intent(
+        args,
+        &plan.setup,
+        &plan.policy,
+        &plan.transports,
+        &plan.env_mounts,
+    )?;
     if jobs
         .as_ref()
         .is_some_and(|existing| !existing.bind_intent(intent.job_session))
@@ -2041,7 +2063,7 @@ fn print_tools(descriptions: Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::SandboxMount;
+    use crate::mounts::SandboxMount;
 
     fn parse(args: &[&str], defaults: PermissionConfig) -> (Args, Policy) {
         let args = Args::try_parse_from(args).unwrap();
@@ -2079,13 +2101,13 @@ mod tests {
             stdio: true,
             http: None,
         };
-        let before = runtime_authority_intent(&args, &setup, &policy, &transports)
+        let before = runtime_authority_intent(&args, &setup, &policy, &transports, &[])
             .unwrap()
             .execution;
 
         let mut changed = setup;
         changed.config.max_shell_timeout_secs = 61;
-        let after = runtime_authority_intent(&args, &changed, &policy, &transports)
+        let after = runtime_authority_intent(&args, &changed, &policy, &transports, &[])
             .unwrap()
             .execution;
         assert_ne!(
@@ -2115,7 +2137,7 @@ mod tests {
             stdio: true,
             http: None,
         };
-        let baseline = runtime_authority_intent(&args, &setup, &policy, &transports)
+        let baseline = runtime_authority_intent(&args, &setup, &policy, &transports, &[])
             .unwrap()
             .execution;
 
@@ -2130,7 +2152,7 @@ mod tests {
                 "max_write_bytes" => setup.config.max_write_bytes = write + 1024,
                 _ => unreachable!(),
             }
-            let after = runtime_authority_intent(&args, &setup, &policy, &transports)
+            let after = runtime_authority_intent(&args, &setup, &policy, &transports, &[])
                 .unwrap()
                 .execution;
             assert_ne!(
@@ -2177,8 +2199,10 @@ mod tests {
             stdio: false,
             http: None,
         };
-        let before = runtime_authority_intent(&args, &setup, &policy, &before_transports).unwrap();
-        let after = runtime_authority_intent(&args, &setup, &policy, &after_transports).unwrap();
+        let before =
+            runtime_authority_intent(&args, &setup, &policy, &before_transports, &[]).unwrap();
+        let after =
+            runtime_authority_intent(&args, &setup, &policy, &after_transports, &[]).unwrap();
         assert_eq!(
             before, after,
             "transport credential rotation must not revoke execution-lifetime job authority"
@@ -2224,17 +2248,17 @@ mod tests {
             http: Some(http("token-two")),
         };
         assert_eq!(
-            runtime_authority_intent(&args, &setup, &policy, &before).unwrap(),
-            runtime_authority_intent(&args, &setup, &policy, &after).unwrap(),
+            runtime_authority_intent(&args, &setup, &policy, &before, &[]).unwrap(),
+            runtime_authority_intent(&args, &setup, &policy, &after, &[]).unwrap(),
             "ngrok credential rotation must not revoke execution-lifetime job authority"
         );
 
         let mut changed_setup = setup;
         let before_revision =
-            runtime_authority_intent(&args, &changed_setup, &policy, &before).unwrap();
+            runtime_authority_intent(&args, &changed_setup, &policy, &before, &[]).unwrap();
         changed_setup.config.owner_password_revision = Some("rotated".to_owned());
         let after_revision =
-            runtime_authority_intent(&args, &changed_setup, &policy, &before).unwrap();
+            runtime_authority_intent(&args, &changed_setup, &policy, &before, &[]).unwrap();
         assert_eq!(
             before_revision, after_revision,
             "OAuth owner-password rotation must not revoke execution-lifetime job authority"
@@ -2275,8 +2299,8 @@ mod tests {
             stdio: false,
             http: None,
         };
-        let before = runtime_authority_intent(&args, &setup, &policy, &before).unwrap();
-        let after = runtime_authority_intent(&args, &setup, &policy, &after).unwrap();
+        let before = runtime_authority_intent(&args, &setup, &policy, &before, &[]).unwrap();
+        let after = runtime_authority_intent(&args, &setup, &policy, &after, &[]).unwrap();
         assert_eq!(
             before.execution, after.execution,
             "logical tunnel topology must not change machine execution authority"
@@ -2322,6 +2346,7 @@ mod tests {
             &setup,
             &policy,
             &transports("https://api.openai.com"),
+            &[],
         )
         .unwrap();
         let slashed = runtime_authority_intent(
@@ -2329,6 +2354,7 @@ mod tests {
             &setup,
             &policy,
             &transports("https://API.OpenAI.com:443///"),
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -2470,6 +2496,60 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn declared_mount_without_a_source_is_an_operator_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let error = LocalMachine::prepare_with_job_root(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                mounts: vec![SandboxMount {
+                    source: root.join("missing"),
+                    target: PathBuf::from("/tmp/home/missing"),
+                    writable: false,
+                    env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Declared,
+                }],
+                host_shell: host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                sync_hold: None,
+                job_retention_secs: 60,
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            manager.protected_path(),
+        )
+        .await
+        .expect_err("a declared mount must not be skipped silently");
+        assert!(
+            error.to_string().contains("has no source directory"),
+            "{error}"
+        );
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn nested_shell_mounts_are_rejected_where_they_are_prepared() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -2494,12 +2574,14 @@ mod tests {
                         target: PathBuf::from("/tmp/home/n/c"),
                         writable: false,
                         env: Vec::new(),
+                        origin: crate::mounts::MountOrigin::Declared,
                     },
                     SandboxMount {
                         source: parent,
                         target: PathBuf::from("/tmp/home/n"),
                         writable: false,
                         env: Vec::new(),
+                        origin: crate::mounts::MountOrigin::Declared,
                     },
                 ],
                 host_shell: host_services::HostShell::default(),
@@ -2549,6 +2631,7 @@ mod tests {
                     target: PathBuf::from("/tmp/home/.cache/test"),
                     writable: false,
                     env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Declared,
                 }],
                 host_shell: host_services::HostShell::default(),
                 log: LogConfig::default(),
