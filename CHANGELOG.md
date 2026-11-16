@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-11-16
+
+### Fixed
+
+- 0.17.2 did not build on macOS or Windows, and its Nix check failed: `validate_host_mount_policy` (which takes the Linux-only `HostShell`) was not gated to Linux while the mount retry helper was, and one mount test assumed a real `$HOME/.cargo`. Mount target and environment validation is now a pure function of the profile plus a supplied host home, so the same rules run and are tested on every platform. No behaviour change.
+
 ## [0.17.2] - 2026-11-16
 
 ### Changed
@@ -718,7 +724,8 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.2...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.3...HEAD
+[0.17.3]: https://github.com/abird-ai/dotlink/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/abird-ai/dotlink/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/abird-ai/dotlink/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/abird-ai/dotlink/compare/v0.16.7...v0.17.0
