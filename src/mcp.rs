@@ -277,14 +277,6 @@ pub(crate) struct PendingWrite(crate::secure_fs::StagedWrite);
 #[derive(Debug)]
 pub(crate) struct PendingWrite(crate::staging::StagedWrite);
 
-/// Smallest accepted profile byte limit. Below this the fixed JSON reply framing
-/// and a truncation marker no longer fit, so a configured ceiling could not be
-/// honoured; the value is rejected rather than silently widened.
-pub const MIN_BYTE_LIMIT: usize = 1024;
-
-/// Smallest accepted shell timeout.
-pub const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
-
 /// Private request metadata carried through rmcp by the in-process OpenAI
 /// adapter. These fields are trusted only when the opaque per-runtime token
 /// matches; public HTTP/stdio clients may send the same names but cannot affect
@@ -523,7 +515,7 @@ fn checked_limit<T: PartialOrd + std::fmt::Display>(name: &str, value: T, minimu
 }
 
 fn checked_byte_limit(name: &str, value: usize) -> Result<usize> {
-    let value = checked_limit(name, value, MIN_BYTE_LIMIT)?;
+    let value = checked_limit(name, value, crate::limits::MIN_BYTE_LIMIT)?;
     if value > crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES {
         return Err(crate::recovery::operator(anyhow!(
             "{name} must not exceed {} bytes, the configured transfer ceiling below the OpenAI tunnel's {} byte serialized-message limit",
@@ -1498,6 +1490,16 @@ fn validate_shell_guards(
 }
 
 #[cfg(target_os = "linux")]
+/// A declared mount whose source is not usable yet is host state, not a broken
+/// declaration: retry the runtime in-process with backoff instead of exiting as
+/// CONFIG, and never skip the mount silently.
+fn unavailable(error: anyhow::Error) -> anyhow::Error {
+    crate::recovery::Recovery::Runtime {
+        reset_backoff: false,
+    }
+    .tag(error)
+}
+
 fn validate_host_mount_policy(
     access: &AccessPolicy,
     host_shell: &crate::host_services::HostShell,
@@ -1766,7 +1768,7 @@ impl LocalMachine {
         let max_shell_timeout_secs = checked_limit(
             "max_shell_timeout_secs",
             args.max_shell_timeout_secs,
-            MIN_SHELL_TIMEOUT_SECS,
+            crate::limits::MIN_SHELL_TIMEOUT_SECS,
         )?;
         let max_output_bytes = checked_byte_limit("max_output_bytes", args.max_output_bytes)?;
         let max_read_bytes = checked_byte_limit("max_read_bytes", args.max_read_bytes)?;
@@ -1801,8 +1803,8 @@ impl LocalMachine {
                 Ok(source) => source,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     if mount.origin.is_declared() {
-                        return Err(crate::recovery::operator(anyhow!(
-                            "declared mount {} has no source directory",
+                        return Err(unavailable(anyhow!(
+                            "declared mount {} is not available yet: source does not exist",
                             mount.label()
                         )));
                     }
@@ -1813,18 +1815,35 @@ impl LocalMachine {
                     continue;
                 }
                 Err(error) => {
-                    return Err(crate::recovery::operator(anyhow!(
-                        "mount {} cannot be prepared: {error}",
+                    if mount.origin.is_declared() {
+                        return Err(unavailable(anyhow!(
+                            "declared mount {} cannot be prepared: {error}",
+                            mount.label()
+                        )));
+                    }
+                    tracing::warn!(
+                        "skipping cache mount {}: source cannot be inspected: {error}",
+                        mount.label()
+                    );
+                    continue;
+                }
+            };
+            let metadata = match fs::metadata(&source).await {
+                Ok(metadata) => metadata,
+                Err(error) if mount.origin.is_declared() => {
+                    return Err(unavailable(anyhow!(
+                        "declared mount {} cannot be inspected: {error}",
                         mount.label()
                     )));
                 }
+                Err(error) => {
+                    tracing::warn!(
+                        "skipping cache mount {}: source cannot be inspected: {error}",
+                        mount.label()
+                    );
+                    continue;
+                }
             };
-            let metadata = fs::metadata(&source).await.map_err(|error| {
-                crate::recovery::operator(anyhow!(
-                    "mount {} cannot be inspected: {error}",
-                    mount.label()
-                ))
-            })?;
             if !metadata.is_dir() {
                 if mount.origin.is_declared() {
                     return Err(crate::recovery::operator(anyhow!(
@@ -1885,13 +1904,20 @@ impl LocalMachine {
                 if writable { "rw" } else { "ro" }
             );
             #[cfg(target_os = "linux")]
-            let pinned = Arc::new(
-                crate::secure_fs::SecureFs::open_canonical_directory(&source).map_err(|error| {
-                    crate::recovery::operator(
-                        error.context(format!("mount {} cannot be pinned", mount.label())),
-                    )
-                })?,
-            );
+            let pinned = match crate::secure_fs::SecureFs::open_canonical_directory(&source) {
+                Ok(file) => Arc::new(file),
+                Err(error) => {
+                    let error = error.context(format!("mount {} cannot be pinned", mount.label()));
+                    if mount.origin.is_declared() {
+                        return Err(unavailable(error));
+                    }
+                    tracing::warn!(
+                        "skipping cache mount {}: source cannot be pinned: {error:#}",
+                        mount.label()
+                    );
+                    continue;
+                }
+            };
             prepared_mounts.push(PreparedMount {
                 source,
                 target,

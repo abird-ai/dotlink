@@ -2410,7 +2410,7 @@ fn result_object(result: CallToolResult) -> JsonObject {
 }
 
 fn job_output_payload_ceiling(response_ceiling: usize) -> Result<usize> {
-    if response_ceiling < crate::mcp::MIN_BYTE_LIMIT {
+    if response_ceiling < crate::limits::MIN_BYTE_LIMIT {
         bail!("job output response ceiling is below the supported minimum");
     }
     let reserve = JOB_OUTPUT_RESPONSE_RESERVE.min(response_ceiling / 4);

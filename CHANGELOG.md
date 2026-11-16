@@ -9,13 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Nested shell mount targets are rejected (`mount targets must not nest`). A profile whose caches resolve to nested targets (for example `cargo-registry` at `~/.cargo` plus `cargo-git` at `~/.cargo/git`) used to start with bind-order-dependent shadowing and now fails closed as an operator configuration error at load time. Mount errors are `CONFIG` exits, never restart loops.
-- An unreadable or otherwise unusable mount source is an operator configuration
-  error (`CONFIG`) instead of a generic exit that a supervisor restarts forever.
+- A declared shell mount whose source is not usable yet is host state: the
+  runtime retries in-process with backoff instead of exiting, and an unusable
+  discovered cache is skipped with a warning. Declaration mistakes (bad target,
+  nesting, environment conflict, non-directory source, deny/protected overlap,
+  host-integration collision) stay `CONFIG` errors, so a supervisor never
+  restart-loops on a configuration fault.
 - Shell mounts are keyed by target with the last declaration winning, so a profile `mounts` entry, `DOTLINK_MOUNTS` or `--mount` replaces a builtin developer cache on the same target (and the CLI/env cache flags remain the bottom layer).
 
 ### Added
 
-- Manual shell mounts: schema v13 `mounts` entries (`source`, `target`, `mode`, optional `env`), `DOTLINK_MOUNTS=SOURCE:TARGET[:ro|rw],...`, and repeatable `--mount SOURCE:TARGET[:ro|rw]`. They resolve to the same `SandboxMount` layer developer caches use, so a host directory can be shared with the sandboxed shell without a hardcoded cache kind. Mounts are keyed by target with builtins first and the last declaration winning, so a mount can repoint a cache; nested targets are rejected so bind order never decides the layout. Mounts stay shell-only and obey the existing deny, protected-path, pinning and identity-revalidation rules, and a missing source now logs why it was skipped.
+- Manual shell mounts: schema v13 `mounts` entries (`source`, `target`, `mode`, optional `env`), `DOTLINK_MOUNTS=SOURCE:TARGET[:ro|rw],...`, and repeatable `--mount SOURCE:TARGET[:ro|rw]`. They resolve to the same `SandboxMount` layer developer caches use, so a host directory can be shared with the sandboxed shell without a hardcoded cache kind. Mounts are keyed by target with builtins first and the last declaration winning, so a mount can repoint a cache; nested targets are rejected so bind order never decides the layout. Mounts stay shell-only and obey the existing deny, protected-path, pinning and identity-revalidation rules; a discovered cache that cannot be prepared is skipped with a warning naming the mount.
 
 ## [0.17.1] - 2026-11-14
 

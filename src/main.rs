@@ -1103,12 +1103,12 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
                 tracing::warn!(
                     restart = runtime_restarts,
                     delay_secs = delay.as_secs(),
-                    "OpenAI transport remained unhealthy; restarting dotlink runtime"
+                    "runtime needs recovery; restarting dotlink runtime"
                 );
                 log.developer("runtime", format!("restart reason: {error:#}"));
                 tracing::debug!(%error, "runtime restart reason");
                 eprintln!(
-                    "\nOpenAI tunnel unhealthy — restarting dotlink runtime in {}s…",
+                    "\nruntime unhealthy — restarting dotlink runtime in {}s…",
                     delay.as_secs()
                 );
 
@@ -1232,6 +1232,10 @@ fn oauth_profile_target(name: &str) -> Option<&str> {
 /// Inspection and setup modes never start transports, so their failures are
 /// ordinary command failures.
 async fn run_one_shot(args: &Args, launch_dir: &Path, setup_color: bool) -> Result<()> {
+    // Validate the shell-surface environment even for one-shot commands, so a
+    // typo is CONFIG everywhere instead of depending on which command ran.
+    setup::env_cache_requests().map_err(recovery::config_failure)?;
+    setup::env_mount_grants().map_err(recovery::config_failure)?;
     if args.setup {
         load_or_setup(
             true,
@@ -2496,7 +2500,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn unreadable_mount_source_is_an_operator_error() {
+    async fn unreadable_mount_source_retries_the_runtime() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().unwrap();
@@ -2541,11 +2545,11 @@ mod tests {
             manager.protected_path(),
         )
         .await
-        .expect_err("an unreadable source must not restart the process forever");
+        .expect_err("an unreadable source must not be skipped silently");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(
-            crate::recovery::Recovery::of(&error),
-            crate::recovery::Recovery::Operator
+        assert!(
+            crate::recovery::Recovery::of(&error).restarts_runtime(),
+            "a source it cannot open yet is host state, not a broken declaration"
         );
         assert!(
             error.to_string().contains("/tmp/home/locked"),
@@ -2556,7 +2560,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn declared_mount_without_a_source_is_an_operator_error() {
+    async fn declared_mount_without_a_source_retries_the_runtime() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
@@ -2598,12 +2602,123 @@ mod tests {
         .await
         .expect_err("a declared mount must not be skipped silently");
         assert!(
-            error.to_string().contains("has no source directory"),
+            error.to_string().contains("is not available yet"),
             "{error}"
         );
+        assert!(
+            crate::recovery::Recovery::of(&error).restarts_runtime(),
+            "host-state unavailability retries instead of stopping the service"
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn declared_mount_source_that_is_a_file_is_a_config_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = root.join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let error = LocalMachine::prepare_with_job_root(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                mounts: vec![SandboxMount {
+                    source: file,
+                    target: PathBuf::from("/tmp/home/file"),
+                    writable: false,
+                    env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Declared,
+                }],
+                host_shell: host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                sync_hold: None,
+                job_retention_secs: 60,
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            manager.protected_path(),
+        )
+        .await
+        .expect_err("a file where a directory belongs is a broken declaration");
         assert_eq!(
             crate::recovery::Recovery::of(&error),
             crate::recovery::Recovery::Operator
+        );
+        assert!(error.to_string().contains("is not a directory"), "{error}");
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unreadable_cache_mount_is_skipped_instead_of_restarting() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let locked = root.join("locked-cache");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let prepared = LocalMachine::prepare_with_job_root(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                mounts: vec![SandboxMount {
+                    source: locked.clone(),
+                    target: PathBuf::from("/tmp/home/.cache/locked"),
+                    writable: false,
+                    env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Discovered,
+                }],
+                host_shell: host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                sync_hold: None,
+                job_retention_secs: 60,
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            manager.protected_path(),
+        )
+        .await
+        .expect("a discovered cache is optional");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            prepared.authority_value()["mounts"]
+                .as_array()
+                .expect("mounts is a list")
+                .is_empty()
         );
         manager.shutdown().await.unwrap();
     }

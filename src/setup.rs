@@ -3734,10 +3734,10 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
     // honour here, with the number the user wrote, rather than widening it at
     // startup. Below the minimum the fixed reply framing and a truncation
     // marker no longer fit.
-    if config.max_shell_timeout_secs < crate::mcp::MIN_SHELL_TIMEOUT_SECS {
+    if config.max_shell_timeout_secs < crate::limits::MIN_SHELL_TIMEOUT_SECS {
         bail!(
             "max_shell_timeout_secs must be at least {} second",
-            crate::mcp::MIN_SHELL_TIMEOUT_SECS
+            crate::limits::MIN_SHELL_TIMEOUT_SECS
         );
     }
     for (name, value) in [
@@ -3745,10 +3745,10 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
         ("max_read_bytes", config.max_read_bytes),
         ("max_write_bytes", config.max_write_bytes),
     ] {
-        if value < crate::mcp::MIN_BYTE_LIMIT {
+        if value < crate::limits::MIN_BYTE_LIMIT {
             bail!(
                 "{name} must be at least {} bytes, got {value}",
-                crate::mcp::MIN_BYTE_LIMIT
+                crate::limits::MIN_BYTE_LIMIT
             );
         }
         if value > crate::limits::OPENAI_TUNNEL_TRANSFER_CEILING_BYTES {

@@ -23,6 +23,13 @@ const _: () = assert!(
     OPENAI_TUNNEL_SYNC_HOLD.as_secs() + OPENAI_TUNNEL_DELIVERY_RESERVE.as_secs()
         < OPENAI_TUNNEL_REQUEST_DEADLINE.as_secs()
 );
+/// Smallest accepted profile byte limit. Below this the fixed JSON reply framing
+/// and a truncation marker no longer fit, so a configured ceiling could not be
+/// honoured; the value is rejected rather than silently widened.
+pub(crate) const MIN_BYTE_LIMIT: usize = 1024;
+/// Smallest accepted shell timeout.
+pub(crate) const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
+
 /// How many recent jobs `job_list` returns when the caller does not ask.
 pub(crate) const DEFAULT_JOB_LIST: usize = 64;
 /// Ceiling for `job_list.limit`, and the shape of the advertised bound.

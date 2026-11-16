@@ -54,12 +54,12 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
                     (crate::limits::DEFAULT_OUTPUT_PAGE_BYTES.min(max_output_bytes)) as u64
                 ),
                 super::human_bytes(max_output_bytes as u64),
-                crate::mcp::MIN_BYTE_LIMIT,
+                crate::limits::MIN_BYTE_LIMIT,
             )),
         );
         property.insert(
             "minimum".to_owned(),
-            serde_json::Value::from(crate::mcp::MIN_BYTE_LIMIT),
+            serde_json::Value::from(crate::limits::MIN_BYTE_LIMIT),
         );
         property.insert(
             "maximum".to_owned(),
