@@ -109,6 +109,18 @@ fn one_shot_failures_are_ordinary_command_failures() {
 }
 
 #[test]
+fn one_shot_configuration_typos_need_the_operator() {
+    let home = tempfile::tempdir().unwrap();
+    let (status, stderr) = exit(
+        dotlink(home.path(), &local_http_profile("127.0.0.1:0"))
+            .arg("--list-tools")
+            .env("DOTLINK_MOUNTS", "not-a-mount"),
+    );
+    assert_eq!(status, Some(EXIT_CONFIG), "{stderr}");
+    assert!(stderr.contains("must be SOURCE:TARGET"), "{stderr}");
+}
+
+#[test]
 fn unconfigured_services_stop_cleanly() {
     let home = tempfile::tempdir().unwrap();
     let (status, stderr) = exit(unconfigured(home.path()).env("DOTLINK_SUPERVISOR", "systemd"));

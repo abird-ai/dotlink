@@ -878,6 +878,32 @@ fn next_runtime_restart_attempt(current: u32, reset_backoff: bool) -> u32 {
     }
 }
 
+/// Operator-facing restart reason: one bounded, single-line message.
+///
+/// Full detail and causes stay at the developer level, so a pathological error
+/// cannot flood a terminal or a journal entry. Control and line-separator
+/// characters are replaced because the message can carry a configured path.
+fn runtime_restart_reason(error: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 240;
+    let text = error.to_string();
+    let mut chars = text.chars();
+    let mut reason = chars
+        .by_ref()
+        .take(MAX_CHARS)
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if chars.next().is_some() {
+        reason.push('…');
+    }
+    reason
+}
+
 /// Runtime restart schedule: 1 s doubling to a 30 s cap, no jitter.
 const RUNTIME_RESTART_BACKOFF: Backoff = Backoff {
     base: Duration::from_secs(1),
@@ -1107,8 +1133,11 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
                 );
                 log.developer("runtime", format!("restart reason: {error:#}"));
                 tracing::debug!(%error, "runtime restart reason");
+                // The outer message only: a retrying runtime must say why at the
+                // level an operator reads, not just at `-vv`.
                 eprintln!(
-                    "\nruntime unhealthy — restarting dotlink runtime in {}s…",
+                    "\nruntime unhealthy ({}) — restarting dotlink runtime in {}s…",
+                    runtime_restart_reason(&error),
                     delay.as_secs()
                 );
 
@@ -1229,8 +1258,10 @@ fn oauth_profile_target(name: &str) -> Option<&str> {
     }
 }
 
-/// Inspection and setup modes never start transports, so their failures are
-/// ordinary command failures.
+/// Inspection and setup modes never start transports, so their failures exit by
+/// classification rather than restarting: an operator mistake is `CONFIG`, a
+/// pending setup is `NOTCONFIGURED`, and anything unclassified is an ordinary
+/// command failure.
 async fn run_one_shot(args: &Args, launch_dir: &Path, setup_color: bool) -> Result<()> {
     // Validate the shell-surface environment even for one-shot commands, so a
     // typo is CONFIG everywhere instead of depending on which command ran.
@@ -1273,8 +1304,10 @@ struct RuntimePlan {
     setup: SetupResult,
     policy: Policy,
     transports: ActiveTransports,
-    /// `DOTLINK_MOUNTS`, parsed once with the rest of the configuration so a
-    /// typo is an operator error instead of a runtime restart loop.
+    /// `DOTLINK_CACHES` and `DOTLINK_MOUNTS`, parsed once with the rest of the
+    /// configuration so a typo is an operator error instead of a runtime
+    /// restart loop.
+    env_caches: Vec<(CacheKind, MountMode)>,
     env_mounts: Vec<MountGrant>,
 }
 
@@ -1398,7 +1431,7 @@ async fn plan_runtime(
     // Validate the environment cache and mount lists here: their only consumer
     // is the sandboxed shell, but a typo must fail closed as CONFIG even when
     // that shell is off.
-    setup::env_cache_requests()?;
+    let env_caches = setup::env_cache_requests()?;
     let env_mounts = setup::env_mount_grants()?;
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
@@ -1486,6 +1519,7 @@ async fn plan_runtime(
         setup,
         policy,
         transports,
+        env_caches,
         env_mounts,
     }))
 }
@@ -1501,6 +1535,7 @@ async fn prepare_runtime(
         setup,
         policy,
         mut transports,
+        env_caches,
         env_mounts,
     } = plan;
 
@@ -1519,7 +1554,7 @@ async fn prepare_runtime(
         // and CLI layers and are resolved together, later layers winning.
         let (mut caches, requests) = setup::merge_cache_layers(
             &setup.config.caches,
-            &setup::env_cache_requests()?,
+            &env_caches,
             &args.cache_flags.requested(),
         );
         for override_cache in cache_grants_for_cli(&requests).await? {
@@ -2508,6 +2543,13 @@ mod tests {
         let locked = root.join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged runner can open a mode-000 directory; there is nothing to
+        // observe then, so the assertions below are skipped rather than faked.
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        if !unreadable {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
         let error = LocalMachine::prepare_with_job_root(
             MachineConfig {
@@ -2675,6 +2717,11 @@ mod tests {
         let locked = root.join("locked-cache");
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        if !unreadable {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
         let prepared = LocalMachine::prepare_with_job_root(
             MachineConfig {
@@ -2780,6 +2827,69 @@ mod tests {
         .await
         .expect_err("nested shell mounts must fail closed");
         assert!(error.to_string().contains("must not nest"), "{error}");
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn duplicate_mount_targets_are_an_internal_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let target = PathBuf::from("/tmp/home/same");
+        let error = LocalMachine::prepare_with_job_root(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                mounts: [first, second]
+                    .into_iter()
+                    .map(|source| SandboxMount {
+                        source,
+                        target: target.clone(),
+                        writable: false,
+                        env: Vec::new(),
+                        origin: crate::mounts::MountOrigin::Declared,
+                    })
+                    .collect(),
+                host_shell: host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                sync_hold: None,
+                job_retention_secs: 60,
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            manager.protected_path(),
+        )
+        .await
+        .expect_err("resolution keys mounts by target");
+        assert!(
+            error.to_string().contains("internal error"),
+            "a caller that skipped resolution is a bug, not a configuration mistake: {error}"
+        );
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Process,
+            "an invariant must leave the runtime restartable instead of parking the service as CONFIG"
+        );
         manager.shutdown().await.unwrap();
     }
 
@@ -3690,6 +3800,35 @@ mod tests {
         let args = Args::try_parse_from(["dotlink", "-S", "-p", "work"]).unwrap();
         assert!(args.setup);
         assert_eq!(selected_profile(&args).as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn runtime_restart_reason_is_one_bounded_line() {
+        let short = anyhow!("declared mount /srv/a is not available yet");
+        assert_eq!(
+            runtime_restart_reason(&short),
+            "declared mount /srv/a is not available yet"
+        );
+
+        let injected = anyhow!("declared mount /srv/a\u{1b}[31m\u{2028} is not available yet");
+        let safe = runtime_restart_reason(&injected);
+        assert!(
+            !safe
+                .chars()
+                .any(|character| character.is_control()
+                    || matches!(character, '\u{2028}' | '\u{2029}')),
+            "configured paths must not reach the terminal as control characters: {safe:?}"
+        );
+        assert!(safe.contains('\u{fffd}'), "{safe:?}");
+
+        let long = anyhow!("{}", "é".repeat(400));
+        let bounded = runtime_restart_reason(&long);
+        assert_eq!(bounded.chars().count(), 241);
+        assert!(bounded.ends_with('…'));
+        assert!(
+            bounded.chars().take(240).all(|character| character == 'é'),
+            "a truncated reason never splits a character"
+        );
     }
 
     #[test]

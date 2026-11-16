@@ -5516,6 +5516,7 @@ mod tests {
                         PathBuf::from("/tmp/home/.cargo/registry"),
                         false,
                         vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
+                        crate::mounts::MountOrigin::Discovered,
                     ),
                     PreparedMount::for_test(
                         read_write.clone(),
@@ -5606,6 +5607,7 @@ mod tests {
                         "ABIRD_CACHE_DIR".to_owned(),
                         "/tmp/home/.cache/abird".to_owned(),
                     )],
+                    crate::mounts::MountOrigin::Declared,
                 )],
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),

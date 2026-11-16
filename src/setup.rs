@@ -18,7 +18,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     credentials,
-    mounts::{self, MountOrigin, SandboxMount, sandbox_join, sandbox_parent, validate_target},
+    mounts::{
+        self, MountOrigin, SandboxMount, sandbox_join, sandbox_parent, validate_path,
+        validate_target,
+    },
     oauth::{self, OAuthConfig},
 };
 
@@ -425,6 +428,7 @@ impl MountGrant {
 
     /// Structural checks shared by every layer; callers add their own context.
     fn validate(&self) -> Result<()> {
+        validate_path(&self.source, "mount source")?;
         if !self.source.is_absolute() {
             bail!(
                 "source must be an absolute host path: {}",
@@ -450,6 +454,11 @@ impl MountGrant {
 impl std::str::FromStr for MountGrant {
     type Err = anyhow::Error;
 
+    /// One `SOURCE:TARGET[:ro|rw]` spec, as `--mount` and `DOTLINK_MOUNTS` spell it.
+    ///
+    /// The entry and both path fields are trimmed, so a list written with spaces
+    /// around its separators behaves like the compact form; a path that itself
+    /// begins or ends with a space needs the profile `mounts` list.
     fn from_str(spec: &str) -> Result<Self> {
         let spec = spec.trim();
         let (rest, mode) = match spec.rsplit_once(':') {
@@ -463,18 +472,42 @@ impl std::str::FromStr for MountGrant {
             .split_once(':')
             .ok_or_else(|| anyhow!("mount {spec:?} must be SOURCE:TARGET[:ro|rw]"))?;
         if target.contains(':') {
-            bail!(
-                "mount {spec:?}: the one-line form splits on ':', so paths containing ':' need the profile `mounts` list"
-            );
+            bail!("{}", ambiguous_spec(spec));
         }
         let grant = Self {
-            source: PathBuf::from(source),
-            target: PathBuf::from(target),
+            source: PathBuf::from(source.trim()),
+            target: PathBuf::from(target.trim()),
             mode,
             env: BTreeMap::new(),
         };
         grant.validate()?;
         Ok(grant)
+    }
+}
+
+/// Explain a one-line spec whose `TARGET` still contains a colon.
+///
+/// The form cannot tell a path containing ':' from a mode the parser does not
+/// know, so name both readings when they are distinguishable: a slash-free tail
+/// after a clean `SOURCE:TARGET` pair can only have been meant as a mode, and a
+/// trailing ':' means the mode is missing.
+fn ambiguous_spec(spec: &str) -> String {
+    if spec.ends_with(':') {
+        return format!("mount {spec:?}: a trailing ':' needs a mode (`ro` or `rw`)");
+    }
+    let mode = spec.rsplit_once(':').and_then(|(head, tail)| {
+        let clean_pair = head
+            .split_once(':')
+            .is_some_and(|(_, target)| !target.contains(':'));
+        (!tail.is_empty() && !tail.contains('/') && clean_pair).then_some(tail)
+    });
+    match mode {
+        Some(mode) => format!(
+            "mount {spec:?}: `{mode}` is not a mount mode (use `ro` or `rw`); a path containing ':' needs the profile `mounts` list"
+        ),
+        None => format!(
+            "mount {spec:?}: the one-line form splits on ':', so paths containing ':' need the profile `mounts` list"
+        ),
     }
 }
 
@@ -953,7 +986,12 @@ async fn load_or_setup_with(
     let tunnel_requested = tunnel.requested();
 
     if !force_setup {
-        if let Some(mut config) = read_profile_config(profile)? {
+        if let Some(mut config) = read_profile_config(profile).with_context(|| {
+            config_path(profile).map_or_else(
+                |_| "invalid profile config".to_owned(),
+                |path| format!("invalid profile config {}", path.display()),
+            )
+        })? {
             // Resolve an active explicit file once. Its secret and verified
             // protected target travel together through override application.
             // Dormant OpenAI profiles do not open the saved or explicit key.
@@ -1083,16 +1121,35 @@ fn env_flag(name: &str) -> Result<Option<bool>> {
     parse_env_flag(name, &raw.to_string_lossy())
 }
 
+/// A list-valued environment variable that is parsed as text.
+///
+/// Malformed bytes cannot express the entries at all, so they are an operator
+/// mistake rather than a value to guess at with a lossy conversion: for a mount
+/// list a mangled path would otherwise look like a directory that has not
+/// appeared yet.
+fn env_utf8(name: &str) -> Result<Option<String>> {
+    env_utf8_value(name, env::var_os(name))
+}
+
+fn env_utf8_value(name: &str, raw: Option<OsString>) -> Result<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    raw.into_string()
+        .map(Some)
+        .map_err(|_| crate::recovery::operator(anyhow!("{name} must be valid UTF-8")))
+}
+
 /// `DOTLINK_CACHES=cargo-registry:rw,go-mod:ro` as CLI-equivalent requests.
 ///
 /// Returned in order so a caller can let a later layer override an earlier one
 /// for the same cache kind. Resolution to concrete paths is async and lives
 /// next to the `--allow-cache-*` resolver.
 pub fn env_cache_requests() -> Result<Vec<(CacheKind, MountMode)>> {
-    let Some(raw) = env::var_os("DOTLINK_CACHES") else {
+    let Some(raw) = env_utf8("DOTLINK_CACHES")? else {
         return Ok(Vec::new());
     };
-    parse_cache_requests(&raw.to_string_lossy())
+    parse_cache_requests(&raw)
 }
 
 fn parse_cache_requests(raw: &str) -> Result<Vec<(CacheKind, MountMode)>> {
@@ -1414,10 +1471,10 @@ pub(crate) fn merge_cache_layers(
 
 /// Mounts declared by `DOTLINK_MOUNTS` as comma-separated `SOURCE:TARGET[:ro|rw]`.
 pub fn env_mount_grants() -> Result<Vec<MountGrant>> {
-    let Some(raw) = env::var_os("DOTLINK_MOUNTS") else {
+    let Some(raw) = env_utf8("DOTLINK_MOUNTS")? else {
         return Ok(Vec::new());
     };
-    parse_mount_list(&raw.to_string_lossy())
+    parse_mount_list(&raw)
 }
 
 fn parse_mount_list(raw: &str) -> Result<Vec<MountGrant>> {
@@ -1428,13 +1485,12 @@ fn parse_mount_list(raw: &str) -> Result<Vec<MountGrant>> {
         .collect()
 }
 
-/// Resolve mount layers over the builtin mounts.
-///
-/// Resolve the declared mount layers over the builtin cache mounts.
+/// Resolve mount layers over the builtin cache mounts.
 ///
 /// The slice order is the precedence order, so callers write the policy once
-/// and adding a layer is one line. Everything else (keyed last-wins, nesting
-/// and environment checks) lives in [`mounts::merge_layers`].
+/// and adding a layer is one line. Precedence and keying live in
+/// [`mounts::merge_layers`]; whoever binds the result validates it with
+/// [`mounts::validate_assembled`].
 pub fn resolve_mounts(
     builtin: Vec<SandboxMount>,
     layers: &[(&'static str, &[MountGrant])],
@@ -1449,26 +1505,100 @@ pub fn resolve_mounts(
     mounts::merge_layers(builtin, &resolved)
 }
 
-/// Every sandbox target a saved profile would mount, for early layout checks.
-pub fn declared_sandbox_targets(config: &AppConfig) -> Vec<PathBuf> {
-    let mut targets = config
-        .mounts
-        .iter()
-        .map(|mount| mount.target.clone())
-        .collect::<Vec<_>>();
-    for cache in &config.caches {
-        let Some(path) = cache.path.as_ref() else {
-            continue;
-        };
-        // A cache whose source is absent is skipped at runtime, so it must not
-        // reject an otherwise runnable profile here.
-        if path.is_dir()
-            && let Ok(target) = cache.sandbox_path(path)
-        {
-            targets.push(target);
+/// The mounts a saved profile declares, keyed by target exactly as the runtime
+/// assembles them: its cache entries first, then `mounts`, last declaration
+/// winning. Each target remembers the entry that owns it, so a layout mistake
+/// can name the configuration entry instead of only two sandbox paths.
+///
+/// A cache whose source directory is absent is skipped: the runtime skips it
+/// too, so it must not reject an otherwise runnable profile. Path-less caches
+/// need host discovery and are first seen when the runtime prepares them.
+struct DeclaredMounts {
+    mounts: Vec<SandboxMount>,
+    owners: BTreeMap<PathBuf, String>,
+}
+
+impl DeclaredMounts {
+    fn resolve(config: &AppConfig) -> Self {
+        let mut owners = BTreeMap::new();
+        let mut caches = Vec::new();
+        for (index, cache) in config.caches.iter().enumerate() {
+            let Some(source) = cache.path.as_ref().filter(|path| path.is_dir()) else {
+                continue;
+            };
+            let mount = match cache.resolve(source) {
+                Ok(mount) => mount,
+                Err(error) => {
+                    tracing::debug!(
+                        "cache entry {index} ({}) cannot be resolved for layout checks: {error}",
+                        cache.kind.label()
+                    );
+                    continue;
+                }
+            };
+            owners.insert(
+                mount.target.clone(),
+                format!("caches[{index}] {}", cache.kind.label()),
+            );
+            caches.push(mount);
         }
+        let declared = config
+            .mounts
+            .iter()
+            .map(MountGrant::resolve)
+            .collect::<Vec<_>>();
+        for (index, mount) in declared.iter().enumerate() {
+            owners.insert(mount.target.clone(), format!("mounts[{index}]"));
+        }
+        let mounts = mounts::merge_layers(
+            caches,
+            &[mounts::MountLayer {
+                name: "profile",
+                mounts: declared,
+            }],
+        );
+        Self { mounts, owners }
     }
-    targets
+
+    /// Apply every mount rule that needs no host state to the declared set.
+    ///
+    /// Layout comes first: environment wiring is derived from the layout, so a
+    /// nested pair would otherwise be reported as a derived variable conflict.
+    fn validate(&self) -> Result<()> {
+        // The target rule applies to every declared mount, including the ones a
+        // cache kind derives: a cache rooted at the host home would otherwise
+        // be accepted here and refused when the runtime binds it.
+        for mount in &self.mounts {
+            mounts::validate_target(&mount.target).with_context(|| {
+                format!(
+                    "{} must name a valid sandbox target",
+                    self.owner(&mount.target)
+                )
+            })?;
+        }
+        if let Some((first, second)) =
+            mounts::nesting_conflict(self.mounts.iter().map(|mount| mount.target.as_path()))
+        {
+            return Err(crate::recovery::operator(anyhow!(
+                "mount targets must not nest: {} ({}), {} ({}); {}",
+                first.display(),
+                self.owner(first),
+                second.display(),
+                self.owner(second),
+                mounts::NESTING_REMEDY
+            )));
+        }
+        mounts::validate_env(&self.mounts).map_err(|conflict| {
+            crate::recovery::operator(anyhow!(
+                "{}",
+                conflict.describe(|mount| Some(self.owner(&mount.target).to_owned()))
+            ))
+        })
+    }
+
+    fn owner(&self, target: &Path) -> &str {
+        self.owners.get(target).map_or("mount", String::as_str)
+    }
 }
 
 pub async fn cache_grants_for_cli(requests: &[(CacheKind, MountMode)]) -> Result<Vec<CacheGrant>> {
@@ -2247,17 +2377,17 @@ async fn interactive_setup(
                 )
             );
         }
+    }
 
-        if !config.mounts.is_empty() {
-            println!("  • Shared shell mounts:");
-            for mount in &config.mounts {
-                println!(
-                    "      {:<9} {} -> {}",
-                    mount.mode.label(),
-                    mount.source.display(),
-                    mount.target.display()
-                );
-            }
+    if !config.mounts.is_empty() {
+        println!("  • Shared shell mounts:");
+        for mount in &config.mounts {
+            println!(
+                "      {:<10} {} -> {}",
+                mount.mode.label(),
+                mount.source.display(),
+                mount.target.display()
+            );
         }
     }
     if config.transports.openai {
@@ -3698,14 +3828,15 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
 
     let mut cache_kinds = std::collections::BTreeSet::new();
     for cache in &config.caches {
-        if let Some(path) = cache.path.as_ref()
-            && !path.is_absolute()
-        {
-            bail!(
-                "cache path for {} must be absolute: {}",
-                cache.kind.label(),
-                path.display()
-            );
+        if let Some(path) = cache.path.as_ref() {
+            validate_path(path, &format!("cache path for {}", cache.kind.label()))?;
+            if !path.is_absolute() {
+                bail!(
+                    "cache path for {} must be absolute: {}",
+                    cache.kind.label(),
+                    path.display()
+                );
+            }
         }
         if !cache_kinds.insert(cache.kind) {
             bail!("duplicate cache grant for {}", cache.kind.label());
@@ -3717,14 +3848,7 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
             .validate()
             .with_context(|| format!("mounts[{index}]"))?;
     }
-    let profile_mounts = config
-        .mounts
-        .iter()
-        .map(MountGrant::resolve)
-        .collect::<Vec<_>>();
-    mounts::validate_assembled(&profile_mounts)?;
-    let targets = declared_sandbox_targets(config);
-    mounts::reject_nested_targets(targets.iter().map(PathBuf::as_path))?;
+    DeclaredMounts::resolve(config).validate()?;
 
     if let Some(tunnel_id) = config.tunnel_id.as_deref() {
         validate_tunnel_id(tunnel_id)?;
@@ -4367,6 +4491,67 @@ mod tests {
         ];
         let error = validate_config(&config).unwrap_err().to_string();
         assert!(error.contains("must not nest"), "{error}");
+        assert!(
+            error.contains("caches[0] Cargo registry") && error.contains("caches[1] Cargo git"),
+            "the message names the owning entries: {error}"
+        );
+        assert_eq!(
+            crate::recovery::Recovery::of(&validate_config(&config).unwrap_err()),
+            crate::recovery::Recovery::Operator
+        );
+    }
+
+    #[test]
+    fn nested_mount_over_a_cache_names_both_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().canonicalize().unwrap();
+        let mut config = example_config();
+        config.caches = vec![CacheGrant {
+            kind: CacheKind::CargoRegistry,
+            path: Some(source),
+            mode: MountMode::ReadOnly,
+        }];
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/mount"),
+            // The fallback target of a cache outside the host home.
+            target: PathBuf::from("/tmp/home/.cargo/registry/extra"),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::new(),
+        }];
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("must not nest"), "{error}");
+        assert!(
+            error.contains("caches[0] Cargo registry") && error.contains("mounts[0]"),
+            "both entries are named: {error}"
+        );
+        assert!(
+            error.contains(mounts::NESTING_REMEDY),
+            "the remedy is stated once for every presentation: {error}"
+        );
+    }
+
+    #[test]
+    fn cache_environment_conflicts_are_rejected_at_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().canonicalize().unwrap();
+        let mut config = example_config();
+        config.caches = vec![CacheGrant {
+            kind: CacheKind::CargoRegistry,
+            path: Some(source),
+            mode: MountMode::ReadOnly,
+        }];
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/mount"),
+            target: PathBuf::from("/tmp/home/other"),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::from([("CARGO_HOME".to_owned(), "/tmp/home/other".to_owned())]),
+        }];
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("CARGO_HOME is set to"), "{error}");
+        assert!(
+            error.contains("mounts[0]") && error.contains("caches[0] Cargo registry"),
+            "the message names both owners: {error}"
+        );
         assert_eq!(
             crate::recovery::Recovery::of(&validate_config(&config).unwrap_err()),
             crate::recovery::Recovery::Operator
@@ -4405,12 +4590,121 @@ mod tests {
     }
 
     #[test]
+    fn mount_spec_names_a_mode_typo_instead_of_a_colon_in_a_path() {
+        for spec in ["/srv/a:/tmp/home/x:r", "/srv/a:/tmp/home/x:read"] {
+            let error = spec.parse::<MountGrant>().err().unwrap().to_string();
+            assert!(
+                error.contains("is not a mount mode (use `ro` or `rw`)"),
+                "{spec}: {error}"
+            );
+        }
+        let error = "/srv/a:/tmp/home/x:"
+            .parse::<MountGrant>()
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("a trailing ':' needs a mode"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_environment_lists_are_operator_errors() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let raw = OsString::from_vec(b"/srv/\xff:/tmp/home/x".to_vec());
+        let error = env_utf8_value("DOTLINK_MOUNTS", Some(raw)).unwrap_err();
+        assert!(error.to_string().contains("valid UTF-8"), "{error}");
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator,
+            "a list that cannot express its entries is a declaration mistake"
+        );
+        assert_eq!(env_utf8_value("DOTLINK_MOUNTS", None).unwrap(), None);
+        assert_eq!(
+            env_utf8_value("DOTLINK_MOUNTS", Some(OsString::from("/srv:/tmp/home/x")))
+                .unwrap()
+                .as_deref(),
+            Some("/srv:/tmp/home/x")
+        );
+    }
+
+    #[test]
+    fn configured_paths_reject_nul_bytes() {
+        let mut config = example_config();
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/a\u{0}b"),
+            target: PathBuf::from("/tmp/home/a"),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::new(),
+        }];
+        let rendered = format!("{:#}", validate_config(&config).unwrap_err());
+        assert!(rendered.contains("mounts[0]"), "{rendered}");
+        assert!(rendered.contains("NUL byte"), "{rendered}");
+
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/a"),
+            target: PathBuf::from("/tmp/home/a\u{0}b"),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::new(),
+        }];
+        let rendered = format!("{:#}", validate_config(&config).unwrap_err());
+        assert!(rendered.contains("NUL byte"), "{rendered}");
+
+        config.mounts.clear();
+        config.caches = vec![CacheGrant {
+            kind: CacheKind::Npm,
+            path: Some(PathBuf::from("/srv/a\u{0}b")),
+            mode: MountMode::ReadOnly,
+        }];
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("NUL byte"), "{error}");
+        assert_eq!(
+            crate::recovery::Recovery::of(&validate_config(&config).unwrap_err()),
+            crate::recovery::Recovery::Operator
+        );
+    }
+
+    #[test]
+    fn cache_path_at_the_host_home_is_rejected_at_load() {
+        let mut config = example_config();
+        config.caches = vec![CacheGrant {
+            kind: CacheKind::Npm,
+            path: Some(home_dir().unwrap()),
+            mode: MountMode::ReadOnly,
+        }];
+        let error = validate_config(&config).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("caches[0] npm must name a valid sandbox target"),
+            "the entry that owns the target is named: {rendered}"
+        );
+        assert!(
+            rendered.contains("an absolute path below /tmp/home"),
+            "{rendered}"
+        );
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+    }
+
+    #[test]
     fn mount_list_env_parses_one_spec_per_comma() {
         let grants = parse_mount_list("/srv/a:/tmp/home/a, /srv/b:/tmp/home/b:rw").unwrap();
         assert_eq!(grants.len(), 2);
         assert!(!grants[0].mode.writable());
         assert!(grants[1].mode.writable());
         assert!(parse_mount_list("/srv/a:/opt/a").is_err());
+
+        // Spaces around the separators are list formatting, not part of a path.
+        let spaced =
+            parse_mount_list(" /srv/a : /tmp/home/a : rw , /srv/b : /tmp/home/b ").unwrap();
+        assert_eq!(spaced.len(), 2);
+        assert_eq!(spaced[0].source, PathBuf::from("/srv/a"));
+        assert_eq!(spaced[0].target, PathBuf::from("/tmp/home/a"));
+        assert!(spaced[0].mode.writable());
+        assert_eq!(spaced[1].source, PathBuf::from("/srv/b"));
+        assert!(!spaced[1].mode.writable());
     }
 
     #[test]

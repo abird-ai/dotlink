@@ -132,7 +132,13 @@ impl PreparedMount {
 #[cfg(all(test, target_os = "linux"))]
 impl PreparedMount {
     fn for_test(source: PathBuf, target: PathBuf, writable: bool) -> Self {
-        Self::for_test_with_env(source, target, writable, Vec::new())
+        Self::for_test_with_env(
+            source,
+            target,
+            writable,
+            Vec::new(),
+            crate::mounts::MountOrigin::Discovered,
+        )
     }
 
     fn for_test_with_env(
@@ -140,6 +146,7 @@ impl PreparedMount {
         target: PathBuf,
         writable: bool,
         env: Vec<(String, String)>,
+        origin: crate::mounts::MountOrigin,
     ) -> Self {
         let source = std::fs::canonicalize(source).expect("test mount source canonicalizes");
         let pinned = Arc::new(
@@ -151,7 +158,7 @@ impl PreparedMount {
             target,
             writable,
             env,
-            origin: crate::mounts::MountOrigin::Discovered,
+            origin,
             pinned,
         }
     }
@@ -1794,6 +1801,10 @@ impl LocalMachine {
         }
         let protected_paths = resolve_guards(&access.base_dir, &configured_protected).await?;
 
+        // Preflight in declaration order. Availability is host state and is
+        // decided here, before the assembled layout/environment rules below, so
+        // an unusable source is reported before a declaration mistake in the
+        // same run.
         let mut prepared_mounts = Vec::with_capacity(args.mounts.len());
         let mut mount_targets = BTreeSet::new();
         for mount in args.mounts {
@@ -1892,24 +1903,23 @@ impl LocalMachine {
                 }
             }
             if !mount_targets.insert(target.clone()) {
-                return Err(crate::recovery::operator(anyhow!(
-                    "mount target {} is declared more than once after resolution",
+                // Resolution keys mounts by target, so a duplicate means a caller
+                // bypassed it: an invariant, not a configuration mistake a user
+                // could fix, so leave it unclassified for a supervisor retry.
+                bail!(
+                    "internal error: duplicate sandbox mount target: {}",
                     target.display()
-                )));
+                );
             }
-            tracing::debug!(
-                "mount {} <- {} ({})",
-                target.display(),
-                source.display(),
-                if writable { "rw" } else { "ro" }
-            );
             #[cfg(target_os = "linux")]
             let pinned = match crate::secure_fs::SecureFs::open_canonical_directory(&source) {
                 Ok(file) => Arc::new(file),
                 Err(error) => {
-                    let error = error.context(format!("mount {} cannot be pinned", mount.label()));
                     if mount.origin.is_declared() {
-                        return Err(unavailable(error));
+                        return Err(unavailable(error.context(format!(
+                            "declared mount {} cannot be pinned",
+                            mount.label()
+                        ))));
                     }
                     tracing::warn!(
                         "skipping cache mount {}: source cannot be pinned: {error:#}",
@@ -1940,7 +1950,19 @@ impl LocalMachine {
                 origin: prepared.origin,
             })
             .collect::<Vec<_>>();
+        // The bound set is the truth: replacements, skips and deny downgrades
+        // have all been applied, so `-vv` shows exactly what the shell sees.
         crate::mounts::validate_assembled(&assembled)?;
+        for mount in &assembled {
+            args.log.developer(
+                "mounts",
+                format!(
+                    "{} ({})",
+                    mount.label(),
+                    if mount.writable { "rw" } else { "ro" }
+                ),
+            );
+        }
         #[cfg(target_os = "linux")]
         {
             let host_targets = args

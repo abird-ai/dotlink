@@ -286,7 +286,7 @@ The environment layer covers every setting the NixOS module can express, so a de
 - `DOTLINK_MOUNTS` — `/srv/cache:/tmp/home/.cache/srv:rw,...`
 - `DOTLINK_COLOR` — `auto`, `always` or `never` (used when no `--color` is given)
 
-Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES`, `DOTLINK_MOUNTS` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` and `DOTLINK_MOUNTS` are parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell.
+Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES`, `DOTLINK_MOUNTS` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` and `DOTLINK_MOUNTS` are parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell. Both list variables must be valid UTF-8: malformed bytes cannot name a path, so they are an operator error instead of a lossy guess.
 
 A profile is a named slot; its default config file is `config.jsonc` or `config.<profile>.jsonc`. `settings` and `configFile` author the config file, while `profile` selects the private state slot (saved keys, OAuth grants). An explicit config file is read verbatim — the profile then only suffixes the *default* path. If a suffixed sibling exists beside the explicit file, loading fails and names both, instead of silently reading one of them.
 
@@ -381,13 +381,18 @@ directory that appears inside the sandboxed shell at an absolute target.
 `DOTLINK_MOUNTS` is how a NixOS service declares mounts without a profile
 edit. The one-line forms cannot carry `env`; `DOTLINK_MOUNTS` splits entries
 on `,` and both one-line forms split fields on `:`, so a path containing those
-characters needs the profile list.
+characters needs the profile list. Whitespace around an entry and around a
+field is ignored, so a list can be written with spaces around its separators;
+a path that itself begins or ends with a space needs the profile list.
 
 **Mounts are keyed by target and the last declaration wins**, in this order:
 builtin developer caches, profile `mounts`, `DOTLINK_MOUNTS`, `--mount`. So a
 mount can repoint a cache at the same sandbox target
 (`--mount /srv/npm:/tmp/home/.npm:rw` repoints the discovered npm cache), and a
-later layer replaces the earlier mount's source, mode *and* `env` wholesale.
+later layer replaces the earlier mount's source, mode *and* `env` wholesale. A
+replacement inherits no environment: a tool whose default location is that
+target (npm under `~/.npm`) keeps working, while one that needs wiring (a
+registry below `CARGO_HOME`) has to declare `env` on the mount.
 That also makes the `--allow-cache-*`/`DOTLINK_CACHES` request a bottom-layer
 default: a mount on the same target wins, which is the one place the general
 CLI-over-environment-over-profile order does not apply.
@@ -396,21 +401,34 @@ CLI-over-environment-over-profile order does not apply.
 path below `/tmp/home`. Targets must not nest: binding a parent would hide a
 child (or need a mountpoint that only exists on the host), so
 `/tmp/home/.cache` together with `/tmp/home/.cache/abird` is rejected, and so
-is binding a parent over a cache target. To share a whole tree, remove or
-override the cache entries that own the nested targets — mounts cannot unmount
-a builtin cache. Fixed host-integration targets (the Git/Nix config files,
-device nodes) are conflict-checked: a mount that collides with one is rejected
-instead of being silently shadowed.
+is binding a parent over a cache target. A saved profile is checked when it
+loads for its `mounts` and for cache entries with an explicit path; a
+discovered cache is only known when the runtime prepares it, and is checked
+there. Layout and environment mistakes in a saved profile name the owning
+configuration entries (`mounts[0]`, `caches[1] Cargo registry`); a discovered
+cache or a `--mount` has no profile entry, so it is reported by its sandbox
+target. At load, a declared mount whose source is absent is still checked,
+because it is declared intent, while an explicit-path cache whose source is
+absent is skipped, exactly as the runtime skips it. To share a whole tree,
+remove or override the cache entries that own the nested targets — mounts
+cannot unmount a builtin cache. Fixed host-integration targets (the Git/Nix
+config files, device nodes) are conflict-checked: a mount that collides with
+one is rejected instead of being silently shadowed.
 
 A mount's `env` may not repoint what the sandbox owns (`HOME`, `PATH`,
 `TMPDIR`, `USER`, `LANG`, `LC_ALL`, `TERM`) and may not disagree with another
 mount or a host-integration variable; setting the same value twice is allowed.
 
-A declared mount is required: a missing or unreadable source, a deny rule, a
-protected path or a host-integration conflict fails closed as a configuration
-error (`CONFIG`, so a service stops for the operator instead of restarting).
-Use `-vv` to log every resolved mount once at startup. Only a
-discovered cache is skipped with a warning, because cache directories come and
-go with the user's activity. Deny rules apply exactly as for caches, and mounts
-are shell-only: they never expand MCP read/write roots. Mounts configured while
-the shell or sandbox is disabled are inert and reported once at startup.
+A declared mount is required, in two failure classes. A **declaration mistake**
+— a target outside the sandbox home, nesting, an environment conflict, a
+non-directory source, a deny rule or protected path that blocks it, a collision
+with a fixed host integration — is a configuration error (`CONFIG`, so a
+supervisor never restart-loops on it). A source that is **not usable yet** (not
+created, not readable, not pinnable) is host state: the runtime retries
+in-process with backoff and never skips the mount. A discovered cache that
+cannot be prepared is skipped with a warning naming it, because cache
+directories come and go with the user's activity. `-vv` logs the resolved mount
+set once at startup. Deny rules apply exactly as for caches, and mounts are
+shell-only: they never expand MCP read/write roots. Mounts configured while the
+shell or sandbox is disabled are inert and reported once at startup, but their
+layout is still validated when the profile loads.

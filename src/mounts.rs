@@ -15,10 +15,11 @@ use crate::recovery;
 
 /// Where a mount came from.
 ///
-/// A declared mount was asked for explicitly, so it fails closed when it cannot
-/// be honoured. A discovered cache is a best-effort convenience and is skipped
-/// with a warning, matching the fact that cache directories appear and
-/// disappear with the user's activity.
+/// A declared mount was asked for explicitly: a mistake in the declaration
+/// itself is a configuration error, and a source that is not usable yet retries
+/// the runtime instead of disappearing. A discovered cache is a best-effort
+/// convenience and is skipped with a warning, matching the fact that cache
+/// directories appear and disappear with the user's activity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MountOrigin {
     Declared,
@@ -84,12 +85,26 @@ pub fn sandbox_parent(sandbox_path: &Path) -> String {
     }
 }
 
+/// A configured path must be representable to the OS. An interior NUL byte can
+/// never name a file, so it is a declaration mistake rather than a path that
+/// might appear later.
+pub fn validate_path(path: &Path, what: &str) -> Result<()> {
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(recovery::operator(anyhow::anyhow!(
+            "{what} must not contain a NUL byte"
+        )));
+    }
+    Ok(())
+}
+
 /// A sandbox target must be an absolute path strictly below `/tmp/home`.
 ///
 /// Mounting `/tmp/home` itself would replace the sandbox home the runtime
 /// builds, and a `..`/`.` component would make the target spelling depend on
-/// lexical normalization instead of the declared path.
+/// lexical normalization instead of the declared path. A NUL byte can never
+/// name a path at all.
 pub fn validate_target(target: &Path) -> Result<()> {
+    validate_path(target, "sandbox mount target")?;
     if !target.has_root()
         || !target.starts_with("/tmp/home")
         || target == Path::new("/tmp/home")
@@ -105,50 +120,116 @@ pub fn validate_target(target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reject mount targets that contain one another.
+/// What to do about a nested layout, phrased once for every presentation of
+/// the rule.
+pub const NESTING_REMEDY: &str =
+    "mount one target per tree (remove or override the cache entry, or drop one of the mounts)";
+
+/// The first pair of targets that contain one another, if any.
 ///
 /// Nested targets are order-dependent in a bind namespace: binding a parent
 /// after a child silently hides the child, and binding it before needs a
 /// mountpoint inside the parent that only exists on the host.
-pub fn reject_nested_targets<'a>(targets: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+pub fn nesting_conflict<'a>(
+    targets: impl IntoIterator<Item = &'a Path>,
+) -> Option<(&'a Path, &'a Path)> {
     let targets = targets.into_iter().collect::<Vec<_>>();
     for (index, target) in targets.iter().enumerate() {
         for other in &targets[index + 1..] {
-            if target == other {
-                continue;
-            }
-            if target.starts_with(other) || other.starts_with(target) {
-                return Err(recovery::operator(anyhow::anyhow!(
-                    "mount targets must not nest: {} and {}; mount one target per tree (remove or override the cache entry, or drop one of the mounts)",
-                    target.display(),
-                    other.display()
-                )));
+            if target != other && (target.starts_with(other) || other.starts_with(target)) {
+                return Some((target, other));
             }
         }
     }
-    Ok(())
+    None
+}
+
+/// Reject mount targets that contain one another.
+pub fn reject_nested_targets<'a>(targets: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+    let Some((first, second)) = nesting_conflict(targets) else {
+        return Ok(());
+    };
+    Err(recovery::operator(anyhow::anyhow!(
+        "mount targets must not nest: {} and {}; {NESTING_REMEDY}",
+        first.display(),
+        second.display()
+    )))
+}
+
+/// A mount environment rule the configuration breaks.
+///
+/// The rule names the mounts that disagree; presentation adds provenance when
+/// the caller knows which configuration entry owns each mount, so a profile can
+/// report `mounts[0]` while the binder reports `source -> target`.
+#[derive(Clone, Copy, Debug)]
+pub enum EnvConflict<'a> {
+    Reserved {
+        mount: &'a SandboxMount,
+        name: &'a str,
+    },
+    Mismatch {
+        name: &'a str,
+        value: &'a str,
+        mount: &'a SandboxMount,
+        other_value: &'a str,
+        other: &'a SandboxMount,
+    },
+}
+
+impl EnvConflict<'_> {
+    /// One line, naming each mount through `owner` when it has a provenance.
+    pub fn describe(&self, owner: impl Fn(&SandboxMount) -> Option<String>) -> String {
+        let named = |mount: &SandboxMount| {
+            owner(mount).map_or_else(
+                || mount.label(),
+                |owner| format!("{owner} ({})", mount.label()),
+            )
+        };
+        match self {
+            Self::Reserved { mount, name } => format!(
+                "mount {} must not set {name}: the sandbox owns that variable",
+                named(mount)
+            ),
+            Self::Mismatch {
+                name,
+                value,
+                mount,
+                other_value,
+                other,
+            } => format!(
+                "{name} is set to {value} by {} and to {other_value} by {}",
+                named(mount),
+                named(other)
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for EnvConflict<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.describe(|_| None))
+    }
 }
 
 /// Reject mount environment that would repoint the sandbox or silently
 /// disagree with another mount. Caches legitimately share a variable when they
 /// share the same value (both Cargo caches point `CARGO_HOME` at `.cargo`).
-fn validate_env(mounts: &[SandboxMount]) -> Result<()> {
+pub fn validate_env(mounts: &[SandboxMount]) -> Result<(), EnvConflict<'_>> {
     let mut seen: BTreeMap<&str, (&str, &SandboxMount)> = BTreeMap::new();
     for mount in mounts {
         for (name, value) in &mount.env {
             if RESERVED_ENV.contains(&name.as_str()) {
-                return Err(recovery::operator(anyhow::anyhow!(
-                    "mount {} must not set {name}: the sandbox owns that variable",
-                    mount.label()
-                )));
+                return Err(EnvConflict::Reserved { mount, name });
             }
             match seen.get(name.as_str()) {
                 Some((existing, other)) if *existing != value.as_str() => {
-                    return Err(recovery::operator(anyhow::anyhow!(
-                        "mount {} sets {name}={value} but {} sets {name}={existing}",
-                        mount.label(),
-                        other.label()
-                    )));
+                    return Err(EnvConflict::Mismatch {
+                        name,
+                        value,
+                        mount,
+                        other_value: existing,
+                        other,
+                    });
                 }
                 Some(_) => {}
                 None => {
@@ -165,6 +246,10 @@ fn validate_env(mounts: &[SandboxMount]) -> Result<()> {
 /// Mounts are keyed by sandbox target and the last declaration wins, so a layer
 /// list reads exactly like the precedence it implements. A first-seen target
 /// keeps its position, so the assembled list stays deterministic.
+///
+/// This is precedence only. The result is not valid by construction: whoever
+/// binds it must apply [`validate_assembled`] to the set that survives its own
+/// skips, because that is the only set the binder can be wrong about.
 pub fn merge_layers(builtin: Vec<SandboxMount>, layers: &[MountLayer]) -> Vec<SandboxMount> {
     let mut merged = builtin;
     for layer in layers {
@@ -188,14 +273,16 @@ pub fn merge_layers(builtin: Vec<SandboxMount>, layers: &[MountLayer]) -> Vec<Sa
     merged
 }
 
-/// Apply every assembly rule to the mounts that will actually be bound.
+/// Apply the layout and environment rules to the mounts that will be bound.
 ///
-/// Called by the resolver (early, so a profile error is reported as a
-/// configuration error) and again by the runtime preparation, so no caller can
-/// assemble a set the binder would have to guess about.
+/// The binder calls this on its post-skip set, and configuration load calls it
+/// (through `setup::DeclaredMounts`) on what a saved profile declares, so a
+/// mistake is a configuration error wherever it is seen. Host-integration
+/// conflicts are the separate [`reject_host_conflicts`] rule, which needs host
+/// state. Layout is checked first because environment wiring is derived from it.
 pub fn validate_assembled(mounts: &[SandboxMount]) -> Result<()> {
     reject_nested_targets(mounts.iter().map(|mount| mount.target.as_path()))?;
-    validate_env(mounts)
+    validate_env(mounts).map_err(|conflict| recovery::operator(anyhow::anyhow!("{conflict}")))
 }
 
 /// Reject a mount that would collide with a fixed host integration.
@@ -292,6 +379,33 @@ mod tests {
     }
 
     #[test]
+    fn nesting_conflict_names_the_offending_pair() {
+        assert_eq!(
+            nesting_conflict([
+                Path::new("/tmp/home/.cache"),
+                Path::new("/tmp/home/other"),
+                Path::new("/tmp/home/.cache/abird"),
+            ]),
+            Some((
+                Path::new("/tmp/home/.cache"),
+                Path::new("/tmp/home/.cache/abird")
+            ))
+        );
+        assert_eq!(
+            nesting_conflict([Path::new("/tmp/home/a"), Path::new("/tmp/home/a")]),
+            None,
+            "one target declared twice is an override, not nesting"
+        );
+        assert_eq!(
+            nesting_conflict([
+                Path::new("/tmp/home/.cargo/registry"),
+                Path::new("/tmp/home/.cargo/git"),
+            ]),
+            None
+        );
+    }
+
+    #[test]
     fn shared_cache_env_is_allowed_but_disagreement_is_not() {
         let shared = [
             SandboxMount {
@@ -312,8 +426,14 @@ mod tests {
                 ..shared[1].clone()
             },
         ];
-        let error = validate_env(&conflicting).unwrap_err().to_string();
-        assert!(error.contains("sets CARGO_HOME"), "{error}");
+        let conflict = validate_env(&conflicting).unwrap_err();
+        let error = conflict.to_string();
+        assert!(error.contains("CARGO_HOME is set to"), "{error}");
+        let owned = conflict.describe(|mount| {
+            (mount.target == Path::new("/tmp/home/.cargo/registry")).then(|| "mounts[1]".to_owned())
+        });
+        assert!(owned.starts_with("CARGO_HOME is set to"), "{owned}");
+        assert!(owned.contains("mounts[1] ("), "{owned}");
     }
 
     #[test]
