@@ -512,6 +512,9 @@ DEVELOPER CACHES (discovered paths; bare flag = ro, =rw enables writes)
 --allow-cache-gradle[=ro|rw]           --allow-cache-sccache[=ro|rw]
 --allow-cache-ccache[=ro|rw]
 
+SHELL MOUNTS (sandbox-only; bare spec = ro, :rw enables writes)
+--mount SOURCE:TARGET[:ro|rw]           repeatable explicit host → sandbox mount
+
 OUTPUT & DIAGNOSTICS
 --list-tools                    show tools exposed by the effective policy
 --print-id                      print configured tunnel ID (no Runtime key needed)

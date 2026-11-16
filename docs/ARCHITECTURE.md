@@ -199,7 +199,7 @@ SHA-256 precondition without retaining source plus output in memory.
 
 ## Profiles and persisted defaults
 
-The default config is `~/.config/abird/dotlink/config.jsonc`. Named profiles use `config.<profile>.jsonc` and are selected with `-p/--profile`. Setup can target the same profile with `-S/--setup -p <name>`. Schema v12 JSONC supports line/block comments and trailing commas. Compatible older schemas migrate forward in memory through explicit version-to-version migration steps (currently v9 → v10 → v11 → v12); newer schemas and older versions without a defined migration path are rejected. Migrated profiles are serialized as the current schema when they are next edited or saved.
+The default config is `~/.config/abird/dotlink/config.jsonc`. Named profiles use `config.<profile>.jsonc` and are selected with `-p/--profile`. Setup can target the same profile with `-S/--setup -p <name>`. Schema v13 JSONC supports line/block comments and trailing commas. Compatible older schemas migrate forward in memory through explicit version-to-version migration steps (currently v9 → v10 → v11 → v12 → v13); newer schemas and older versions without a defined migration path are rejected. Migrated profiles are serialized as the current schema when they are next edited or saved.
 
 Each profile persists transport behavior plus the local permission model:
 
@@ -537,7 +537,7 @@ serialized and bounded before staging, and post-rename directory-sync failures
 are warnings, never grounds to roll back a paired key. Unix private-file readers
 use nonblocking opens and reject non-regular descriptors before reading.
 
-Developer caches are predefined sandbox mounts, not a separate runtime layer. A cache record stores its tool family, host source path and RO/RW mode; at runtime it resolves to the same `SandboxMount { source, target, writable, env }` every other shell-only remapping uses, with the kind supplying the target below `/tmp/home` and the tool's cache environment. The source is canonicalized, descriptor-pinned and mounted only into the shell sandbox. Mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical mount sources before mounting.
+Developer caches are predefined sandbox mounts, not a separate runtime layer. A cache record stores its tool family, host source path and RO/RW mode; at runtime it resolves to the same `SandboxMount { source, target, writable, env }` every other shell-only remapping uses, with the kind supplying the target below `/tmp/home` and the tool's cache environment. The source is canonicalized, descriptor-pinned and mounted only into the shell sandbox. Profile `mounts`, `DOTLINK_MOUNTS` and `--mount` declare the same `SandboxMount` directly, so the shell has one mount layer regardless of whether a mount came from a cache kind or an explicit grant. Mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical mount sources before mounting.
 
 ## Dynamic tool router
 

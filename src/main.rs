@@ -57,10 +57,10 @@ use crate::{
     mcp::{AccessSpec, LocalMachine, MachineConfig, PreparedMachine},
     recovery::Recovery,
     setup::{
-        CacheKind, CacheMode, GpuVendor, PermissionConfig, ProfileBool, ProfileRuleKind,
-        SetupResult, TransportConfig, cache_grants_for_cli, create_profile, delete_profile,
-        edit_profile, list_profiles, load_or_setup, mutate_profile_rule, set_profile_bool,
-        show_profile, validate_ngrok_domain,
+        CacheKind, GpuVendor, MountGrant, MountMode, PermissionConfig, ProfileBool,
+        ProfileRuleKind, SetupResult, TransportConfig, cache_grants_for_cli, create_profile,
+        delete_profile, edit_profile, list_profiles, load_or_setup, mutate_profile_rule,
+        set_profile_bool, show_profile, validate_ngrok_domain,
     },
     shutdown::Shutdown,
     supervisor::Supervisor,
@@ -343,6 +343,11 @@ struct Args {
     #[command(flatten)]
     cache_flags: CacheFlags,
 
+    /// Mount a host directory into the sandboxed shell (repeatable).
+    #[arg(long = "mount", value_name = "SOURCE:TARGET[:ro|rw]", action = ArgAction::Append,
+        conflicts_with = "setup", help_heading = "Shell mounts")]
+    mounts: Vec<MountGrant>,
+
     /// Disable the shell sandbox. Requires --allow-all or --unrestricted.
     #[arg(long)]
     #[arg(help_heading = "Shell & network")]
@@ -398,59 +403,59 @@ struct Args {
 struct CacheFlags {
     /// Share discovered Cargo registry cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_cargo_registry: Option<CacheMode>,
+    allow_cache_cargo_registry: Option<MountMode>,
 
     /// Share discovered Cargo Git cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_cargo_git: Option<CacheMode>,
+    allow_cache_cargo_git: Option<MountMode>,
 
     /// Share discovered npm cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_npm: Option<CacheMode>,
+    allow_cache_npm: Option<MountMode>,
 
     /// Share discovered pnpm cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_pnpm: Option<CacheMode>,
+    allow_cache_pnpm: Option<MountMode>,
 
     /// Share discovered Yarn cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_yarn: Option<CacheMode>,
+    allow_cache_yarn: Option<MountMode>,
 
     /// Share discovered pip cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_pip: Option<CacheMode>,
+    allow_cache_pip: Option<MountMode>,
 
     /// Share discovered uv cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_uv: Option<CacheMode>,
+    allow_cache_uv: Option<MountMode>,
 
     /// Share discovered Go module cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_go_mod: Option<CacheMode>,
+    allow_cache_go_mod: Option<MountMode>,
 
     /// Share discovered Go build cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_go_build: Option<CacheMode>,
+    allow_cache_go_build: Option<MountMode>,
 
     /// Share discovered Maven cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_maven: Option<CacheMode>,
+    allow_cache_maven: Option<MountMode>,
 
     /// Share discovered Gradle cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_gradle: Option<CacheMode>,
+    allow_cache_gradle: Option<MountMode>,
 
     /// Share discovered sccache cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_sccache: Option<CacheMode>,
+    allow_cache_sccache: Option<MountMode>,
 
     /// Share discovered ccache cache; bare flag means read-only, =rw enables writes.
     #[arg(long, value_enum, value_name = "MODE", num_args=0..=1, default_missing_value="ro", require_equals=true, conflicts_with="setup", help_heading="Developer caches")]
-    allow_cache_ccache: Option<CacheMode>,
+    allow_cache_ccache: Option<MountMode>,
 }
 
 impl CacheFlags {
-    fn requested(&self) -> Vec<(CacheKind, CacheMode)> {
+    fn requested(&self) -> Vec<(CacheKind, MountMode)> {
         let mut selected = Vec::new();
         if let Some(mode) = self.allow_cache_cargo_registry {
             selected.push((CacheKind::CargoRegistry, mode));
@@ -1515,6 +1520,25 @@ async fn prepare_runtime(
                 continue;
             }
             mounts.push(cache.resolve(source)?);
+        }
+        // Explicit mounts share that layer, keyed by target: CLI > env > profile.
+        let explicit_mounts = setup::merge_mount_layers(
+            &setup.config.mounts,
+            &setup::env_mount_grants()?,
+            &args.mounts,
+        );
+        for grant in explicit_mounts {
+            let mount = grant.resolve();
+            if mounts
+                .iter()
+                .any(|existing| existing.target == mount.target)
+            {
+                bail!(
+                    "mount target {} is declared more than once; remove the duplicate cache or mount",
+                    mount.target.display()
+                );
+            }
+            mounts.push(mount);
         }
     }
 
@@ -3363,6 +3387,23 @@ mod tests {
     }
 
     #[test]
+    fn mount_flag_parses_source_target_and_mode() {
+        let args = Args::try_parse_from([
+            "dotlink",
+            "--mount",
+            "/srv/cache:/tmp/home/.cache/srv:rw",
+            "--mount",
+            "/srv/other:/tmp/home/other",
+        ])
+        .unwrap();
+        assert_eq!(args.mounts.len(), 2);
+        assert_eq!(args.mounts[0].target, PathBuf::from("/tmp/home/.cache/srv"));
+        assert!(args.mounts[0].mode.writable());
+        assert!(!args.mounts[1].mode.writable());
+        assert!(Args::try_parse_from(["dotlink", "--mount", "/srv:/opt/x"]).is_err());
+    }
+
+    #[test]
     fn detected_cache_families_have_symmetric_ro_rw_flags() {
         use clap::CommandFactory;
         let command = Args::command();
@@ -3378,7 +3419,7 @@ mod tests {
             assert!(
                 ro.cache_flags
                     .requested()
-                    .contains(&(kind, CacheMode::ReadOnly)),
+                    .contains(&(kind, MountMode::ReadOnly)),
                 "{flag}"
             );
             let rw_flag = format!("{flag}=rw");
@@ -3386,7 +3427,7 @@ mod tests {
             assert!(
                 rw.cache_flags
                     .requested()
-                    .contains(&(kind, CacheMode::ReadWrite)),
+                    .contains(&(kind, MountMode::ReadWrite)),
                 "{rw_flag}"
             );
         }

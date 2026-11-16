@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -341,9 +341,10 @@ impl CacheKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
-pub enum CacheMode {
+pub enum MountMode {
+    #[default]
     #[serde(alias = "ro", alias = "read-only")]
     #[value(name = "ro", alias = "read-only")]
     ReadOnly,
@@ -352,7 +353,16 @@ pub enum CacheMode {
     ReadWrite,
 }
 
-impl CacheMode {
+impl MountMode {
+    /// Parse the CLI/spec spelling of a mount mode.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ro" | "read-only" => Some(Self::ReadOnly),
+            "rw" | "read-write" => Some(Self::ReadWrite),
+            _ => None,
+        }
+    }
+
     pub fn writable(self) -> bool {
         matches!(self, Self::ReadWrite)
     }
@@ -375,7 +385,102 @@ pub struct CacheGrant {
     /// hard-coding a path that only the host knows.
     #[serde(default)]
     pub path: Option<PathBuf>,
-    pub mode: CacheMode,
+    pub mode: MountMode,
+}
+
+/// One explicit host → sandbox shell mount.
+///
+/// A developer cache is the same thing with a predefined source/target/env, so
+/// this is the primitive a profile, `DOTLINK_MOUNTS` or `--mount` declares
+/// directly. Mounts are shell-only: they never expand MCP filesystem access.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MountGrant {
+    /// Absolute host directory the sandbox sees.
+    pub source: PathBuf,
+    /// Absolute sandbox path, below the sandbox home.
+    pub target: PathBuf,
+    #[serde(default)]
+    pub mode: MountMode,
+    /// Environment the mount wires into sandboxed commands, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+impl MountGrant {
+    /// The sandbox mount this grant describes.
+    pub fn resolve(&self) -> SandboxMount {
+        SandboxMount {
+            source: self.source.clone(),
+            target: self.target.clone(),
+            writable: self.mode.writable(),
+            env: self
+                .env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        }
+    }
+
+    /// Structural checks shared by every layer; callers add their own context.
+    fn validate(&self) -> Result<()> {
+        if !self.source.is_absolute() {
+            bail!(
+                "source must be an absolute host path: {}",
+                self.source.display()
+            );
+        }
+        if !self.target.has_root()
+            || !self.target.starts_with("/tmp/home")
+            || self
+                .target
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        {
+            bail!(
+                "target must be an absolute sandbox path below /tmp/home: {}",
+                self.target.display()
+            );
+        }
+        for (name, value) in &self.env {
+            if name.is_empty() || name.contains('=') || name.contains('\0') {
+                bail!("mount environment name is invalid: {name:?}");
+            }
+            if value.contains('\0') {
+                bail!("mount environment value for {name} contains a NUL byte");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for MountGrant {
+    type Err = anyhow::Error;
+
+    fn from_str(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        let (rest, mode) = match spec.rsplit_once(':') {
+            Some((rest, trailing)) => match MountMode::parse(trailing) {
+                Some(mode) => (rest, mode),
+                None => (spec, MountMode::default()),
+            },
+            None => (spec, MountMode::default()),
+        };
+        let (source, target) = rest
+            .split_once(':')
+            .ok_or_else(|| anyhow!("mount {spec:?} must be SOURCE:TARGET[:ro|rw]"))?;
+        if target.contains(':') {
+            bail!("mount {spec:?}: a target containing ':' is not supported in a mount spec");
+        }
+        let grant = Self {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            mode,
+            env: BTreeMap::new(),
+        };
+        grant.validate()?;
+        Ok(grant)
+    }
 }
 
 /// Cache mounts live inside the Linux sandbox home, a POSIX path, whatever host
@@ -471,6 +576,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub caches: Vec<CacheGrant>,
 
+    /// Extra shell-only host → sandbox mounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountGrant>,
+
     #[serde(default)]
     pub tunnel_id: Option<String>,
     #[serde(skip_serializing, skip_deserializing, default)]
@@ -554,7 +663,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    12
+    13
 }
 
 fn default_true() -> bool {
@@ -625,6 +734,7 @@ fn default_app_config() -> AppConfig {
         oauth: OAuthConfig::default(),
         permissions: PermissionConfig::default(),
         caches: Vec::new(),
+        mounts: Vec::new(),
         tunnel_id: None,
         runtime_api_key: String::new(),
         runtime_key_revision: None,
@@ -694,7 +804,8 @@ fn migration_step(
         // and transports.ngrok_domain (None by default).
         // v11 adds serialize (false) and logging.verbosity (lifecycle).
         // v12 makes a cache entry's `path` optional so discovery can supply it.
-        9..=11 => Ok(()),
+        // v13 adds `mounts`, an explicit shell mount list (empty by default).
+        9..=12 => Ok(()),
         version => bail!(
             "profile uses schema version {version}; no automatic migration path to version {} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one",
             config_version()
@@ -1004,14 +1115,14 @@ fn env_flag(name: &str) -> Result<Option<bool>> {
 /// Returned in order so a caller can let a later layer override an earlier one
 /// for the same cache kind. Resolution to concrete paths is async and lives
 /// next to the `--allow-cache-*` resolver.
-pub fn env_cache_requests() -> Result<Vec<(CacheKind, CacheMode)>> {
+pub fn env_cache_requests() -> Result<Vec<(CacheKind, MountMode)>> {
     let Some(raw) = env::var_os("DOTLINK_CACHES") else {
         return Ok(Vec::new());
     };
     parse_cache_requests(&raw.to_string_lossy())
 }
 
-fn parse_cache_requests(raw: &str) -> Result<Vec<(CacheKind, CacheMode)>> {
+fn parse_cache_requests(raw: &str) -> Result<Vec<(CacheKind, MountMode)>> {
     let mut requests = Vec::new();
     for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
         let (name, mode) = match entry.split_once(':') {
@@ -1021,8 +1132,8 @@ fn parse_cache_requests(raw: &str) -> Result<Vec<(CacheKind, CacheMode)>> {
         let kind = CacheKind::from_name(name)
             .ok_or_else(|| anyhow!("DOTLINK_CACHES has unknown cache kind {name:?}"))?;
         let mode = match mode.trim().to_ascii_lowercase().as_str() {
-            "ro" => CacheMode::ReadOnly,
-            "rw" => CacheMode::ReadWrite,
+            "ro" => MountMode::ReadOnly,
+            "rw" => MountMode::ReadWrite,
             other => bail!("DOTLINK_CACHES mode must be ro or rw, not {other:?}"),
         };
         requests.retain(|(existing, _)| *existing != kind);
@@ -1305,15 +1416,15 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
 /// layers for their kind and the last layer wins.
 pub(crate) fn merge_cache_layers(
     saved: &[CacheGrant],
-    environment: &[(CacheKind, CacheMode)],
-    cli: &[(CacheKind, CacheMode)],
-) -> (Vec<CacheGrant>, Vec<(CacheKind, CacheMode)>) {
+    environment: &[(CacheKind, MountMode)],
+    cli: &[(CacheKind, MountMode)],
+) -> (Vec<CacheGrant>, Vec<(CacheKind, MountMode)>) {
     let mut explicit: Vec<CacheGrant> = saved
         .iter()
         .filter(|grant| grant.path.is_some())
         .cloned()
         .collect();
-    let mut requests: Vec<(CacheKind, CacheMode)> = saved
+    let mut requests: Vec<(CacheKind, MountMode)> = saved
         .iter()
         .filter(|grant| grant.path.is_none())
         .map(|grant| (grant.kind, grant.mode))
@@ -1328,7 +1439,42 @@ pub(crate) fn merge_cache_layers(
     (explicit, requests)
 }
 
-pub async fn cache_grants_for_cli(requests: &[(CacheKind, CacheMode)]) -> Result<Vec<CacheGrant>> {
+/// Mounts declared by `DOTLINK_MOUNTS` as comma-separated `SOURCE:TARGET[:ro|rw]`.
+pub fn env_mount_grants() -> Result<Vec<MountGrant>> {
+    let Some(raw) = env::var_os("DOTLINK_MOUNTS") else {
+        return Ok(Vec::new());
+    };
+    parse_mount_list(&raw.to_string_lossy())
+}
+
+fn parse_mount_list(raw: &str) -> Result<Vec<MountGrant>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.parse::<MountGrant>())
+        .collect()
+}
+
+/// Merge mount layers by target: later layers win, profile order is preserved.
+pub fn merge_mount_layers(
+    saved: &[MountGrant],
+    environment: &[MountGrant],
+    cli: &[MountGrant],
+) -> Vec<MountGrant> {
+    let mut merged: Vec<MountGrant> = Vec::new();
+    for grant in saved.iter().chain(environment).chain(cli) {
+        match merged
+            .iter_mut()
+            .find(|existing| existing.target == grant.target)
+        {
+            Some(existing) => *existing = grant.clone(),
+            None => merged.push(grant.clone()),
+        }
+    }
+    merged
+}
+
+pub async fn cache_grants_for_cli(requests: &[(CacheKind, MountMode)]) -> Result<Vec<CacheGrant>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
@@ -1345,7 +1491,7 @@ pub async fn cache_grants_for_cli(requests: &[(CacheKind, CacheMode)]) -> Result
 }
 
 fn cache_grants_from_discovery(
-    requests: &[(CacheKind, CacheMode)],
+    requests: &[(CacheKind, MountMode)],
     detected: &[DiscoveredCache],
 ) -> Vec<CacheGrant> {
     requests
@@ -1369,12 +1515,12 @@ fn yes_no_hint(default: bool) -> &'static str {
 
 fn prompt_cache_mode(
     cache: &DiscoveredCache,
-    existing: Option<CacheMode>,
+    existing: Option<MountMode>,
     color: bool,
-) -> Result<Option<CacheMode>> {
+) -> Result<Option<MountMode>> {
     let default_key = match existing {
-        Some(CacheMode::ReadOnly) => "r",
-        Some(CacheMode::ReadWrite) => "w",
+        Some(MountMode::ReadOnly) => "r",
+        Some(MountMode::ReadWrite) => "w",
         None => "n",
     };
     loop {
@@ -1396,9 +1542,9 @@ fn prompt_cache_mode(
         };
         match value.to_ascii_lowercase().as_str() {
             "n" | "none" | "no" => return Ok(None),
-            "r" | "ro" | "read" | "read-only" => return Ok(Some(CacheMode::ReadOnly)),
+            "r" | "ro" | "read" | "read-only" => return Ok(Some(MountMode::ReadOnly)),
             "w" | "rw" | "write" | "read-write" | "read+write" => {
-                return Ok(Some(CacheMode::ReadWrite));
+                return Ok(Some(MountMode::ReadWrite));
             }
             _ => println!("      Please enter n, r, or w."),
         }
@@ -3557,6 +3703,16 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
         }
     }
 
+    let mut mount_targets = std::collections::BTreeSet::new();
+    for (index, mount) in config.mounts.iter().enumerate() {
+        mount
+            .validate()
+            .with_context(|| format!("mounts[{index}]"))?;
+        if !mount_targets.insert(mount.target.clone()) {
+            bail!("duplicate mount target: {}", mount.target.display());
+        }
+    }
+
     if let Some(tunnel_id) = config.tunnel_id.as_deref() {
         validate_tunnel_id(tunnel_id)?;
     }
@@ -3737,6 +3893,7 @@ mod tests {
             oauth: OAuthConfig::default(),
             permissions: PermissionConfig::default(),
             caches: Vec::new(),
+            mounts: Vec::new(),
             serialize: false,
             logging: LoggingConfig::default(),
             tunnel_id: Some("tunnel_0123456789abcdef0123456789abcdef".to_owned()),
@@ -3960,26 +4117,26 @@ mod tests {
             path: temp.path().to_path_buf(),
         }];
         let granted = cache_grants_from_discovery(
-            &[(CacheKind::CargoRegistry, CacheMode::ReadOnly)],
+            &[(CacheKind::CargoRegistry, MountMode::ReadOnly)],
             &detected,
         );
         assert_eq!(granted.len(), 1);
         assert_eq!(granted[0].path.as_deref(), Some(temp.path()));
-        assert_eq!(granted[0].mode, CacheMode::ReadOnly);
+        assert_eq!(granted[0].mode, MountMode::ReadOnly);
         let writable = cache_grants_from_discovery(
-            &[(CacheKind::CargoRegistry, CacheMode::ReadWrite)],
+            &[(CacheKind::CargoRegistry, MountMode::ReadWrite)],
             &detected,
         );
-        assert_eq!(writable[0].mode, CacheMode::ReadWrite);
+        assert_eq!(writable[0].mode, MountMode::ReadWrite);
         assert!(
-            cache_grants_from_discovery(&[(CacheKind::Npm, CacheMode::ReadWrite)], &detected,)
+            cache_grants_from_discovery(&[(CacheKind::Npm, MountMode::ReadWrite)], &detected,)
                 .is_empty()
         );
         // A missing request is skipped without dropping discovered siblings.
         let mixed = cache_grants_from_discovery(
             &[
-                (CacheKind::Npm, CacheMode::ReadWrite),
-                (CacheKind::CargoRegistry, CacheMode::ReadOnly),
+                (CacheKind::Npm, MountMode::ReadWrite),
+                (CacheKind::CargoRegistry, MountMode::ReadOnly),
             ],
             &detected,
         );
@@ -4036,7 +4193,7 @@ mod tests {
         let cargo = CacheGrant {
             kind: CacheKind::CargoRegistry,
             path: Some(home.join(".cargo/registry")),
-            mode: CacheMode::ReadOnly,
+            mode: MountMode::ReadOnly,
         };
         let source = cargo.path.clone().unwrap();
         let target = cargo.sandbox_path(&source).unwrap();
@@ -4049,7 +4206,7 @@ mod tests {
         let npm = CacheGrant {
             kind: CacheKind::Npm,
             path: Some(home.join(".npm")),
-            mode: CacheMode::ReadWrite,
+            mode: MountMode::ReadWrite,
         };
         let source = npm.path.clone().unwrap();
         let target = npm.sandbox_path(&source).unwrap();
@@ -4068,7 +4225,7 @@ mod tests {
         config.caches = vec![CacheGrant {
             kind: CacheKind::Npm,
             path: Some(PathBuf::from(".npm")),
-            mode: CacheMode::ReadOnly,
+            mode: MountMode::ReadOnly,
         }];
         assert!(validate_config(&config).is_err());
 
@@ -4077,15 +4234,118 @@ mod tests {
             CacheGrant {
                 kind: CacheKind::Npm,
                 path: Some(home.join(".npm")),
-                mode: CacheMode::ReadOnly,
+                mode: MountMode::ReadOnly,
             },
             CacheGrant {
                 kind: CacheKind::Npm,
                 path: Some(home.join(".npm-alt")),
-                mode: CacheMode::ReadWrite,
+                mode: MountMode::ReadWrite,
             },
         ];
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn mount_specs_parse_source_target_and_mode() {
+        let grant: MountGrant = "/srv/cache:/tmp/home/.cache/srv".parse().unwrap();
+        assert_eq!(grant.source, PathBuf::from("/srv/cache"));
+        assert_eq!(grant.target, PathBuf::from("/tmp/home/.cache/srv"));
+        assert_eq!(grant.mode, MountMode::ReadOnly);
+        assert!(grant.env.is_empty());
+
+        let grant: MountGrant = "/srv/cache:/tmp/home/.cache/srv:rw".parse().unwrap();
+        assert_eq!(grant.mode, MountMode::ReadWrite);
+
+        let grant: MountGrant = "/srv/cache:/tmp/home/.cache/srv:read-only".parse().unwrap();
+        assert_eq!(grant.mode, MountMode::ReadOnly);
+
+        for invalid in [
+            "",
+            "/srv/cache",
+            "relative:/tmp/home/x",
+            "/srv/cache:/opt/elsewhere",
+            "/srv/cache:/tmp/home/../escape",
+            "/srv/cache:/tmp/home/a:b",
+        ] {
+            assert!(invalid.parse::<MountGrant>().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn mount_layers_override_by_target_and_keep_profile_order() {
+        fn grant(source: &str, target: &str, mode: MountMode) -> MountGrant {
+            MountGrant {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+                mode,
+                env: BTreeMap::new(),
+            }
+        }
+        let saved = vec![
+            grant("/srv/a", "/tmp/home/a", MountMode::ReadOnly),
+            grant("/srv/b", "/tmp/home/b", MountMode::ReadOnly),
+        ];
+        let environment = vec![grant("/srv/a2", "/tmp/home/a", MountMode::ReadWrite)];
+        let cli = vec![grant("/srv/c", "/tmp/home/c", MountMode::ReadWrite)];
+
+        let merged = merge_mount_layers(&saved, &environment, &cli);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].source, PathBuf::from("/srv/a2"));
+        assert!(merged[0].mode.writable());
+        assert_eq!(merged[1].target, PathBuf::from("/tmp/home/b"));
+        assert_eq!(merged[2].target, PathBuf::from("/tmp/home/c"));
+    }
+
+    #[test]
+    fn mount_list_env_parses_one_spec_per_comma() {
+        let grants = parse_mount_list("/srv/a:/tmp/home/a, /srv/b:/tmp/home/b:rw").unwrap();
+        assert_eq!(grants.len(), 2);
+        assert!(!grants[0].mode.writable());
+        assert!(grants[1].mode.writable());
+        assert!(parse_mount_list("/srv/a:/opt/a").is_err());
+    }
+
+    #[test]
+    fn mount_validation_rejects_unsafe_targets_and_duplicates() {
+        let mut config = example_config();
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/a"),
+            target: PathBuf::from("/opt/a"),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::new(),
+        }];
+        assert!(validate_config(&config).is_err());
+
+        config.mounts = vec![
+            MountGrant {
+                source: PathBuf::from("/srv/a"),
+                target: PathBuf::from("/tmp/home/a"),
+                mode: MountMode::ReadOnly,
+                env: BTreeMap::new(),
+            },
+            MountGrant {
+                source: PathBuf::from("/srv/b"),
+                target: PathBuf::from("/tmp/home/a"),
+                mode: MountMode::ReadWrite,
+                env: BTreeMap::new(),
+            },
+        ];
+        assert!(validate_config(&config).is_err());
+
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/a"),
+            target: PathBuf::from("/tmp/home/a"),
+            mode: MountMode::ReadWrite,
+            env: BTreeMap::from([("CACHE_DIR".to_owned(), "/tmp/home/a".to_owned())]),
+        }];
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn v12_profile_without_mounts_migrates_forward() {
+        let config = load_config(r#"{"version": 12}"#).unwrap();
+        assert_eq!(config.version, config_version());
+        assert!(config.mounts.is_empty());
     }
 
     #[test]
@@ -4411,31 +4671,31 @@ mod tests {
             CacheGrant {
                 kind: CacheKind::Npm,
                 path: Some(PathBuf::from("/srv/npm")),
-                mode: CacheMode::ReadOnly,
+                mode: MountMode::ReadOnly,
             },
             CacheGrant {
                 kind: CacheKind::Uv,
                 path: None,
-                mode: CacheMode::ReadOnly,
+                mode: MountMode::ReadOnly,
             },
         ];
 
         // A later layer changes the mode of an explicit grant without moving it.
         let (grants, requests) = merge_cache_layers(
             &saved,
-            &[(CacheKind::Npm, CacheMode::ReadWrite)],
-            &[(CacheKind::Uv, CacheMode::ReadWrite)],
+            &[(CacheKind::Npm, MountMode::ReadWrite)],
+            &[(CacheKind::Uv, MountMode::ReadWrite)],
         );
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].path.as_deref(), Some(Path::new("/srv/npm")));
-        assert_eq!(grants[0].mode, CacheMode::ReadWrite);
+        assert_eq!(grants[0].mode, MountMode::ReadWrite);
         // The path-less saved grant is a request, so the CLI layer replaced it.
-        assert_eq!(requests, vec![(CacheKind::Uv, CacheMode::ReadWrite)]);
+        assert_eq!(requests, vec![(CacheKind::Uv, MountMode::ReadWrite)]);
 
         // Nothing newer: saved values stand.
         let (grants, requests) = merge_cache_layers(&saved, &[], &[]);
-        assert_eq!(grants[0].mode, CacheMode::ReadOnly);
-        assert_eq!(requests, vec![(CacheKind::Uv, CacheMode::ReadOnly)]);
+        assert_eq!(grants[0].mode, MountMode::ReadOnly);
+        assert_eq!(requests, vec![(CacheKind::Uv, MountMode::ReadOnly)]);
     }
 
     #[test]
@@ -4476,9 +4736,10 @@ mod tests {
 
     #[test]
     fn cache_grant_may_omit_its_path() {
-        let config = parse_jsonc::<AppConfig>(
-            r#"{ "version": 12, "transports": { "openai": false }, "caches": [ { "kind": "cargo-registry", "mode": "read_write" } ] }"#,
-        )
+        let config = parse_jsonc::<AppConfig>(&format!(
+            r#"{{ "version": {}, "transports": {{ "openai": false }}, "caches": [ {{ "kind": "cargo-registry", "mode": "read_write" }} ] }}"#,
+            config_version()
+        ))
         .unwrap();
         assert_eq!(config.caches.len(), 1);
         assert!(config.caches[0].path.is_none());
@@ -4536,14 +4797,14 @@ mod tests {
         assert_eq!(
             requests,
             vec![
-                (CacheKind::CargoRegistry, CacheMode::ReadWrite),
-                (CacheKind::GoMod, CacheMode::ReadOnly),
-                (CacheKind::Ccache, CacheMode::ReadOnly),
+                (CacheKind::CargoRegistry, MountMode::ReadWrite),
+                (CacheKind::GoMod, MountMode::ReadOnly),
+                (CacheKind::Ccache, MountMode::ReadOnly),
             ]
         );
         // A later entry for the same kind replaces the earlier one.
         let deduped = parse_cache_requests("npm:rw,npm:ro").unwrap();
-        assert_eq!(deduped, vec![(CacheKind::Npm, CacheMode::ReadOnly)]);
+        assert_eq!(deduped, vec![(CacheKind::Npm, MountMode::ReadOnly)]);
         assert!(parse_cache_requests("npm:bogus").is_err());
         assert!(parse_cache_requests("not-a-cache").is_err());
     }
@@ -4632,8 +4893,15 @@ mod tests {
         let too_old = load_config(r#"{ "version": 8 }"#).err().unwrap();
         assert!(too_old.to_string().contains("no automatic migration path"));
 
-        let newer = load_config(r#"{ "version": 13 }"#).err().unwrap();
-        assert!(newer.to_string().contains("newer schema version 13"));
+        let newer_version = config_version() + 1;
+        let newer = load_config(&format!(r#"{{ "version": {newer_version} }}"#))
+            .err()
+            .unwrap();
+        assert!(
+            newer
+                .to_string()
+                .contains(&format!("newer schema version {newer_version}"))
+        );
 
         let missing = load_config(r#"{ "transports": { "openai": false }, "permissions": {} }"#);
         assert!(missing.is_err(), "a missing version is never guessed");

@@ -330,7 +330,7 @@ fails startup; a stale inherited `SSH_AUTH_SOCK` may fall back to GCR. See
 ## Hardware acceleration
 
 Linux Bubblewrap supports `--allow-kvm` and repeatable
-`--allow-gpu=amd`/`--allow-gpu=nvidia`. Profile schema v12 has additive,
+`--allow-gpu=amd`/`--allow-gpu=nvidia`. Profile schema v13 has additive,
 default-disabled `permissions.allow_kvm: bool` and
 `permissions.allow_gpu: ["amd", "nvidia"]` fields. Persist with
 `dotlink profile enable/disable <name> kvm|gpu-amd|gpu-nvidia` or opt in
@@ -358,3 +358,32 @@ same shell-only sandbox mount the other remappings use (target plus cache
 environment included), so the runtime below setup has no separate cache layer.
 
 Cache grants are shell-only. They never expand MCP read/write roots. Deny rules are re-applied to mount sources before mounting; a write deny downgrades a matching RW mount to RO and a read deny removes it.
+
+## Manual shell mounts
+
+Schema v13 adds `mounts`, the explicit form of the same primitive: a host
+directory that appears inside the sandboxed shell at an absolute target.
+
+```jsonc
+"mounts": [
+  {
+    "source": "/home/alice/.cache/abird",
+    "target": "/tmp/home/.cache/abird",
+    "mode": "rw",                                  // ro (default) or rw
+    "env": {"ABIRD_CACHE_DIR": "/tmp/home/.cache/abird"}   // optional
+  }
+]
+```
+
+`--mount SOURCE:TARGET[:ro|rw]` (repeatable) and
+`DOTLINK_MOUNTS=SOURCE:TARGET[:ro|rw],...` declare the same thing per run;
+`DOTLINK_MOUNTS` is how a NixOS service declares mounts without a profile
+edit. Precedence is CLI > `DOTLINK_MOUNTS` > profile, keyed by target, so a
+later layer replaces that target. `env` exists only in the profile form,
+because the one-line spec has nowhere to put it.
+
+`source` must be an absolute host directory, `target` must be an absolute
+sandbox path below `/tmp/home`, and a target may be declared once across
+caches and mounts together. A missing source is skipped with a warning, deny
+rules apply exactly as for caches, and mounts are shell-only: they never
+expand MCP read/write roots.

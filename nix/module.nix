@@ -183,7 +183,7 @@
   # Keep in sync with `setup::config_version()`. The module supplies the version
   # so `settings` never restates it and an older dotlink fails closed instead of
   # guessing at a newer file.
-  schemaVersion = 12;
+  schemaVersion = 13;
   validProfile = profile: profile == null || validName profile;
   # Nix store files are public: reject the common credential-shaped keys,
   # including nested keys. Users must provide secrets with LoadCredential.

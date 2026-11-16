@@ -19,7 +19,7 @@ The NixOS module runs dotlink as the explicitly selected Unix user (non-root str
 
 ## Profiles and permission precedence
 
-Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v12 is the current profile format. Known compatible older schemas are migrated forward in memory (v9 → v10 → v11 → v12 are additive); newer schemas and older schemas without an explicit migration path are rejected rather than guessed. A migrated profile is written as the current schema the next time it is edited or saved.
+Profiles persist `default_allow`, path grants/denies, shell/network policy, transport/HTTP/ngrok defaults, and local-HTTP OAuth settings. Named profiles use `config.<profile>.jsonc`; the default uses `config.jsonc`. Schema v13 is the current profile format. Known compatible older schemas are migrated forward in memory (v9 → v10 → v11 → v12 → v13 are additive); newer schemas and older schemas without an explicit migration path are rejected rather than guessed. A migrated profile is written as the current schema the next time it is edited or saved.
 
 Saved profiles express defaults, not mandatory grants. A grant-free profile is
 valid; runtime admission checks minimum effective capabilities after composing
@@ -265,6 +265,8 @@ When shell is enabled, onboarding can autodiscover existing package/build caches
 Supported cache families currently include Cargo registry/git, npm, pnpm, Yarn, pip, uv, Go module/build caches, Maven, Gradle, sccache, and ccache.
 
 Cache grants are **shell-only**. They do not add the host cache path to the MCP filesystem allow-list, so `read`, `write`, `ls`, and related MCP tools cannot use cache sharing to inspect the user's home directory.
+
+Explicit shell mounts (`mounts`, `DOTLINK_MOUNTS`, `--mount`) are the same capability with a user-chosen source and target. They are shell-only for the same reason, must target a path below the sandbox home, obey the same deny and protected-path rules, and are descriptor-pinned and revalidated exactly like cache mounts. A target may be declared once across caches and mounts together.
 
 dotlink maps approved host caches into the sandbox's private home at the package manager's expected location. During runtime preparation each Linux cache source is canonicalized and opened once as a pinned directory capability; the authority fingerprint records that descriptor identity and Bubblewrap clones the same descriptor for every command instead of reopening the host pathname. Before each command, the configured cache pathname must still canonicalize to the prepared path and inode; replacement, rename, disappearance, or symlink-back drift fails closed and requires runtime re-preparation. Only the cache directory itself is mounted; adjacent credential/config files such as `~/.cargo/credentials.toml`, `~/.cargo/config.toml`, or `~/.npmrc` are not included.
 

@@ -47,6 +47,13 @@
         mode = "rw";
       }
     ];
+    mounts = [
+      {
+        source = "/home/alice/.cache/abird";
+        target = "/tmp/home/.cache/abird";
+        mode = "rw";
+      }
+    ];
     logging.verbosity = "tools";
     serialize = true;
   };
@@ -217,7 +224,7 @@
   managedUnitText = managed.config.systemd.units."dotlink.service".text;
   # The same writeText name and content hash to the same store path, so this is
   # exactly the source the unit stages; reading it needs no internal derivation.
-  managedSource = pkgs.writeText "dotlink-default.jsonc" (builtins.toJSON (managedSettings // {version = 12;}));
+  managedSource = pkgs.writeText "dotlink-default.jsonc" (builtins.toJSON (managedSettings // {version = 13;}));
   managedProfile = builtins.fromJSON (builtins.readFile managedSource);
 
   valid = cfg:
@@ -305,6 +312,7 @@
     # stay in the environment.
     (lib.any (cache: cache.kind == "cargo-registry" && cache.mode == "ro") managedProfile.caches)
     (lib.any (cache: cache.kind == "go-mod" && cache.mode == "rw") managedProfile.caches)
+    (lib.any (mount: mount.target == "/tmp/home/.cache/abird" && mount.mode == "rw") managedProfile.mounts)
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_ALLOW_KVM))
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_SERIALIZE))
     (managed.config.systemd.services.dotlink.environment.DOTLINK_STDIO == "0")
