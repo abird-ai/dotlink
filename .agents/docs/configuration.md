@@ -353,6 +353,8 @@ Every explicit CLI flag uses the same detected source as onboarding; a
 requested cache whose directory does not exist is skipped with a warning
 rather than failing startup, so a service configured for a cache that has not
 been created yet still starts. A CLI-selected mode overrides
-the persisted mode for that cache for one run.
+the persisted mode for that cache for one run. Each cache resolves to the
+same shell-only sandbox mount the other remappings use (target plus cache
+environment included), so the runtime below setup has no separate cache layer.
 
-Cache grants are shell-only. They never expand MCP read/write roots. Deny rules are re-applied to cache sources before mounting; a write deny downgrades a matching RW cache to RO and a read deny removes it.
+Cache grants are shell-only. They never expand MCP read/write roots. Deny rules are re-applied to mount sources before mounting; a write deny downgrades a matching RW mount to RO and a read deny removes it.

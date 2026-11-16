@@ -90,7 +90,7 @@ dotlink v0.16.3
 • Profile    aw
 • Transports openai
 • Tunnel     tunnel_…
-• Access     read:2 write:1 deny-read:0 deny-write:0 caches:0 + shell
+• Access     read:2 write:1 deny-read:0 deny-write:0 mounts:0 + shell
 • Sandbox    Bubblewrap
 • Network    enabled
 • Logging    TOOL

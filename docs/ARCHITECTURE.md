@@ -537,7 +537,7 @@ serialized and bounded before staging, and post-rename directory-sync failures
 are warnings, never grounds to roll back a paired key. Unix private-file readers
 use nonblocking opens and reject non-regular descriptors before reading.
 
-Developer caches are modeled separately from filesystem grants. A cache record stores its tool family, host source path, and RO/RW mode. At runtime the source is canonicalized and mounted only into the shell sandbox, typically below `/tmp/home` at the tool's expected path. Cache mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical cache sources before mounting.
+Developer caches are predefined sandbox mounts, not a separate runtime layer. A cache record stores its tool family, host source path and RO/RW mode; at runtime it resolves to the same `SandboxMount { source, target, writable, env }` every other shell-only remapping uses, with the kind supplying the target below `/tmp/home` and the tool's cache environment. The source is canonicalized, descriptor-pinned and mounted only into the shell sandbox. Mounts never expand the LocalMachine read/write roots. Read/write deny rules are re-applied to canonical mount sources before mounting.
 
 ## Dynamic tool router
 

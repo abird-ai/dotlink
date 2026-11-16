@@ -46,8 +46,7 @@ pub(crate) fn test_machine_with(
             unrestricted_fs: false,
         })
         .unwrap(),
-        cache_mounts: Vec::new(),
-        shell_env: Vec::new(),
+        mounts: Vec::new(),
         #[cfg(target_os = "linux")]
         host_shell: crate::host_services::HostShell::default(),
         log: LogConfig::default(),

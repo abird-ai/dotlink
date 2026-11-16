@@ -31,7 +31,6 @@ mod windows_private;
 mod xdg;
 
 use std::{
-    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -55,7 +54,7 @@ use crate::{
     backoff::Backoff,
     controls::{RuntimeControl, RuntimeControls, StdioInterruptGuard},
     logging::{ColorMode, LogConfig},
-    mcp::{AccessSpec, LocalMachine, MachineConfig, PreparedMachine, SandboxCacheMount},
+    mcp::{AccessSpec, LocalMachine, MachineConfig, PreparedMachine},
     recovery::Recovery,
     setup::{
         CacheKind, CacheMode, GpuVendor, PermissionConfig, ProfileBool, ProfileRuleKind,
@@ -1488,8 +1487,7 @@ async fn prepare_runtime(
     // its failures restart by default. Resolve/pin machine authority once into a
     // PreparedMachine; the fingerprint and final LocalMachine consume that exact
     // snapshot instead of independently traversing the same pathnames.
-    let mut cache_mounts = Vec::new();
-    let mut shell_env = BTreeMap::new();
+    let mut mounts = Vec::new();
     #[cfg(target_os = "linux")]
     let mut host_shell = host_services::HostShell::prepare(policy.host_access)?;
     #[cfg(target_os = "linux")]
@@ -1507,6 +1505,8 @@ async fn prepare_runtime(
             caches.retain(|saved| saved.kind != override_cache.kind);
             caches.push(override_cache);
         }
+        // Every developer cache is a predefined, wired sandbox mount: the kind
+        // supplies the target below the sandbox home and the tool environment.
         for cache in &caches {
             let Some(source) = cache.path.as_ref() else {
                 continue;
@@ -1514,15 +1514,7 @@ async fn prepare_runtime(
             if !source.is_dir() {
                 continue;
             }
-            let target = cache.sandbox_path(source)?;
-            if let Some((name, value)) = cache.shell_env(&target) {
-                shell_env.insert(name, value);
-            }
-            cache_mounts.push(SandboxCacheMount {
-                source: source.clone(),
-                target,
-                writable: cache.mode.writable(),
-            });
+            mounts.push(cache.resolve(source)?);
         }
     }
 
@@ -1537,8 +1529,7 @@ async fn prepare_runtime(
             deny_write_roots: policy.deny_write_roots.clone(),
             unrestricted_fs: policy.unrestricted_fs,
         },
-        cache_mounts,
-        shell_env: shell_env.into_iter().collect(),
+        mounts,
         #[cfg(target_os = "linux")]
         host_shell,
         log: log.clone(),
@@ -2036,6 +2027,7 @@ fn print_tools(descriptions: Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::SandboxMount;
 
     fn parse(args: &[&str], defaults: PermissionConfig) -> (Args, Policy) {
         let args = Args::try_parse_from(args).unwrap();
@@ -2359,8 +2351,7 @@ mod tests {
                 deny_write_roots: vec![deny_alias.clone()],
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell: host_services::HostShell::default(),
             log: LogConfig::default(),
             serialize: false,
@@ -2417,8 +2408,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -2482,12 +2472,12 @@ mod tests {
                     deny_write_roots: Vec::new(),
                     unrestricted_fs: false,
                 },
-                cache_mounts: vec![SandboxCacheMount {
+                mounts: vec![SandboxMount {
                     source: cache,
                     target: PathBuf::from("/tmp/home/.cache/test"),
                     writable: false,
+                    env: Vec::new(),
                 }],
-                shell_env: Vec::new(),
                 host_shell: host_services::HostShell::default(),
                 log: LogConfig::default(),
                 serialize: false,
@@ -2508,7 +2498,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let cache = &prepared.authority_value()["cache_mounts"][0];
+        let cache = &prepared.authority_value()["mounts"][0];
         assert!(cache["dev"].as_u64().is_some(), "{cache}");
         assert!(cache["ino"].as_u64().is_some(), "{cache}");
         assert!(cache["rdev"].as_u64().is_some(), "{cache}");
@@ -2538,8 +2528,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell: host_services::HostShell::default(),
             log: LogConfig::default(),
             serialize: false,

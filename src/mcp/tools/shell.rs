@@ -1436,7 +1436,7 @@ fn resolve_shell_guards(config: &RuntimeConfig) -> Result<ShellGuards> {
     let access = config.access.refreshed()?;
     let protected = guard_identities(&access.base_dir, &config.protected_paths)?;
     let runtime = RuntimeLayout::for_shell(config.allow_network, config.host_shell.ssh_agent)?;
-    let anchors = validate_shell_guards(&access, &config.cache_mounts, &protected, &runtime)?;
+    let anchors = validate_shell_guards(&access, &config.mounts, &protected, &runtime)?;
     validate_host_mount_policy(&access, &config.host_shell, &protected)?;
     Ok(ShellGuards {
         access,
@@ -1704,14 +1704,14 @@ impl ShellRuntime {
             );
         }
 
-        for cache in &self.config.cache_mounts {
-            prepare_directory_mount_target(&mut command, &cache.target);
-            let source = cache.pinned.try_clone()?;
+        for mount in &self.config.mounts {
+            prepare_directory_mount_target(&mut command, &mount.target);
+            let source = mount.pinned.try_clone()?;
             bind_fd(
                 &mut command,
                 source,
-                &cache.target,
-                if cache.writable {
+                &mount.target,
+                if mount.writable {
                     BindFdKind::ReadWrite
                 } else {
                     BindFdKind::ReadOnly
@@ -1810,7 +1810,16 @@ impl ShellRuntime {
             }
         }
 
-        for (name, value) in &self.config.shell_env {
+        // Mounts own their environment wiring, so the sandbox environment is
+        // exactly what the approved mounts declare, sorted for stable commands.
+        let mount_env = self
+            .config
+            .mounts
+            .iter()
+            .flat_map(|mount| mount.env.iter())
+            .map(|(name, value)| (name, value))
+            .collect::<BTreeMap<_, _>>();
+        for (name, value) in mount_env {
             command.arg("--setenv").arg(name).arg(value);
         }
         for (name, value) in &self.config.host_shell.environment {
@@ -2717,10 +2726,10 @@ mod tests {
 
     use crate::logging::LogConfig;
     #[cfg(target_os = "linux")]
-    use crate::mcp::PreparedCacheMount;
+    use crate::mcp::PreparedMount;
     use crate::mcp::{
         AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, PreparedLaunchers,
-        RuntimeConfig, SandboxCacheMount, TransportContextToken,
+        RuntimeConfig, SandboxMount, TransportContextToken,
     };
 
     #[cfg(unix)]
@@ -2744,8 +2753,7 @@ mod tests {
         LocalMachine {
             config: RuntimeConfig {
                 access,
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
@@ -3296,8 +3304,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -4668,8 +4675,7 @@ mod tests {
                     unrestricted_fs: false,
                 })
                 .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
                 allow_shell: true,
@@ -5049,7 +5055,7 @@ mod tests {
 
         let mut machine = sandbox_machine(&root, Vec::new());
         machine.config.access.write_roots.clear();
-        machine.config.cache_mounts = vec![PreparedCacheMount::for_test(
+        machine.config.mounts = vec![PreparedMount::for_test(
             cache.clone(),
             PathBuf::from("/tmp/home/.cache/shared"),
             true,
@@ -5072,7 +5078,7 @@ mod tests {
             .bubblewrap_command(Path::new("/bin/bash"), &root, "true")
             .expect_err("the current symlink target must be checked on every command");
         assert!(
-            error.to_string().contains("cache mount")
+            error.to_string().contains("sandbox mount")
                 || error.to_string().contains("readable shell mount"),
             "{error}"
         );
@@ -5210,39 +5216,44 @@ mod tests {
                 ],
                 unrestricted_fs: false,
             },
-            cache_mounts: vec![
-                SandboxCacheMount {
+            mounts: vec![
+                SandboxMount {
                     source: denied_read,
                     target: PathBuf::from("/tmp/home/.cache/read-denied"),
                     writable: true,
+                    env: Vec::new(),
                 },
-                SandboxCacheMount {
+                SandboxMount {
                     source: read_cache_ancestor,
                     target: PathBuf::from("/tmp/home/.cache/read-ancestor"),
                     writable: true,
+                    env: Vec::new(),
                 },
-                SandboxCacheMount {
+                SandboxMount {
                     source: read_cache_descendant,
                     target: PathBuf::from("/tmp/home/.cache/read-descendant"),
                     writable: true,
+                    env: Vec::new(),
                 },
-                SandboxCacheMount {
+                SandboxMount {
                     source: denied_write,
                     target: PathBuf::from("/tmp/home/.cache/write-denied"),
                     writable: true,
+                    env: Vec::new(),
                 },
-                SandboxCacheMount {
+                SandboxMount {
                     source: write_cache_ancestor,
                     target: PathBuf::from("/tmp/home/.cache/write-ancestor"),
                     writable: true,
+                    env: Vec::new(),
                 },
-                SandboxCacheMount {
+                SandboxMount {
                     source: write_cache_descendant,
                     target: PathBuf::from("/tmp/home/.cache/write-descendant"),
                     writable: true,
+                    env: Vec::new(),
                 },
             ],
-            shell_env: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -5266,11 +5277,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(machine.config.cache_mounts.len(), 3);
+        assert_eq!(machine.config.mounts.len(), 3);
         assert_eq!(
             machine
                 .config
-                .cache_mounts
+                .mounts
                 .iter()
                 .map(|mount| mount.target.clone())
                 .collect::<Vec<_>>(),
@@ -5281,11 +5292,7 @@ mod tests {
             ]
         );
         assert!(
-            machine
-                .config
-                .cache_mounts
-                .iter()
-                .all(|mount| !mount.writable),
+            machine.config.mounts.iter().all(|mount| !mount.writable),
             "deny-write overlap in either direction must downgrade caches to read-only"
         );
     }
@@ -5308,12 +5315,12 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: vec![SandboxCacheMount {
+            mounts: vec![SandboxMount {
                 source: cache_root,
                 target: PathBuf::from("/tmp/home/.cache/remapped"),
                 writable: false,
+                env: Vec::new(),
             }],
-            shell_env: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -5338,7 +5345,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            machine.config.cache_mounts.is_empty(),
+            machine.config.mounts.is_empty(),
             "a cache ancestor must not remap a protected descendant"
         );
     }
@@ -5359,12 +5366,12 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: vec![SandboxCacheMount {
+            mounts: vec![SandboxMount {
                 source: cache_root.clone(),
                 target: PathBuf::from("/tmp/home/.cargo/registry"),
                 writable: true,
+                env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
             }],
-            shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -5417,12 +5424,12 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: vec![SandboxCacheMount {
+            mounts: vec![SandboxMount {
                 source: cache.clone(),
                 target: PathBuf::from("/tmp/home/.cache/test"),
                 writable: true,
+                env: Vec::new(),
             }],
-            shell_env: Vec::new(),
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
             serialize: false,
@@ -5441,21 +5448,21 @@ mod tests {
         })
         .await
         .unwrap();
-        let pinned_before = machine.config.cache_mounts[0].pinned.metadata().unwrap();
+        let pinned_before = machine.config.mounts[0].pinned.metadata().unwrap();
         std::fs::rename(&cache, &old).unwrap();
         std::fs::create_dir(&cache).unwrap();
         std::fs::write(cache.join("replacement"), b"new").unwrap();
         let replacement = std::fs::metadata(&cache).unwrap();
-        let pinned_after = machine.config.cache_mounts[0].pinned.metadata().unwrap();
+        let pinned_after = machine.config.mounts[0].pinned.metadata().unwrap();
         assert_eq!(pinned_before.dev(), pinned_after.dev());
         assert_eq!(pinned_before.ino(), pinned_after.ino());
         assert_ne!(pinned_after.ino(), replacement.ino());
         let error = machine
             .shell_guards()
             .err()
-            .expect("replaced cache source must fail closed");
+            .expect("replaced mount source must fail closed");
         assert!(
-            error.to_string().contains("cache source changed"),
+            error.to_string().contains("mount source changed"),
             "{error}"
         );
 
@@ -5464,9 +5471,9 @@ mod tests {
         let error = machine
             .shell_guards()
             .err()
-            .expect("symlink-back cache source must also fail closed");
+            .expect("symlink-back mount source must also fail closed");
         assert!(
-            error.to_string().contains("cache source changed"),
+            error.to_string().contains("mount source changed"),
             "{error}"
         );
     }
@@ -5494,19 +5501,19 @@ mod tests {
                     unrestricted_fs: false,
                 })
                 .unwrap(),
-                cache_mounts: vec![
-                    PreparedCacheMount::for_test(
+                mounts: vec![
+                    PreparedMount::for_test_with_env(
                         read_only.clone(),
                         PathBuf::from("/tmp/home/.cargo/registry"),
                         false,
+                        vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
                     ),
-                    PreparedCacheMount::for_test(
+                    PreparedMount::for_test(
                         read_write.clone(),
                         PathBuf::from("/tmp/home/.cargo/git"),
                         true,
                     ),
                 ],
-                shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
@@ -5584,8 +5591,7 @@ mod tests {
                     unrestricted_fs: false,
                 })
                 .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
@@ -5705,8 +5711,7 @@ mod tests {
                     unrestricted_fs: false,
                 })
                 .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
@@ -5785,8 +5790,7 @@ mod tests {
                     unrestricted_fs: false,
                 })
                 .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
@@ -5888,19 +5892,20 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: vec![
-                SandboxCacheMount {
+            mounts: vec![
+                SandboxMount {
                     source: read_only.clone(),
                     target: PathBuf::from("/tmp/home/.cargo/registry"),
                     writable: false,
+                    env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
                 },
-                SandboxCacheMount {
+                SandboxMount {
                     source: read_write.clone(),
                     target: PathBuf::from("/tmp/home/.cargo/git"),
                     writable: true,
+                    env: Vec::new(),
                 },
             ],
-            shell_env: vec![("CARGO_HOME".to_owned(), "/tmp/home/.cargo".to_owned())],
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -5988,8 +5993,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -6083,8 +6087,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell,
             log: LogConfig::default(),
             serialize: false,
@@ -6188,8 +6191,7 @@ mod tests {
                     deny_write_roots: Vec::new(),
                     unrestricted_fs,
                 },
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
                 serialize: false,
@@ -6276,8 +6278,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell: HostShell {
                 mounts: vec![mount],
                 ..HostShell::default()
@@ -6344,8 +6345,7 @@ mod tests {
                     deny_write_roots: Vec::new(),
                     unrestricted_fs: false,
                 },
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 host_shell: HostShell {
                     mounts: vec![mount],
                     ..HostShell::default()
@@ -6470,8 +6470,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell,
             log: LogConfig::default(),
             serialize: false,
@@ -6531,8 +6530,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: true,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
             serialize: false,
@@ -6569,8 +6567,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: true,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
             serialize: false,
@@ -6632,8 +6629,7 @@ mod tests {
                 deny_write_roots: vec![source],
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell: HostShell {
                 mounts: vec![mount],
                 kvm: true,
@@ -6725,8 +6721,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell,
             log: LogConfig::default(),
             serialize: false,
@@ -6824,8 +6819,7 @@ mod tests {
                     deny_write_roots: Vec::new(),
                     unrestricted_fs: false,
                 },
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 host_shell,
                 log: LogConfig::default(),
                 serialize: false,
@@ -6918,8 +6912,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell,
             log: LogConfig::default(),
             serialize: false,
@@ -7004,8 +6997,7 @@ mod tests {
                     unrestricted_fs: false,
                 })
                 .unwrap(),
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),

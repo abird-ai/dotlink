@@ -58,8 +58,7 @@ pub struct AccessSpec {
 #[derive(Clone, Debug)]
 pub struct MachineConfig {
     pub access: AccessSpec,
-    pub cache_mounts: Vec<SandboxCacheMount>,
-    pub shell_env: Vec<(String, String)>,
+    pub mounts: Vec<SandboxMount>,
     #[cfg(target_os = "linux")]
     pub host_shell: crate::host_services::HostShell,
     pub log: LogConfig,
@@ -83,41 +82,48 @@ pub struct MachineConfig {
     pub protected_paths: Vec<PathBuf>,
 }
 
+/// One shell-only remapping into the sandbox: host `source` appears at
+/// `target`, read-only or read+write, with the environment that points a tool
+/// family at it. A developer cache is one of these with a predefined
+/// source/target/env derived from its kind; nothing below this struct knows
+/// about caches.
 #[derive(Clone, Debug)]
-pub struct SandboxCacheMount {
+pub struct SandboxMount {
     pub source: PathBuf,
     pub target: PathBuf,
     pub writable: bool,
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
-struct PreparedCacheMount {
+struct PreparedMount {
     source: PathBuf,
     target: PathBuf,
     writable: bool,
+    env: Vec<(String, String)>,
     #[cfg(target_os = "linux")]
     pinned: Arc<std::fs::File>,
 }
 
 #[cfg(target_os = "linux")]
-impl PreparedCacheMount {
+impl PreparedMount {
     fn verify_source_identity(&self) -> Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         let pinned = self.pinned.metadata().with_context(|| {
             format!(
-                "cannot inspect prepared cache source {}",
+                "cannot inspect prepared mount source {}",
                 self.source.display()
             )
         })?;
         let current_path = std::fs::canonicalize(&self.source).with_context(|| {
             format!(
-                "shell cache source changed or disappeared since preparation: {}",
+                "shell mount source changed or disappeared since preparation: {}",
                 self.source.display()
             )
         })?;
         let current = std::fs::metadata(&current_path).with_context(|| {
             format!(
-                "cannot inspect shell cache source {}",
+                "cannot inspect shell mount source {}",
                 current_path.display()
             )
         })?;
@@ -126,7 +132,7 @@ impl PreparedCacheMount {
             || pinned.ino() != current.ino()
         {
             bail!(
-                "shell cache source changed since preparation: {}; restart dotlink to re-authorize the new directory",
+                "shell mount source changed since preparation: {}; restart dotlink to re-authorize the new directory",
                 self.source.display()
             );
         }
@@ -135,17 +141,27 @@ impl PreparedCacheMount {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-impl PreparedCacheMount {
+impl PreparedMount {
     fn for_test(source: PathBuf, target: PathBuf, writable: bool) -> Self {
-        let source = std::fs::canonicalize(source).expect("test cache source canonicalizes");
+        Self::for_test_with_env(source, target, writable, Vec::new())
+    }
+
+    fn for_test_with_env(
+        source: PathBuf,
+        target: PathBuf,
+        writable: bool,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        let source = std::fs::canonicalize(source).expect("test mount source canonicalizes");
         let pinned = Arc::new(
             crate::secure_fs::SecureFs::open_canonical_directory(&source)
-                .expect("test cache source pins"),
+                .expect("test mount source pins"),
         );
         Self {
             source,
             target,
             writable,
+            env,
             pinned,
         }
     }
@@ -167,8 +183,7 @@ struct AccessPolicy {
 #[derive(Clone, Debug)]
 struct RuntimeConfig {
     access: AccessPolicy,
-    cache_mounts: Vec<PreparedCacheMount>,
-    shell_env: Vec<(String, String)>,
+    mounts: Vec<PreparedMount>,
     #[cfg(target_os = "linux")]
     host_shell: crate::host_services::HostShell,
     log: LogConfig,
@@ -1332,12 +1347,12 @@ fn shell_policy_conflict(message: String) -> anyhow::Error {
 #[cfg(target_os = "linux")]
 fn validate_shell_guards(
     access: &AccessPolicy,
-    cache_mounts: &[PreparedCacheMount],
+    mounts: &[PreparedMount],
     protected_paths: &[PathBuf],
     runtime: &tools::shell::RuntimeLayout,
 ) -> Result<Vec<GuardAnchor>> {
-    for cache in cache_mounts {
-        cache.verify_source_identity()?;
+    for mount in mounts {
+        mount.verify_source_identity()?;
     }
     let guards = protected_paths
         .iter()
@@ -1357,7 +1372,7 @@ fn validate_shell_guards(
                 .iter()
                 .map(|path| ("deny-write path", path, false)),
         );
-    let mounts = access.sandbox_mounts();
+    let grant_mounts = access.sandbox_mounts();
     // One hidden canonical directory makes every guarded descendant invisible
     // as well. Standard dotlink state deliberately uses this shape (private
     // directory plus sometimes a redundant active credential file beneath it),
@@ -1383,17 +1398,17 @@ fn validate_shell_guards(
         {
             continue;
         }
-        for cache in cache_mounts.iter().filter(|cache| hide || cache.writable) {
-            if paths_overlap(guarded, &cache.source) || paths_overlap(guarded, &cache.target) {
+        for mount in mounts.iter().filter(|mount| hide || mount.writable) {
+            if paths_overlap(guarded, &mount.source) || paths_overlap(guarded, &mount.target) {
                 return Err(shell_policy_conflict(format!(
-                    "cache mount {} -> {} overlaps {label} {}; remove that cache grant",
-                    cache.source.display(),
-                    cache.target.display(),
+                    "sandbox mount {} -> {} overlaps {label} {}; remove that mount",
+                    mount.source.display(),
+                    mount.target.display(),
                     guarded.display()
                 )));
             }
         }
-        for (mount, writable) in &mounts {
+        for (mount, writable) in &grant_mounts {
             if !(hide || *writable) || !paths_overlap(guarded, mount) {
                 continue;
             }
@@ -1596,23 +1611,24 @@ fn prepared_authority_value(
             .map(|path| authority_path_identity(path))
             .collect::<Vec<_>>(),
     );
-    let caches = config
-        .cache_mounts
+    let mount_authority = config
+        .mounts
         .iter()
-        .map(|cache| -> Result<serde_json::Value> {
+        .map(|mount| -> Result<serde_json::Value> {
             #[cfg(target_os = "linux")]
             {
                 let identity =
-                    crate::secure_fs::file_identity(&cache.pinned).with_context(|| {
+                    crate::secure_fs::file_identity(&mount.pinned).with_context(|| {
                         format!(
-                            "cannot fingerprint prepared cache source {}",
-                            cache.source.display()
+                            "cannot fingerprint prepared mount source {}",
+                            mount.source.display()
                         )
                     })?;
                 Ok(serde_json::json!({
-                    "source": cache.source,
-                    "target": cache.target,
-                    "writable": cache.writable,
+                    "source": mount.source,
+                    "target": mount.target,
+                    "writable": mount.writable,
+                    "env": mount.env,
                     "dev": identity.dev,
                     "ino": identity.ino,
                     "rdev": identity.rdev,
@@ -1621,9 +1637,10 @@ fn prepared_authority_value(
             #[cfg(not(target_os = "linux"))]
             {
                 Ok(serde_json::json!({
-                    "source": authority_path_identity(&cache.source),
-                    "target": cache.target,
-                    "writable": cache.writable,
+                    "source": authority_path_identity(&mount.source),
+                    "target": mount.target,
+                    "writable": mount.writable,
+                    "env": mount.env,
                 }))
             }
         })
@@ -1683,7 +1700,7 @@ fn prepared_authority_value(
         "deny_read_roots": config.access.deny_read_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
         "deny_write_roots": config.access.deny_write_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
         "protected_paths": protected_paths,
-        "cache_mounts": caches,
+        "mounts": mount_authority,
         "shell_program": shell_program_authority,
         "bwrap_program": bwrap_program_authority,
     });
@@ -1785,9 +1802,9 @@ impl LocalMachine {
         }
         let protected_paths = resolve_guards(&access.base_dir, &configured_protected).await?;
 
-        let mut cache_mounts = Vec::with_capacity(args.cache_mounts.len());
-        let mut cache_targets = BTreeSet::new();
-        for mount in args.cache_mounts {
+        let mut prepared_mounts = Vec::with_capacity(args.mounts.len());
+        let mut mount_targets = BTreeSet::new();
+        for mount in args.mounts {
             if !mount.target.has_root()
                 || !mount.target.starts_with("/tmp/home")
                 || mount
@@ -1796,7 +1813,7 @@ impl LocalMachine {
                     .any(|component| component == Component::ParentDir)
             {
                 bail!(
-                    "internal error: cache sandbox target must stay below /tmp/home: {}",
+                    "internal error: mount sandbox target must stay below /tmp/home: {}",
                     mount.target.display()
                 );
             }
@@ -1820,9 +1837,9 @@ impl LocalMachine {
             let writable = mount.writable
                 && !access.overlaps_deny_write(&source)
                 && !access.overlaps_deny_write(&target);
-            if !cache_targets.insert(target.clone()) {
+            if !mount_targets.insert(target.clone()) {
                 bail!(
-                    "internal error: duplicate cache sandbox target: {}",
+                    "internal error: duplicate mount sandbox target: {}",
                     target.display()
                 );
             }
@@ -1830,10 +1847,11 @@ impl LocalMachine {
             let pinned = Arc::new(crate::secure_fs::SecureFs::open_canonical_directory(
                 &source,
             )?);
-            cache_mounts.push(PreparedCacheMount {
+            prepared_mounts.push(PreparedMount {
                 source,
                 target,
                 writable,
+                env: mount.env,
                 #[cfg(target_os = "linux")]
                 pinned,
             });
@@ -1845,7 +1863,7 @@ impl LocalMachine {
                 args.allow_network,
                 args.host_shell.ssh_agent,
             )?;
-            let _ = validate_shell_guards(&access, &cache_mounts, &protected_paths, &runtime)?;
+            let _ = validate_shell_guards(&access, &prepared_mounts, &protected_paths, &runtime)?;
         }
         #[cfg(target_os = "linux")]
         validate_host_mount_policy(&access, &args.host_shell, &protected_paths)?;
@@ -1892,8 +1910,7 @@ impl LocalMachine {
 
         let config = RuntimeConfig {
             access,
-            cache_mounts,
-            shell_env: args.shell_env,
+            mounts: prepared_mounts,
             #[cfg(target_os = "linux")]
             host_shell: args.host_shell,
             log: args.log,
@@ -1969,8 +1986,7 @@ impl LocalMachine {
             self.config.allow_network,
             self.config.host_shell.ssh_agent,
         )?;
-        let anchors =
-            validate_shell_guards(&access, &self.config.cache_mounts, &protected, &runtime)?;
+        let anchors = validate_shell_guards(&access, &self.config.mounts, &protected, &runtime)?;
         validate_host_mount_policy(&access, &self.config.host_shell, &protected)?;
         Ok(ShellGuards {
             access,
@@ -2063,12 +2079,12 @@ impl LocalMachine {
             return "unrestricted read+write".to_owned();
         }
         format!(
-            "read:{} write:{} deny-read:{} deny-write:{} caches:{}{}",
+            "read:{} write:{} deny-read:{} deny-write:{} mounts:{}{}",
             self.config.access.read_roots.len(),
             self.config.access.write_roots.len(),
             self.config.access.deny_rules[0],
             self.config.access.deny_rules[1],
-            self.config.cache_mounts.len(),
+            self.config.mounts.len(),
             if self.config.allow_shell {
                 " + shell"
             } else {
@@ -2994,8 +3010,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3041,8 +3056,7 @@ mod tests {
                     deny_write_roots: Vec::new(),
                     unrestricted_fs: false,
                 },
-                cache_mounts: Vec::new(),
-                shell_env: Vec::new(),
+                mounts: Vec::new(),
                 #[cfg(target_os = "linux")]
                 host_shell: crate::host_services::HostShell::default(),
                 log: LogConfig::default(),
@@ -3093,8 +3107,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3147,8 +3160,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3217,8 +3229,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3279,8 +3290,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3626,8 +3636,7 @@ mod tests {
         .unwrap();
         let config = RuntimeConfig {
             access,
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3687,8 +3696,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3803,8 +3811,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             #[cfg(target_os = "linux")]
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
@@ -3939,8 +3946,7 @@ mod tests {
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
             },
-            cache_mounts: Vec::new(),
-            shell_env: Vec::new(),
+            mounts: Vec::new(),
             host_shell: crate::host_services::HostShell::default(),
             log: LogConfig::default(),
             serialize: false,
@@ -4016,7 +4022,7 @@ mod tests {
         let runtime = tools::shell::RuntimeLayout::for_shell(false, false).unwrap();
         let anchors = validate_shell_guards(
             &prepared.config.access,
-            &prepared.config.cache_mounts,
+            &prepared.config.mounts,
             &prepared.config.protected_paths,
             &runtime,
         )

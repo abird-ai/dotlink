@@ -1010,7 +1010,7 @@ impl SecureFs {
         Ok(File::from(fd))
     }
 
-    /// Pin an explicitly configured shell-only cache source to the directory
+    /// Pin an explicitly configured shell-only mount source to the directory
     /// validated at startup. This is not an MCP filesystem grant.
     #[cfg(target_os = "linux")]
     pub fn open_canonical_directory(path: &Path) -> Result<File> {
@@ -1028,7 +1028,7 @@ impl SecureFs {
             0,
             RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
         )
-        .with_context(|| format!("unsafe shell cache source {}", path.display()))?;
+        .with_context(|| format!("unsafe shell mount source {}", path.display()))?;
         Ok(File::from(fd))
     }
 }

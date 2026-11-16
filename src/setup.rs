@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     credentials,
+    mcp::SandboxMount,
     oauth::{self, OAuthConfig},
 };
 
@@ -401,7 +402,20 @@ fn sandbox_parent(sandbox_path: &Path) -> String {
 }
 
 impl CacheGrant {
-    pub fn sandbox_path(&self, source: &Path) -> Result<PathBuf> {
+    /// Resolve the predefined, wired sandbox mount this cache describes: the
+    /// kind supplies the target below the sandbox home and the tool's cache
+    /// environment, the profile supplies the host source and the mode.
+    pub fn resolve(&self, source: &Path) -> Result<SandboxMount> {
+        let target = self.sandbox_path(source)?;
+        Ok(SandboxMount {
+            source: source.to_path_buf(),
+            target: target.clone(),
+            writable: self.mode.writable(),
+            env: self.shell_env(&target).into_iter().collect(),
+        })
+    }
+
+    fn sandbox_path(&self, source: &Path) -> Result<PathBuf> {
         let home = home_dir()?;
         let home = fs::canonicalize(&home).unwrap_or(home);
         let path = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
@@ -411,7 +425,7 @@ impl CacheGrant {
         Ok(self.kind.fallback_sandbox_path())
     }
 
-    pub fn shell_env(&self, sandbox_path: &Path) -> Option<(String, String)> {
+    fn shell_env(&self, sandbox_path: &Path) -> Option<(String, String)> {
         let value = sandbox_path.to_string_lossy().to_string();
         match self.kind {
             CacheKind::CargoRegistry | CacheKind::CargoGit => {
