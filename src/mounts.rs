@@ -165,10 +165,7 @@ fn validate_env(mounts: &[SandboxMount]) -> Result<()> {
 /// Mounts are keyed by sandbox target and the last declaration wins, so a layer
 /// list reads exactly like the precedence it implements. A first-seen target
 /// keeps its position, so the assembled list stays deterministic.
-pub fn merge_layers(
-    builtin: Vec<SandboxMount>,
-    layers: &[MountLayer],
-) -> Result<Vec<SandboxMount>> {
+pub fn merge_layers(builtin: Vec<SandboxMount>, layers: &[MountLayer]) -> Vec<SandboxMount> {
     let mut merged = builtin;
     for layer in layers {
         for mount in &layer.mounts {
@@ -188,9 +185,17 @@ pub fn merge_layers(
             }
         }
     }
-    reject_nested_targets(merged.iter().map(|mount| mount.target.as_path()))?;
-    validate_env(&merged)?;
-    Ok(merged)
+    merged
+}
+
+/// Apply every assembly rule to the mounts that will actually be bound.
+///
+/// Called by the resolver (early, so a profile error is reported as a
+/// configuration error) and again by the runtime preparation, so no caller can
+/// assemble a set the binder would have to guess about.
+pub fn validate_assembled(mounts: &[SandboxMount]) -> Result<()> {
+    reject_nested_targets(mounts.iter().map(|mount| mount.target.as_path()))?;
+    validate_env(mounts)
 }
 
 /// Reject a mount that would collide with a fixed host integration.
@@ -262,7 +267,7 @@ mod tests {
                 mounts: vec![mount("/srv/c", "/tmp/home/c", true)],
             },
         ];
-        let merged = merge_layers(builtin, &layers).unwrap();
+        let merged = merge_layers(builtin, &layers);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].source, PathBuf::from("/srv/a"));
         assert_eq!(merged[1].target, PathBuf::from("/tmp/home/c"));
@@ -274,10 +279,14 @@ mod tests {
                 ..mount("/srv/a", "/tmp/home/a", false)
             }],
         }];
-        let error = merge_layers(Vec::new(), &layers).unwrap_err().to_string();
-        assert!(error.contains("sandbox owns that variable"), "{error}");
+        let reserved = merge_layers(Vec::new(), &layers);
+        let error = validate_assembled(&reserved).unwrap_err();
+        assert!(
+            error.to_string().contains("sandbox owns that variable"),
+            "{error}"
+        );
         assert_eq!(
-            crate::recovery::Recovery::of(&merge_layers(Vec::new(), &layers).unwrap_err()),
+            crate::recovery::Recovery::of(&error),
             crate::recovery::Recovery::Operator
         );
     }

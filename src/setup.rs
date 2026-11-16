@@ -1438,7 +1438,7 @@ fn parse_mount_list(raw: &str) -> Result<Vec<MountGrant>> {
 pub fn resolve_mounts(
     builtin: Vec<SandboxMount>,
     layers: &[(&'static str, &[MountGrant])],
-) -> Result<Vec<SandboxMount>> {
+) -> Vec<SandboxMount> {
     let resolved = layers
         .iter()
         .map(|(name, grants)| mounts::MountLayer {
@@ -1460,7 +1460,11 @@ pub fn declared_sandbox_targets(config: &AppConfig) -> Vec<PathBuf> {
         let Some(path) = cache.path.as_ref() else {
             continue;
         };
-        if let Ok(target) = cache.sandbox_path(path) {
+        // A cache whose source is absent is skipped at runtime, so it must not
+        // reject an otherwise runnable profile here.
+        if path.is_dir()
+            && let Ok(target) = cache.sandbox_path(path)
+        {
             targets.push(target);
         }
     }
@@ -3713,6 +3717,12 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
             .validate()
             .with_context(|| format!("mounts[{index}]"))?;
     }
+    let profile_mounts = config
+        .mounts
+        .iter()
+        .map(MountGrant::resolve)
+        .collect::<Vec<_>>();
+    mounts::validate_assembled(&profile_mounts)?;
     let targets = declared_sandbox_targets(config);
     mounts::reject_nested_targets(targets.iter().map(PathBuf::as_path))?;
 
@@ -4307,8 +4317,7 @@ mod tests {
                 ("DOTLINK_MOUNTS", &environment),
                 ("--mount", &cli),
             ],
-        )
-        .unwrap();
+        );
         assert_eq!(merged.len(), 3);
         // The mount replaced the builtin cache on the same target, and the
         // later layer replaced the source, mode and env wholesale.
@@ -4317,6 +4326,27 @@ mod tests {
         assert!(merged[0].env.is_empty());
         assert_eq!(merged[1].target, PathBuf::from("/tmp/home/b"));
         assert_eq!(merged[2].target, PathBuf::from("/tmp/home/c"));
+    }
+
+    #[test]
+    fn absent_cache_paths_do_not_reject_a_runnable_mount_layout() {
+        let mut config = example_config();
+        let home = home_dir().unwrap();
+        config.caches = vec![CacheGrant {
+            kind: CacheKind::CargoRegistry,
+            path: Some(home.join(".dotlink-absent-cargo")),
+            mode: MountMode::ReadWrite,
+        }];
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/mount"),
+            target: mounts::sandbox_join(Path::new(".dotlink-absent-cargo/git")),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::new(),
+        }];
+        assert!(
+            validate_config(&config).is_ok(),
+            "a cache that would be skipped must not reject the mount that replaces its tree"
+        );
     }
 
     #[test]

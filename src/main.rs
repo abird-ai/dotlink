@@ -1538,7 +1538,7 @@ async fn prepare_runtime(
             ("DOTLINK_MOUNTS", env_mounts.as_slice()),
             ("--mount", args.mounts.as_slice()),
         ];
-        mounts = setup::resolve_mounts(builtin, &layers)?;
+        mounts = setup::resolve_mounts(builtin, &layers);
     } else if !setup.config.mounts.is_empty() || !env_mounts.is_empty() || !args.mounts.is_empty() {
         let hint = if cfg!(target_os = "linux") {
             "enable the shell and keep the sandbox"
@@ -2490,6 +2490,66 @@ mod tests {
         assert_eq!(
             before, after,
             "materializing dotlink's own lazy session root must not revoke an unchanged job session"
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unreadable_mount_source_is_an_operator_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let manager = jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let error = LocalMachine::prepare_with_job_root(
+            MachineConfig {
+                access: AccessSpec {
+                    base_dir: root.clone(),
+                    read_roots: vec![root.clone()],
+                    write_roots: Vec::new(),
+                    deny_read_roots: Vec::new(),
+                    deny_write_roots: Vec::new(),
+                    unrestricted_fs: false,
+                },
+                mounts: vec![SandboxMount {
+                    source: locked.clone(),
+                    target: PathBuf::from("/tmp/home/locked"),
+                    writable: false,
+                    env: Vec::new(),
+                    origin: crate::mounts::MountOrigin::Declared,
+                }],
+                host_shell: host_services::HostShell::default(),
+                log: LogConfig::default(),
+                serialize: false,
+                allow_shell: false,
+                sandbox_shell: false,
+                allow_network: false,
+                max_shell_timeout_secs: 60,
+                max_output_bytes: 4096,
+                max_read_bytes: 4096,
+                max_write_bytes: 4096,
+                task_result_budget: None,
+                sync_hold: None,
+                job_retention_secs: 60,
+                job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+                protected_paths: Vec::new(),
+            },
+            manager.protected_path(),
+        )
+        .await
+        .expect_err("an unreadable source must not restart the process forever");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            crate::recovery::Recovery::of(&error),
+            crate::recovery::Recovery::Operator
+        );
+        assert!(
+            error.to_string().contains("/tmp/home/locked"),
+            "the error names the mount: {error}"
         );
         manager.shutdown().await.unwrap();
     }

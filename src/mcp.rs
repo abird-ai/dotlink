@@ -1812,9 +1812,20 @@ impl LocalMachine {
                     );
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(crate::recovery::operator(anyhow!(
+                        "mount {} cannot be prepared: {error}",
+                        mount.label()
+                    )));
+                }
             };
-            if !fs::metadata(&source).await?.is_dir() {
+            let metadata = fs::metadata(&source).await.map_err(|error| {
+                crate::recovery::operator(anyhow!(
+                    "mount {} cannot be inspected: {error}",
+                    mount.label()
+                ))
+            })?;
+            if !metadata.is_dir() {
                 if mount.origin.is_declared() {
                     return Err(crate::recovery::operator(anyhow!(
                         "declared mount {} is not a directory",
@@ -1874,9 +1885,13 @@ impl LocalMachine {
                 if writable { "rw" } else { "ro" }
             );
             #[cfg(target_os = "linux")]
-            let pinned = Arc::new(crate::secure_fs::SecureFs::open_canonical_directory(
-                &source,
-            )?);
+            let pinned = Arc::new(
+                crate::secure_fs::SecureFs::open_canonical_directory(&source).map_err(|error| {
+                    crate::recovery::operator(
+                        error.context(format!("mount {} cannot be pinned", mount.label())),
+                    )
+                })?,
+            );
             prepared_mounts.push(PreparedMount {
                 source,
                 target,
@@ -1887,11 +1902,19 @@ impl LocalMachine {
                 pinned,
             });
         }
-        // Enforce one layout per tree here, where the mounts are actually
-        // bound, so no caller can reintroduce order-dependent nesting.
-        crate::mounts::reject_nested_targets(
-            prepared_mounts.iter().map(|mount| mount.target.as_path()),
-        )?;
+        // Re-apply the assembly rules where the mounts are actually bound, and
+        // compare the fixed host integrations against the same set.
+        let assembled = prepared_mounts
+            .iter()
+            .map(|prepared| crate::mounts::SandboxMount {
+                source: prepared.source.clone(),
+                target: prepared.target.clone(),
+                writable: prepared.writable,
+                env: prepared.env.clone(),
+                origin: prepared.origin,
+            })
+            .collect::<Vec<_>>();
+        crate::mounts::validate_assembled(&assembled)?;
         #[cfg(target_os = "linux")]
         {
             let host_targets = args
@@ -1906,17 +1929,7 @@ impl LocalMachine {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str()))
                 .collect::<Vec<_>>();
-            let mounts = prepared_mounts
-                .iter()
-                .map(|prepared| crate::mounts::SandboxMount {
-                    source: prepared.source.clone(),
-                    target: prepared.target.clone(),
-                    writable: prepared.writable,
-                    env: prepared.env.clone(),
-                    origin: prepared.origin,
-                })
-                .collect::<Vec<_>>();
-            crate::mounts::reject_host_conflicts(&mounts, &host_targets, &host_env)?;
+            crate::mounts::reject_host_conflicts(&assembled, &host_targets, &host_env)?;
         }
 
         #[cfg(target_os = "linux")]

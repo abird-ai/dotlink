@@ -406,8 +406,10 @@ A mount's `env` may not repoint what the sandbox owns (`HOME`, `PATH`,
 `TMPDIR`, `USER`, `LANG`, `LC_ALL`, `TERM`) and may not disagree with another
 mount or a host-integration variable; setting the same value twice is allowed.
 
-A declared mount is required: a missing source, a deny rule, a protected path
-or a host-integration conflict fails closed as a configuration error. Only a
+A declared mount is required: a missing or unreadable source, a deny rule, a
+protected path or a host-integration conflict fails closed as a configuration
+error (`CONFIG`, so a service stops for the operator instead of restarting).
+Use `-vv` to log every resolved mount once at startup. Only a
 discovered cache is skipped with a warning, because cache directories come and
 go with the user's activity. Deny rules apply exactly as for caches, and mounts
 are shell-only: they never expand MCP read/write roots. Mounts configured while
