@@ -375,15 +375,25 @@ directory that appears inside the sandboxed shell at an absolute target.
 ]
 ```
 
-`--mount SOURCE:TARGET[:ro|rw]` (repeatable) and
+`--mount SOURCE:TARGET[:ro|rw]` (repeatable; `ro` is the default) and
 `DOTLINK_MOUNTS=SOURCE:TARGET[:ro|rw],...` declare the same thing per run;
 `DOTLINK_MOUNTS` is how a NixOS service declares mounts without a profile
-edit. Precedence is CLI > `DOTLINK_MOUNTS` > profile, keyed by target, so a
-later layer replaces that target. `env` exists only in the profile form,
-because the one-line spec has nowhere to put it.
+edit. The one-line forms cannot carry `env`, and `SOURCE`/`TARGET` may not
+contain the `,` or `:` separators those forms use — use the profile list for
+paths that do.
 
-`source` must be an absolute host directory, `target` must be an absolute
-sandbox path below `/tmp/home`, and a target may be declared once across
-caches and mounts together. A missing source is skipped with a warning, deny
-rules apply exactly as for caches, and mounts are shell-only: they never
-expand MCP read/write roots.
+**Mounts are keyed by target and the last declaration wins**, in this order:
+builtin developer caches, profile `mounts`, `DOTLINK_MOUNTS`, `--mount`. So a
+mount can repoint a cache at the same sandbox target
+(`--mount /srv/abird:/tmp/home/.cache/abird:rw` overrides the `abird`-style
+cache target), and a later layer replaces the earlier mount's source, mode
+*and* `env` wholesale.
+
+`source` must be an absolute host directory and `target` an absolute sandbox
+path below `/tmp/home`. Targets must not nest: binding a parent would hide a
+child (or need a mountpoint that only exists on the host), so
+`/tmp/home/.cache` together with `/tmp/home/.cache/abird` is rejected — use a
+filesystem grant for the parent instead. A missing source is skipped with a
+warning, deny rules apply exactly as for caches, and mounts are shell-only:
+they never expand MCP read/write roots. Mounts configured while the shell or
+sandbox is disabled are inert and reported once at startup.

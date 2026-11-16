@@ -1820,10 +1820,22 @@ impl LocalMachine {
             let target = lexical_normalize(&mount.target);
             let source = match fs::canonicalize(&mount.source).await {
                 Ok(source) => source,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        "skipping mount {}: source {} does not exist",
+                        mount.target.display(),
+                        mount.source.display()
+                    );
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
             if !fs::metadata(&source).await?.is_dir() {
+                tracing::warn!(
+                    "skipping mount {}: source {} is not a directory",
+                    mount.target.display(),
+                    mount.source.display()
+                );
                 continue;
             }
             if access.overlaps_deny_read(&source)

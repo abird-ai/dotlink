@@ -1492,6 +1492,10 @@ async fn prepare_runtime(
     // its failures restart by default. Resolve/pin machine authority once into a
     // PreparedMachine; the fingerprint and final LocalMachine consume that exact
     // snapshot instead of independently traversing the same pathnames.
+    // Parse the mount environment even when the shell is inert, so a typo in
+    // `DOTLINK_MOUNTS` fails the same way everywhere instead of silently
+    // disappearing under --no-sandbox/--unrestricted.
+    let env_mounts = setup::env_mount_grants()?;
     let mut mounts = Vec::new();
     #[cfg(target_os = "linux")]
     let mut host_shell = host_services::HostShell::prepare(policy.host_access)?;
@@ -1512,6 +1516,7 @@ async fn prepare_runtime(
         }
         // Every developer cache is a predefined, wired sandbox mount: the kind
         // supplies the target below the sandbox home and the tool environment.
+        let mut builtin = Vec::new();
         for cache in &caches {
             let Some(source) = cache.path.as_ref() else {
                 continue;
@@ -1519,27 +1524,16 @@ async fn prepare_runtime(
             if !source.is_dir() {
                 continue;
             }
-            mounts.push(cache.resolve(source)?);
+            builtin.push(cache.resolve(source)?);
         }
-        // Explicit mounts share that layer, keyed by target: CLI > env > profile.
-        let explicit_mounts = setup::merge_mount_layers(
-            &setup.config.mounts,
-            &setup::env_mount_grants()?,
-            &args.mounts,
+        // Mounts are keyed by target and the last declaration wins, so a mount
+        // can replace a builtin cache on the same target.
+        mounts = setup::resolve_mounts(builtin, &setup.config.mounts, &env_mounts, &args.mounts);
+        setup::reject_nested_mount_targets(mounts.iter().map(|mount| mount.target.as_path()))?;
+    } else if !setup.config.mounts.is_empty() || !env_mounts.is_empty() || !args.mounts.is_empty() {
+        tracing::warn!(
+            "shell mounts are inactive: enable the shell and keep the sandbox to mount them"
         );
-        for grant in explicit_mounts {
-            let mount = grant.resolve();
-            if mounts
-                .iter()
-                .any(|existing| existing.target == mount.target)
-            {
-                bail!(
-                    "mount target {} is declared more than once; remove the duplicate cache or mount",
-                    mount.target.display()
-                );
-            }
-            mounts.push(mount);
-        }
     }
 
     let retention = std::time::Duration::from_secs(setup.config.job_retention_secs);
@@ -3394,12 +3388,15 @@ mod tests {
             "/srv/cache:/tmp/home/.cache/srv:rw",
             "--mount",
             "/srv/other:/tmp/home/other",
+            "--mount",
+            "/srv/third:/tmp/home/third:ro",
         ])
         .unwrap();
-        assert_eq!(args.mounts.len(), 2);
+        assert_eq!(args.mounts.len(), 3);
         assert_eq!(args.mounts[0].target, PathBuf::from("/tmp/home/.cache/srv"));
         assert!(args.mounts[0].mode.writable());
         assert!(!args.mounts[1].mode.writable());
+        assert!(!args.mounts[2].mode.writable());
         assert!(Args::try_parse_from(["dotlink", "--mount", "/srv:/opt/x"]).is_err());
     }
 

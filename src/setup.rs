@@ -432,6 +432,7 @@ impl MountGrant {
         }
         if !self.target.has_root()
             || !self.target.starts_with("/tmp/home")
+            || self.target == Path::new("/tmp/home")
             || self
                 .target
                 .components()
@@ -443,8 +444,11 @@ impl MountGrant {
             );
         }
         for (name, value) in &self.env {
-            if name.is_empty() || name.contains('=') || name.contains('\0') {
-                bail!("mount environment name is invalid: {name:?}");
+            let mut chars = name.chars();
+            let identifier = matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !identifier {
+                bail!("mount environment name must be a shell identifier: {name:?}");
             }
             if value.contains('\0') {
                 bail!("mount environment value for {name} contains a NUL byte");
@@ -1455,23 +1459,55 @@ fn parse_mount_list(raw: &str) -> Result<Vec<MountGrant>> {
         .collect()
 }
 
-/// Merge mount layers by target: later layers win, profile order is preserved.
-pub fn merge_mount_layers(
+/// Resolve mount layers over the builtin mounts.
+///
+/// Mounts are keyed by target and the last declaration wins: profile, then
+/// `DOTLINK_MOUNTS`, then `--mount`. Builtins (developer caches) come first, so
+/// a mount that names the same target replaces that cache. A first-seen target
+/// keeps its position, so the assembled list stays deterministic.
+pub fn resolve_mounts(
+    builtin: Vec<SandboxMount>,
     saved: &[MountGrant],
     environment: &[MountGrant],
     cli: &[MountGrant],
-) -> Vec<MountGrant> {
-    let mut merged: Vec<MountGrant> = Vec::new();
+) -> Vec<SandboxMount> {
+    let mut mounts = builtin;
     for grant in saved.iter().chain(environment).chain(cli) {
-        match merged
+        let mount = grant.resolve();
+        match mounts
             .iter_mut()
-            .find(|existing| existing.target == grant.target)
+            .find(|existing| existing.target == mount.target)
         {
-            Some(existing) => *existing = grant.clone(),
-            None => merged.push(grant.clone()),
+            Some(existing) => *existing = mount,
+            None => mounts.push(mount),
         }
     }
-    merged
+    mounts
+}
+
+/// Reject mount targets that contain one another.
+///
+/// Nested targets are order-dependent in a bind namespace: binding a parent
+/// after a child silently hides the child, and binding it before needs a
+/// mountpoint inside the parent that only exists on the host. Fail closed
+/// instead, so one mount list means one layout whatever the order.
+pub fn reject_nested_mount_targets<'a>(targets: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+    let targets = targets.into_iter().collect::<Vec<_>>();
+    for (index, target) in targets.iter().enumerate() {
+        for other in &targets[index + 1..] {
+            if target == other {
+                continue;
+            }
+            if target.starts_with(other) || other.starts_with(target) {
+                bail!(
+                    "mount targets must not nest: {} and {}; declare one target, or use a filesystem grant for the parent",
+                    target.display(),
+                    other.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn cache_grants_for_cli(requests: &[(CacheKind, MountMode)]) -> Result<Vec<CacheGrant>> {
@@ -3703,15 +3739,12 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
         }
     }
 
-    let mut mount_targets = std::collections::BTreeSet::new();
     for (index, mount) in config.mounts.iter().enumerate() {
         mount
             .validate()
             .with_context(|| format!("mounts[{index}]"))?;
-        if !mount_targets.insert(mount.target.clone()) {
-            bail!("duplicate mount target: {}", mount.target.display());
-        }
     }
+    reject_nested_mount_targets(config.mounts.iter().map(|mount| mount.target.as_path()))?;
 
     if let Some(tunnel_id) = config.tunnel_id.as_deref() {
         validate_tunnel_id(tunnel_id)?;
@@ -4264,6 +4297,7 @@ mod tests {
             "/srv/cache",
             "relative:/tmp/home/x",
             "/srv/cache:/opt/elsewhere",
+            "/srv/cache:/tmp/home",
             "/srv/cache:/tmp/home/../escape",
             "/srv/cache:/tmp/home/a:b",
         ] {
@@ -4272,7 +4306,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_layers_override_by_target_and_keep_profile_order() {
+    fn mounts_are_keyed_by_target_and_the_last_declaration_wins() {
         fn grant(source: &str, target: &str, mode: MountMode) -> MountGrant {
             MountGrant {
                 source: PathBuf::from(source),
@@ -4281,6 +4315,13 @@ mod tests {
                 env: BTreeMap::new(),
             }
         }
+        // A builtin cache mount, then profile, DOTLINK_MOUNTS and CLI layers.
+        let builtin = vec![SandboxMount {
+            source: PathBuf::from("/srv/cache"),
+            target: PathBuf::from("/tmp/home/a"),
+            writable: false,
+            env: vec![("CACHE_HOME".to_owned(), "/tmp/home".to_owned())],
+        }];
         let saved = vec![
             grant("/srv/a", "/tmp/home/a", MountMode::ReadOnly),
             grant("/srv/b", "/tmp/home/b", MountMode::ReadOnly),
@@ -4288,12 +4329,36 @@ mod tests {
         let environment = vec![grant("/srv/a2", "/tmp/home/a", MountMode::ReadWrite)];
         let cli = vec![grant("/srv/c", "/tmp/home/c", MountMode::ReadWrite)];
 
-        let merged = merge_mount_layers(&saved, &environment, &cli);
+        let merged = resolve_mounts(builtin, &saved, &environment, &cli);
         assert_eq!(merged.len(), 3);
+        // The mount replaced the builtin cache on the same target, and the
+        // later layer replaced the source, mode and env wholesale.
         assert_eq!(merged[0].source, PathBuf::from("/srv/a2"));
-        assert!(merged[0].mode.writable());
+        assert!(merged[0].writable);
+        assert!(merged[0].env.is_empty());
         assert_eq!(merged[1].target, PathBuf::from("/tmp/home/b"));
         assert_eq!(merged[2].target, PathBuf::from("/tmp/home/c"));
+    }
+
+    #[test]
+    fn nested_mount_targets_are_rejected() {
+        let targets = [
+            Path::new("/tmp/home/n"),
+            Path::new("/tmp/home/n/c"),
+            Path::new("/tmp/home/other"),
+        ];
+        let error = reject_nested_mount_targets(targets)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not nest"), "{error}");
+        // Siblings and a shared prefix that is not a path component are fine.
+        reject_nested_mount_targets([Path::new("/tmp/home/n"), Path::new("/tmp/home/other")])
+            .unwrap();
+        reject_nested_mount_targets([
+            Path::new("/tmp/home/.cargo/registry"),
+            Path::new("/tmp/home/.cargo/git"),
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -4306,7 +4371,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_validation_rejects_unsafe_targets_and_duplicates() {
+    fn mount_validation_rejects_unsafe_targets_and_env_names() {
         let mut config = example_config();
         config.mounts = vec![MountGrant {
             source: PathBuf::from("/srv/a"),
@@ -4316,6 +4381,23 @@ mod tests {
         }];
         assert!(validate_config(&config).is_err());
 
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("relative/source"),
+            target: PathBuf::from("/tmp/home/a"),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::new(),
+        }];
+        assert!(validate_config(&config).is_err());
+
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/a"),
+            target: PathBuf::from("/tmp/home/a"),
+            mode: MountMode::ReadWrite,
+            env: BTreeMap::from([("not an identifier".to_owned(), "/tmp/home/a".to_owned())]),
+        }];
+        assert!(validate_config(&config).is_err());
+
+        // Duplicate targets are last-wins, not an error; nesting still is.
         config.mounts = vec![
             MountGrant {
                 source: PathBuf::from("/srv/a"),
@@ -4330,6 +4412,14 @@ mod tests {
                 env: BTreeMap::new(),
             },
         ];
+        assert!(validate_config(&config).is_ok());
+
+        config.mounts.push(MountGrant {
+            source: PathBuf::from("/srv/c"),
+            target: PathBuf::from("/tmp/home/a/child"),
+            mode: MountMode::ReadOnly,
+            env: BTreeMap::new(),
+        });
         assert!(validate_config(&config).is_err());
 
         config.mounts = vec![MountGrant {
@@ -4339,6 +4429,24 @@ mod tests {
             env: BTreeMap::from([("CACHE_DIR".to_owned(), "/tmp/home/a".to_owned())]),
         }];
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn profile_mounts_survive_a_save_round_trip() {
+        let mut config = example_config();
+        config.mounts = vec![MountGrant {
+            source: PathBuf::from("/srv/a"),
+            target: PathBuf::from("/tmp/home/a"),
+            mode: MountMode::ReadWrite,
+            env: BTreeMap::from([("CACHE_DIR".to_owned(), "/tmp/home/a".to_owned())]),
+        }];
+        let text = serde_json::to_string(&config).unwrap();
+        let reloaded = load_config(&text).unwrap();
+        assert_eq!(reloaded.mounts, config.mounts);
+        // An empty list stays out of the file entirely.
+        config.mounts.clear();
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(!text.contains("\"mounts\""), "{text}");
     }
 
     #[test]

@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Manual shell mounts: schema v13 `mounts` entries (`source`, `target`, `mode`, optional `env`), `DOTLINK_MOUNTS=SOURCE:TARGET[:ro|rw],...`, and repeatable `--mount SOURCE:TARGET[:ro|rw]`. They resolve to the same `SandboxMount` layer developer caches use, so a host directory can be shared with the sandboxed shell without a hardcoded cache kind. Precedence is CLI > `DOTLINK_MOUNTS` > profile, keyed by target; mounts stay shell-only and obey the existing deny, protected-path, pinning and identity-revalidation rules.
+- Manual shell mounts: schema v13 `mounts` entries (`source`, `target`, `mode`, optional `env`), `DOTLINK_MOUNTS=SOURCE:TARGET[:ro|rw],...`, and repeatable `--mount SOURCE:TARGET[:ro|rw]`. They resolve to the same `SandboxMount` layer developer caches use, so a host directory can be shared with the sandboxed shell without a hardcoded cache kind. Mounts are keyed by target with builtins first and the last declaration winning, so a mount can repoint a cache; nested targets are rejected so bind order never decides the layout. Mounts stay shell-only and obey the existing deny, protected-path, pinning and identity-revalidation rules, and a missing source now logs why it was skipped.
 
 ## [0.17.1] - 2026-11-14
 

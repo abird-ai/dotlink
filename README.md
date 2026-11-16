@@ -512,8 +512,9 @@ DEVELOPER CACHES (discovered paths; bare flag = ro, =rw enables writes)
 --allow-cache-gradle[=ro|rw]           --allow-cache-sccache[=ro|rw]
 --allow-cache-ccache[=ro|rw]
 
-SHELL MOUNTS (sandbox-only; bare spec = ro, :rw enables writes)
---mount SOURCE:TARGET[:ro|rw]           repeatable explicit host → sandbox mount
+SHELL MOUNTS (sandbox-only; mode defaults to ro, :rw enables writes)
+--mount SOURCE:TARGET[:ro|rw]   repeatable; last mount wins per target, and a
+                                mount may replace a builtin cache on that target
 
 OUTPUT & DIAGNOSTICS
 --list-tools                    show tools exposed by the effective policy

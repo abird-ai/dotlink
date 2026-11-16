@@ -158,6 +158,14 @@ services.dotlink = {
     {kind = "cargo-registry"; mode = "rw";}
     {kind = "cargo-git"; mode = "ro";}
   ];
+  # Explicit shell mounts work in declarative settings too.
+  settings.mounts = [
+    {
+      source = "/home/alice/.cache/abird";
+      target = "/tmp/home/.cache/abird";
+      mode = "rw";
+    }
+  ];
 };
 ```
 
@@ -202,6 +210,15 @@ true. Git similarly maps only the user's existing `~/.gitconfig` and
 implicitly mounted. These config files may contain credentials—review before
 enabling. Each enabled `settings.caches` entry maps to a matching discovered
 `--allow-cache-<kind>=ro|rw` flag; all 13 known families are accepted.
+
+A profile-backed instance (no `settings`) declares the same mounts without a
+profile edit through the service environment:
+`environment.DOTLINK_MOUNTS = "/home/alice/.cache/abird:/tmp/home/.cache/abird:rw";`
+— comma-separated `SOURCE:TARGET[:ro|rw]` entries, keyed by target with the
+last declaration winning, so an entry there replaces a builtin cache on that
+target. `env` wiring needs the profile `mounts` list, which the one-line form
+cannot carry. Mounts are inert while the shell sandbox is disabled and are
+reported once at startup.
 
 ## KVM and GPU acceleration
 
