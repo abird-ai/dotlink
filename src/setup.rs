@@ -4531,41 +4531,45 @@ mod tests {
 
     #[test]
     fn nested_mount_over_a_cache_names_both_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().canonicalize().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".cargo/registry")).unwrap();
         let mut config = example_config();
         config.caches = vec![CacheGrant {
             kind: CacheKind::CargoRegistry,
-            path: Some(source),
+            path: Some(home.join(".cargo/registry")),
             mode: MountMode::ReadOnly,
         }];
         config.mounts = vec![MountGrant {
             source: mounts::test_host_path("srv/mount"),
-            // The fallback target of a cache outside the host home.
             target: PathBuf::from("/tmp/home/.cargo/registry/extra"),
             mode: MountMode::ReadOnly,
             env: BTreeMap::new(),
         }];
-        let error = validate_config(&config).unwrap_err().to_string();
-        assert!(error.contains("must not nest"), "{error}");
+        let error = DeclaredMounts::resolve_with_home(&config, Some(&home))
+            .validate()
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("must not nest"), "{rendered}");
         assert!(
-            error.contains("caches[0] Cargo registry") && error.contains("mounts[0]"),
-            "both entries are named: {error}"
+            rendered.contains("caches[0] Cargo registry") && rendered.contains("mounts[0]"),
+            "both entries are named: {rendered}"
         );
         assert!(
-            error.contains(mounts::NESTING_REMEDY),
-            "the remedy is stated once for every presentation: {error}"
+            rendered.contains(mounts::NESTING_REMEDY),
+            "the remedy is stated once for every presentation: {rendered}"
         );
     }
 
     #[test]
     fn cache_environment_conflicts_are_rejected_at_load() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().canonicalize().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".cargo/registry")).unwrap();
         let mut config = example_config();
         config.caches = vec![CacheGrant {
             kind: CacheKind::CargoRegistry,
-            path: Some(source),
+            path: Some(home.join(".cargo/registry")),
             mode: MountMode::ReadOnly,
         }];
         config.mounts = vec![MountGrant {
@@ -4574,14 +4578,17 @@ mod tests {
             mode: MountMode::ReadOnly,
             env: BTreeMap::from([("CARGO_HOME".to_owned(), "/tmp/home/other".to_owned())]),
         }];
-        let error = validate_config(&config).unwrap_err().to_string();
-        assert!(error.contains("CARGO_HOME is set to"), "{error}");
+        let error = DeclaredMounts::resolve_with_home(&config, Some(&home))
+            .validate()
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("CARGO_HOME is set to"), "{rendered}");
         assert!(
-            error.contains("mounts[0]") && error.contains("caches[0] Cargo registry"),
-            "the message names both owners: {error}"
+            rendered.contains("mounts[0]") && rendered.contains("caches[0] Cargo registry"),
+            "the message names both owners: {rendered}"
         );
         assert_eq!(
-            crate::recovery::Recovery::of(&validate_config(&config).unwrap_err()),
+            crate::recovery::Recovery::of(&error),
             crate::recovery::Recovery::Operator
         );
     }
