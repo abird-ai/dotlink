@@ -1496,10 +1496,10 @@ fn validate_shell_guards(
     Ok(anchors)
 }
 
-#[cfg(target_os = "linux")]
 /// A declared mount whose source is not usable yet is host state, not a broken
 /// declaration: retry the runtime in-process with backoff instead of exiting as
-/// CONFIG, and never skip the mount silently.
+/// CONFIG, and never skip the mount silently. Mount preparation is
+/// platform-neutral, so this helper is too.
 fn unavailable(error: anyhow::Error) -> anyhow::Error {
     crate::recovery::Recovery::Runtime {
         reset_backoff: false,
@@ -1507,6 +1507,9 @@ fn unavailable(error: anyhow::Error) -> anyhow::Error {
     .tag(error)
 }
 
+/// Host integrations exist only where the sandboxed shell does, so this rule
+/// and its `HostShell` input are Linux-only.
+#[cfg(target_os = "linux")]
 fn validate_host_mount_policy(
     access: &AccessPolicy,
     host_shell: &crate::host_services::HostShell,

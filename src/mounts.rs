@@ -324,6 +324,17 @@ pub fn reject_host_conflicts(
     Ok(())
 }
 
+/// A host-absolute scratch path for tests: the mount grammar requires an
+/// absolute source, and "absolute" is host-shaped.
+#[cfg(test)]
+pub(crate) fn test_host_path(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!(r"C:\{name}"))
+    } else {
+        PathBuf::from(format!("/{name}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

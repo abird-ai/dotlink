@@ -3831,6 +3831,10 @@ mod tests {
         );
     }
 
+    // The spec separator is ':', which a Windows drive path already contains, so
+    // the one-line form is only expressible for POSIX-shaped host paths. Mounts
+    // are Linux shell-only; the profile `mounts` list carries them elsewhere.
+    #[cfg(unix)]
     #[test]
     fn mount_flag_parses_source_target_and_mode() {
         let args = Args::try_parse_from([

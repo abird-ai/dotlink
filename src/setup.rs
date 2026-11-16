@@ -516,24 +516,29 @@ impl CacheGrant {
     /// kind supplies the target below the sandbox home and the tool's cache
     /// environment, the profile supplies the host source and the mode.
     pub fn resolve(&self, source: &Path) -> Result<SandboxMount> {
-        let target = self.sandbox_path(source)?;
-        Ok(SandboxMount {
+        let home = canonical_home(&home_dir()?);
+        Ok(self.resolve_in(source, &home))
+    }
+
+    /// [`Self::resolve`] with the host home supplied, so the projection is a
+    /// pure function of its inputs and can be tested without a real home.
+    fn resolve_in(&self, source: &Path, home: &Path) -> SandboxMount {
+        let target = self.sandbox_path(source, home);
+        SandboxMount {
             source: source.to_path_buf(),
             target: target.clone(),
             writable: self.mode.writable(),
             env: self.shell_env(&target).into_iter().collect(),
             origin: MountOrigin::Discovered,
-        })
+        }
     }
 
-    fn sandbox_path(&self, source: &Path) -> Result<PathBuf> {
-        let home = home_dir()?;
-        let home = fs::canonicalize(&home).unwrap_or(home);
+    fn sandbox_path(&self, source: &Path, home: &Path) -> PathBuf {
         let path = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
-        if let Ok(relative) = path.strip_prefix(&home) {
-            return Ok(sandbox_join(relative));
+        match path.strip_prefix(home) {
+            Ok(relative) => sandbox_join(relative),
+            Err(_) => self.kind.fallback_sandbox_path(),
         }
-        Ok(self.kind.fallback_sandbox_path())
     }
 
     fn shell_env(&self, sandbox_path: &Path) -> Option<(String, String)> {
@@ -1520,22 +1525,29 @@ struct DeclaredMounts {
 
 impl DeclaredMounts {
     fn resolve(config: &AppConfig) -> Self {
+        Self::resolve_with_home(
+            config,
+            home_dir().ok().map(|home| canonical_home(&home)).as_deref(),
+        )
+    }
+
+    /// [`Self::resolve`] with the host home supplied, so layout validation can be
+    /// tested without depending on the machine's home directory.
+    fn resolve_with_home(config: &AppConfig, home: Option<&Path>) -> Self {
         let mut owners = BTreeMap::new();
         let mut caches = Vec::new();
         for (index, cache) in config.caches.iter().enumerate() {
             let Some(source) = cache.path.as_ref().filter(|path| path.is_dir()) else {
                 continue;
             };
-            let mount = match cache.resolve(source) {
-                Ok(mount) => mount,
-                Err(error) => {
-                    tracing::debug!(
-                        "cache entry {index} ({}) cannot be resolved for layout checks: {error}",
-                        cache.kind.label()
-                    );
-                    continue;
-                }
+            let Some(home) = home else {
+                tracing::debug!(
+                    "cache entry {index} ({}) has no host home to resolve against",
+                    cache.kind.label()
+                );
+                continue;
             };
+            let mount = cache.resolve_in(source, home);
             owners.insert(
                 mount.target.clone(),
                 format!("caches[{index}] {}", cache.kind.label()),
@@ -3724,6 +3736,11 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("could not determine the user's home directory"))
 }
 
+/// The home spelling every sandbox-target derivation compares against.
+fn canonical_home(home: &Path) -> PathBuf {
+    fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())
+}
+
 fn validate_config_structure(config: &AppConfig) -> Result<()> {
     if config.version != config_version() {
         bail!(
@@ -4326,14 +4343,15 @@ mod tests {
 
     #[test]
     fn cache_grants_map_home_paths_into_private_sandbox_home() {
-        let home = home_dir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
         let cargo = CacheGrant {
             kind: CacheKind::CargoRegistry,
             path: Some(home.join(".cargo/registry")),
             mode: MountMode::ReadOnly,
         };
         let source = cargo.path.clone().unwrap();
-        let target = cargo.sandbox_path(&source).unwrap();
+        let target = cargo.sandbox_path(&source, &home);
         assert_eq!(target, PathBuf::from("/tmp/home/.cargo/registry"));
         assert_eq!(
             cargo.shell_env(&target),
@@ -4346,7 +4364,7 @@ mod tests {
             mode: MountMode::ReadWrite,
         };
         let source = npm.path.clone().unwrap();
-        let target = npm.sandbox_path(&source).unwrap();
+        let target = npm.sandbox_path(&source, &home);
         assert_eq!(target, PathBuf::from("/tmp/home/.npm"));
         assert_eq!(
             npm.shell_env(&target),
@@ -4382,6 +4400,10 @@ mod tests {
         assert!(validate_config(&config).is_err());
     }
 
+    // A Windows drive path contains the spec separator itself, so the one-line
+    // form is only expressible for POSIX-shaped host paths. Mounts are Linux
+    // shell-only; the profile `mounts` list carries them everywhere else.
+    #[cfg(unix)]
     #[test]
     fn mount_specs_parse_source_target_and_mode() {
         let grant: MountGrant = "/srv/cache:/tmp/home/.cache/srv".parse().unwrap();
@@ -4462,7 +4484,7 @@ mod tests {
             mode: MountMode::ReadWrite,
         }];
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/mount"),
+            source: mounts::test_host_path("srv/mount"),
             target: mounts::sandbox_join(Path::new(".dotlink-absent-cargo/git")),
             mode: MountMode::ReadOnly,
             env: BTreeMap::new(),
@@ -4474,9 +4496,11 @@ mod tests {
     }
 
     #[test]
-    fn nested_cache_targets_are_rejected_by_config_validation() {
+    fn nested_cache_targets_are_rejected_at_load() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join(".cargo/git")).unwrap();
         let mut config = example_config();
-        let home = home_dir().unwrap();
         config.caches = vec![
             CacheGrant {
                 kind: CacheKind::CargoRegistry,
@@ -4489,14 +4513,18 @@ mod tests {
                 mode: MountMode::ReadWrite,
             },
         ];
-        let error = validate_config(&config).unwrap_err().to_string();
-        assert!(error.contains("must not nest"), "{error}");
+        let error = DeclaredMounts::resolve_with_home(&config, Some(&home))
+            .validate()
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("must not nest"), "{rendered}");
         assert!(
-            error.contains("caches[0] Cargo registry") && error.contains("caches[1] Cargo git"),
-            "the message names the owning entries: {error}"
+            rendered.contains("caches[0] Cargo registry")
+                && rendered.contains("caches[1] Cargo git"),
+            "the message names the owning entries: {rendered}"
         );
         assert_eq!(
-            crate::recovery::Recovery::of(&validate_config(&config).unwrap_err()),
+            crate::recovery::Recovery::of(&error),
             crate::recovery::Recovery::Operator
         );
     }
@@ -4512,7 +4540,7 @@ mod tests {
             mode: MountMode::ReadOnly,
         }];
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/mount"),
+            source: mounts::test_host_path("srv/mount"),
             // The fallback target of a cache outside the host home.
             target: PathBuf::from("/tmp/home/.cargo/registry/extra"),
             mode: MountMode::ReadOnly,
@@ -4541,7 +4569,7 @@ mod tests {
             mode: MountMode::ReadOnly,
         }];
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/mount"),
+            source: mounts::test_host_path("srv/mount"),
             target: PathBuf::from("/tmp/home/other"),
             mode: MountMode::ReadOnly,
             env: BTreeMap::from([("CARGO_HOME".to_owned(), "/tmp/home/other".to_owned())]),
@@ -4630,9 +4658,13 @@ mod tests {
 
     #[test]
     fn configured_paths_reject_nul_bytes() {
+        let mut nul_source = mounts::test_host_path("srv/a");
+        nul_source.push("b\u{0}c");
+        let mut nul_target = PathBuf::from("/tmp/home/a");
+        nul_target.push("b\u{0}c");
         let mut config = example_config();
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/a\u{0}b"),
+            source: nul_source.clone(),
             target: PathBuf::from("/tmp/home/a"),
             mode: MountMode::ReadOnly,
             env: BTreeMap::new(),
@@ -4642,8 +4674,8 @@ mod tests {
         assert!(rendered.contains("NUL byte"), "{rendered}");
 
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/a"),
-            target: PathBuf::from("/tmp/home/a\u{0}b"),
+            source: mounts::test_host_path("srv/a"),
+            target: nul_target,
             mode: MountMode::ReadOnly,
             env: BTreeMap::new(),
         }];
@@ -4653,7 +4685,7 @@ mod tests {
         config.mounts.clear();
         config.caches = vec![CacheGrant {
             kind: CacheKind::Npm,
-            path: Some(PathBuf::from("/srv/a\u{0}b")),
+            path: Some(nul_source),
             mode: MountMode::ReadOnly,
         }];
         let error = validate_config(&config).unwrap_err().to_string();
@@ -4665,14 +4697,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_path_at_the_host_home_is_rejected_at_load() {
+    fn cache_rooted_at_the_host_home_is_rejected_at_load() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
         let mut config = example_config();
         config.caches = vec![CacheGrant {
             kind: CacheKind::Npm,
-            path: Some(home_dir().unwrap()),
+            path: Some(home.clone()),
             mode: MountMode::ReadOnly,
         }];
-        let error = validate_config(&config).unwrap_err();
+        let error = DeclaredMounts::resolve_with_home(&config, Some(&home))
+            .validate()
+            .unwrap_err();
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains("caches[0] npm must name a valid sandbox target"),
@@ -4688,6 +4724,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn mount_list_env_parses_one_spec_per_comma() {
         let grants = parse_mount_list("/srv/a:/tmp/home/a, /srv/b:/tmp/home/b:rw").unwrap();
@@ -4711,7 +4748,7 @@ mod tests {
     fn mount_validation_rejects_unsafe_targets_and_env_names() {
         let mut config = example_config();
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/a"),
+            source: mounts::test_host_path("srv/a"),
             target: PathBuf::from("/opt/a"),
             mode: MountMode::ReadOnly,
             env: BTreeMap::new(),
@@ -4727,7 +4764,7 @@ mod tests {
         assert!(validate_config(&config).is_err());
 
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/a"),
+            source: mounts::test_host_path("srv/a"),
             target: PathBuf::from("/tmp/home/a"),
             mode: MountMode::ReadWrite,
             env: BTreeMap::from([("not an identifier".to_owned(), "/tmp/home/a".to_owned())]),
@@ -4737,13 +4774,13 @@ mod tests {
         // Duplicate targets are last-wins, not an error; nesting still is.
         config.mounts = vec![
             MountGrant {
-                source: PathBuf::from("/srv/a"),
+                source: mounts::test_host_path("srv/a"),
                 target: PathBuf::from("/tmp/home/a"),
                 mode: MountMode::ReadOnly,
                 env: BTreeMap::new(),
             },
             MountGrant {
-                source: PathBuf::from("/srv/b"),
+                source: mounts::test_host_path("srv/b"),
                 target: PathBuf::from("/tmp/home/a"),
                 mode: MountMode::ReadWrite,
                 env: BTreeMap::new(),
@@ -4752,7 +4789,7 @@ mod tests {
         assert!(validate_config(&config).is_ok());
 
         config.mounts.push(MountGrant {
-            source: PathBuf::from("/srv/c"),
+            source: mounts::test_host_path("srv/c"),
             target: PathBuf::from("/tmp/home/a/child"),
             mode: MountMode::ReadOnly,
             env: BTreeMap::new(),
@@ -4760,7 +4797,7 @@ mod tests {
         assert!(validate_config(&config).is_err());
 
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/a"),
+            source: mounts::test_host_path("srv/a"),
             target: PathBuf::from("/tmp/home/a"),
             mode: MountMode::ReadWrite,
             env: BTreeMap::from([("CACHE_DIR".to_owned(), "/tmp/home/a".to_owned())]),
@@ -4772,7 +4809,7 @@ mod tests {
     fn profile_mounts_survive_a_save_round_trip() {
         let mut config = example_config();
         config.mounts = vec![MountGrant {
-            source: PathBuf::from("/srv/a"),
+            source: mounts::test_host_path("srv/a"),
             target: PathBuf::from("/tmp/home/a"),
             mode: MountMode::ReadWrite,
             env: BTreeMap::from([("CACHE_DIR".to_owned(), "/tmp/home/a".to_owned())]),
