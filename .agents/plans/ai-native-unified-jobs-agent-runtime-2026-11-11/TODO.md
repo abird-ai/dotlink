@@ -41,6 +41,7 @@ Session, Agent, guardian or routing semantics here.
       Qualified typed SDK/host `jobs.*` leaves do not expand the standalone provider schema.
 
 ### Dotlink checkpoint 1 — standalone
+
 - [x] Run together: flat catalog, shell sync/handoff/background, Graph whole/node reads,
       ACK ownership, authorized→revoked stdin, cancel/unknown, duplicate control replay,
       **runtime restart rejects stale Job refs/cursors without ID reuse or resurrection**,
@@ -74,6 +75,7 @@ Session, Agent, guardian or routing semantics here.
       a separately reviewed atomic source-owner event protocol exists.
 
 ### Dotlink checkpoint 2 — bridge
+
 - [x] Run together: AW→remote Process/Graph execution/control/read, stale writer/source/site denial,
       missing local sandbox grant despite upstream allow, revoked stdin before bytes, duplicate
       request idempotence, no Agent state leakage, unsupported remote wake rejection. Race
@@ -114,6 +116,7 @@ Session, Agent, guardian or routing semantics here.
         serialization.
 
 ### Dotlink checkpoint 3 — final
+
 - [x] Run only the affected dotlink package/integration lanes plus:
   - standalone Job flows from checkpoint 1;
   - bridge authority/replay flows from checkpoint 2;
@@ -140,6 +143,7 @@ Session, Agent, guardian or routing semantics here.
 - [x] Do not requalify unchanged native filesystem/sandbox primitives merely because old routes were removed.
 
 ### Final exact shared pin
+
 - [x] Finalized against pushed AW `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`:
   `aw-tools`, `aw-tools-fs-unix`, and `aw-tools-fs-win` all use that exact Git revision;
   the temporary local digest implementation is removed in favor of

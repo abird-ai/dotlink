@@ -101,7 +101,8 @@ fn bounded_replayed_job_handoff(cached: CallToolResult, budget: Option<usize>) -
 
 #[derive(Clone, Copy)]
 enum ControlReceipt {
-    Ack(u64),
+    AckThrough(u64),
+    Finish,
     Cancel,
 }
 
@@ -122,9 +123,10 @@ fn bounded_control_success(
     }
     let reference = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
     let receipt = match effect {
-        ControlReceipt::Ack(through) => {
+        ControlReceipt::AckThrough(through) => {
             format!("{reference} ack=through:{through} next=jobs_get no-rerun")
         }
+        ControlReceipt::Finish => format!("{reference} ack=finish next=jobs_get no-rerun"),
         ControlReceipt::Cancel => format!("{reference} cancel=accepted next=jobs_get no-rerun"),
     };
     let compact = ok_text(receipt);
@@ -245,7 +247,7 @@ pub(crate) fn canonicalize_graph_router(
 
 pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes: usize) {
     let name = tool.name.as_ref();
-    if !matches!(name, "jobs_read" | "jobs_list") {
+    if !matches!(name, "jobs_get" | "jobs_read" | "jobs_list") {
         return;
     }
     let mut schema = (*tool.input_schema).clone();
@@ -275,6 +277,21 @@ pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes:
             "maximum".to_owned(),
             serde_json::Value::from(max_output_bytes),
         );
+    }
+    if name == "jobs_get"
+        && let Some(property) = properties
+            .get_mut("tail")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        property.insert(
+            "description".to_owned(),
+            serde_json::Value::String(
+                "Combined stdout+stderr tail bytes for Process output. Defaults to 512; 0 disables; maximum 1024."
+                    .to_owned(),
+            ),
+        );
+        property.insert("minimum".to_owned(), serde_json::Value::from(0));
+        property.insert("maximum".to_owned(), serde_json::Value::from(1024));
     }
     if name == "jobs_list"
         && let Some(property) = properties
@@ -361,6 +378,8 @@ struct JobsGetArgs {
     rev: Option<u64>,
     #[serde(default)]
     wait_ms: Option<u64>,
+    #[serde(default)]
+    tail: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -387,7 +406,8 @@ struct JobsAckArgs {
     reference: String,
     #[serde(default)]
     view: Option<ReadView>,
-    offset: u64,
+    #[serde(default)]
+    offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
@@ -668,7 +688,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Observe one standalone Process/Graph Job or Graph node. wait_ms waits only for this target to settle or for the wait deadline; rev is status metadata, not an early-wake condition. This never changes execution timeout.",
+        description = "Observe one standalone Process/Graph Job or Graph node. Process output includes the last 512 raw bytes total across stdout/stderr by default; tail=0 disables output and explicit tail is capped at 1024 combined. wait_ms waits only for this target to settle or for the wait deadline. Tail peeks never ACK.",
         annotations(
             title = "Get Job status",
             read_only_hint = true,
@@ -690,20 +710,29 @@ impl LocalMachine {
         if wait_ms > MAX_WAIT_MS {
             return tool_error(format!("jobs_get wait_ms exceeds {MAX_WAIT_MS}"));
         }
+        if args.tail.is_some_and(|tail| tail > 1024) {
+            return tool_error("jobs_get tail exceeds 1024 combined bytes");
+        }
         let wait_ms = bounded_wait_ms(wait_ms, self.request_sync_budget_millis(&context));
+        let result_budget = self
+            .request_result_budget(&context)
+            .unwrap_or(self.config.max_output_bytes)
+            .min(self.config.max_output_bytes);
         match self
             .jobs
             .standalone_get(&reference.id, reference.node, args.rev, wait_ms)
             .await
         {
-            Ok(status) => bounded_job_status(
+            Ok(status) => match self.jobs.standalone_process_tail(
+                &reference.id,
+                reference.node,
+                args.tail,
                 status,
-                Some(
-                    self.request_result_budget(&context)
-                        .unwrap_or(self.config.max_output_bytes)
-                        .min(self.config.max_output_bytes),
-                ),
-            ),
+                result_budget,
+            ) {
+                Ok(status) => bounded_job_status(status, Some(result_budget)),
+                Err(error) => tool_error(error),
+            },
             Err(error) => tool_error(error),
         }
     }
@@ -789,7 +818,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Explicitly acknowledge one exact retained Job ref/view through a raw byte offset after safe receipt. ACK is monotonic/idempotent and is never implied by jobs_read.",
+        description = "Explicitly acknowledge one retained Job ref/view. With offset, ACK only that contiguous delivered raw-byte prefix. Omit offset to Finish this exact terminal Job/node scope, releasing unread bytes for only the current Job owner. ACK is never implied by jobs_read.",
         annotations(
             title = "Acknowledge Job output",
             read_only_hint = false,
@@ -812,6 +841,10 @@ impl LocalMachine {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
+        let effect = args
+            .offset
+            .map(ControlReceipt::AckThrough)
+            .unwrap_or(ControlReceipt::Finish);
         let remote_start = context
             .extensions
             .get::<crate::remote_start::ValidatedRemoteStart>()
@@ -819,12 +852,7 @@ impl LocalMachine {
         let guard = if let Some(start) = remote_start.as_ref() {
             match self.jobs.claim_remote_start(start) {
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return bounded_control_replay(
-                        result,
-                        &reference,
-                        ControlReceipt::Ack(args.offset),
-                        result_budget,
-                    );
+                    return bounded_control_replay(result, &reference, effect, result_budget);
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -837,12 +865,20 @@ impl LocalMachine {
         } else {
             None
         };
-        let outcome = match self.jobs.acknowledge_node_output(
-            &reference.id,
-            reference.node,
-            args.view.map(Into::into),
-            args.offset,
-        ) {
+        let applied = match args.offset {
+            Some(offset) => self.jobs.acknowledge_node_output(
+                &reference.id,
+                reference.node,
+                args.view.map(Into::into),
+                offset,
+            ),
+            None => self.jobs.finish_node_output(
+                &reference.id,
+                reference.node,
+                args.view.map(Into::into),
+            ),
+        };
+        let outcome = match applied {
             Ok(_) => self
                 .jobs
                 .standalone_status(&reference.id, reference.node)
@@ -852,12 +888,7 @@ impl LocalMachine {
         };
         match outcome {
             Ok(text) => {
-                let result = bounded_control_success(
-                    &reference,
-                    text,
-                    ControlReceipt::Ack(args.offset),
-                    result_budget,
-                );
+                let result = bounded_control_success(&reference, text, effect, result_budget);
                 if let Some(guard) = guard
                     && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
                 {
@@ -1242,6 +1273,24 @@ mod tests {
             .await
             .unwrap();
         assert!(first.contains(" settled "), "{first}");
+        let first_tail = machine
+            .jobs
+            .standalone_process_tail(&started.id, Some(1), None, first.clone(), 4096)
+            .unwrap();
+        assert!(first_tail.contains("stdout [0..5] eof"), "{first_tail}");
+        assert!(first_tail.contains("first"), "{first_tail}");
+        assert!(
+            machine
+                .jobs
+                .acknowledge_node_output(
+                    &started.id,
+                    Some(1),
+                    Some(crate::jobs::JobOutputStream::Stdout),
+                    5,
+                )
+                .is_err(),
+            "jobs_get tail must not create node delivery credit"
+        );
         let root = machine
             .jobs
             .standalone_get(&started.id, None, Some(rev), 30)
@@ -1250,6 +1299,21 @@ mod tests {
         assert!(
             root.contains(" running ") || root.contains(" waiting "),
             "root must not be settled while sibling remains active: {root}"
+        );
+        assert_eq!(
+            machine
+                .jobs
+                .standalone_process_tail(&started.id, None, None, root.clone(), 4096,)
+                .unwrap(),
+            root,
+            "Graph roots do not synthesize Process tails"
+        );
+        assert!(
+            machine
+                .jobs
+                .standalone_process_tail(&started.id, None, Some(1), root.clone(), 4096,)
+                .is_err(),
+            "explicit Graph-root tail must fail rather than guess a node"
         );
         let settled = machine
             .jobs
@@ -1517,16 +1581,26 @@ mod tests {
         let acknowledged = bounded_control_success(
             &node,
             large.clone(),
-            ControlReceipt::Ack(47),
+            ControlReceipt::AckThrough(47),
             Some(ack_size),
         );
         assert!(!acknowledged.is_error.unwrap_or(false));
         assert_eq!(acknowledged.content[0].as_text().unwrap().text, ack_compact);
         assert!(crate::mcp::serialized_json_len(&acknowledged).unwrap() <= ack_size);
+        let finish_compact = "j:control-123/n:2 ack=finish next=jobs_get no-rerun";
+        let finish_size = crate::mcp::serialized_json_len(&ok_text(finish_compact)).unwrap();
+        let finished = bounded_control_success(
+            &node,
+            large.clone(),
+            ControlReceipt::Finish,
+            Some(finish_size),
+        );
+        assert!(!finished.is_error.unwrap_or(false));
+        assert_eq!(finished.content[0].as_text().unwrap().text, finish_compact);
         let too_small = bounded_control_success(
             &node,
             large.clone(),
-            ControlReceipt::Ack(47),
+            ControlReceipt::AckThrough(47),
             Some(ack_size - 1),
         );
         assert!(too_small.is_error.unwrap_or(false));
@@ -2027,6 +2101,32 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .contains_key("filter")
+        );
+    }
+
+    #[test]
+    fn jobs_get_schema_advertises_combined_tail_bounds() {
+        let mut get = LocalMachine::all_tools().get("jobs_get").cloned().unwrap();
+        with_job_limits(&mut get, 3600, 8 * 1024 * 1024);
+        let tail = &get.input_schema["properties"]["tail"];
+        assert_eq!(tail["minimum"], 0);
+        assert_eq!(tail["maximum"], 1024);
+        assert!(
+            !get.input_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|value| value == "tail")),
+            "omitted tail must select the 512-byte Process default"
+        );
+    }
+
+    #[test]
+    fn jobs_ack_schema_makes_offset_optional_for_terminal_finish() {
+        let ack = LocalMachine::all_tools().get("jobs_ack").cloned().unwrap();
+        let required = ack.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|value| value == "ref"));
+        assert!(
+            !required.iter().any(|value| value == "offset"),
+            "omitting offset is the explicit terminal Finish form"
         );
     }
 }

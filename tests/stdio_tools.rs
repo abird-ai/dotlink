@@ -655,3 +655,173 @@ fn text_tools_share_binary_detection_without_restricting_binary_tools() {
 
     probe.finish();
 }
+
+#[test]
+fn stdio_grep_context_and_graph_parity_use_the_shared_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::create_dir(root.join("oversized")).unwrap();
+    let wide = (1..=300)
+        .map(|line| {
+            if line == 151 {
+                "hit".to_owned()
+            } else {
+                format!("line-{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(root.join("one.txt"), wide).unwrap();
+    std::fs::write(root.join("sub/two.txt"), "pre\nhit nested\npost\n").unwrap();
+    std::fs::write(root.join("paged.txt"), "hit one\nhit two\nhit three\n").unwrap();
+    std::fs::write(
+        root.join("oversized/too-big.txt"),
+        vec![b'z'; 1024 * 1024 + 1],
+    )
+    .unwrap();
+
+    let mut probe = Probe::start(&root);
+    let initialized = probe.request(&initialize_request(1));
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "dotlink");
+
+    let listed = probe.request(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+    let grep = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "grep")
+        .expect("grep advertised");
+    for key in ["context", "before", "after"] {
+        assert_eq!(grep["inputSchema"]["properties"][key]["minimum"], 0);
+        assert_eq!(grep["inputSchema"]["properties"][key]["maximum"], 128);
+    }
+    assert_eq!(grep["inputSchema"]["properties"]["context"]["default"], 0);
+
+    let file_args = json!({
+        "pattern":"hit",
+        "path":"one.txt",
+        "literal":true,
+        "context":8,
+        "before":128,
+        "after":0
+    });
+    let direct_file = probe.request(&call_request(3, "grep", file_args.clone()));
+    assert_ne!(direct_file["result"]["isError"], true, "{direct_file}");
+    let direct_file_text = text_of(&direct_file);
+    assert!(
+        direct_file_text.contains("one.txt-23-line-23"),
+        "{direct_file}"
+    );
+    assert!(
+        direct_file_text.contains("one.txt:151:hit"),
+        "{direct_file}"
+    );
+    assert!(
+        !direct_file_text.contains("one.txt-152-line-152"),
+        "{direct_file}"
+    );
+
+    let direct_dir = probe.request(&call_request(
+        4,
+        "grep",
+        json!({
+            "pattern":"hit",
+            "path":".",
+            "literal":true,
+            "context":1,
+            "depth":8,
+            "gitignore":false
+        }),
+    ));
+    assert_ne!(direct_dir["result"]["isError"], true, "{direct_dir}");
+    let direct_dir_text = text_of(&direct_dir);
+    assert!(direct_dir_text.contains("one.txt:151:hit"), "{direct_dir}");
+    assert!(
+        direct_dir_text.contains("sub/two.txt-1-pre"),
+        "{direct_dir}"
+    );
+    assert!(
+        direct_dir_text.contains("sub/two.txt:2:hit nested"),
+        "{direct_dir}"
+    );
+    assert!(
+        direct_dir_text.contains("sub/two.txt-3-post"),
+        "{direct_dir}"
+    );
+
+    let zero = probe.request(&call_request(
+        14,
+        "grep",
+        json!({"pattern":"hit nested","path":"sub/two.txt","literal":true,"context":0}),
+    ));
+    assert_ne!(zero["result"]["isError"], true, "{zero}");
+    assert_eq!(text_of(&zero), "sub/two.txt:2:hit nested\n");
+
+    for (id, arguments) in [
+        (5, json!({"pattern":"hit","path":"one.txt","context":129})),
+        (6, json!({"pattern":"hit","path":"one.txt","before":129})),
+        (7, json!({"pattern":"hit","path":"one.txt","after":129})),
+        (8, json!({"pattern":"hit","path":"one.txt","beforee":1})),
+    ] {
+        let invalid = probe.request(&call_request(id, "grep", arguments));
+        assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+    }
+
+    let first = probe.request(&call_request(
+        9,
+        "grep",
+        json!({"pattern":"hit","path":"paged.txt","literal":true,"limit":2}),
+    ));
+    assert_ne!(first["result"]["isError"], true, "{first}");
+    assert!(text_of(&first).contains("paged.txt:1:hit one"), "{first}");
+    assert!(text_of(&first).contains("paged.txt:2:hit two"), "{first}");
+    assert!(text_of(&first).contains("more offset=2"), "{first}");
+    let resumed = probe.request(&call_request(
+        10,
+        "grep",
+        json!({"pattern":"hit","path":"paged.txt","literal":true,"offset":2,"limit":2}),
+    ));
+    assert_ne!(resumed["result"]["isError"], true, "{resumed}");
+    assert!(
+        text_of(&resumed).contains("paged.txt:3:hit three"),
+        "{resumed}"
+    );
+    assert!(
+        !text_of(&resumed).contains("paged.txt:1:hit one"),
+        "{resumed}"
+    );
+
+    let incomplete = probe.request(&call_request(
+        11,
+        "grep",
+        json!({
+            "pattern":"hit",
+            "path":"oversized",
+            "literal":true,
+            "depth":2,
+            "gitignore":false
+        }),
+    ));
+    assert_ne!(incomplete["result"]["isError"], true, "{incomplete}");
+    assert_eq!(text_of(&incomplete), "incomplete budget\n");
+
+    let graph = probe.request(&call_request(
+        12,
+        "batch",
+        json!({"ops":[["grep", file_args]]}),
+    ));
+    assert_ne!(graph["result"]["isError"], true, "{graph}");
+    assert!(text_of(&graph).contains("one.txt-23-line-23"), "{graph}");
+    assert!(text_of(&graph).contains("one.txt:151:hit"), "{graph}");
+    assert!(!text_of(&graph).contains("one.txt-152-line-152"), "{graph}");
+
+    let invalid_graph = probe.request(&call_request(
+        13,
+        "batch",
+        json!({"ops":[["grep",{"pattern":"hit","path":"one.txt","before":129}]]}),
+    ));
+    assert_eq!(invalid_graph["result"]["isError"], true, "{invalid_graph}");
+    probe.finish();
+}

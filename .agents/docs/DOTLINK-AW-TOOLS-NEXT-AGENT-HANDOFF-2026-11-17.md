@@ -1,9 +1,10 @@
 # Dotlink → AW shared tools: next-agent handoff
+
 Prepared: 2026-11-17 · source host pvl-l5 · Owner: @pvl
 Purpose: dotlink entrypoint into the **canonical cross-repo handoff** and exact D0–D4 dependency boundary.
 Status: documentation/handoff only; this file is not authority to commit, push, rebase, repin or release.
 
-**Post-snapshot update:** D0 is complete. AW `main` is published at `403eb8473498454a97871702ff37aaedb1de9ee1`; the reviewed shared implementation pin consumed by dotlink is its signed parent `be6d48db552fd44b9dd85364cd8734454109ce68`. Dotlink adoption is signed in `d0a392234e918bd4ec9f0fbd7ab6fe771e1eb696` with all three shared dependencies/lock entries on that SHA. Full binary qualification is **676 passed / 1 ignored**, stdio MCP **5/5**, strict Clippy/check/fmt/diff green. Historical snapshot tables below are preserved as chronology; live Git and the owning convergence TODO supersede them.
+**Post-snapshot update:** D0–D4 are complete in the finalized dotlink checkpoint. AW `main` is published at signed `beef1bc2d2f37b5660ebe928d368bca37368e608`; dotlink consumes that exact revision in all three dependency/lock records. The new AW writer-quiescence rule is compatible with dotlink's existing writer-before-settlement ordering and required no host source workaround. Fresh exact-pin qualification is **684 passed / 1 ignored** plus **36/36** integrations; locked all-target/all-feature check and strict all-feature Clippy/fmt/diff are green. Prior D4 release qualification also remains green: Markdown 0 issues, all Nix checks, native Bubblewrap and targeted GPU/KVM/device-security smoke. Push/version/tag/release/deploy remain separately authorized actions.
 
 **Read the full current master:**
 [AW–dotlink shared tools comprehensive handoff](../../../aw/.agents/docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md).
@@ -13,6 +14,7 @@ The master documents the original AW Agent/ToolPolicy/TurnJournal foundations, d
 ## 0. Safety and first reads
 
 Use **dotlink---l5 only**. Existing main worktrees:
+
 - AW: /home/pvl/spaces/abird/src/aw
 - dotlink: /home/pvl/spaces/abird/src/dotlink
 
@@ -67,13 +69,13 @@ Primary dated records: `.agents/docs/RELEASE-017-OPERATIONS-PORT-2026-11-15.md` 
 
 **D0 (complete):** reviewed AW implementation pin `be6d48db552fd44b9dd85364cd8734454109ce68` is signed, remotely available and consumed by all three dotlink shared dependencies/lock records. Dotlink compatibility fixes and D0 qualification are committed in `d0a3922`.
 
-**D1 (next):** integrate shared Job get/read/tail/ACK/Finish and owner-delivery APIs through the existing dotlink adapter. Retire temporary duplicate host-side delivery proof only when the canonical shared owner path is fully wired and qualified. Keep source/actor authorization, exact per-stream owner, Task/replay retention and authenticated remaining-window clamps.
+**D1 (complete in the current uncommitted dotlink tree):** shared read delivery proof, Through-ACK, omitted-offset terminal Finish and aggregate `jobs_get.tail` are wired to AW on pin `26a8c78`. Tail uses 512 default / 1024 max combined stdout+stderr with shared redistribution and exact final-response fitting, and remains a pure peek with no delivery/ACK credit. The temporary dotlink watermark is legacy/test-only. Preserve Task/replay owners and authenticated remaining-window clamps.
 
-**D2:** use shared grep file/dir context caps/parser/engine, including 0, 8, 128, invalid 129 and asymmetric explicit values; avoid duplicate grep engine. Project shared Toolset titles/descriptions to MCP with host metadata overrides.
+**D2 (complete in the current uncommitted tree):** direct MCP and Graph-native grep share AW schema/parser/engine. Real stdio qualification covers exact files/directories, context 0/8/128, invalid 129, asymmetric overrides, pagination/resume and compact incomplete markers. No duplicate grep engine or nested Graph schema was added.
 
-**D3 (partial on old pin):** canonical output proof vs Task/consumer owners, immutable remote Start across bounded success/error and failed physical delivery, exact replay/source generation, model/SDK status and transport wait budgets, signed read offsets, combined tail, old-owner release. Never confuse formatted response success with physically received bytes.
+**D3 (complete in the current uncommitted tree):** canonical Job/Task output proof, signed read offsets and combined tail are adopted; standalone native Tasks use AW's plan-bound `task_result_owner`, while Graph remains Task-ineligible. Hosted replay distinguishes positive physical delivery from 404/expiry/ambiguous POSTs; namespace/execution-authority rotation retires old durable shell request owners through the bounded existing handoff; Busy retirement remains queued until it can succeed; positive Delivered tombstones remain final under later revocation. Optional consumer leases remain unadopted because no distinct authenticated consumer audience exists.
 
-**D4:** targeted real stdio/HTTP/remote/Task integration and independent ACK/replay security review; strict Rust lint/feature checks; platform-native and real flake/release gates remain separately honest. Update plan checklists and current handoff; signing, push, version/release/deploy each need explicit approval.
+**D4 (complete):** independent ACK/Finish/Task/replay/retirement review and executable stdio/HTTP/remote/Task/all-feature gates are complete, including the guard-revocation Busy-discard red/green fix and test-fixture race hardening. Host Rust/lint gates are green; Markdown is 0/76; all Nix checks are green, including hermetic release tests **684/0/1 + 36/36 integrations** with a verified store output. Native full Bubblewrap qualification is also **684/0/1 + 36/36**, and all seven targeted GPU/KVM/device-security cases pass on the capable host. No D1–D4 correctness gate remains. Signing, push, version/release/deploy still need explicit approval.
 
 Next execution slices should be ~30 minutes, one coherent checkpoint each, with completed work and tests recorded in the owning plan, then pause.
 
@@ -106,8 +108,8 @@ L5 has on occasion externally terminated large Rust test compilation, without an
 >
 > Read in **each** repo `AGENTS.md`, `.agents/plans/README.md`, `.agents/plans/TODO.md`; then AW `.agents/docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md`, dotlink `.agents/docs/DOTLINK-AW-TOOLS-NEXT-AGENT-HANDOFF-2026-11-17.md`; AW Job/output + Toolset builder + dotlink-tool-port plan DESIGN/TODOs; dotlink aw-job-output-grep-convergence DESIGN/TODO; follow linked historical handoffs for a design's origin.
 >
-> Revalidate current Git state and three exact Cargo dependency pins. Current checkpoint: AW `main` `403eb8473498454a97871702ff37aaedb1de9ee1`, reviewed implementation pin `be6d48db552fd44b9dd85364cd8734454109ce68`; dotlink signed adoption commit `d0a392234e918bd4ec9f0fbd7ab6fe771e1eb696`, with all three AW dependencies and lock entries on `be6d48d`. Revalidate rather than assuming these remain current.
+> Revalidate current Git state and three exact Cargo dependency pins. Current checkpoint: AW `main` and reviewed shared pin are `beef1bc2d2f37b5660ebe928d368bca37368e608`; the finalized dotlink D1–D4 checkpoint pins all three AW dependencies/lock entries to `beef1bc`. Revalidate rather than assuming these remain current.
 >
-> Continue with **D1**: review the current dotlink Job get/read/ack projections against the newly pinned shared owner/delivery/range/Finish APIs, then replace only the temporary duplicate host-side proof that can now be safely delegated to shared AW. Preserve MCP Task/replay leases and current authority fences. Qualify one coherent failure boundary, update the owning plan and pause; do not jump ahead to D2–D4 unless D1 is demonstrably complete.
+> D0–D4 are complete. Do **not** reopen D1–D4 source work without a concrete regression. All host Rust, Markdown, Nix, native Bubblewrap, and targeted GPU/KVM/device-security qualification is green. Next work requires explicit authorization for commit/push/version/tag/release/deploy or other external publication/signing/platform actions; do not perform them on your own.
 
 **Full design, chronology, all post-merge checkpoints, reference map, and precise source/testing gates:** [canonical AW handoff](../../../aw/.agents/docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md).

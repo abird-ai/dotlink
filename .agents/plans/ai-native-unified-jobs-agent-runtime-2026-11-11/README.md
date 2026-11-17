@@ -70,6 +70,7 @@ The original provider wire ToolCall remains immutable evidence.
 ## Job ownership boundary
 
 dotlink standalone owns/exposes:
+
 - Process Jobs from bash/pwsh/powershell;
 - Graph Jobs from batch;
 - Graph embedded deterministic n:<1-based Graph coordinate> node streams/results beneath Graph Job refs, with no extra opaque node mapping;
@@ -81,15 +82,17 @@ dotlink standalone owns/exposes:
 Control/read refs use the shared AW semantics. Standalone has no implicit self, so get/read/ack/send/cancel require explicit finite ref; jobs_list has no ref.
 
 rev is exposed only where it adds control value:
+
 - send/cancel use supplied rev as exact compare-and-act;
 - get uses rev as the conditional observation/change token for lost-wakeup-safe wait_ms polling;
 - read and ack have no rev: exact ref + offset/cursor/ACK watermark preserve replayable DL-150 paging and idempotent release.
 Calls that permit omitted rev remain valid against current state.
 
-Standalone dotlink does not invent domain/principal/project/Agent identity. Its finite refs resolve inside its **authenticated live runtime session** as j:<handle> or j:<handle>/n:<1-based coordinate>. Every restart creates a **new unforgeable runtime generation**; stale listing cursors/Start proofs fail, old live Process/Graph Jobs are never resurrected, and finite `j:` handles cannot be reused to identify unrelated work across generations. Because it has no current Agent, get/read/ack/send/cancel require an explicit finite ref; no omitted/"." AW self or structural default d:0/i:0/p:0/a:0 can mint dotlink authority. Under an AW bridge those :0 values are fixed AW canonical objects, never caller-relative aliases, and only AW resolves/authorizes them. jobs.subscribe exists only with a real authenticated AW Agent host.
+Standalone dotlink does not invent domain/principal/project/Agent identity. Its finite refs resolve inside its **authenticated live runtime session** as `j:<handle>` or `j:<handle>/n:<1-based coordinate>`. Every restart creates a **new unforgeable runtime generation**; stale listing cursors/Start proofs fail, old live Process/Graph Jobs are never resurrected, and finite `j:` handles cannot be reused to identify unrelated work across generations. Because it has no current Agent, get/read/ack/send/cancel require an explicit finite ref; no omitted/"." AW self or structural default d:0/i:0/p:0/a:0 can mint dotlink authority. Under an AW bridge those :0 values are fixed AW canonical objects, never caller-relative aliases, and only AW resolves/authorizes them. jobs.subscribe exists only with a real authenticated AW Agent host.
 
 When an authenticated AW bridge is present:
-- AW owns fully resolved canonical /d:<h>/i:<h>/p:<h>/a:<h>[/t:<h>][/j:<h>...][/n:<h>...] identity;
+
+- AW owns fully resolved canonical `/d:<h>/i:<h>/p:<h>/a:<h>[/t:<h>][/j:<h>...][/n:<h>...]` identity;
 - canonical handles are already direct immutable identities; no friendly-name alias lookup layer is part of the execution ref;
 - AW owns contextual overlay resolution for d:/i:/p:/a:, omitted/".", "^" and t:/j:/n: paths relative to the current Agent;
 - AW applies inherit-ancestors/reset-descendants-to-:0 **only to existing provisioned authenticated identities**; missing default principals/projects/root Agents fail closed and are never created by reference lookup;
@@ -103,6 +106,7 @@ AW host policy defaults to Local with zero auxiliary inference; advanced configu
 **Standalone/provider-facing dotlink Graph remains on reviewed DL-150 native/shell leaves.** An AW-hosted model Graph additionally admits `agent` only when AW owns its Agent/Turn/effect settlement. **Nested `batch` is rejected by every Graph entrypoint**, including SDK/host and **AW Agent descendants still owned by an active Graph node**; a direct Agent-issued `batch` cannot bypass the active Graph scope. A new independently authorized Turn after Graph settlement can launch its own top-level Graph. Advanced `jobs.*` Graph controls are typed AW SDK/host-only after an explicit owner/Control/result/cycle qualification, never implicitly model-exposed or implemented by standalone dotlink. Child Agent depth/cost/causal authority belongs to AW, not dotlink.
 
 dotlink does not own/copy:
+
 - AW principal/project/Agent namespace state;
 - AW Session/branch;
 - Agent Turn generation;
@@ -120,7 +124,7 @@ At the original concrete native/Process/Graph/Job owner, dotlink must independen
 
 The dotlink registry/router carries only exact routing identity and minimum signed/current Start provenance needed by its concrete owner, never shadow Agent state or a second scoped policy database. Source-owner event/wake restrictions remain unchanged.
 
-The generic wire/API must not grow node/turn/step fields. Shared handles use the same delimiter-safe canonical lexical grammar as AW. Execution suffixes are owner-typed; Graph nodes use directly derivable n:<1-based coordinate> segments (n:0/leading zeros invalid), and any n:<coordinate>/j:<handle> continuation exists only for genuinely independent durable child work. Agent t:<handle>/Step semantics remain AW-owned, and Step has no public path segment.
+The generic wire/API must not grow node/turn/step fields. Shared handles use the same delimiter-safe canonical lexical grammar as AW. Execution suffixes are owner-typed; Graph nodes use directly derivable `n:<1-based coordinate>` segments (`n:0`/leading zeros invalid), and any `n:<coordinate>/j:<handle>` continuation exists only for genuinely independent durable child work. Agent `t:<handle>`/Step semantics remain AW-owned, and Step has no public path segment.
 
 ### Shared Session and coordination boundary
 
@@ -141,19 +145,21 @@ Replace old model-facing job_output with jobs_read.
 Standalone valid views:
 
 Process:
+
 - stdout
 - stderr
 - result
 
 Graph:
+
 - result
 - valid n:<1-based coordinate> result/stdout/stderr
 
 Preserve exact DL-150 retained-byte semantics: Process/Process-backed Graph-node default read is **stdout**; native/Graph default is result. Raw offsets are encoding-independent; EOF/truncation remains immutable; read never ACKs. ACK is monotonic/idempotent exact ref/view/offset with no rev, cannot exceed retained bytes delivered/available to that exact owner's lease, and cleanup waits for every replay/Task/protocol owner.
 
-jobs.list is flat deterministic exposed-Job-root discovery with immutable exposure ordering and an opaque strictly-older cursor; later activity never reorders pages and it is not subtree traversal. jobs.get/read/ack/send/cancel use explicit standalone refs. Process Job refs are j:<handle>; Graph nodes are directly derivable j:<handle>/n:<1-based coordinate>.
+jobs.list is flat deterministic exposed-Job-root discovery with immutable exposure ordering and an opaque strictly-older cursor; later activity never reorders pages and it is not subtree traversal. jobs.get/read/ack/send/cancel use explicit standalone refs. Process Job refs are `j:<handle>`; Graph nodes are directly derivable `j:<handle>/n:<1-based coordinate>`.
 
-Shared schemas stay strongly typed: ReadView=result|stdout|stderr for standalone resolved kinds; SendInput is exactly {text}|{eof:true}. jobs.send mode is auto|queue|steer|interrupt. **For bridged retries**, AW first looks up the original authenticated invocation claim and uses its stored canonical target, *before* resolving `^` or contextual overlays; dotlink receives only the already accepted exact canonical ref and original attempt. Reparenting cannot retarget a replay. Process j:<handle> accepts live stdin only if interactive custody was retained **and current exact Control plus independent `process.input` launcher/source/epoch/resource policy still permits new input under the Process's actual retained original sandbox**. An existing open handle cannot bypass policy revocation/narrowing. Graph interactive n:<handle> delegates to node owner. Every effectful SDK/transport/bridge send carries a **stable host-envelope invocation ID** established before effect and reused on retry; uncertain stdin bytes are never blindly written twice. Standalone dotlink does not interpret AW causal budgets, subscriptions or Agent filters; AW owns them. Unsupported inputs/modes reject.
+Shared schemas stay strongly typed: ReadView=result|stdout|stderr for standalone resolved kinds; SendInput is exactly {text}|{eof:true}. jobs.send mode is auto|queue|steer|interrupt. **For bridged retries**, AW first looks up the original authenticated invocation claim and uses its stored canonical target, *before* resolving `^` or contextual overlays; dotlink receives only the already accepted exact canonical ref and original attempt. Reparenting cannot retarget a replay. Process `j:<handle>` accepts live stdin only if interactive custody was retained **and current exact Control plus independent `process.input` launcher/source/epoch/resource policy still permits new input under the Process's actual retained original sandbox**. An existing open handle cannot bypass policy revocation/narrowing. Graph interactive `n:<handle>` delegates to node owner. Every effectful SDK/transport/bridge send carries a **stable host-envelope invocation ID** established before effect and reused on retry; uncertain stdin bytes are never blindly written twice. Standalone dotlink does not interpret AW causal budgets, subscriptions or Agent filters; AW owns them. Unsupported inputs/modes reject.
 
 Public finite lifecycle uses only the shared vocabulary subset running|waiting|cancelling|cancelled|settled, with DL-150 outcomes reported separately.
 
@@ -180,6 +186,7 @@ or grouped jobs({op}) / agents({op}) proposals.
 No model-facing restart exists.
 
 DL-150 Job functionality is simplified rather than weakened:
+
 - job_start(ops) -> batch({ops,background:true});
 - shell-shaped job_start -> original shell constructor with background:true;
 - job_output -> jobs.read;
@@ -192,6 +199,7 @@ For the **new** API, finite constructors still reserve replay/exposure recovery 
 ## Security invariants retained
 
 Do not regress:
+
 - protected path/deny precedence;
 - descriptor-rooted native filesystem authority;
 - Bubblewrap guard semantics;
@@ -209,6 +217,7 @@ Do not regress:
 Consume exact reviewed aw-tools / secured backend revisions.
 
 Shared low layer may provide **only concretely needed host-neutral primitives**:
+
 - DomainId/PrincipalId/ProjectId/AgentId/TurnId/JobId/NodeId/Revision where genuinely host-neutral;
 - typed immutable-handle ExecutionRef/ResolvedExecutionRef parsing and bounded contextual-path representation;
 - typed Job snapshot/read/control request/result types;

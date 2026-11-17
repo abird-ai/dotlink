@@ -104,7 +104,7 @@ candidate path names; it cannot leave the grant. Symlink entries are listed by
 matching are pure matchers over already-authorized paths and bounded buffers.
 Search bounds are explicit: 1 MiB per file, at most 4096 retained/scanned candidate files per production request, 50 matches
 per file per `content` page, 200 hits or files, 1024-character patterns, regex
-size/DFA limits of 1 MiB, 8 context lines per side, 64 KiB / 1024 lines per
+size/DFA limits of 1 MiB, `context`/`before`/`after` each capped at 128 lines per side, 64 KiB / 1024 lines per
 `.gitignore` file with invalid patterns failing closed, and a rendered-output
 budget that stops collection at `max_output_bytes` in every mode. `content`
 pages select matching lines and clip context at adjacent matching lines outside

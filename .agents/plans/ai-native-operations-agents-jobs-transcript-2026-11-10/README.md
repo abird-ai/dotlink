@@ -16,6 +16,7 @@ The **one canonical vNext design** is in the new AW plan:
 **Read AW DESIGN.md for authoritative semantics; this file only constrains dotlink integration.** Never duplicate the same Graph/Job/policy specification in the dotlink tree.
 
 Preserve, without edits:
+
 - original sealed dotlink `dotlink-ai-native-filesystem-2026-10-31/` (DL-150);
 - earlier dotlink `ai-native-job-control-wake-2026-11-10/`;
 - earlier AW Jobs/wake plan;
@@ -54,6 +55,7 @@ Standalone dotlink **does not** advertise/implement invented `agents.run`, `agen
 The original DL-150 is normative for short schemas, one-concept-per-tool filesystem calls, exact paths, compact status/output, unambiguous Graph dependencies, no request echoes and bounded truthful continuation.
 
 Before changing the advertised public dotlink schema, compare:
+
 1. **Actually generated** model tool-schema bytes and tokenizer estimate for authorized profiles, especially grouped `jobs` vs current `job_*`.
 2. Representative model workflows: read, 3-node read-only Graph, shell background/status/output, read-only Job cancel/ACK, and error/unknown cases.
 3. First schema-valid tool choice, model/tool round count and returned result tokens. More powerful semantics do not by themselves prove fewer model tokens.

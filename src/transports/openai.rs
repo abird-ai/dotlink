@@ -931,6 +931,14 @@ struct RequestReplayState {
     expirations: VecDeque<ReplayExpiration>,
     shell_retirements: VecDeque<String>,
     queued_shell_retirements: HashSet<String>,
+    /// Replay identities that may own an inner durable shell/batch request key.
+    /// This is learned before dispatch and survives outer replay-state changes so
+    /// namespace/authority rotation can retire the old inner owner without
+    /// misclassifying ordinary replay-protected mutations.
+    shell_owner_dependencies: HashSet<String>,
+    /// Subset whose live sandbox/source authority was revoked. These keys must
+    /// discard/cancel hidden work rather than expose it when bounded cleanup runs.
+    shell_discard_dependencies: HashSet<String>,
     active_namespace: Option<[u8; 32]>,
     active_authority: Option<[u8; 32]>,
 }
@@ -1097,9 +1105,13 @@ impl ReplayLeaderGuard {
         ledger: RequestReplayLedger,
         key: &str,
         namespace: [u8; 32],
+        authority: [u8; 32],
         fingerprint: [u8; 32],
         retryable_by_inner_owner: bool,
     ) -> Self {
+        if retryable_by_inner_owner {
+            ledger.mark_shell_owner_dependency(key, namespace, authority, fingerprint);
+        }
         Self {
             ledger,
             key: key.to_owned(),
@@ -1143,6 +1155,48 @@ impl RequestReplayLedger {
         record.namespace == namespace && record.fingerprint == fingerprint
     }
 
+    fn queue_shell_retirement(state: &mut RequestReplayState, key: &str) {
+        if let Some(record) = state.entries.get_mut(key) {
+            record.state = RequestReplayEntry::RetireShell;
+            record.delivery_leases = 0;
+            record.deferred_expiry = None;
+        }
+        if state.queued_shell_retirements.insert(key.to_owned()) {
+            state.shell_retirements.push_back(key.to_owned());
+        }
+    }
+
+    fn queue_shell_discard(state: &mut RequestReplayState, key: &str) {
+        state.shell_discard_dependencies.insert(key.to_owned());
+        Self::queue_shell_retirement(state, key);
+    }
+
+    fn mark_shell_owner_dependency(
+        &self,
+        key: &str,
+        namespace: [u8; 32],
+        authority: [u8; 32],
+        fingerprint: [u8; 32],
+    ) {
+        let mut state = self.slot();
+        let Some(record) = state.entries.get(key) else {
+            return;
+        };
+        if !Self::same_identity(record, namespace, fingerprint) {
+            return;
+        }
+        state.shell_owner_dependencies.insert(key.to_owned());
+        if state.active_namespace != Some(namespace) || state.active_authority != Some(authority) {
+            let released = state
+                .entries
+                .get(key)
+                .map(|record| Self::state_bytes(&record.state))
+                .unwrap_or(0);
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
+            Self::queue_shell_retirement(&mut state, key);
+        }
+    }
+
     fn state_bytes(state: &RequestReplayEntry) -> usize {
         match state {
             RequestReplayEntry::InFlight { .. } => REQUEST_REPLAY_RESERVATION_BYTES,
@@ -1176,6 +1230,8 @@ impl RequestReplayLedger {
                 });
                 if remove {
                     state.entries.remove(&expiration.key);
+                    state.shell_owner_dependencies.remove(&expiration.key);
+                    state.shell_discard_dependencies.remove(&expiration.key);
                 }
             }
             ReplayExpirationKind::DropReadyBody => {
@@ -1246,6 +1302,8 @@ impl RequestReplayLedger {
                 match action {
                     Some(ExpiryAction::Remove) => {
                         state.entries.remove(&expiration.key);
+                        state.shell_owner_dependencies.remove(&expiration.key);
+                        state.shell_discard_dependencies.remove(&expiration.key);
                     }
                     Some(ExpiryAction::RetireShell) => {
                         if let Some(record) = state.entries.get_mut(&expiration.key) {
@@ -1364,15 +1422,17 @@ impl RequestReplayLedger {
     fn finish_shell_retirement(&self, key: &str) {
         let mut state = self.slot();
         state.queued_shell_retirements.remove(key);
+        state.shell_owner_dependencies.remove(key);
+        state.shell_discard_dependencies.remove(key);
         if state
             .entries
             .get(key)
             .is_some_and(|record| matches!(record.state, RequestReplayEntry::RetireShell))
         {
-            // The inner execution is now user-discoverable and no longer owns
-            // the transport request key, but the hosted request identity must
-            // remain fail-closed for one final replay horizon. Removing it here
-            // would let the same redelivery immediately claim a fresh leader.
+            // Inner owner cleanup is complete: ordinary retirement exposed the
+            // same execution; guard-revocation cleanup discarded hidden work.
+            // Keep the hosted request identity fail-closed for one final replay
+            // horizon so the same redelivery cannot claim a fresh leader.
             let until = Self::identity_until(Instant::now());
             let record = state.entries.get_mut(key).expect("record checked above");
             record.state = RequestReplayEntry::Uncertain { until };
@@ -1398,6 +1458,10 @@ impl RequestReplayLedger {
         }
     }
 
+    fn shell_cleanup_discards(&self, key: &str) -> bool {
+        self.slot().shell_discard_dependencies.contains(key)
+    }
+
     fn activate_scope(&self, namespace: [u8; 32], authority: [u8; 32]) {
         let signals = {
             let mut state = self.slot();
@@ -1414,7 +1478,9 @@ impl RequestReplayLedger {
             let mut signals = Vec::new();
             let mut expirations = Vec::new();
             let mut dequeue = Vec::new();
+            let mut enqueue = Vec::new();
             let mut released = 0_usize;
+            let shell_owner_dependencies = state.shell_owner_dependencies.clone();
             for (key, record) in &mut state.entries {
                 if record.namespace != namespace {
                     if matches!(
@@ -1426,6 +1492,13 @@ impl RequestReplayLedger {
                     released = released.saturating_add(Self::state_bytes(&record.state));
                     if let RequestReplayEntry::InFlight { signal } = &record.state {
                         signals.push(signal.clone());
+                    }
+                    if shell_owner_dependencies.contains(key) {
+                        record.state = RequestReplayEntry::RetireShell;
+                        record.delivery_leases = 0;
+                        record.deferred_expiry = None;
+                        enqueue.push(key.clone());
+                        continue;
                     }
                     if matches!(record.state, RequestReplayEntry::RetireShell) {
                         dequeue.push(key.clone());
@@ -1476,6 +1549,13 @@ impl RequestReplayLedger {
                 if let RequestReplayEntry::InFlight { signal } = &record.state {
                     signals.push(signal.clone());
                 }
+                if shell_owner_dependencies.contains(key) {
+                    record.state = RequestReplayEntry::RetireShell;
+                    record.delivery_leases = 0;
+                    record.deferred_expiry = None;
+                    enqueue.push(key.clone());
+                    continue;
+                }
                 if matches!(record.state, RequestReplayEntry::RetireShell) {
                     dequeue.push(key.clone());
                 }
@@ -1492,6 +1572,11 @@ impl RequestReplayLedger {
             state.expirations.extend(expirations);
             for key in dequeue {
                 state.queued_shell_retirements.remove(&key);
+            }
+            for key in enqueue {
+                if state.queued_shell_retirements.insert(key.clone()) {
+                    state.shell_retirements.push_back(key);
+                }
             }
             signals
         };
@@ -1697,9 +1782,29 @@ impl RequestReplayLedger {
         true
     }
 
-    /// Drop a stale cached shell body while preserving the exact inner execution
-    /// as the recovery owner. This is used only when the Job request key still
-    /// exists but its committed response representation changed before delivery.
+    /// Drop a cached shell response whose live sandbox/source guard was revoked.
+    /// Queue bounded inner-owner cleanup in discard mode so Busy cancellation/
+    /// cleanup cannot degrade into a replayable or user-visible execution.
+    fn invalidate_ready_for_shell_discard(
+        &self,
+        key: &str,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+    ) -> bool {
+        let mut state = self.slot();
+        let released = state.entries.get(key).and_then(|record| {
+            (Self::same_identity(record, namespace, fingerprint)
+                && matches!(record.state, RequestReplayEntry::Ready { .. }))
+            .then(|| Self::state_bytes(&record.state))
+        });
+        let Some(released) = released else {
+            return false;
+        };
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
+        Self::queue_shell_discard(&mut state, key);
+        true
+    }
+
     fn invalidate_ready_for_shell_recovery(
         &self,
         key: &str,
@@ -1992,7 +2097,12 @@ impl TunnelClient {
     }
 
     fn settle_shell_retirement(&self, mcp: &EmbeddedMcp, key: &str) -> bool {
-        match mcp.machine.retire_job_request_delivery(key) {
+        let outcome = if self.replays.shell_cleanup_discards(key) {
+            mcp.machine.discard_hidden_job_request_delivery(key)
+        } else {
+            mcp.machine.retire_job_request_delivery(key)
+        };
+        match outcome {
             crate::jobs::RequestRetirement::Retired | crate::jobs::RequestRetirement::Missing => {
                 self.replays.finish_shell_retirement(key);
                 true
@@ -2463,6 +2573,7 @@ impl TunnelClient {
             self.replays.clone(),
             replay.request_key,
             replay.namespace,
+            self.execution_authority,
             replay.fingerprint,
             recoverable_shell,
         );
@@ -2664,14 +2775,13 @@ impl TunnelClient {
                 }
                 RequestReplayClaim::Ready(terminal, _delivery) => {
                     if !Self::cached_shell_guard_is_current(mcp, &terminal) {
-                        if self.replays.invalidate_ready(
+                        if self.replays.invalidate_ready_for_shell_discard(
                             replay.request_key,
                             replay.namespace,
                             replay.fingerprint,
-                        ) {
-                            let _ = mcp
-                                .machine
-                                .discard_hidden_job_request_delivery(replay.request_key);
+                        ) && !self.settle_shell_retirement(mcp, replay.request_key)
+                        {
+                            return Ok(());
                         }
                         continue;
                     }
@@ -4179,6 +4289,7 @@ mod tests {
             client.replays.clone(),
             &key,
             client.request_namespace,
+            client.execution_authority,
             fingerprint,
             true,
         ));
@@ -5247,6 +5358,7 @@ mod tests {
             mutator.clone(),
             "mutator",
             namespace,
+            [0; 32],
             fingerprint,
             false,
         ));
@@ -5270,6 +5382,7 @@ mod tests {
             shell.clone(),
             "shell",
             namespace,
+            [0; 32],
             fingerprint,
             true,
         ));
@@ -5659,6 +5772,7 @@ mod tests {
             client.replays.clone(),
             &request_key,
             client.request_namespace,
+            client.execution_authority,
             fingerprint,
             true,
         ));
@@ -5950,6 +6064,470 @@ mod tests {
     }
 
     #[test]
+    fn authority_change_retires_only_inflight_shell_owner_dependencies() {
+        let ledger = RequestReplayLedger::default();
+        let namespace = [61; 32];
+        let old_authority = [62; 32];
+        let new_authority = [63; 32];
+        let shell_fingerprint = [64; 32];
+        let mutator_fingerprint = [65; 32];
+        ledger.activate_scope(namespace, old_authority);
+        assert!(matches!(
+            ledger
+                .claim(
+                    "shell-inflight",
+                    namespace,
+                    old_authority,
+                    shell_fingerprint
+                )
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        let shell_guard = ReplayLeaderGuard::new(
+            ledger.clone(),
+            "shell-inflight",
+            namespace,
+            old_authority,
+            shell_fingerprint,
+            true,
+        );
+        assert!(matches!(
+            ledger
+                .claim(
+                    "mutator-inflight",
+                    namespace,
+                    old_authority,
+                    mutator_fingerprint
+                )
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        let mutator_guard = ReplayLeaderGuard::new(
+            ledger.clone(),
+            "mutator-inflight",
+            namespace,
+            old_authority,
+            mutator_fingerprint,
+            false,
+        );
+
+        ledger.activate_scope(namespace, new_authority);
+        {
+            let state = ledger.slot();
+            assert!(matches!(
+                state.entries["shell-inflight"].state,
+                RequestReplayEntry::RetireShell
+            ));
+            assert!(state.queued_shell_retirements.contains("shell-inflight"));
+            assert!(matches!(
+                state.entries["mutator-inflight"].state,
+                RequestReplayEntry::Uncertain { .. }
+            ));
+            assert!(!state.queued_shell_retirements.contains("mutator-inflight"));
+        }
+        drop(shell_guard);
+        drop(mutator_guard);
+        assert!(matches!(
+            ledger.slot().entries["shell-inflight"].state,
+            RequestReplayEntry::RetireShell
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authority_change_retires_old_inner_shell_owner_without_rerun() {
+        use crate::mcp::ShellArgs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let process_state = ProcessState::default();
+        let first = TunnelClient::new(
+            Config {
+                process_state: process_state.clone(),
+                execution_authority: Some([71; 32]),
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let request_key =
+            durable_request_key(&first.request_namespace, "authority-retire-inner-shell");
+        let started = mcp
+            .machine
+            .start_shell_job(
+                ShellArgs {
+                    command: "sleep 0.2; printf stable".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: Some(1024),
+                    writes: None,
+                },
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                Some(request_key.clone()),
+                false,
+            )
+            .unwrap();
+        let job_id = started.id.clone();
+        drop(started);
+        assert!(mcp.machine.has_job_request_delivery(&request_key));
+
+        let fingerprint = [72; 32];
+        assert!(matches!(
+            first
+                .replays
+                .claim(
+                    &request_key,
+                    first.request_namespace,
+                    first.execution_authority,
+                    fingerprint
+                )
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        drop(ReplayLeaderGuard::new(
+            first.replays.clone(),
+            &request_key,
+            first.request_namespace,
+            first.execution_authority,
+            fingerprint,
+            true,
+        ));
+        assert!(matches!(
+            first
+                .replays
+                .claim(
+                    &request_key,
+                    first.request_namespace,
+                    first.execution_authority,
+                    fingerprint
+                )
+                .unwrap(),
+            RequestReplayClaim::RecoverableShell
+        ));
+
+        let replacement = TunnelClient::new(
+            Config {
+                process_state,
+                execution_authority: Some([73; 32]),
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(replacement.request_namespace, first.request_namespace);
+        assert_ne!(replacement.execution_authority, first.execution_authority);
+        {
+            let state = replacement.replays.slot();
+            assert!(matches!(
+                state.entries[&request_key].state,
+                RequestReplayEntry::RetireShell
+            ));
+            assert!(state.queued_shell_retirements.contains(&request_key));
+        }
+
+        replacement.prune_replays(&mcp);
+        assert!(
+            !mcp.machine.has_job_request_delivery(&request_key),
+            "authority rotation must release the old transport request owner"
+        );
+        assert!(matches!(
+            replacement
+                .replays
+                .claim(
+                    &request_key,
+                    replacement.request_namespace,
+                    replacement.execution_authority,
+                    fingerprint
+                )
+                .unwrap(),
+            RequestReplayClaim::Uncertain(_)
+        ));
+        let response = mcp
+            .dispatch(
+                &BTreeMap::new(),
+                &json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"jobs_list","arguments":{}}
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains(&job_id)),
+            "retiring the old owner must expose the same execution, not delete or rerun it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn busy_old_shell_retirement_stays_queued_until_response_attempt_releases() {
+        use crate::mcp::ShellArgs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let process_state = ProcessState::default();
+        let first = TunnelClient::new(
+            Config {
+                process_state: process_state.clone(),
+                execution_authority: Some([81; 32]),
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let request_key =
+            durable_request_key(&first.request_namespace, "busy-authority-retirement");
+        let started = mcp
+            .machine
+            .start_shell_job(
+                ShellArgs {
+                    command: "sleep 0.2; printf stable".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: Some(1024),
+                    writes: None,
+                },
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                Some(request_key.clone()),
+                false,
+            )
+            .unwrap();
+        let job_id = started.id.clone();
+        let fingerprint = [82; 32];
+        assert!(matches!(
+            first
+                .replays
+                .claim(
+                    &request_key,
+                    first.request_namespace,
+                    first.execution_authority,
+                    fingerprint
+                )
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        drop(ReplayLeaderGuard::new(
+            first.replays.clone(),
+            &request_key,
+            first.request_namespace,
+            first.execution_authority,
+            fingerprint,
+            true,
+        ));
+
+        let replacement = TunnelClient::new(
+            Config {
+                process_state,
+                execution_authority: Some([83; 32]),
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        replacement.prune_replays(&mcp);
+        assert!(
+            mcp.machine.has_job_request_delivery(&request_key),
+            "an active response attempt must keep the inner request owner"
+        );
+        {
+            let state = replacement.replays.slot();
+            assert!(matches!(
+                state.entries[&request_key].state,
+                RequestReplayEntry::RetireShell
+            ));
+            assert!(
+                state.queued_shell_retirements.contains(&request_key),
+                "Busy retirement must remain queued for a later bounded retry"
+            );
+        }
+
+        drop(started);
+        replacement.prune_replays(&mcp);
+        assert!(
+            !mcp.machine.has_job_request_delivery(&request_key),
+            "dropping the last response attempt must allow deferred retirement"
+        );
+        let response = mcp
+            .dispatch(
+                &BTreeMap::new(),
+                &json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"jobs_list","arguments":{}}
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains(&job_id)),
+            "Busy retry must eventually expose the same execution"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_guard_busy_discard_keeps_cleanup_until_hidden_owner_releases() {
+        use crate::mcp::ShellArgs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = shell_enabled_test_machine(&root).await;
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let ledger = RequestReplayLedger::default();
+        let authority = [85; 32];
+        let fingerprint = [86; 32];
+        let client = TunnelClient::new(
+            Config {
+                process_state: ProcessState {
+                    rejections: RejectionLedger::default(),
+                    replays: ledger.clone(),
+                },
+                execution_authority: Some(authority),
+                ..test_config()
+            },
+            TunnelTuning::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let namespace = client.request_namespace;
+        let request_key = "stale-guard-busy-discard".to_owned();
+        let started = mcp
+            .machine
+            .start_shell_job(
+                ShellArgs {
+                    command: "sleep 0.2; printf stale".to_owned(),
+                    dir: ".".to_owned(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: Some(1024),
+                    writes: None,
+                },
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                Some(request_key.clone()),
+                false,
+            )
+            .unwrap();
+        let job_id = started.id.clone();
+        assert!(matches!(
+            ledger
+                .claim(&request_key, namespace, authority, fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        let mut leader = ReplayLeaderGuard::new(
+            ledger.clone(),
+            &request_key,
+            namespace,
+            authority,
+            fingerprint,
+            true,
+        );
+        ledger
+            .complete(
+                &request_key,
+                namespace,
+                fingerprint,
+                ReplayTerminal {
+                    response: TunnelResponse {
+                        request_id: request_key.clone(),
+                        channel: Some("main".to_owned()),
+                        resp_json: Some(json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: 200,
+                        resp_type: "jsonrpc_response".to_owned(),
+                    },
+                    finalize_job_delivery: true,
+                    requires_job_owner: false,
+                    shell_guard_generation: Some([87; 32]),
+                    recoverable_shell: false,
+                },
+            )
+            .unwrap();
+        leader.disarm();
+        assert!(ledger.invalidate_ready_for_shell_discard(&request_key, namespace, fingerprint));
+        assert!(
+            !client.settle_shell_retirement(&mcp, &request_key),
+            "active response attempt must make revoked hidden discard retryable"
+        );
+        {
+            let state = ledger.slot();
+            assert!(matches!(
+                state.entries[&request_key].state,
+                RequestReplayEntry::RetireShell
+            ));
+            assert!(state.queued_shell_retirements.contains(&request_key));
+            assert!(state.shell_discard_dependencies.contains(&request_key));
+        }
+
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        {
+            let mut state = ledger.slot();
+            RequestReplayLedger::apply_expiration(
+                &mut state,
+                ReplayExpiration {
+                    until: past,
+                    key: request_key.clone(),
+                    kind: ReplayExpirationKind::ExpireIdentity,
+                },
+                Instant::now(),
+            );
+            assert!(matches!(
+                state.entries[&request_key].state,
+                RequestReplayEntry::RetireShell
+            ));
+            assert!(state.queued_shell_retirements.contains(&request_key));
+        }
+        assert!(mcp.machine.has_job_request_delivery(&request_key));
+
+        drop(started);
+        for _ in 0..100 {
+            client.prune_replays(&mcp);
+            if !mcp.machine.has_job_request_delivery(&request_key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !mcp.machine.has_job_request_delivery(&request_key),
+            "revoked hidden owner must eventually be discarded after Busy clears"
+        );
+        let response = mcp
+            .dispatch(
+                &BTreeMap::new(),
+                &json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"jobs_list","arguments":{}}
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !response
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains(&job_id)),
+            "guard-revoked hidden execution must be discarded, never exposed"
+        );
+    }
+
+    #[test]
     fn terminal_delivery_lease_prevents_ready_expiry_from_beating_positive_post() {
         let ledger = RequestReplayLedger::default();
         let namespace = [53; 32];
@@ -6118,6 +6696,7 @@ mod tests {
             ledger.clone(),
             "uncertain-delivery",
             namespace,
+            [0; 32],
             fingerprint,
             false,
         ));
@@ -6175,6 +6754,14 @@ mod tests {
                 .unwrap(),
             RequestReplayClaim::Leader
         ));
+        let mut leader = ReplayLeaderGuard::new(
+            ledger.clone(),
+            "durable",
+            namespace,
+            authority,
+            fingerprint,
+            true,
+        );
         ledger
             .complete(
                 "durable",
@@ -6200,6 +6787,7 @@ mod tests {
                 },
             )
             .unwrap();
+        leader.disarm();
         let (held_by_racing_redelivery, delivery) = match ledger
             .claim("durable", namespace, authority, fingerprint)
             .unwrap()
@@ -6210,12 +6798,24 @@ mod tests {
 
         assert!(ledger.commit_ready_delivery("durable", namespace, authority, fingerprint));
         drop(delivery);
-        // Model the second redelivery observing that the inner job key was
-        // intentionally acknowledged after the first delivery committed.
+        // Positive physical delivery is final for the hosted request identity:
+        // later authority revocation cannot reopen or queue the old shell owner.
+        let new_authority = [47; 32];
+        ledger.activate_scope(namespace, new_authority);
+        {
+            let state = ledger.slot();
+            assert!(matches!(
+                state.entries["durable"].state,
+                RequestReplayEntry::Delivered { .. }
+            ));
+            assert!(!state.queued_shell_retirements.contains("durable"));
+        }
+        // Model a racing redelivery observing that the inner job key was already
+        // acknowledged after the first delivery committed.
         ledger.invalidate_ready("durable", namespace, fingerprint);
         assert!(matches!(
             ledger
-                .claim("durable", namespace, authority, fingerprint)
+                .claim("durable", namespace, new_authority, fingerprint)
                 .unwrap(),
             RequestReplayClaim::Delivered
         ));
@@ -6506,6 +7106,7 @@ name"
             ledger.clone(),
             "request",
             namespace,
+            [0; 32],
             original,
             true,
         ));

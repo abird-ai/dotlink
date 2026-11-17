@@ -537,10 +537,8 @@ struct JobEntry {
     /// Runner-owned live stdin command channels keyed by exact Process/Graph
     /// coordinate. The ChildStdin itself never leaves the runner.
     process_inputs: HashMap<usize, mpsc::Sender<ProcessInputRequest>>,
-    /// Highest raw offset actually returned through this host's standalone
-    /// jobs_read projection for each exact retained output owner. This is an
-    /// authorization fence for jobs_ack only; bytes remain owned by the shared
-    /// JobManager.
+    /// Legacy/test-only delivery fence for Jobs without a shared output owner.
+    /// Shared Jobs keep exact delivery proof in aw-tools.
     delivered_through: HashMap<(usize, JobOutputStream), u64>,
     /// RAII owner of the canonical shared lifecycle projection.
     shared_job: Option<SharedJobLease>,
@@ -1059,11 +1057,10 @@ pub(crate) struct SharedShellWriters {
     pub(crate) stderr: SharedOutputWriter,
 }
 
-fn shared_task_output_owner(id: &str) -> Result<SharedOutputOwner> {
-    let mut bytes = b"dotlink-native-task-output-owner-v1\0".to_vec();
-    bytes.extend_from_slice(id.as_bytes());
-    SharedOutputOwner::new(crate::mcp::sha256(&bytes))
-        .map_err(|error| anyhow!("invalid shared native-task output owner: {error:?}"))
+fn shared_task_output_owner(manager: &SharedJobManager, id: &str) -> Result<SharedOutputOwner> {
+    manager.task_result_owner(id, 1).map_err(|error| {
+        anyhow!("canonical shared native-task output owner unavailable: {error:?}")
+    })
 }
 
 fn rollback_shared_claim(inner: &JobManagerInner, id: &str, transition_gate: &Arc<Mutex<()>>) {
@@ -1358,7 +1355,11 @@ impl JobHandle {
                 registry_generation: 1,
                 authority_binding: authority,
                 runtime_binding: authority,
-                task_result_eligible: false,
+                // A standalone shell Process can later become the exact native
+                // MCP Task for this same immutable execution. Declare that
+                // eligibility in the sealed shared plan instead of inventing a
+                // host-private output owner after admission.
+                task_result_eligible: true,
             })
         })
         .map_err(|error| anyhow!("cannot plan shared shell Job: {error:?}"))?;
@@ -1380,7 +1381,7 @@ impl JobHandle {
             .shared_jobs
             .job_output_owner(&self.id)
             .map_err(|error| anyhow!("cannot derive shared shell output owner: {error:?}"))?;
-        let task_owner = shared_task_output_owner(&self.id)?;
+        let task_owner = shared_task_output_owner(&inner.shared_jobs, &self.id)?;
         let owners = [job_owner, task_owner];
         let stdout_file = self
             .stdout_file
@@ -2919,6 +2920,141 @@ impl JobManager {
         }
     }
 
+    fn standalone_process_tail_coordinate(
+        &self,
+        id: &str,
+        node: Option<usize>,
+    ) -> JobResult<Option<(Arc<SharedJobManager>, usize)>> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let Some(shared) = entry.shared_job.as_ref() else {
+            return Ok(None);
+        };
+        if !entry.shared_graph_authoritative && node.is_none() {
+            return Ok(Some((shared.manager.clone(), 1)));
+        }
+        let Some(coordinate) = node else {
+            return Ok(None);
+        };
+        let graph = shared.manager.graph(id).map_err(|error| {
+            JobError::Internal(anyhow!(
+                "cannot inspect shared Job Graph for {id}: {error:?}"
+            ))
+        })?;
+        let Some(step) = graph.steps().get(coordinate.saturating_sub(1)) else {
+            return Err(JobError::Unknown(format!(
+                "job {id} node is outside 1..={}",
+                graph.steps().len()
+            )));
+        };
+        Ok(step
+            .tool
+            .native()
+            .is_none()
+            .then(|| (shared.manager.clone(), coordinate)))
+    }
+
+    pub(crate) fn standalone_process_tail(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        requested: Option<usize>,
+        status: String,
+        response_ceiling: usize,
+    ) -> JobResult<String> {
+        const DEFAULT_TAIL: usize = 512;
+        const MAX_TAIL: usize = 1024;
+        let tail = requested.unwrap_or(DEFAULT_TAIL);
+        if tail > MAX_TAIL {
+            return Err(JobError::Unknown(format!(
+                "jobs_get tail exceeds {MAX_TAIL} combined bytes"
+            )));
+        }
+        if tail == 0 {
+            return Ok(status);
+        }
+        let Some((manager, coordinate)) = self.standalone_process_tail_coordinate(id, node)? else {
+            return if requested.is_some() {
+                Err(JobError::Unknown(
+                    "jobs_get tail is supported only by Process Job streams".into(),
+                ))
+            } else {
+                Ok(status)
+            };
+        };
+        let owner = manager.job_output_owner(id).map_err(|error| {
+            JobError::Internal(anyhow!(
+                "cannot derive shared Job output owner for {id}: {error:?}"
+            ))
+        })?;
+        let project = |limit: usize, capped: bool| -> JobResult<String> {
+            let pages = manager.process_tail_for_owner(id, coordinate, owner, limit);
+            let mut rendered = status.clone();
+            match pages {
+                Ok((stdout, stderr)) => {
+                    let mut any = false;
+                    for (stream, page) in [("stdout", stdout), ("stderr", stderr)] {
+                        if let Some(page) = page {
+                            any = true;
+                            let end = page.offset + page.bytes.len() as u64;
+                            rendered.push_str(&format!(
+                                "\n{stream} [{}..{}]{}:\n",
+                                page.offset,
+                                end,
+                                if page.writer_finished { " eof" } else { "" }
+                            ));
+                            rendered.push_str(&String::from_utf8_lossy(&page.bytes));
+                        }
+                    }
+                    if any && capped {
+                        rendered.push_str("\ntail=capped");
+                    }
+                }
+                Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {
+                    rendered.push_str("\ntail=released");
+                }
+                Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
+                    rendered.push_str("\ntail=unavailable");
+                }
+                Err(error) => {
+                    return Err(JobError::Internal(anyhow!(
+                        "job {id} Process tail unavailable: {error:?}"
+                    )));
+                }
+            }
+            Ok(rendered)
+        };
+        let full = project(tail, false)?;
+        if serialized_tool_result_len(&full).is_ok_and(|size| size <= response_ceiling) {
+            return Ok(full);
+        }
+        let budget_marker = format!("{status}\ntail=budget");
+        if match serialized_tool_result_len(&budget_marker) {
+            Ok(size) => size > response_ceiling,
+            Err(_) => true,
+        } {
+            return Ok(status);
+        }
+        let mut low = 0usize;
+        let mut high = tail;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let candidate = project(middle, middle < tail)?;
+            if serialized_tool_result_len(&candidate).is_ok_and(|size| size <= response_ceiling) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        if low == 0 {
+            Ok(budget_marker)
+        } else {
+            project(low, low < tail)
+        }
+    }
+
     pub(crate) fn standalone_list_fitted(
         &self,
         cursor: Option<&str>,
@@ -4339,6 +4475,7 @@ impl JobManager {
             base64,
         };
         fit_shared_output_page(&render, &bytes[start..end], &snapshot, payload_ceiling)
+            .map(|(rendered, _)| rendered)
             .map_err(JobError::Internal)
     }
 
@@ -4571,7 +4708,7 @@ impl JobManager {
         }
         let read_cap = requested_bytes.min(payload_ceiling).max(1);
         let page = manager
-            .output_page(id, coordinate, selected.shared(), offset, read_cap)
+            .output_page_for_owner(id, coordinate, selected.shared(), owner, offset, read_cap)
             .map_err(|error| {
                 JobError::Internal(anyhow!(
                     "job {id} node {coordinate} {} page failed: {error:?}",
@@ -4597,9 +4734,24 @@ impl JobManager {
             released: snapshot.released,
             base64,
         };
-        let rendered = fit_shared_output_page(&render, &page.bytes, &snapshot, payload_ceiling)
-            .map_err(JobError::Internal)?;
-        self.record_standalone_delivery(id, coordinate, selected, &rendered)?;
+        let (rendered, credited) =
+            fit_shared_output_page(&render, &page.bytes, &snapshot, payload_ceiling)
+                .map_err(JobError::Internal)?;
+        manager
+            .record_delivered_output(
+                id,
+                coordinate,
+                selected.shared(),
+                owner,
+                page.offset,
+                credited,
+            )
+            .map_err(|error| {
+                JobError::Internal(anyhow!(
+                    "cannot record delivered job {id} node {coordinate} {} prefix: {error:?}",
+                    selected.label()
+                ))
+            })?;
         Ok(rendered)
     }
 
@@ -4617,8 +4769,8 @@ impl JobManager {
             ));
         }
         let (shared, coordinate, selected) = self.resolve_output_target(id, node, stream)?;
-        self.require_standalone_delivery(id, coordinate, selected, offset)?;
         let Some(manager) = shared else {
+            self.require_standalone_delivery(id, coordinate, selected, offset)?;
             return self.acknowledge_output(
                 id,
                 selected.legacy().expect("legacy target validated"),
@@ -4630,12 +4782,85 @@ impl JobManager {
                 "cannot derive shared Job output owner for {id}: {error:?}"
             ))
         })?;
-        match manager.acknowledge_output(id, coordinate, selected.shared(), owner, offset) {
+        match manager.acknowledge_delivered_output(id, coordinate, selected.shared(), owner, offset)
+        {
             Ok(_) | Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {}
+            Err(aw_tools::filesystem::job_manager::Error::InvalidOutput) => {
+                return Err(JobError::Unknown(format!(
+                    "jobs_ack offset {offset} exceeds bytes delivered by jobs_read for this exact output owner"
+                )));
+            }
+            Err(aw_tools::filesystem::job_manager::Error::Busy) => {
+                return Err(JobError::Unknown(
+                    "Job output acknowledgement is blocked by an unresolved persistence transition"
+                        .into(),
+                ));
+            }
+            Err(aw_tools::filesystem::job_manager::Error::ReplayUnknown) => {
+                return Err(JobError::Unknown(
+                    "Job effect is unknown; reconcile before acknowledging output".into(),
+                ));
+            }
             Err(error) => {
                 return Err(JobError::Internal(anyhow!(
                     "job {id} node {coordinate} {} acknowledgement failed: {error:?}",
                     selected.label()
+                )));
+            }
+        }
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available_mut(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        entry.output_cleanup_requested = true;
+        maybe_release_output(entry);
+        Ok(render_status_locked(&self.inner, entry))
+    }
+
+    pub(crate) fn finish_node_output(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        stream: Option<JobOutputStream>,
+    ) -> JobResult<String> {
+        sweep_expired(&self.inner);
+        let (manager, graph) = {
+            let state = self.inner.state.lock().expect("job manager lock");
+            let entry = state
+                .available(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            let shared = entry.shared_job.as_ref().ok_or_else(|| {
+                JobError::Unknown("terminal Finish requires canonical shared Job output".into())
+            })?;
+            (shared.manager.clone(), entry.shared_graph_authoritative)
+        };
+        if graph && node.is_none() && stream.is_some() {
+            return Err(JobError::Unknown(
+                "Graph root Finish cannot select one stream; finish the root or an exact node"
+                    .into(),
+            ));
+        }
+        let owner = manager.job_output_owner(id).map_err(|error| {
+            JobError::Internal(anyhow!(
+                "cannot derive shared Job output owner for {id}: {error:?}"
+            ))
+        })?;
+        match manager.finish_output_for_owner(id, node, stream.map(JobOutputStream::shared), owner)
+        {
+            Ok(_) => {}
+            Err(aw_tools::filesystem::job_manager::Error::Busy) => {
+                return Err(JobError::Unknown(
+                    "Job output is not yet terminal; inspect with jobs_get before finishing".into(),
+                ));
+            }
+            Err(aw_tools::filesystem::job_manager::Error::ReplayUnknown) => {
+                return Err(JobError::Unknown(
+                    "Job effect is unknown; reconcile before finishing output".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(JobError::Internal(anyhow!(
+                    "job {id} output Finish failed: {error:?}"
                 )));
             }
         }
@@ -5061,7 +5286,7 @@ fn fit_shared_output_page(
     bytes: &[u8],
     snapshot: &OutputSnapshot,
     payload_ceiling: usize,
-) -> Result<String> {
+) -> Result<(String, usize)> {
     let offset = render.offset;
     let base64 = render.base64;
     let empty = render.render(snapshot.stored, false, &[])?;
@@ -5118,7 +5343,7 @@ fn fit_shared_output_page(
     if serialized_tool_result_len(&rendered)? > payload_ceiling {
         bail!("job output MCP result exceeded its reserved response budget");
     }
-    Ok(rendered)
+    Ok((rendered, take))
 }
 
 fn stream_path(entry: &JobEntry, stream: JobStream) -> &Path {
@@ -5890,13 +6115,13 @@ fn release_shared_task_owner(entry: &JobEntry) -> bool {
     {
         return true;
     }
-    if entry.shared_job.is_none() {
+    let Some(shared) = entry.shared_job.as_ref() else {
         return true;
-    }
+    };
     let Some(completion) = entry.completion.as_ref() else {
         return false;
     };
-    let owner = match shared_task_output_owner(&entry.id) {
+    let owner = match shared_task_output_owner(&shared.manager, &entry.id) {
         Ok(owner) => owner,
         Err(error) => {
             tracing::warn!(id = %entry.id, %error, "cannot derive shared non-Task output owner");
@@ -5929,7 +6154,7 @@ fn compact_shared_native_task_stream(entry: &mut JobEntry, stream: JobStream) ->
     let Some(completion) = entry.completion.as_ref() else {
         return false;
     };
-    let owner = match shared_task_output_owner(&entry.id) {
+    let owner = match shared_task_output_owner(&shared.manager, &entry.id) {
         Ok(owner) => owner,
         Err(error) => {
             tracing::warn!(id = %entry.id, %error, "cannot derive shared native-Task output owner");
@@ -6905,10 +7130,19 @@ mod tests {
             "{SESSION_PREFIX}retained-test-{}",
             Uuid::new_v4().simple()
         ));
-        crate::private_state::prepare_owned_dir(&retained).unwrap();
-        create_private_file(&retained.join(SESSION_LOCK_FILE)).unwrap();
-        mark_session_unresolved(&retained).unwrap();
-        fs::write(retained.join("uncertain.stdout"), b"evidence").unwrap();
+        // Build this synthetic crash-leftover outside the session namespace.
+        // Concurrent JobManager tests legitimately sweep unlocked session dirs,
+        // so publishing the fixture before its unresolved marker exists makes
+        // the test itself racy.
+        let retained_staging = parent.join(format!(
+            ".retained-test-staging-{}",
+            Uuid::new_v4().simple()
+        ));
+        crate::private_state::prepare_owned_dir(&retained_staging).unwrap();
+        create_private_file(&retained_staging.join(SESSION_LOCK_FILE)).unwrap();
+        mark_session_unresolved(&retained_staging).unwrap();
+        fs::write(retained_staging.join("uncertain.stdout"), b"evidence").unwrap();
+        fs::rename(&retained_staging, &retained).unwrap();
 
         let second = JobManager::new(Duration::from_secs(60)).unwrap();
         let second_job = second.create_for_test(30).unwrap();
@@ -9862,6 +10096,12 @@ mod tests {
         assert_eq!(late["next_offset"], 16);
         assert_eq!(late["data"], "ijklmnop");
         assert!(
+            manager.inner.state.lock().unwrap().jobs[&job.id]
+                .delivered_through
+                .is_empty(),
+            "shared delivery proof must live only in aw-tools"
+        );
+        assert!(
             manager
                 .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 0,)
                 .is_err(),
@@ -9882,6 +10122,12 @@ mod tests {
 
         let first = page_at(0);
         assert_eq!(first["next_offset"], 8);
+        assert!(
+            manager.inner.state.lock().unwrap().jobs[&job.id]
+                .delivered_through
+                .is_empty(),
+            "shared first-page delivery must not repopulate the legacy host ledger"
+        );
         assert!(
             manager
                 .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 0,)
@@ -9917,6 +10163,63 @@ mod tests {
         assert_eq!(state.through, 16);
         drop(job);
         manager.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn shared_process_get_tail_is_aggregate_budgeted_and_never_delivery_credit() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        manager.expose_compatibility(&job.id).unwrap();
+        let stdout = vec![b'X'; 700];
+        let stderr = vec![b'Y'; 100];
+        assert_eq!(writers.stdout.append(&stdout).unwrap(), stdout.len());
+        assert_eq!(writers.stderr.append(&stderr).unwrap(), stderr.len());
+
+        let (_, running) = manager.standalone_status(&job.id, None).unwrap();
+        let tail = manager
+            .standalone_process_tail(&job.id, None, None, running, 16 * 1024)
+            .unwrap();
+        assert!(tail.contains("stdout [288..700]"), "{tail}");
+        assert!(tail.contains("stderr [0..100]"), "{tail}");
+        assert_eq!(tail.matches('X').count(), 412, "{tail}");
+        assert_eq!(tail.matches('Y').count(), 100, "{tail}");
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 700)
+                .is_err(),
+            "jobs_get tail is a pure peek and must not create ACK credit"
+        );
+
+        let (_, running) = manager.standalone_status(&job.id, None).unwrap();
+        let capped = manager
+            .standalone_process_tail(&job.id, None, Some(1024), running, 520)
+            .unwrap();
+        assert!(serialized_tool_result_len(&capped).unwrap() <= 520);
+        assert!(capped.contains("tail=capped") || capped.contains("tail=budget"));
+
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let stdout_summary = job.shared_stream_summary(JobStream::Stdout, false);
+        let stderr_summary = job.shared_stream_summary(JobStream::Stderr, false);
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(Some(0), true, stdout_summary, stderr_summary),
+        );
+        let (_, terminal) = manager.standalone_status(&job.id, None).unwrap();
+        let tail = manager
+            .standalone_process_tail(&job.id, None, Some(1024), terminal.clone(), 16 * 1024)
+            .unwrap();
+        assert!(tail.contains("stdout [0..700] eof"), "{tail}");
+        assert!(tail.contains("stderr [0..100] eof"), "{tail}");
+        assert_eq!(
+            manager
+                .standalone_process_tail(&job.id, None, Some(0), terminal.clone(), 16 * 1024)
+                .unwrap(),
+            terminal,
+            "tail=0 disables output"
+        );
     }
 
     #[tokio::test]
@@ -10052,10 +10355,23 @@ mod tests {
         }
         manager.expose_native_task(&job.id, None).unwrap().unwrap();
         let owner = manager.inner.shared_jobs.job_output_owner(&job.id).unwrap();
-        let task_owner = shared_task_output_owner(&job.id).unwrap();
+        let task_owner = shared_task_output_owner(&manager.inner.shared_jobs, &job.id).unwrap();
         assert_ne!(
             owner, task_owner,
             "MCP Task and Job leases must be independent"
+        );
+        assert!(
+            manager.inner.shared_jobs.plans(&job.id).unwrap()[0].task_result_eligible(),
+            "native Task retention must be declared in the sealed shared plan"
+        );
+        assert_eq!(
+            task_owner,
+            manager
+                .inner
+                .shared_jobs
+                .task_result_owner(&job.id, 1)
+                .unwrap(),
+            "dotlink must use the canonical AW Task-result owner"
         );
 
         // The model has not received any output, even though the Task
@@ -10122,6 +10438,62 @@ mod tests {
         let rendered = serde_json::Value::Object(result).to_string();
         assert!(rendered.contains("abcd"), "{rendered}");
         assert!(!rendered.contains("efgh"), "{rendered}");
+    }
+
+    #[test]
+    fn terminal_finish_acks_only_job_owner_and_preserves_native_task_output() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        assert_eq!(writers.stdout.append(b"abcdefgh").unwrap(), 8);
+        assert_eq!(writers.stderr.append(b"err").unwrap(), 3);
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let stdout = job.shared_stream_summary(JobStream::Stdout, false);
+        let stderr = job.shared_stream_summary(JobStream::Stderr, false);
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(Some(0), true, stdout, stderr),
+        );
+        manager.expose_native_task(&job.id, None).unwrap().unwrap();
+
+        manager.finish_node_output(&job.id, None, None).unwrap();
+        let job_owner = manager.inner.shared_jobs.job_output_owner(&job.id).unwrap();
+        let task_owner = shared_task_output_owner(&manager.inner.shared_jobs, &job.id).unwrap();
+        for (stream, through) in [
+            (SharedOutputStream::Stdout, 8),
+            (SharedOutputStream::Stderr, 3),
+        ] {
+            let job_state = manager
+                .inner
+                .shared_jobs
+                .output_owner_state(&job.id, 1, stream, job_owner)
+                .unwrap();
+            assert!(job_state.acknowledged);
+            assert_eq!(job_state.through, through);
+            assert!(!job_state.released);
+            let task_state = manager
+                .inner
+                .shared_jobs
+                .output_owner_state(&job.id, 1, stream, task_owner)
+                .unwrap();
+            assert!(!task_state.acknowledged);
+            assert_eq!(task_state.through, 0);
+            assert!(!task_state.released);
+            assert_eq!(
+                manager
+                    .inner
+                    .shared_jobs
+                    .output_summary(&job.id, 1, stream)
+                    .unwrap()
+                    .0
+                    .retained_bytes,
+                through,
+                "Finish must not discard an independent Task owner's retained bytes"
+            );
+        }
+        manager.finish_node_output(&job.id, None, None).unwrap();
     }
 
     #[test]
