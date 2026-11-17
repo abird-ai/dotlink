@@ -285,6 +285,78 @@ fn cross_process_mutation_case(independent_xdg: bool) {
 }
 
 #[test]
+fn stdio_job_read_cannot_authorize_ack_across_an_unread_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("data.txt"), "abcdefghijklmnop").unwrap();
+    let mut probe = Probe::start(&root);
+    let init = probe.request(&initialize_request(1));
+    assert_eq!(init["result"]["serverInfo"]["name"], "dotlink");
+    let batch = probe.request(&call_request(
+        2,
+        "batch",
+        json!({
+            "ops":[["read", {"path":"data.txt","numbered":false}]],
+            "background":true
+        }),
+    ));
+    assert_ne!(batch["result"]["isError"], true, "{batch}");
+    let job_ref = text_of(&batch)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let node_ref = format!("{job_ref}/n:1");
+    let terminal = probe.request(&call_request(
+        3,
+        "jobs_get",
+        json!({"ref":job_ref,"wait_ms":1000}),
+    ));
+    assert!(text_of(&terminal).contains("settled"), "{terminal}");
+    let late = probe.request(&call_request(
+        4,
+        "jobs_read",
+        json!({"ref":node_ref,"view":"result","offset":8}),
+    ));
+    assert_ne!(late["result"]["isError"], true, "{late}");
+    let late: Value = serde_json::from_str(text_of(&late)).unwrap();
+    let through = late["next_offset"].as_u64().unwrap();
+    assert!(through > 8, "{late}");
+
+    let over_ack = probe.request(&call_request(
+        5,
+        "jobs_ack",
+        json!({"ref":node_ref,"view":"result","offset":through}),
+    ));
+    assert_eq!(
+        over_ack["result"]["isError"], true,
+        "unread prefix must not be acknowledged: {over_ack}"
+    );
+    let zero_ack = probe.request(&call_request(
+        6,
+        "jobs_ack",
+        json!({"ref":node_ref,"view":"result","offset":0}),
+    ));
+    assert_eq!(zero_ack["result"]["isError"], true, "{zero_ack}");
+
+    let first = probe.request(&call_request(
+        7,
+        "jobs_read",
+        json!({"ref":node_ref,"view":"result","offset":0}),
+    ));
+    assert_ne!(first["result"]["isError"], true, "{first}");
+    let first: Value = serde_json::from_str(text_of(&first)).unwrap();
+    assert_eq!(first["next_offset"], through);
+    let acknowledged = probe.request(&call_request(
+        8,
+        "jobs_ack",
+        json!({"ref":node_ref,"view":"result","offset":through}),
+    ));
+    assert_ne!(acknowledged["result"]["isError"], true, "{acknowledged}");
+    probe.finish();
+}
+
+#[test]
 fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

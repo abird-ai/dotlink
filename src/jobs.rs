@@ -329,10 +329,11 @@ impl JobCompletion {
     }
 
     pub(crate) fn from_shared_graph(snapshot: &SharedSnapshot) -> Self {
-        let uncertain = matches!(
-            snapshot.summary,
-            Some((SharedPrimary::Unknown, _, _)) | None
-        );
+        let uncertain = snapshot.journal_unknown
+            || matches!(
+                snapshot.summary,
+                Some((SharedPrimary::Unknown, _, _)) | None
+            );
         let (status, success, error) = if uncertain {
             (
                 JobStatus::Unknown,
@@ -2844,11 +2845,45 @@ impl JobManager {
         self.standalone_status_locked(entry, node)
     }
 
+    /// Observe an exact Job or Graph node until settlement or the caller's
+    /// deadline. rev is only a status token: stdout, sibling progress and
+    /// revision changes do not complete this wait. Execution keeps its own
+    /// independent timeout.
+    // The existing Job notify is the sole observation signal; state and node
+    // settlement are always read from their authoritative owners under the
+    // original lock. No public revision is a completion condition.
+    fn standalone_wait_snapshot(
+        &self,
+        id: &str,
+        node: Option<usize>,
+    ) -> JobResult<(String, Arc<Notify>, bool)> {
+        sweep_expired(&self.inner);
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let (_, rendered) = self.standalone_status_locked(entry, node)?;
+        let settled = if let Some(coordinate) = node {
+            matches!(
+                self.inner
+                    .shared_jobs
+                    .node_state(id, coordinate)
+                    .map_err(|error| {
+                        JobError::Unknown(format!("unavailable Graph node: {error:?}"))
+                    })?,
+                SharedNodeState::Terminal { .. }
+            )
+        } else {
+            entry.status().terminal()
+        };
+        Ok((rendered, entry.notify.clone(), settled))
+    }
+
     pub(crate) async fn standalone_get(
         &self,
         id: &str,
         node: Option<usize>,
-        observed_revision: Option<u64>,
+        _observed_revision: Option<u64>,
         wait_ms: u64,
     ) -> JobResult<String> {
         const MAX_WAIT_MS: u64 = 30_000;
@@ -2861,38 +2896,25 @@ impl JobManager {
             .checked_add(Duration::from_millis(wait_ms))
             .ok_or_else(|| JobError::Unknown("jobs_get wait window overflow".into()))?;
         loop {
-            let (revision, rendered, notify, terminal) = {
-                sweep_expired(&self.inner);
-                let state = self.inner.state.lock().expect("job manager lock");
-                let entry = state
-                    .available(id)
-                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-                let (revision, rendered) = self.standalone_status_locked(entry, node)?;
-                (
-                    revision,
-                    rendered,
-                    entry.notify.clone(),
-                    entry.status().terminal(),
-                )
-            };
-            let should_wait = wait_ms > 0
-                && !terminal
-                && observed_revision.is_none_or(|observed| observed == revision);
-            if !should_wait {
+            let (rendered, notify, settled) = self.standalone_wait_snapshot(id, node)?;
+            if settled || wait_ms == 0 || TokioInstant::now() >= deadline {
                 return Ok(rendered);
             }
+            // Register before rechecking. A committed transition between the
+            // first snapshot and this point can neither be missed nor mistaken
+            // for an early return on an unrelated revision/output event.
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let (latest, _) = self.standalone_status(id, node)?;
-            if latest != revision {
-                continue;
+            let (current, _, settled) = self.standalone_wait_snapshot(id, node)?;
+            if settled || TokioInstant::now() >= deadline {
+                return Ok(current);
             }
-            if TokioInstant::now() >= deadline {
-                return Ok(rendered);
-            }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return Ok(rendered);
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                return self.standalone_status(id, node).map(|(_, status)| status);
             }
         }
     }
@@ -4107,19 +4129,32 @@ impl JobManager {
     ) -> JobResult<bool> {
         let (shared, coordinate, selected) = self.resolve_output_target(id, node, stream)?;
         if let Some(manager) = shared {
+            let settled = || -> JobResult<bool> {
+                if let Some(node) = node {
+                    return manager
+                        .node_state(id, node)
+                        .map(|state| matches!(state, SharedNodeState::Terminal { .. }))
+                        .map_err(|error| {
+                            JobError::Unknown(format!("unavailable Graph node: {error:?}"))
+                        });
+                }
+                let state = self.inner.state.lock().expect("job manager lock");
+                let entry = state
+                    .available(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+                Ok(entry.status().terminal())
+            };
             return match manager.output_summary(id, coordinate, selected.shared()) {
                 Ok((summary, writer_finished)) => {
-                    Ok(summary.retained_bytes > offset || summary.truncated || writer_finished)
+                    if summary.retained_bytes > offset || summary.truncated || writer_finished {
+                        Ok(true)
+                    } else {
+                        settled()
+                    }
                 }
-                Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
-                    let state = self.inner.state.lock().expect("job manager lock");
-                    let terminal = state
-                        .available(id)
-                        .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
-                        .status()
-                        .terminal();
-                    Ok(terminal)
-                }
+                // A skipped/failed Graph node may have no stream at all.
+                // Its own terminal state ends the wait, not a slow sibling.
+                Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => settled(),
                 Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => Ok(true),
                 Err(error) => Err(JobError::Internal(anyhow!(
                     "cannot observe job {id} output before wait: {error:?}"
@@ -4172,23 +4207,36 @@ impl JobManager {
                 "cannot inspect rendered jobs_read page for delivery fence: {error}"
             ))
         })?;
+        let start = page
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| JobError::Internal(anyhow!("jobs_read page is missing raw offset")))?;
         let through = page
             .get("next_offset")
             .and_then(serde_json::Value::as_u64)
+            .filter(|through| *through >= start)
             .ok_or_else(|| {
                 JobError::Internal(anyhow!(
-                    "jobs_read page is missing next_offset delivery evidence"
+                    "jobs_read page has invalid next_offset delivery evidence"
                 ))
             })?;
         let mut state = self.inner.state.lock().expect("job manager lock");
         let entry = state
             .available_mut(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        let delivered = entry
-            .delivered_through
-            .entry((coordinate, stream))
-            .or_default();
-        *delivered = (*delivered).max(through);
+        use std::collections::hash_map::Entry;
+        // Only a contiguous, *observed* prefix is ACKable. An out-of-order
+        // page does not certify any prefix, including an empty offset-0 ACK.
+        // Retire this host-side fence after adopting AW's reviewed owner proof.
+        match entry.delivered_through.entry((coordinate, stream)) {
+            Entry::Vacant(vacant) if start == 0 => {
+                vacant.insert(through);
+            }
+            Entry::Occupied(mut present) if start <= *present.get() => {
+                *present.get_mut() = (*present.get()).max(through);
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -4207,7 +4255,17 @@ impl JobManager {
             .delivered_through
             .get(&(coordinate, stream))
             .copied()
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                if through == 0 {
+                    JobError::Unknown(
+                        "jobs_ack offset 0 requires a projected jobs_read page at offset 0".into(),
+                    )
+                } else {
+                    JobError::Unknown(format!(
+                        "jobs_ack offset {through} exceeds bytes delivered by jobs_read (0)"
+                    ))
+                }
+            })?;
         if through > delivered {
             return Err(JobError::Unknown(format!(
                 "jobs_ack offset {through} exceeds bytes delivered by jobs_read ({delivered})"
@@ -4449,8 +4507,17 @@ impl JobManager {
         {
             Ok(state) => state,
             Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
+                let absent_after_settlement = matches!(
+                    manager.node_state(id, coordinate),
+                    Ok(SharedNodeState::Terminal { .. })
+                );
+                let detail = if absent_after_settlement {
+                    "has no retained output after settlement"
+                } else {
+                    "output is not available yet"
+                };
                 return Err(JobError::Unknown(format!(
-                    "job {id} node {coordinate} {} output is not available yet",
+                    "job {id} node {coordinate} {} {detail}",
                     selected.label()
                 )));
             }
@@ -6640,6 +6707,7 @@ mod tests {
             label: "graph".into(),
             lifecycle: SharedLifecycle::Terminal,
             stop_reason: None,
+            journal_unknown: false,
             sequence: 1,
             finished: 2,
             total: 2,
@@ -6654,7 +6722,7 @@ mod tests {
         let cancelled = SharedSnapshot {
             id: "cancelled".into(),
             stop_reason: Some(SharedStopReason::Cancelled),
-            ..skipped
+            ..skipped.clone()
         };
         let completion = JobCompletion::from_shared_graph(&cancelled);
         assert_eq!(completion.status, JobStatus::Cancelled);
@@ -6667,6 +6735,17 @@ mod tests {
             ..cancelled
         };
         let completion = JobCompletion::from_shared_graph(&cancelled_unknown);
+        assert_eq!(completion.status, JobStatus::Unknown);
+        assert!(!completion.success);
+        assert!(!completion.stop_proven);
+
+        let journal_unknown = SharedSnapshot {
+            id: "journal-unknown".into(),
+            journal_unknown: true,
+            summary: Some((SharedPrimary::Ok, false, false)),
+            ..skipped
+        };
+        let completion = JobCompletion::from_shared_graph(&journal_unknown);
         assert_eq!(completion.status, JobStatus::Unknown);
         assert!(!completion.success);
         assert!(!completion.stop_proven);
@@ -9742,6 +9821,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_delivery_cannot_ack_unread_gaps_or_another_stream() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        manager.expose_compatibility(&job.id).unwrap();
+        let content = b"abcdefghijklmnop";
+        assert_eq!(writers.stdout.append(content).unwrap(), content.len());
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let page_at = |offset| {
+            serde_json::from_str::<serde_json::Value>(
+                &manager
+                    .output_node_page(
+                        &job.id,
+                        OutputPageRequest {
+                            node: None,
+                            stream: Some(JobOutputStream::Stdout),
+                            offset,
+                            requested_bytes: 8,
+                            response_ceiling: 4096,
+                            base64: false,
+                        },
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        // Before any projected response, even an empty-prefix ACK has no
+        // delivery proof. One out-of-order page cannot create that proof.
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 0,)
+                .is_err()
+        );
+        let late = page_at(8);
+        assert_eq!(late["offset"], 8);
+        assert_eq!(late["next_offset"], 16);
+        assert_eq!(late["data"], "ijklmnop");
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 0,)
+                .is_err(),
+            "late page may not mint a zero-prefix ACK"
+        );
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 16,)
+                .is_err(),
+            "late page must not ACK bytes [0,8)"
+        );
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stderr), 1,)
+                .is_err(),
+            "output evidence must be stream-scoped"
+        );
+
+        let first = page_at(0);
+        assert_eq!(first["next_offset"], 8);
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 0,)
+                .is_ok(),
+            "a projected first page certifies its zero prefix"
+        );
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 8,)
+                .is_ok()
+        );
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 16,)
+                .is_err(),
+            "a previously viewed late page must not bridge the gap"
+        );
+
+        let continuation = page_at(8);
+        assert_eq!(continuation["next_offset"], 16);
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 16,)
+                .is_ok()
+        );
+
+        let owner = manager.inner.shared_jobs.job_output_owner(&job.id).unwrap();
+        let state = manager
+            .inner
+            .shared_jobs
+            .output_owner_state(&job.id, 1, SharedOutputStream::Stdout, owner)
+            .unwrap();
+        assert_eq!(state.through, 16);
+        drop(job);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_expires_unacknowledged_shared_output_before_removing_session_dir() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let root = manager.inner.root.clone();
@@ -9773,6 +9951,177 @@ mod tests {
             !root.exists(),
             "shutdown must expire terminal shared output and close file handles before removing the session directory"
         );
+    }
+
+    #[test]
+    fn bounded_mcp_page_only_credits_serialized_source_prefix() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        let bytes = b"quoted\" slash\\ newline\n	";
+        let data = bytes.repeat(160);
+        assert_eq!(writers.stdout.append(&data).unwrap(), data.len());
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let request = |offset, ceiling, base64| OutputPageRequest {
+            node: None,
+            stream: Some(JobOutputStream::Stdout),
+            offset,
+            requested_bytes: data.len(),
+            response_ceiling: ceiling,
+            base64,
+        };
+        assert!(
+            manager
+                .output_node_page(&job.id, request(0, 900, false))
+                .is_err()
+        );
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 1)
+                .is_err(),
+            "failed response preflight cannot mint delivered proof"
+        );
+
+        let rendered = manager
+            .output_node_page(&job.id, request(0, 1024, false))
+            .unwrap();
+        assert!(serialized_tool_result_len(&rendered).unwrap() <= 1024);
+        let page: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(page["offset"], 0);
+        let through = page["next_offset"].as_u64().unwrap();
+        assert!(through > 0 && through < data.len() as u64);
+        assert_eq!(
+            page["data"],
+            String::from_utf8_lossy(&data[..through as usize]).as_ref()
+        );
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), through + 1)
+                .is_err(),
+            "fetching a large spool does not credit unrendered bytes"
+        );
+        manager
+            .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), through)
+            .unwrap();
+        let late_offset = (through + 40).min(data.len() as u64 - 1);
+        let late = manager
+            .output_node_page(&job.id, request(late_offset, 1024, true))
+            .unwrap();
+        assert!(serialized_tool_result_len(&late).unwrap() <= 1024);
+        let late: serde_json::Value = serde_json::from_str(&late).unwrap();
+        let late_end = late["next_offset"].as_u64().unwrap();
+        assert!(late_end > late_offset);
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), late_end)
+                .is_err(),
+            "base64 page past a gap cannot advance the ACK prefix"
+        );
+
+        let bridge = manager
+            .output_node_page(&job.id, request(through, 1024, true))
+            .unwrap();
+        let bridge: serde_json::Value = serde_json::from_str(&bridge).unwrap();
+        let bridged = bridge["next_offset"].as_u64().unwrap();
+        assert!(bridged > through);
+        manager
+            .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), bridged)
+            .unwrap();
+    }
+
+    #[test]
+    fn model_ack_preserves_independent_native_task_result_and_replay() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        assert_eq!(writers.stdout.append(b"abcdefgh").unwrap(), 8);
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let stdout = job.shared_stream_summary(JobStream::Stdout, false);
+        let stderr = job.shared_stream_summary(JobStream::Stderr, false);
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(Some(0), true, stdout, stderr),
+        );
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            state.jobs.get_mut(&job.id).unwrap().result_limit = 4;
+        }
+        manager.expose_native_task(&job.id, None).unwrap().unwrap();
+        let owner = manager.inner.shared_jobs.job_output_owner(&job.id).unwrap();
+        let task_owner = shared_task_output_owner(&job.id).unwrap();
+        assert_ne!(
+            owner, task_owner,
+            "MCP Task and Job leases must be independent"
+        );
+
+        // The model has not received any output, even though the Task
+        // already owns the retained source. Task ownership is not ACK proof.
+        assert!(
+            manager
+                .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 8,)
+                .is_err()
+        );
+        let page = manager
+            .output_node_page(
+                &job.id,
+                OutputPageRequest {
+                    node: None,
+                    stream: Some(JobOutputStream::Stdout),
+                    offset: 0,
+                    requested_bytes: 8,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(page["data"], "abcdefgh");
+        assert_eq!(page["next_offset"], 8);
+        manager
+            .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 8)
+            .unwrap();
+        let (still_retained, finished) = manager
+            .inner
+            .shared_jobs
+            .output_summary(&job.id, 1, SharedOutputStream::Stdout)
+            .unwrap();
+        assert!(finished);
+        assert_eq!(still_retained.retained_bytes, 4);
+        let task_state = manager
+            .inner
+            .shared_jobs
+            .output_owner_state(&job.id, 1, SharedOutputStream::Stdout, task_owner)
+            .unwrap();
+        assert!(
+            !task_state.released,
+            "Job ACK must not release native Task bytes"
+        );
+
+        // Replaying an ACK cannot widen the Task lease or corrupt its prefix.
+        manager
+            .acknowledge_node_output(&job.id, None, Some(JobOutputStream::Stdout), 8)
+            .unwrap();
+        assert_eq!(
+            manager
+                .inner
+                .shared_jobs
+                .output_summary(&job.id, 1, SharedOutputStream::Stdout,)
+                .unwrap()
+                .0
+                .retained_bytes,
+            4
+        );
+        let detail = manager.detailed_task(&job.id).unwrap();
+        let TaskPayload::Completed { result } = detail.payload else {
+            panic!("native Task result disappeared after model ACK");
+        };
+        let rendered = serde_json::Value::Object(result).to_string();
+        assert!(rendered.contains("abcd"), "{rendered}");
+        assert!(!rendered.contains("efgh"), "{rendered}");
     }
 
     #[test]

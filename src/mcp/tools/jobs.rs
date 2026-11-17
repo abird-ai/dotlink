@@ -37,6 +37,196 @@ fn wait_budget_only_narrows_by_authenticated_transport_remaining() {
     assert_eq!(bounded_wait_ms(0, Some(7_000)), 0);
 }
 
+/// Read-only status must be complete; outer response truncation would
+/// destroy its outcome/revision semantics while still reporting success.
+fn bounded_job_status(status: String, budget: Option<usize>) -> CallToolResult {
+    let result = ok_text(status);
+    if budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(&result).is_some_and(|size| size <= limit)
+    }) {
+        return result;
+    }
+    tool_error(
+        "Job status exceeds the response budget; use an exact node ref or increase the budget",
+    )
+}
+
+/// A launched Job must retain a complete model-visible continuation ref, even
+/// when its full status cannot fit the authenticated transport envelope.
+fn bounded_job_handoff(id: &str, status: String, budget: Option<usize>) -> CallToolResult {
+    let result = ok_text(status);
+    if budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(&result).is_some_and(|size| size <= limit)
+    }) {
+        return result;
+    }
+    let concise = ok_text(format!("j:{id} next=jobs_get no-rerun"));
+    if budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(&concise).is_some_and(|size| size <= limit)
+    }) {
+        concise
+    } else {
+        tool_error(
+            "Job is already admitted, but its handoff exceeds the response budget; list Jobs to recover it without rerunning",
+        )
+    }
+}
+
+/// The replay ledger retains the original receipt. A narrower authenticated
+/// response may project the same Job ref compactly; it may never rerun work or
+/// silently clip away the continuation.
+fn bounded_replayed_job_handoff(cached: CallToolResult, budget: Option<usize>) -> CallToolResult {
+    if cached.is_error.unwrap_or(false)
+        || budget.is_none_or(|limit| {
+            crate::mcp::serialized_json_len(&cached).is_some_and(|size| size <= limit)
+        })
+    {
+        return cached;
+    }
+    let Some(status) = cached
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(|text| text.text.as_str()))
+    else {
+        return tool_error("Cached Job receipt has no continuation; list Jobs, do not rerun");
+    };
+    let Some(reference) = status.split_whitespace().next() else {
+        return tool_error("Cached Job receipt has no continuation; list Jobs, do not rerun");
+    };
+    match parse_ref(reference) {
+        Ok(StandaloneRef { id, node: None }) => bounded_job_handoff(&id, status.to_owned(), budget),
+        _ => tool_error("Cached Job reference is invalid; list Jobs, do not rerun"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ControlReceipt {
+    Ack(u64),
+    Cancel,
+}
+
+fn bounded_control_success(
+    reference: &StandaloneRef,
+    status: String,
+    effect: ControlReceipt,
+    budget: Option<usize>,
+) -> CallToolResult {
+    let result = ok_text(status);
+    let fits = |result: &CallToolResult| {
+        budget.is_none_or(|limit| {
+            crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
+        })
+    };
+    if fits(&result) {
+        return result;
+    }
+    let reference = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
+    let receipt = match effect {
+        ControlReceipt::Ack(through) => {
+            format!("{reference} ack=through:{through} next=jobs_get no-rerun")
+        }
+        ControlReceipt::Cancel => format!("{reference} cancel=accepted next=jobs_get no-rerun"),
+    };
+    let compact = ok_text(receipt);
+    if fits(&compact) {
+        compact
+    } else {
+        tool_error(format!(
+            "{reference} Job Control effect already applied, but its receipt exceeds the response budget; inspect with jobs_get before retrying"
+        ))
+    }
+}
+
+/// Reproject the original completed effect; never mutate its replay receipt
+/// or convert an error into a successful Control acknowledgement.
+fn bounded_control_replay(
+    cached: CallToolResult,
+    reference: &StandaloneRef,
+    effect: ControlReceipt,
+    budget: Option<usize>,
+) -> CallToolResult {
+    if cached.is_error.unwrap_or(false) {
+        return cached;
+    }
+    let expected = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
+    let Some(status) = cached
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(|text| text.text.as_str()))
+    else {
+        return tool_error("Cached Control outcome is unverified; inspect the Job before retrying");
+    };
+    if status.split_whitespace().next() != Some(expected.as_str()) {
+        return tool_error("Cached Control Job identity differs; inspect the Job before retrying");
+    }
+    bounded_control_success(reference, status.to_owned(), effect, budget)
+}
+
+/// A completed stdin write must never become an ambiguously truncated
+/// success. The minimal receipt deliberately avoids claiming a new revision.
+fn bounded_send_result(
+    reference: &StandaloneRef,
+    original: CallToolResult,
+    budget: Option<usize>,
+) -> CallToolResult {
+    let fits = |result: &CallToolResult| {
+        budget.is_none_or(|limit| {
+            crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
+        })
+    };
+    if fits(&original) {
+        return original;
+    }
+    let reference = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
+    let compact = ok_text(format!("{reference} sent"));
+    if fits(&compact) {
+        compact
+    } else {
+        tool_error(format!(
+            "{reference} stdin was already accepted, but its receipt exceeds the response budget; inspect with jobs_get, do not resend"
+        ))
+    }
+}
+
+fn bounded_send_replay(
+    reference: &StandaloneRef,
+    cached: CallToolResult,
+    budget: Option<usize>,
+) -> CallToolResult {
+    if cached.is_error.unwrap_or(false) {
+        return cached;
+    }
+    let expected = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
+    let Some(text) = cached
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(|text| text.text.as_str()))
+    else {
+        return tool_error("Cached stdin receipt is unverified; inspect Job, do not resend");
+    };
+    let mut tokens = text.split_whitespace();
+    if tokens.next() != Some(expected.as_str()) {
+        return tool_error("Cached stdin Job identity differs; inspect Job, do not resend");
+    }
+    let next = tokens.next();
+    let valid = match next {
+        Some("sent") => tokens.next().is_none(),
+        Some(revision) => {
+            revision
+                .strip_prefix("rev=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some()
+                && tokens.next() == Some("ok")
+                && tokens.next().is_none()
+        }
+        None => false,
+    };
+    if !valid {
+        return tool_error("Cached stdin outcome is unverified; inspect Job, do not resend");
+    }
+    bounded_send_result(reference, cached, budget)
+}
+
 pub(crate) fn canonicalize_graph_router(
     router: &mut rmcp::handler::server::router::tool::ToolRouter<LocalMachine>,
     capabilities: crate::mcp::Capabilities,
@@ -263,7 +453,7 @@ impl LocalMachine {
         match self.jobs.wait_until(id, deadline).await {
             Ok(JobWait::Pending) => match self.jobs.expose_compatibility(id) {
                 Ok(_) => match self.jobs.standalone_status(id, None) {
-                    Ok((_, status)) => ok_text(status),
+                    Ok((_, status)) => bounded_job_handoff(id, status, result_budget),
                     Err(error) => tool_error(error),
                 },
                 Err(error) => tool_error(error),
@@ -282,7 +472,7 @@ impl LocalMachine {
                         }) {
                             let _ = self.jobs.expose_compatibility(id);
                             return match self.jobs.standalone_status(id, None) {
-                                Ok((_, status)) => ok_text(status),
+                                Ok((_, status)) => bounded_job_handoff(id, status, result_budget),
                                 Err(error) => tool_error(error),
                             };
                         }
@@ -294,7 +484,7 @@ impl LocalMachine {
                     Ok(None) => {
                         let _ = self.jobs.expose_compatibility(id);
                         match self.jobs.standalone_status(id, None) {
-                            Ok((_, status)) => ok_text(status),
+                            Ok((_, status)) => bounded_job_handoff(id, status, result_budget),
                             Err(error) => tool_error(error),
                         }
                     }
@@ -315,7 +505,7 @@ impl LocalMachine {
             Ok(Some(JobHandoff::Compatibility(_))) => Some(
                 self.jobs
                     .standalone_status(id, None)
-                    .map(|(_, status)| ok_text(status))
+                    .map(|(_, status)| bounded_job_handoff(id, status, result_budget))
                     .unwrap_or_else(tool_error),
             ),
             Ok(Some(JobHandoff::Synchronous)) => {
@@ -352,7 +542,13 @@ impl LocalMachine {
         Parameters(args): Parameters<graph::GraphArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let result_budget = self.request_result_budget(&context);
+        // The authenticated transport may narrow the profile ceiling; even
+        // a local stdio handoff must be bounded before the Job is exposed.
+        let result_budget = Some(
+            self.request_result_budget(&context)
+                .unwrap_or(self.config.max_output_bytes)
+                .min(self.config.max_output_bytes),
+        );
         let remote_start = context
             .extensions
             .get::<crate::remote_start::ValidatedRemoteStart>()
@@ -369,7 +565,7 @@ impl LocalMachine {
             // return its original receipt even if the workspace has changed.
             let guard = match self.jobs.claim_remote_start(&start) {
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return result;
+                    return bounded_replayed_job_handoff(result, result_budget);
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -400,7 +596,7 @@ impl LocalMachine {
                     return tool_error(error);
                 }
             };
-            let result = ok_text(status);
+            let result = bounded_job_handoff(&started.id, status, result_budget);
             if let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone())) {
                 return tool_error(error);
             }
@@ -422,7 +618,7 @@ impl LocalMachine {
         }
         if background {
             return match self.jobs.standalone_status(&started.id, None) {
-                Ok((_, status)) => ok_text(status),
+                Ok((_, status)) => bounded_job_handoff(&started.id, status, result_budget),
                 Err(error) => tool_error(error),
             };
         }
@@ -472,7 +668,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Observe one explicit standalone Process/Graph Job or Graph node. rev is a conditional observation token; wait_ms may wait for a different revision without changing execution timeout.",
+        description = "Observe one standalone Process/Graph Job or Graph node. wait_ms waits only for this target to settle or for the wait deadline; rev is status metadata, not an early-wake condition. This never changes execution timeout.",
         annotations(
             title = "Get Job status",
             read_only_hint = true,
@@ -500,7 +696,14 @@ impl LocalMachine {
             .standalone_get(&reference.id, reference.node, args.rev, wait_ms)
             .await
         {
-            Ok(status) => ok_text(status),
+            Ok(status) => bounded_job_status(
+                status,
+                Some(
+                    self.request_result_budget(&context)
+                        .unwrap_or(self.config.max_output_bytes)
+                        .min(self.config.max_output_bytes),
+                ),
+            ),
             Err(error) => tool_error(error),
         }
     }
@@ -600,6 +803,11 @@ impl LocalMachine {
         Parameters(args): Parameters<JobsAckArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let result_budget = Some(
+            self.request_result_budget(&context)
+                .unwrap_or(self.config.max_output_bytes)
+                .min(self.config.max_output_bytes),
+        );
         let reference = match parse_ref(&args.reference) {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
@@ -611,7 +819,12 @@ impl LocalMachine {
         let guard = if let Some(start) = remote_start.as_ref() {
             match self.jobs.claim_remote_start(start) {
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return result;
+                    return bounded_control_replay(
+                        result,
+                        &reference,
+                        ControlReceipt::Ack(args.offset),
+                        result_budget,
+                    );
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -639,7 +852,12 @@ impl LocalMachine {
         };
         match outcome {
             Ok(text) => {
-                let result = ok_text(text);
+                let result = bounded_control_success(
+                    &reference,
+                    text,
+                    ControlReceipt::Ack(args.offset),
+                    result_budget,
+                );
                 if let Some(guard) = guard
                     && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
                 {
@@ -674,6 +892,28 @@ impl LocalMachine {
         Parameters(args): Parameters<JobsSendArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let result_budget = Some(
+            self.request_result_budget(&context)
+                .unwrap_or(self.config.max_output_bytes)
+                .min(self.config.max_output_bytes),
+        );
+        self.jobs_send_impl(
+            args,
+            context
+                .extensions
+                .get::<crate::remote_start::ValidatedRemoteStart>()
+                .cloned(),
+            result_budget,
+        )
+        .await
+    }
+
+    async fn jobs_send_impl(
+        &self,
+        args: JobsSendArgs,
+        remote_start: Option<crate::remote_start::ValidatedRemoteStart>,
+        result_budget: Option<usize>,
+    ) -> CallToolResult {
         if !matches!(args.mode, SendMode::Auto) {
             return tool_error("standalone Process jobs_send supports only mode=auto");
         }
@@ -685,14 +925,10 @@ impl LocalMachine {
             Ok(input) => input,
             Err(error) => return tool_error(error),
         };
-        let remote_start = context
-            .extensions
-            .get::<crate::remote_start::ValidatedRemoteStart>()
-            .cloned();
         let guard = if let Some(start) = remote_start.as_ref() {
             match self.jobs.claim_remote_start(start) {
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return result;
+                    return bounded_send_replay(&reference, result, result_budget);
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -705,16 +941,32 @@ impl LocalMachine {
         } else {
             None
         };
+        // Do not send irreversible stdin unless a complete confirmation can
+        // fit. An existing replay was inspected above, before this preflight.
+        let minimal = ok_text(format!(
+            "{} sent",
+            crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
+        ));
+        if result_budget.is_some_and(|limit| {
+            crate::mcp::serialized_json_len(&minimal).is_none_or(|size| size > limit)
+        }) {
+            if let Some(guard) = guard {
+                guard.release_before_effect();
+            }
+            return tool_error(
+                "jobs_send response budget cannot fit a complete receipt; stdin was not sent",
+            );
+        }
         match self
             .send_process_input_checked(&reference.id, reference.node, args.rev, input)
             .await
         {
             Ok(revision) => {
-                let text = format!(
+                let full = ok_text(format!(
                     "{} rev={revision} ok",
                     crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
-                );
-                let result = ok_text(text);
+                ));
+                let result = bounded_send_result(&reference, full, result_budget);
                 if let Some(guard) = guard
                     && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
                 {
@@ -740,6 +992,7 @@ impl LocalMachine {
         &self,
         args: JobsCancelArgs,
         remote_start: Option<crate::remote_start::ValidatedRemoteStart>,
+        result_budget: Option<usize>,
     ) -> CallToolResult {
         let reference = match parse_ref(&args.reference) {
             Ok(reference) => reference,
@@ -751,7 +1004,12 @@ impl LocalMachine {
         let guard = if let Some(start) = remote_start.as_ref() {
             match self.jobs.claim_remote_start(start) {
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return result;
+                    return bounded_control_replay(
+                        result,
+                        &reference,
+                        ControlReceipt::Cancel,
+                        result_budget,
+                    );
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -805,7 +1063,12 @@ impl LocalMachine {
         };
         match outcome {
             Ok(text) => {
-                let result = ok_text(text);
+                let result = bounded_control_success(
+                    &reference,
+                    text,
+                    ControlReceipt::Cancel,
+                    result_budget,
+                );
                 if let Some(guard) = guard
                     && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
                 {
@@ -844,7 +1107,13 @@ impl LocalMachine {
             .extensions
             .get::<crate::remote_start::ValidatedRemoteStart>()
             .cloned();
-        self.jobs_cancel_impl(args, remote_start).await
+        let result_budget = Some(
+            self.request_result_budget(&context)
+                .unwrap_or(self.config.max_output_bytes)
+                .min(self.config.max_output_bytes),
+        );
+        self.jobs_cancel_impl(args, remote_start, result_budget)
+            .await
     }
 }
 
@@ -880,6 +1149,562 @@ mod tests {
         let limit = &list.input_schema["properties"]["limit"];
         assert_eq!(limit["minimum"], 1);
         assert_eq!(limit["maximum"], MAX_JOB_LIST_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finite_get_waits_for_process_settlement_even_with_stale_revision() {
+        use aw_tools::filesystem::batch::NodeTool;
+
+        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine_with_shell(
+            tmp.path().canonicalize().unwrap(),
+            bash,
+        );
+        let started = machine
+            .start_shell_job(
+                crate::mcp::tools::shell::ShellArgs {
+                    command: "printf early; sleep 0.55; printf late".into(),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(5),
+                    max_output_bytes: Some(1024),
+                    writes: None,
+                },
+                NodeTool::Bash,
+                None,
+                false,
+            )
+            .unwrap();
+        machine.jobs.expose_compatibility(&started.id).unwrap();
+        let (rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+
+        // Older implementation treats this stale revision as permission to
+        // return immediately. New contract: settle-or-deadline, regardless of
+        // revision changes, early stdout or shell launch progress.
+        let pending = machine
+            .jobs
+            .standalone_get(&started.id, None, Some(rev.saturating_sub(1)), 40)
+            .await
+            .unwrap();
+        assert!(
+            pending.contains(" running ") || pending.contains(" waiting "),
+            "{pending}"
+        );
+
+        let terminal = machine
+            .jobs
+            .standalone_get(&started.id, None, Some(rev.saturating_sub(1)), 1500)
+            .await
+            .unwrap();
+        assert!(terminal.contains(" settled "), "{terminal}");
+        assert_eq!(
+            machine
+                .jobs
+                .standalone_get(&started.id, None, None, 1500,)
+                .await
+                .unwrap(),
+            terminal,
+            "terminal get must not wait again"
+        );
+        machine.jobs.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finite_get_node_settles_before_unrelated_graph_sibling() {
+        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine_with_shell(
+            tmp.path().canonicalize().unwrap(),
+            bash,
+        );
+        let args = serde_json::json!({"ops":[
+            ["bash", {"command":"printf first"}, "*"],
+            ["bash", {"command":"sleep 0.65; printf second"}, "*"]
+        ]});
+        let prepared = graph::prepare(&machine, args["ops"].as_array().unwrap().clone())
+            .await
+            .unwrap();
+        let started = graph::start(&machine, prepared, None, None, true)
+            .await
+            .unwrap();
+        let (rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+
+        let first = machine
+            .jobs
+            .standalone_get(&started.id, Some(1), Some(rev), 1500)
+            .await
+            .unwrap();
+        assert!(first.contains(" settled "), "{first}");
+        let root = machine
+            .jobs
+            .standalone_get(&started.id, None, Some(rev), 30)
+            .await
+            .unwrap();
+        assert!(
+            root.contains(" running ") || root.contains(" waiting "),
+            "root must not be settled while sibling remains active: {root}"
+        );
+        let settled = machine
+            .jobs
+            .standalone_get(&started.id, None, Some(rev), 1500)
+            .await
+            .unwrap();
+        assert!(settled.contains(" settled "), "{settled}");
+        assert!(
+            machine
+                .jobs
+                .standalone_get(&started.id, Some(17), None, 1500,)
+                .await
+                .is_err(),
+            "invalid node must fail immediately"
+        );
+        machine.jobs.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skipped_graph_node_read_does_not_wait_for_unrelated_sibling() {
+        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine_with_shell(root, bash);
+        let prepared = graph::prepare(
+            &machine,
+            vec![
+                serde_json::json!(["bash", {"command":"false"}, "*"]),
+                serde_json::json!(["read", {"path":"a.txt","numbered":false}, "1.ok"]),
+                serde_json::json!(["bash", {"command":"sleep 1.2; printf sibling"}, "*"]),
+            ],
+        )
+        .await
+        .unwrap();
+        let started = graph::start(&machine, prepared, None, None, true)
+            .await
+            .unwrap();
+        let skipped = machine
+            .jobs
+            .standalone_get(&started.id, Some(2), None, 1000)
+            .await
+            .unwrap();
+        assert!(
+            skipped.contains("settled") && skipped.contains("skip"),
+            "{skipped}"
+        );
+        let (_, root) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        assert!(root.contains("running"), "{root}");
+
+        // A skipped node has no result stream. Return the truthful missing
+        // output immediately instead of consuming a slow sibling's lifetime.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            machine.jobs.output_node_page_wait(
+                &started.id,
+                crate::jobs::OutputPageRequest {
+                    node: Some(2),
+                    stream: Some(crate::jobs::JobOutputStream::Result),
+                    offset: 0,
+                    requested_bytes: 64,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+                1200,
+            ),
+        )
+        .await
+        .expect("skipped node must not wait for sibling");
+        let error = outcome.expect_err("skipped node cannot fabricate a result page");
+        assert!(
+            error
+                .to_string()
+                .contains("has no retained output after settlement"),
+            "{error}"
+        );
+        let (_, root) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        assert!(root.contains("running"), "{root}");
+        machine.jobs.wait_until(&started.id, None).await.unwrap();
+        machine.jobs.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finite_read_waits_for_new_bytes_and_eof_not_shell_revision() {
+        use aw_tools::filesystem::batch::NodeTool;
+
+        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine_with_shell(
+            temp.path().canonicalize().unwrap(),
+            bash,
+        );
+        let started = machine
+            .start_shell_job(
+                crate::mcp::tools::shell::ShellArgs {
+                    command: "sleep 0.18; printf first; sleep 0.65; printf second".into(),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(5),
+                    max_output_bytes: Some(1024),
+                    writes: None,
+                },
+                NodeTool::Bash,
+                None,
+                false,
+            )
+            .unwrap();
+        machine.jobs.expose_compatibility(&started.id).unwrap();
+        let request = |offset: u64| crate::jobs::OutputPageRequest {
+            node: None,
+            stream: Some(crate::jobs::JobOutputStream::Stdout),
+            offset,
+            requested_bytes: 128,
+            response_ceiling: 4096,
+            base64: false,
+        };
+        let page = machine
+            .jobs
+            .output_node_page_wait(&started.id, request(0), 1500)
+            .await
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(first["data"], "first", "{first}");
+        assert_eq!(first["next_offset"], 5);
+        assert_eq!(first["complete"], false, "first bytes precede process EOF");
+
+        // A status revision can change (launch/other progress) without
+        // making bytes at offset 5 available. The short deadline returns
+        // an empty running page; it does not consume the Process timeout.
+        let short = machine
+            .jobs
+            .output_node_page_wait(&started.id, request(5), 35)
+            .await
+            .unwrap();
+        let short: serde_json::Value = serde_json::from_str(&short).unwrap();
+        assert_eq!(short["data"], "", "{short}");
+        assert_eq!(short["next_offset"], 5);
+        assert_eq!(short["complete"], false);
+
+        let page = machine
+            .jobs
+            .output_node_page_wait(&started.id, request(5), 1500)
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(second["data"], "second", "{second}");
+        assert_eq!(second["next_offset"], 11);
+
+        let eof = machine
+            .jobs
+            .output_node_page_wait(&started.id, request(11), 1500)
+            .await
+            .unwrap();
+        let eof: serde_json::Value = serde_json::from_str(&eof).unwrap();
+        assert_eq!(eof["data"], "", "{eof}");
+        assert_eq!(eof["next_offset"], 11);
+        assert_eq!(
+            eof["complete"], true,
+            "writer EOF is the stream completion gate"
+        );
+        // The status projection retains the shared owner ACK watermark.
+        let status: serde_json::Value =
+            serde_json::from_str(&machine.jobs.status(&started.id).unwrap()).unwrap();
+        assert_eq!(status["stdout"]["acknowledged_bytes"], 0);
+        assert_eq!(status["stdout"]["released"], false);
+        machine.jobs.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn status_budget_never_returns_truncated_success_and_handoff_keeps_ref() {
+        let full = "j:example node settled rev=12 ".to_owned() + &"status-output".repeat(800);
+        let success = ok_text(full.clone());
+        let exact = crate::mcp::serialized_json_len(&success).unwrap();
+        let accepted = bounded_job_status(full.clone(), Some(exact));
+        assert!(!accepted.is_error.unwrap_or(false));
+        assert_eq!(accepted.content[0].as_text().unwrap().text, full);
+
+        let oversized = bounded_job_status(full.clone(), Some(512));
+        assert!(oversized.is_error.unwrap_or(false));
+        let message = &oversized.content[0].as_text().unwrap().text;
+        assert!(message.contains("exceeds the response budget"));
+        assert!(!message.contains("status-output"));
+
+        let id = "20261116-abc";
+        let concise = format!("j:{id} next=jobs_get no-rerun");
+        let concise_size = crate::mcp::serialized_json_len(&ok_text(concise.clone())).unwrap();
+        let admitted = bounded_job_handoff(id, full.clone(), Some(concise_size));
+        assert!(!admitted.is_error.unwrap_or(false));
+        assert_eq!(admitted.content[0].as_text().unwrap().text, concise);
+        assert!(crate::mcp::serialized_json_len(&admitted).unwrap() <= concise_size);
+        let impossible = bounded_job_handoff(id, full, Some(concise_size - 1));
+        assert!(
+            impossible.is_error.unwrap_or(false),
+            "cannot fake a partial handoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_graph_result_handoff_keeps_exact_ref_under_small_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("large.txt"), "long-line ".repeat(2048)).unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine(root.clone());
+        let ops = vec![serde_json::json!([
+            "read", {"path":"large.txt","numbered":false}
+        ])];
+        let prepared = graph::prepare(&machine, ops).await.unwrap();
+        let started = graph::start(&machine, prepared, None, None, true)
+            .await
+            .unwrap();
+        machine.jobs.wait_until(&started.id, None).await.unwrap();
+        let concise = format!("j:{} next=jobs_get no-rerun", started.id);
+        let budget = crate::mcp::serialized_json_len(&ok_text(concise.clone())).unwrap() + 1;
+        let result = machine
+            .finish_graph_call(&started.id, None, Some(budget))
+            .await;
+        assert!(!result.is_error.unwrap_or(false), "{result:?}");
+        assert_eq!(result.content[0].as_text().unwrap().text, concise);
+        assert!(crate::mcp::serialized_json_len(&result).unwrap() <= budget);
+        let repeated = machine
+            .replay_graph_response(&started.id, Some(budget))
+            .await
+            .unwrap();
+        assert!(!repeated.is_error.unwrap_or(false));
+        assert_eq!(repeated.content[0].as_text().unwrap().text, concise);
+        assert_eq!(
+            machine
+                .jobs
+                .standalone_status(&started.id, None)
+                .unwrap()
+                .1
+                .split_whitespace()
+                .next(),
+            Some(format!("j:{}", started.id).as_str()),
+        );
+        machine.jobs.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn control_receipts_keep_action_and_exact_ref_under_tight_budgets() {
+        let root = parse_ref("j:control-123").unwrap();
+        let node = parse_ref("j:control-123/n:2").unwrap();
+        let large = format!(
+            "j:control-123 process settled rev=42 {}",
+            "detail ".repeat(800)
+        );
+        let full = ok_text(large.clone());
+        let exact = crate::mcp::serialized_json_len(&full).unwrap();
+
+        let accepted =
+            bounded_control_success(&root, large.clone(), ControlReceipt::Cancel, Some(exact));
+        assert_eq!(
+            accepted, full,
+            "an already-fitting status must not be modified"
+        );
+
+        let ack_compact = "j:control-123/n:2 ack=through:47 next=jobs_get no-rerun";
+        let ack_size = crate::mcp::serialized_json_len(&ok_text(ack_compact)).unwrap();
+        let acknowledged = bounded_control_success(
+            &node,
+            large.clone(),
+            ControlReceipt::Ack(47),
+            Some(ack_size),
+        );
+        assert!(!acknowledged.is_error.unwrap_or(false));
+        assert_eq!(acknowledged.content[0].as_text().unwrap().text, ack_compact);
+        assert!(crate::mcp::serialized_json_len(&acknowledged).unwrap() <= ack_size);
+        let too_small = bounded_control_success(
+            &node,
+            large.clone(),
+            ControlReceipt::Ack(47),
+            Some(ack_size - 1),
+        );
+        assert!(too_small.is_error.unwrap_or(false));
+        let detail = &too_small.content[0].as_text().unwrap().text;
+        assert!(detail.contains("effect already applied") && detail.contains("before retrying"));
+
+        let cancel_compact = "j:control-123 cancel=accepted next=jobs_get no-rerun";
+        let cancel_size = crate::mcp::serialized_json_len(&ok_text(cancel_compact)).unwrap();
+        let cancelled = bounded_control_success(
+            &root,
+            large.clone(),
+            ControlReceipt::Cancel,
+            Some(cancel_size),
+        );
+        assert_eq!(cancelled.content[0].as_text().unwrap().text, cancel_compact);
+        assert!(!cancelled.is_error.unwrap_or(false));
+
+        let replayed = bounded_control_replay(
+            full.clone(),
+            &root,
+            ControlReceipt::Cancel,
+            Some(cancel_size),
+        );
+        assert_eq!(replayed, cancelled);
+        assert_eq!(
+            full.content[0].as_text().unwrap().text,
+            large,
+            "cached receipt is immutable"
+        );
+
+        let failed = tool_error("stale Job revision");
+        assert_eq!(
+            bounded_control_replay(failed.clone(), &root, ControlReceipt::Cancel, Some(1)),
+            failed,
+            "a failed effect replay cannot be turned into Control success"
+        );
+        let mismatch = ok_text("j:other-456 process settled rev=42");
+        assert!(
+            bounded_control_replay(mismatch, &root, ControlReceipt::Cancel, Some(cancel_size))
+                .is_error
+                .unwrap_or(false),
+            "wrong cached Job identity must fail closed"
+        );
+    }
+
+    #[test]
+    fn send_receipts_are_exact_bounded_and_replay_preserves_semantics() {
+        let reference = parse_ref("j:send-123/n:2").unwrap();
+        let name = "j:send-123/n:2";
+        let full = ok_text(format!("{name} rev={} ok", u64::MAX));
+        let full_size = crate::mcp::serialized_json_len(&full).unwrap();
+        let compact = ok_text(format!("{name} sent"));
+        let compact_size = crate::mcp::serialized_json_len(&compact).unwrap();
+        assert!(compact_size < full_size);
+
+        assert_eq!(
+            bounded_send_result(&reference, full.clone(), Some(full_size)),
+            full
+        );
+        let narrowed = bounded_send_result(&reference, full.clone(), Some(compact_size));
+        assert_eq!(narrowed, compact);
+        assert!(crate::mcp::serialized_json_len(&narrowed).unwrap() <= compact_size);
+        let too_small = bounded_send_result(&reference, full.clone(), Some(compact_size - 1));
+        assert!(too_small.is_error.unwrap_or(false));
+        let detail = &too_small.content[0].as_text().unwrap().text;
+        assert!(detail.contains("already accepted") && detail.contains("do not resend"));
+
+        assert_eq!(
+            bounded_send_replay(&reference, full.clone(), Some(compact_size)),
+            compact,
+            "narrow replay may drop a revision but must preserve the exact send identity"
+        );
+        assert_eq!(
+            bounded_send_replay(&reference, compact.clone(), Some(full_size)),
+            compact,
+            "a replay cannot invent a revision omitted from the cached receipt"
+        );
+        assert_eq!(
+            full.content[0].as_text().unwrap().text,
+            format!("{name} rev={} ok", u64::MAX)
+        );
+        let denied = tool_error("Process authority revoked; stdin outcome unknown");
+        assert_eq!(
+            bounded_send_replay(&reference, denied.clone(), Some(1)),
+            denied,
+            "cached error can never become a success"
+        );
+        for invalid in [
+            "j:different/n:2 rev=1 ok",
+            "j:send-123/n:2 rev=1 maybe",
+            "j:send-123/n:2 rev=bad ok",
+            "j:send-123/n:2 rev=1 ok extra",
+            "j:send-123/n:2 ack=all",
+            "j:send-123/n:2 sent extra",
+        ] {
+            assert!(
+                bounded_send_replay(&reference, ok_text(invalid), Some(compact_size))
+                    .is_error
+                    .unwrap_or(false),
+                "malformed or unrelated cached receipt must be denied: {invalid}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_send_preflights_receipt_and_delivers_once() {
+        use aw_tools::filesystem::batch::NodeTool;
+        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine_with_shell(root.clone(), bash);
+        let started = machine
+            .start_shell_job(
+                crate::mcp::tools::shell::ShellArgs {
+                    command: "IFS= read -r line; printf '%s' \"$line\" > received.txt".into(),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(4),
+                    max_output_bytes: Some(1024),
+                    writes: None,
+                },
+                NodeTool::Bash,
+                None,
+                true,
+            )
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !machine.jobs.process_input_ready_for_test(&started.id, None) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stdin custody not ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let reference = format!("j:{}", started.id);
+        let minimal = ok_text(format!("{reference} sent"));
+        let minimal_size = crate::mcp::serialized_json_len(&minimal).unwrap();
+        let args = || {
+            serde_json::from_value::<JobsSendArgs>(serde_json::json!({
+                "ref":reference, "input":{"text":"hello\n"}
+            }))
+            .unwrap()
+        };
+
+        let denied = machine
+            .jobs_send_impl(args(), None, Some(minimal_size - 1))
+            .await;
+        assert!(denied.is_error.unwrap_or(false));
+        assert!(
+            denied.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("stdin was not sent")
+        );
+        assert!(machine.jobs.process_input_ready_for_test(&started.id, None));
+        assert!(
+            !root.join("received.txt").exists(),
+            "insufficient receipt budget must not send"
+        );
+        let sent = machine
+            .jobs_send_impl(args(), None, Some(minimal_size))
+            .await;
+        assert_eq!(sent, minimal);
+        machine.jobs.wait_until(&started.id, None).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("received.txt")).unwrap(),
+            "hello"
+        );
+        let resend = machine.jobs_send_impl(args(), None, None).await;
+        assert!(
+            resend.is_error.unwrap_or(false),
+            "settled Process cannot accept more input"
+        );
+        machine.jobs.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -977,6 +1802,37 @@ mod tests {
             _ => panic!("duplicate Graph Start must replay the first receipt"),
         };
         assert_eq!(replay, first);
+        // A replay under a smaller envelope keeps the original ledger result
+        // and returns a complete ref instead of a clipped success receipt.
+        let concise = format!("j:{} next=jobs_get no-rerun", started.id);
+        let small_budget = crate::mcp::serialized_json_len(&ok_text(concise.clone())).unwrap();
+        // This particular one-node receipt may already fit that smaller
+        // budget; verify its exact replay before exercising the forced-large
+        // projection case.
+        let projected = bounded_replayed_job_handoff(replay.clone(), Some(small_budget));
+        let fits = crate::mcp::serialized_json_len(&replay).unwrap() <= small_budget;
+        assert_eq!(
+            projected,
+            if fits {
+                replay.clone()
+            } else {
+                ok_text(concise.clone())
+            }
+        );
+        let long_cached = ok_text(format!(
+            "j:{} graph waiting rev=1 {}",
+            started.id,
+            "node waiting ".repeat(100)
+        ));
+        let projected = bounded_replayed_job_handoff(long_cached, Some(small_budget));
+        assert!(!projected.is_error.unwrap_or(false));
+        assert_eq!(projected.content[0].as_text().unwrap().text, concise);
+        assert!(crate::mcp::serialized_json_len(&projected).unwrap() <= small_budget);
+        let original = match machine.jobs.claim_remote_start(&start).unwrap() {
+            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => result,
+            _ => panic!("duplicate Start must preserve the cached original receipt"),
+        };
+        assert_eq!(original, first);
         assert!(!root.join("a.txt").exists());
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
     }
@@ -1083,6 +1939,7 @@ mod tests {
                     rev: Some(initial_rev),
                 },
                 Some(start.clone()),
+                None,
             )
             .await;
         assert_ne!(first.is_error, Some(true));
@@ -1098,12 +1955,44 @@ mod tests {
                     reference,
                     rev: Some(initial_rev),
                 },
-                Some(start),
+                Some(start.clone()),
+                None,
             )
             .await;
         assert_eq!(
             replay, first,
             "duplicate remote Start must replay the original cancel receipt"
+        );
+        let minimal = ok_text(format!(
+            "j:{} cancel=accepted next=jobs_get no-rerun",
+            started.id
+        ));
+        let budget = crate::mcp::serialized_json_len(&minimal).unwrap();
+        let narrow = machine
+            .jobs_cancel_impl(
+                JobsCancelArgs {
+                    reference: format!("j:{}", started.id),
+                    rev: Some(initial_rev),
+                },
+                Some(start.clone()),
+                Some(budget),
+            )
+            .await;
+        assert!(!narrow.is_error.unwrap_or(false), "{narrow:?}");
+        assert!(crate::mcp::serialized_json_len(&narrow).unwrap() <= budget);
+        let still_original = machine
+            .jobs_cancel_impl(
+                JobsCancelArgs {
+                    reference: format!("j:{}", started.id),
+                    rev: Some(initial_rev),
+                },
+                Some(start),
+                None,
+            )
+            .await;
+        assert_eq!(
+            still_original, first,
+            "narrow replay must not replace the cached Control result"
         );
         machine.jobs.wait_until(&started.id, None).await.unwrap();
     }

@@ -69,6 +69,8 @@ pub(crate) fn caps(max_read: usize, max_write: usize) -> Result<SchemaCaps, &'st
         // additionally paged by the actual result/transport ceiling at call time.
         binary_encoded_read_bytes: max_read,
         read_line_limit: 65_536,
+        grep_context_max: aw_tools::filesystem::schema::MAX_GREP_CONTEXT,
+        grep_context_default: 0,
         parallel_reads: false,
         typed_media: true,
     }

@@ -117,3 +117,7 @@ No unified-runtime implementation item remains.
 Future work should begin from live Git state and only reopen this surface for a
 new scoped design/change. Release/tag/deploy/platform certification remain
 separate actions and require their own authorization.
+
+## Cross-repo shared-tools handoff update — 2026-11-17
+
+The [current dotlink AW-tools continuation](DOTLINK-AW-TOOLS-NEXT-AGENT-HANDOFF-2026-11-17.md) points to the [canonical full AW–dotlink design and implementation history](../../../aw/.agents/docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md). It supersedes this dated summary for the *subsequent* Toolset, output/ACK, wait, replay and dependent AW pin D0–D4 work; the unified Jobs runtime baseline documented above remains historical authority for its own commit.
