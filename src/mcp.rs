@@ -2184,10 +2184,11 @@ impl LocalMachine {
         caps: aw_tools::filesystem::schema::SchemaCaps,
         shell_tool: Option<aw_tools::filesystem::batch::NodeTool>,
     ) -> ToolRouter<Self> {
+        let toolset = tools::shared_native::toolset(caps);
         let mut router = Self::all_tools();
         // Add/replace the complete canonical filesystem surface BEFORE policy
         // filtering so new shared tools can never bypass dotlink visibility.
-        tools::shared_native::canonicalize_router(&mut router, caps);
+        tools::shared_native::canonicalize_router(&mut router, &toolset);
         tools::jobs::canonicalize_graph_router(&mut router, capabilities, shell_tool);
         for spec in TOOL_SPECS {
             let shell_matches = match spec.capability {
@@ -2203,6 +2204,7 @@ impl LocalMachine {
         router
     }
 
+    #[cfg(test)]
     pub fn tool_router_for_policy(capabilities: Capabilities) -> ToolRouter<Self> {
         Self::tool_router_for_policy_with_caps(
             capabilities,
@@ -2367,6 +2369,21 @@ impl LocalMachine {
         })
     }
 
+    fn project_tool_for_client(
+        &self,
+        mut tool: Tool,
+        toolset: &aw_tools::toolset::Toolset,
+    ) -> Tool {
+        tool = with_profile_limits(
+            tool,
+            self.config.max_shell_timeout_secs,
+            self.config.max_output_bytes,
+        );
+        tools::jobs::with_job_limits(&mut tool, self.config.max_output_bytes);
+        tools::shared_native::apply_operation_metadata(&mut tool, toolset);
+        tool
+    }
+
     /// Pure reads may overlap each other; everything else takes the operation
     /// gate on platforms without descriptor-rooted IO.
     #[cfg(any(test, windows))]
@@ -2418,8 +2435,24 @@ impl LocalMachine {
         let capabilities = AccessPolicy::resolve(access)
             .await?
             .capabilities(allow_shell);
+        let caps = tools::shared_native::caps(
+            crate::limits::DEFAULT_TRANSFER_BYTES,
+            crate::limits::DEFAULT_TRANSFER_BYTES,
+        )
+        .expect("built-in transfer ceilings fit shared tool limits");
+        let toolset = tools::shared_native::toolset(caps);
         Ok(Self::describe_tools(
-            Self::tool_router_for_policy(capabilities).list_all(),
+            Self::tool_router_for_policy_with_caps(
+                capabilities,
+                caps,
+                capabilities.shell.then_some(platform_shell_node_tool()),
+            )
+            .list_all()
+            .into_iter()
+            .map(|mut tool| {
+                tools::shared_native::apply_operation_metadata(&mut tool, &toolset);
+                tool
+            }),
         ))
     }
 
@@ -2481,25 +2514,14 @@ impl rmcp::ServerHandler for LocalMachine {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        let toolset = tools::shared_native::toolset(self.config.shared_caps);
         Ok(ListToolsResult {
             result_type: Some(ResultType::COMPLETE),
             tools: self
                 .policy_tool_router()
                 .list_all()
                 .into_iter()
-                .map(|tool| {
-                    let mut tool = with_profile_limits(
-                        tool,
-                        self.config.max_shell_timeout_secs,
-                        self.config.max_output_bytes,
-                    );
-                    tools::jobs::with_job_limits(
-                        &mut tool,
-                        self.config.max_shell_timeout_secs,
-                        self.config.max_output_bytes,
-                    );
-                    tool
-                })
+                .map(|tool| self.project_tool_for_client(tool, &toolset))
                 .collect(),
             meta: None,
             next_cursor: None,
@@ -2509,19 +2531,11 @@ impl rmcp::ServerHandler for LocalMachine {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.policy_tool_router().get(name).cloned().map(|tool| {
-            let mut tool = with_profile_limits(
-                tool,
-                self.config.max_shell_timeout_secs,
-                self.config.max_output_bytes,
-            );
-            tools::jobs::with_job_limits(
-                &mut tool,
-                self.config.max_shell_timeout_secs,
-                self.config.max_output_bytes,
-            );
-            tool
-        })
+        let toolset = tools::shared_native::toolset(self.config.shared_caps);
+        self.policy_tool_router()
+            .get(name)
+            .cloned()
+            .map(|tool| self.project_tool_for_client(tool, &toolset))
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -2758,9 +2772,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let toolset = tools::shared_native::toolset(machine.config.shared_caps);
         assert_eq!(
             inspect,
-            LocalMachine::describe_tools(machine.policy_tool_router().list_all())
+            LocalMachine::describe_tools(
+                machine
+                    .policy_tool_router()
+                    .list_all()
+                    .into_iter()
+                    .map(|tool| machine.project_tool_for_client(tool, &toolset))
+            )
         );
     }
 
@@ -3590,10 +3611,9 @@ mod tests {
     fn tool_table_matches_the_advertised_router() {
         // One table drives visibility; prove it covers every route exactly once.
         let mut router = LocalMachine::all_tools();
-        tools::shared_native::canonicalize_router(
-            &mut router,
-            aw_tools::filesystem::schema::SchemaCaps::default(),
-        );
+        let toolset =
+            tools::shared_native::toolset(aw_tools::filesystem::schema::SchemaCaps::default());
+        tools::shared_native::canonicalize_router(&mut router, &toolset);
         let all: Vec<String> = router
             .list_all()
             .into_iter()
@@ -3623,6 +3643,50 @@ mod tests {
                 "jobs_read"
             ]
         );
+    }
+
+    #[test]
+    fn shared_toolset_metadata_preserves_shell_and_batch_host_contracts() {
+        let toolset =
+            tools::shared_native::toolset(aw_tools::filesystem::schema::SchemaCaps::default());
+        let router = LocalMachine::all_tools();
+
+        let shell_name = shell_tool_name();
+        let mut shell = router.get(shell_name).cloned().expect("platform shell");
+        let shell_description = shell.description.clone();
+        shell = with_profile_limits(shell, 42, 2048);
+        let shell_schema = shell.input_schema.clone();
+        tools::shared_native::apply_operation_metadata(&mut shell, &toolset);
+        let shell_operation =
+            aw_tools::operation::OperationId::from_model_name(shell_name).unwrap();
+        let shell_title = aw_tools::toolset::operation_title(shell_operation);
+        assert_eq!(shell.title.as_deref(), Some(shell_title));
+        assert_eq!(
+            shell.annotations.as_ref().and_then(|a| a.title.as_deref()),
+            Some(shell_title)
+        );
+        assert_eq!(shell.description, shell_description);
+        assert_eq!(
+            shell.input_schema["properties"]["timeout_secs"]["maximum"],
+            42
+        );
+        assert_eq!(
+            shell.input_schema["properties"]["max_output_bytes"]["maximum"],
+            2048
+        );
+        assert_eq!(shell.input_schema, shell_schema);
+
+        let mut batch = router.get("batch").cloned().expect("batch");
+        let batch_description = batch.description.clone();
+        let batch_schema = batch.input_schema.clone();
+        tools::shared_native::apply_operation_metadata(&mut batch, &toolset);
+        assert_eq!(batch.title.as_deref(), Some("Run tool Graph"));
+        assert_eq!(
+            batch.annotations.as_ref().and_then(|a| a.title.as_deref()),
+            Some("Run tool Graph")
+        );
+        assert_eq!(batch.description, batch_description);
+        assert_eq!(batch.input_schema, batch_schema);
     }
 
     /// Both HTTP entry points must use the ceiling derived from the profile, not

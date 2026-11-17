@@ -123,7 +123,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aw-tools"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=beef1bc2d2f37b5660ebe928d368bca37368e608#beef1bc2d2f37b5660ebe928d368bca37368e608"
+source = "git+https://github.com/abird-ai/aw?rev=7e6fe20a95640e32610819ce94b61a121e165dea#7e6fe20a95640e32610819ce94b61a121e165dea"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -142,7 +142,7 @@ dependencies = [
 [[package]]
 name = "aw-tools-fs-unix"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=beef1bc2d2f37b5660ebe928d368bca37368e608#beef1bc2d2f37b5660ebe928d368bca37368e608"
+source = "git+https://github.com/abird-ai/aw?rev=7e6fe20a95640e32610819ce94b61a121e165dea#7e6fe20a95640e32610819ce94b61a121e165dea"
 dependencies = [
  "aw-tools",
  "getrandom 0.3.4",
@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "aw-tools-fs-win"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=beef1bc2d2f37b5660ebe928d368bca37368e608#beef1bc2d2f37b5660ebe928d368bca37368e608"
+source = "git+https://github.com/abird-ai/aw?rev=7e6fe20a95640e32610819ce94b61a121e165dea#7e6fe20a95640e32610819ce94b61a121e165dea"
 dependencies = [
  "aw-tools",
  "getrandom 0.3.4",

@@ -16,11 +16,9 @@ use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
 
 use super::{LocalMachine, graph, ok_text, resolve_capped, tool_error};
 use crate::jobs::{
-    JobHandoff, JobOutputStream, JobWait, ProcessInput, RemoteStartDecision, RemoteStartReceipt,
+    DOTLINK_JOB_PROFILE, JobHandoff, JobOutputStream, JobWait, ProcessInput, RemoteStartDecision,
+    RemoteStartReceipt,
 };
-
-const MAX_JOB_LIST_LIMIT: usize = 256;
-const MAX_WAIT_MS: u64 = 30_000;
 
 /// Host-verified transport response windows may only narrow a caller's wait.
 /// This never changes Process/Graph execution or the Job's retained identity.
@@ -31,9 +29,18 @@ fn bounded_wait_ms(requested: u64, transport_remaining: Option<u64>) -> u64 {
 #[cfg(test)]
 #[test]
 fn wait_budget_only_narrows_by_authenticated_transport_remaining() {
-    assert_eq!(bounded_wait_ms(30_000, None), 30_000);
-    assert_eq!(bounded_wait_ms(30_000, Some(7_000)), 7_000);
-    assert_eq!(bounded_wait_ms(30_000, Some(0)), 0);
+    assert_eq!(
+        bounded_wait_ms(DOTLINK_JOB_PROFILE.get_wait_max_ms, None),
+        DOTLINK_JOB_PROFILE.get_wait_max_ms
+    );
+    assert_eq!(
+        bounded_wait_ms(DOTLINK_JOB_PROFILE.get_wait_max_ms, Some(7_000)),
+        7_000
+    );
+    assert_eq!(
+        bounded_wait_ms(DOTLINK_JOB_PROFILE.get_wait_max_ms, Some(0)),
+        0
+    );
     assert_eq!(bounded_wait_ms(0, Some(7_000)), 0);
 }
 
@@ -245,9 +252,9 @@ pub(crate) fn canonicalize_graph_router(
     }
 }
 
-pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes: usize) {
+pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
     let name = tool.name.as_ref();
-    if !matches!(name, "jobs_get" | "jobs_read" | "jobs_list") {
+    if name != "jobs_read" {
         return;
     }
     let mut schema = (*tool.input_schema).clone();
@@ -276,32 +283,6 @@ pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes:
         property.insert(
             "maximum".to_owned(),
             serde_json::Value::from(max_output_bytes),
-        );
-    }
-    if name == "jobs_get"
-        && let Some(property) = properties
-            .get_mut("tail")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        property.insert(
-            "description".to_owned(),
-            serde_json::Value::String(
-                "Combined stdout+stderr tail bytes for Process output. Defaults to 512; 0 disables; maximum 1024."
-                    .to_owned(),
-            ),
-        );
-        property.insert("minimum".to_owned(), serde_json::Value::from(0));
-        property.insert("maximum".to_owned(), serde_json::Value::from(1024));
-    }
-    if name == "jobs_list"
-        && let Some(property) = properties
-            .get_mut("limit")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        property.insert("minimum".to_owned(), serde_json::Value::from(1));
-        property.insert(
-            "maximum".to_owned(),
-            serde_json::Value::from(MAX_JOB_LIST_LIMIT),
         );
     }
     tool.input_schema = std::sync::Arc::new(schema);
@@ -667,9 +648,10 @@ impl LocalMachine {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let limit = args.limit.unwrap_or(20);
-        if !(1..=MAX_JOB_LIST_LIMIT).contains(&limit) {
+        if !(1..=DOTLINK_JOB_PROFILE.list_page_max).contains(&limit) {
             return tool_error(format!(
-                "jobs_list limit must be within 1..={MAX_JOB_LIST_LIMIT}"
+                "jobs_list limit must be within 1..={}",
+                DOTLINK_JOB_PROFILE.list_page_max
             ));
         }
         let ceiling = self
@@ -688,7 +670,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Observe one standalone Process/Graph Job or Graph node. Process output includes the last 512 raw bytes total across stdout/stderr by default; tail=0 disables output and explicit tail is capped at 1024 combined. wait_ms waits only for this target to settle or for the wait deadline. Tail peeks never ACK.",
+        description = "Observe one standalone Process/Graph Job or Graph node. wait_ms waits only for this target to settle or for the wait deadline. Process tail peeks never ACK.",
         annotations(
             title = "Get Job status",
             read_only_hint = true,
@@ -707,11 +689,20 @@ impl LocalMachine {
             Err(error) => return tool_error(error),
         };
         let wait_ms = args.wait_ms.unwrap_or(0);
-        if wait_ms > MAX_WAIT_MS {
-            return tool_error(format!("jobs_get wait_ms exceeds {MAX_WAIT_MS}"));
+        if wait_ms > DOTLINK_JOB_PROFILE.get_wait_max_ms {
+            return tool_error(format!(
+                "jobs_get wait_ms exceeds {}",
+                DOTLINK_JOB_PROFILE.get_wait_max_ms
+            ));
         }
-        if args.tail.is_some_and(|tail| tail > 1024) {
-            return tool_error("jobs_get tail exceeds 1024 combined bytes");
+        if args
+            .tail
+            .is_some_and(|tail| tail > DOTLINK_JOB_PROFILE.get_tail_max)
+        {
+            return tool_error(format!(
+                "jobs_get tail exceeds {} combined bytes",
+                DOTLINK_JOB_PROFILE.get_tail_max
+            ));
         }
         let wait_ms = bounded_wait_ms(wait_ms, self.request_sync_budget_millis(&context));
         let result_budget = self
@@ -752,8 +743,11 @@ impl LocalMachine {
         Parameters(args): Parameters<JobsReadArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        if args.wait_ms.unwrap_or(0) > MAX_WAIT_MS {
-            return tool_error(format!("jobs_read wait_ms exceeds {MAX_WAIT_MS}"));
+        if args.wait_ms.unwrap_or(0) > DOTLINK_JOB_PROFILE.read_wait_max_ms {
+            return tool_error(format!(
+                "jobs_read wait_ms exceeds {}",
+                DOTLINK_JOB_PROFILE.read_wait_max_ms
+            ));
         }
         let reference = match parse_ref(&args.reference) {
             Ok(reference) => reference,
@@ -1152,6 +1146,18 @@ impl LocalMachine {
 mod tests {
     use super::*;
 
+    fn test_toolset() -> aw_tools::toolset::Toolset {
+        crate::mcp::tools::shared_native::toolset(
+            aw_tools::filesystem::schema::SchemaCaps::default(),
+        )
+    }
+
+    fn project_job_tool(mut tool: Tool, max_output_bytes: usize) -> Tool {
+        with_job_limits(&mut tool, max_output_bytes);
+        crate::mcp::tools::shared_native::apply_operation_metadata(&mut tool, &test_toolset());
+        tool
+    }
+
     #[test]
     fn standalone_refs_are_explicit_and_node_coordinates_are_canonical() {
         assert_eq!(
@@ -1175,11 +1181,13 @@ mod tests {
 
     #[test]
     fn jobs_list_schema_rejects_zero_and_caps_pages() {
-        let mut list = LocalMachine::all_tools().get("jobs_list").cloned().unwrap();
-        with_job_limits(&mut list, 3600, 8 * 1024 * 1024);
+        let list = project_job_tool(
+            LocalMachine::all_tools().get("jobs_list").cloned().unwrap(),
+            8 * 1024 * 1024,
+        );
         let limit = &list.input_schema["properties"]["limit"];
         assert_eq!(limit["minimum"], 1);
-        assert_eq!(limit["maximum"], MAX_JOB_LIST_LIMIT);
+        assert_eq!(limit["maximum"], DOTLINK_JOB_PROFILE.list_page_max);
     }
 
     #[cfg(unix)]
@@ -2092,8 +2100,10 @@ mod tests {
 
     #[test]
     fn jobs_read_schema_uses_profile_result_ceiling_and_has_no_filter() {
-        let mut read = LocalMachine::all_tools().get("jobs_read").cloned().unwrap();
-        with_job_limits(&mut read, 3600, 8 * 1024 * 1024);
+        let read = project_job_tool(
+            LocalMachine::all_tools().get("jobs_read").cloned().unwrap(),
+            8 * 1024 * 1024,
+        );
         let output_limit = &read.input_schema["properties"]["limit"];
         assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
         assert!(
@@ -2106,8 +2116,10 @@ mod tests {
 
     #[test]
     fn jobs_get_schema_advertises_combined_tail_bounds() {
-        let mut get = LocalMachine::all_tools().get("jobs_get").cloned().unwrap();
-        with_job_limits(&mut get, 3600, 8 * 1024 * 1024);
+        let get = project_job_tool(
+            LocalMachine::all_tools().get("jobs_get").cloned().unwrap(),
+            8 * 1024 * 1024,
+        );
         let tail = &get.input_schema["properties"]["tail"];
         assert_eq!(tail["minimum"], 0);
         assert_eq!(tail["maximum"], 1024);

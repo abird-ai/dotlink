@@ -46,14 +46,14 @@ url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 # Exact reviewed shared-tools revision. Dotlink must remain standalone: no sibling path dependency.
-aw-tools = { git = "https://github.com/abird-ai/aw", rev = "beef1bc2d2f37b5660ebe928d368bca37368e608", default-features = false, features = ["conformance", "durable"] }
+aw-tools = { git = "https://github.com/abird-ai/aw", rev = "7e6fe20a95640e32610819ce94b61a121e165dea", default-features = false, features = ["conformance", "durable"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-aw-tools-fs-unix = { git = "https://github.com/abird-ai/aw", rev = "beef1bc2d2f37b5660ebe928d368bca37368e608" }
+aw-tools-fs-unix = { git = "https://github.com/abird-ai/aw", rev = "7e6fe20a95640e32610819ce94b61a121e165dea" }
 
 [target.'cfg(windows)'.dependencies]
-aw-tools-fs-win = { git = "https://github.com/abird-ai/aw", rev = "beef1bc2d2f37b5660ebe928d368bca37368e608" }
+aw-tools-fs-win = { git = "https://github.com/abird-ai/aw", rev = "7e6fe20a95640e32610819ce94b61a121e165dea" }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
 
 [dev-dependencies]

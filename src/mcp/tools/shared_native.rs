@@ -9,6 +9,8 @@ use aw_tools::{
         schema::{SchemaCaps, Tool as CoreTool},
     },
     media::MediaKind,
+    operation::OperationId,
+    toolset::{ReceiptProfile, Toolset},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
@@ -77,10 +79,22 @@ pub(crate) fn caps(max_read: usize, max_write: usize) -> Result<SchemaCaps, &'st
     .validate()
 }
 
-fn annotation(action: Action) -> ToolAnnotations {
+/// Dotlink-selected shared catalog profile. Receipt timestamps/checkpoint
+/// guidance stay disabled until dotlink has a typed shared receipt projection;
+/// never decorate existing free-form MCP results by parsing text.
+pub(crate) fn toolset(caps: SchemaCaps) -> Toolset {
+    Toolset::builder()
+        .filesystem(caps)
+        .jobs(crate::jobs::DOTLINK_JOB_PROFILE)
+        .receipts(ReceiptProfile::default())
+        .build()
+        .expect("dotlink shared Toolset profile is valid")
+}
+
+fn annotation(action: Action, title: String) -> ToolAnnotations {
     let read = action == Action::Read;
     ToolAnnotations::from_raw(
-        None,
+        Some(title),
         Some(read),
         Some(matches!(
             action,
@@ -94,15 +108,53 @@ fn annotation(action: Action) -> ToolAnnotations {
     )
 }
 
-pub(crate) fn projected_tool(core: CoreTool, caps: SchemaCaps) -> Tool {
-    let schema = aw_tools::filesystem::schema::spec(core, caps);
-    let parameters = schema
+pub(crate) fn projected_tool(core: CoreTool, toolset: &Toolset) -> Tool {
+    let descriptor = toolset
+        .filesystem_descriptor(core)
+        .expect("dotlink canonical filesystem tool is enabled");
+    let action = aw_tools::filesystem::schema::spec(core, toolset.schema_caps()).action;
+    let parameters = descriptor
         .parameters
         .as_object()
         .cloned()
         .expect("canonical tool schema is an object");
-    Tool::new(schema.name, schema.description, Arc::new(parameters))
-        .with_annotations(annotation(schema.action))
+    Tool::new(
+        descriptor.name,
+        descriptor.description,
+        Arc::new(parameters),
+    )
+    .with_title(descriptor.title.clone())
+    .with_annotations(annotation(action, descriptor.title))
+}
+
+/// Apply shared metadata to host-owned non-filesystem operations after the
+/// host has projected its dynamic schema limits. This never changes routing,
+/// authority or execution; host descriptions and schema shape are preserved.
+pub(crate) fn apply_operation_metadata(tool: &mut Tool, toolset: &Toolset) {
+    let Some(operation) = OperationId::from_model_name(tool.name.as_ref()) else {
+        return;
+    };
+    if matches!(operation, OperationId::Fs(_)) {
+        return;
+    }
+    let descriptor = toolset
+        .describe_operation(
+            operation,
+            serde_json::Value::Object((*tool.input_schema).clone()),
+            tool.description.as_deref().unwrap_or(""),
+        )
+        .expect("dotlink operation schema is compatible with the shared Toolset descriptor");
+    let parameters = descriptor
+        .parameters
+        .as_object()
+        .cloned()
+        .expect("shared operation descriptor parameters are an object");
+    tool.title = Some(descriptor.title.clone());
+    tool.description = Some(descriptor.description.into());
+    tool.input_schema = Arc::new(parameters);
+    if let Some(annotations) = tool.annotations.as_mut() {
+        annotations.title = Some(descriptor.title);
+    }
 }
 
 fn fallback_route(tool: Tool) -> ToolRoute<LocalMachine> {
@@ -116,10 +168,10 @@ fn fallback_route(tool: Tool) -> ToolRoute<LocalMachine> {
     })
 }
 
-pub(crate) fn canonicalize_router(router: &mut ToolRouter<LocalMachine>, caps: SchemaCaps) {
+pub(crate) fn canonicalize_router(router: &mut ToolRouter<LocalMachine>, toolset: &Toolset) {
     let mut seen = BTreeSet::new();
     for core in CoreTool::ALL {
-        let projected = projected_tool(core, caps);
+        let projected = projected_tool(core, toolset);
         let name = core.name();
         seen.insert(name);
         if let Some(route) = router.map.get_mut(name) {
@@ -794,18 +846,34 @@ mod tests {
     }
 
     #[test]
-    fn projected_default_schemas_are_exact_shared_schemas() {
+    fn projected_default_schemas_and_metadata_are_exact_shared_toolset() {
         let caps = SchemaCaps::default();
+        let toolset = toolset(caps);
         for core in CoreTool::ALL {
-            let projected = projected_tool(core, caps);
-            let canonical = aw_tools::filesystem::schema::spec(core, caps);
+            let projected = projected_tool(core, &toolset);
+            let canonical = toolset.filesystem_descriptor(core).unwrap();
             assert_eq!(
                 serde_json::Value::Object(projected.input_schema.as_ref().clone()),
                 canonical.parameters,
                 "{}",
                 core.name()
             );
+            assert_eq!(projected.title.as_deref(), Some(canonical.title.as_str()));
+            assert_eq!(
+                projected.description.as_deref(),
+                Some(canonical.description.as_str())
+            );
+            assert_eq!(
+                projected
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.title.as_deref()),
+                Some(canonical.title.as_str())
+            );
         }
+        assert!(!toolset.receipt_profile().unix_ts);
+        assert_eq!(toolset.receipt_profile().checkpoint_minutes, None);
+        assert_eq!(toolset.jobs_profile(), crate::jobs::DOTLINK_JOB_PROFILE);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Base dotlink: `5c610279dfd266d33712ad5732e53ca489147ca3`
 AW initial pin: `0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
-Current reviewed AW pin: `beef1bc2d2f37b5660ebe928d368bca37368e608`
+Current reviewed AW pin: `7e6fe20a95640e32610819ce94b61a121e165dea`
 Dependency: [AW plan](../../../../aw/.agents/plans/ai-native-tool-output-grep-2026-11-15/README.md).
 
 ## Committed
@@ -38,6 +38,40 @@ Dependency: [AW plan](../../../../aw/.agents/plans/ai-native-tool-output-grep-20
   stays in AW, and replay/guard-revocation cleanup remains dotlink host policy.
 - [x] This repin and the existing D1–D4 source/docs form one reviewed owned
   checkpoint. Push/version/release/signing remain separate actions.
+
+## Shared Toolset metadata adoption — 2026-11-18 (B6 follow-up)
+
+- [x] Dotlink now builds one shared immutable `Toolset` from its existing
+  filesystem caps and one `DOTLINK_JOB_PROFILE`. Canonical filesystem MCP
+  schemas now carry the exact shared titles/descriptions/argument docs; finite
+  `jobs_list/get/read/ack/send/cancel` metadata goes through
+  `Toolset::describe_operation`.
+- [x] Runtime and advertised Job defaults share the same profile:
+  `jobs_get.tail=512` by default / 1024 max, get/read wait max 30 s, list max
+  256. This does not alter JobManager, output owners, ACK/Finish, replay,
+  sandbox or transport authority.
+- [x] Dotlink intentionally selects `ReceiptProfile::default()`: no timestamp
+  or advisory checkpoint metadata yet. Existing compact MCP strings are not
+  parsed into pseudo-typed shared receipts.
+- [x] Structural conformance still compares the linked AW schema exactly except
+  for recursively stripped `description` fields; a separate regression checks
+  exact shared Toolset title/description/annotation metadata. This keeps
+  documentation overlays from weakening semantic-schema drift detection.
+- [x] First provider run exposed a real shared descriptor omission:
+  `jobs_list.limit` max was shared but its runtime `minimum=1` was not.
+  AW published `7e6fe20a95640e32610819ce94b61a121e165dea` owns it
+  centrally while preserving stricter host minima; dotlink is repinned to that
+  exact revision and the temporary local shim is removed.
+- [x] Shell/PowerShell/Batch now use the same shared descriptor metadata after
+  host dynamic schema limits; dotlink descriptions and dynamic shell
+  timeout/output bounds remain unchanged. Inspection, `list_tools`, and
+  `get_tool` share the same canonical title projection.
+- [x] Qualification on published AW `7e6fe20`: all-target/all-feature locked
+  check green; binary **685 passed / 1 ignored**; integrations **36/36**
+  (stdio **6/6** plus 30/30 other groups); strict Clippy, fmt and diff green.
+- [x] B6 cross-product metadata/defaults decision is complete for current
+  surfaces. Timestamp/checkpoint receipts remain explicitly disabled until a
+  typed shared receipt path exists; no version/tag/release action is implied.
 
 ## Reviewed AW repin checkpoint — 2026-11-17 (`d0a3922`)
 

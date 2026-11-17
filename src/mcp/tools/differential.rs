@@ -15,6 +15,27 @@ use aw_tools::filesystem::{request, schema::Tool as CoreTool};
 use super::shared_native;
 use crate::mcp::{Capabilities, LocalMachine};
 
+fn semantic_schema(mut value: serde_json::Value) -> serde_json::Value {
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.remove("description");
+                for child in object.values_mut() {
+                    strip(child);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    strip(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(&mut value);
+    value
+}
+
 fn limits(caps: aw_tools::filesystem::schema::SchemaCaps) -> request::Limits {
     request::Limits {
         schema: caps,
@@ -58,9 +79,11 @@ fn shared_native_cutover_matches_linked_conformance() {
             .get(&vector.tool)
             .unwrap_or_else(|| panic!("dotlink did not advertise {}", vector.tool));
         assert_eq!(
-            serde_json::Value::Object(route.input_schema.as_ref().clone()),
-            vector.parameters,
-            "{} schema drifted from linked aw-tools",
+            semantic_schema(serde_json::Value::Object(
+                route.input_schema.as_ref().clone(),
+            )),
+            semantic_schema(vector.parameters.clone()),
+            "{} semantic schema drifted from linked aw-tools",
             vector.tool
         );
     }

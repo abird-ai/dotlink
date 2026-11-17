@@ -138,3 +138,33 @@ The finalized shared-tools checkpoint consumes reviewed AW follow-up `beef1bc2d2
 - No dotlink execution/owner/replay source change was required for the new AW
   invariant. The D1–D4 source/docs plus repin are one reviewed owned checkpoint;
   unrelated release-worktree state remains separate.
+
+## Shared Toolset B6 metadata checkpoint — 2026-11-18
+
+- Published dotlink `main` before this B6 checkpoint is
+  `4f343c3183d427e036a6cb1a9cc42c8a4f2c2cb4`; the B6 checkpoint consumes
+  published AW `7e6fe20a95640e32610819ce94b61a121e165dea`. Push remains a
+  separate action.
+- Canonical filesystem MCP projection now uses shared
+  `Toolset::filesystem_descriptor`, including shared title, description and
+  argument documentation. Finite Job MCP metadata uses
+  `Toolset::describe_operation`.
+- One `DOTLINK_JOB_PROFILE` now drives both runtime checks and shared metadata:
+  Process tail 512/1024, get/read wait 30 s, list max 256. Grep remains shared
+  0/128 context with default shared work budgets.
+- Receipt timestamp/checkpoint guidance remains intentionally disabled via
+  `ReceiptProfile::default()`; do not parse existing free-form MCP results to
+  synthesize typed receipts.
+- A provider-facing regression found `JobsList.limit` lacked shared
+  `minimum=1`. AW published `7e6fe20` centralizes the invariant; dotlink is
+  repinned and the temporary local lower-bound shim is removed.
+- Shared descriptor metadata now also covers Bash/PowerShell/Batch after
+  dotlink's dynamic schema-limit patching. Product descriptions and dynamic
+  timeout/output bounds are preserved; inspection, `list_tools` and
+  `get_tool` agree on canonical titles.
+- Current dotlink B6 gates: binary **685/0/1**, integrations **36/36**, locked
+  all-target/all-feature check, strict Clippy, fmt and diff green. No runtime
+  authority, replay, output-owner, sandbox or transport behavior changed.
+- B6 is complete for current product surfaces. Receipt timestamp/checkpoint
+  metadata remains deliberately disabled pending a typed factual receipt path.
+  Version/tag/release/deploy remain separate.

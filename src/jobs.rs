@@ -42,6 +42,7 @@ use aw_tools::filesystem::{
     },
     status::Primary as SharedPrimary,
 };
+use aw_tools::toolset::JobProfile;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::FutureExt as _;
 use rmcp::{
@@ -66,6 +67,15 @@ use crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM;
 
 const MAX_ACTIVE_JOBS: usize = 32;
 pub(crate) const MAX_RETAINED_JOBS: usize = 256;
+/// Dotlink's model-facing finite Job defaults. The same values drive the
+/// shared Toolset metadata and the runtime guards below.
+pub(crate) const DOTLINK_JOB_PROFILE: JobProfile = JobProfile {
+    get_tail_default: 512,
+    get_tail_max: 1024,
+    get_wait_max_ms: 30_000,
+    read_wait_max_ms: 30_000,
+    list_page_max: 256,
+};
 const SHARED_MAX_RETAINED_JOBS: usize = MAX_RETAINED_JOBS + MAX_REQUEST_REPLAYS;
 /// Transport-owned hidden state is separate from ordinary user-visible job
 /// retention. Request-key replay mappings plus positive-delivery cleanup-only
@@ -2887,10 +2897,10 @@ impl JobManager {
         _observed_revision: Option<u64>,
         wait_ms: u64,
     ) -> JobResult<String> {
-        const MAX_WAIT_MS: u64 = 30_000;
-        if wait_ms > MAX_WAIT_MS {
+        if wait_ms > DOTLINK_JOB_PROFILE.get_wait_max_ms {
             return Err(JobError::Unknown(format!(
-                "jobs_get wait_ms exceeds {MAX_WAIT_MS}"
+                "jobs_get wait_ms exceeds {}",
+                DOTLINK_JOB_PROFILE.get_wait_max_ms
             )));
         }
         let deadline = TokioInstant::now()
@@ -2964,12 +2974,11 @@ impl JobManager {
         status: String,
         response_ceiling: usize,
     ) -> JobResult<String> {
-        const DEFAULT_TAIL: usize = 512;
-        const MAX_TAIL: usize = 1024;
-        let tail = requested.unwrap_or(DEFAULT_TAIL);
-        if tail > MAX_TAIL {
+        let tail = requested.unwrap_or(DOTLINK_JOB_PROFILE.get_tail_default);
+        if tail > DOTLINK_JOB_PROFILE.get_tail_max {
             return Err(JobError::Unknown(format!(
-                "jobs_get tail exceeds {MAX_TAIL} combined bytes"
+                "jobs_get tail exceeds {} combined bytes",
+                DOTLINK_JOB_PROFILE.get_tail_max
             )));
         }
         if tail == 0 {
@@ -4488,10 +4497,10 @@ impl JobManager {
         base64: bool,
         wait_ms: u64,
     ) -> JobResult<String> {
-        const MAX_WAIT_MS: u64 = 30_000;
-        if wait_ms > MAX_WAIT_MS {
+        if wait_ms > DOTLINK_JOB_PROFILE.read_wait_max_ms {
             return Err(JobError::Unknown(format!(
-                "jobs_read wait_ms exceeds {MAX_WAIT_MS}"
+                "jobs_read wait_ms exceeds {}",
+                DOTLINK_JOB_PROFILE.read_wait_max_ms
             )));
         }
         if wait_ms == 0 {
@@ -4565,10 +4574,10 @@ impl JobManager {
         request: OutputPageRequest,
         wait_ms: u64,
     ) -> JobResult<String> {
-        const MAX_WAIT_MS: u64 = 30_000;
-        if wait_ms > MAX_WAIT_MS {
+        if wait_ms > DOTLINK_JOB_PROFILE.read_wait_max_ms {
             return Err(JobError::Unknown(format!(
-                "jobs_read wait_ms exceeds {MAX_WAIT_MS}"
+                "jobs_read wait_ms exceeds {}",
+                DOTLINK_JOB_PROFILE.read_wait_max_ms
             )));
         }
         if wait_ms == 0 {
