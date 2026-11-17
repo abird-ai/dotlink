@@ -3,6 +3,8 @@ Prepared: 2026-11-17 · source host pvl-l5 · Owner: @pvl
 Purpose: dotlink entrypoint into the **canonical cross-repo handoff** and exact D0–D4 dependency boundary.
 Status: documentation/handoff only; this file is not authority to commit, push, rebase, repin or release.
 
+**Post-snapshot update:** D0 is complete. AW `main` is published at `403eb8473498454a97871702ff37aaedb1de9ee1`; the reviewed shared implementation pin consumed by dotlink is its signed parent `be6d48db552fd44b9dd85364cd8734454109ce68`. Dotlink adoption is signed in `d0a392234e918bd4ec9f0fbd7ab6fe771e1eb696` with all three shared dependencies/lock entries on that SHA. Full binary qualification is **676 passed / 1 ignored**, stdio MCP **5/5**, strict Clippy/check/fmt/diff green. Historical snapshot tables below are preserved as chronology; live Git and the owning convergence TODO supersede them.
+
 **Read the full current master:**
 [AW–dotlink shared tools comprehensive handoff](../../../aw/.agents/docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md).
 
@@ -63,9 +65,9 @@ Primary dated records: `.agents/docs/RELEASE-017-OPERATIONS-PORT-2026-11-15.md` 
 
 ## 4. Work queue: D0 → D4
 
-**D0 (blocked):** AW coordinator reviewed/approved *signed AW commit* containing the current shared Job/output/wait/grep work; verify exact SHA and remote availability. The first task for a new agent is **read-only commit-readiness review**, not automatic source editing/repin. The latest separate AW plan identifies terminal-journal uncertainty/restart-source eligibility as a remaining review point. Preserve concurrent work.
+**D0 (complete):** reviewed AW implementation pin `be6d48db552fd44b9dd85364cd8734454109ce68` is signed, remotely available and consumed by all three dotlink shared dependencies/lock records. Dotlink compatibility fixes and D0 qualification are committed in `d0a3922`.
 
-**D1:** after approved AW pin, update three `aw-tools` Git deps to the same SHA; integrate shared Job get/read/tail/ACK/Finish and owner-delivery APIs through the existing dotlink adapter. Keep source/actor authorization, exact per-stream owner, Task/replay retention and authenticated remaining-window clamps.
+**D1 (next):** integrate shared Job get/read/tail/ACK/Finish and owner-delivery APIs through the existing dotlink adapter. Retire temporary duplicate host-side delivery proof only when the canonical shared owner path is fully wired and qualified. Keep source/actor authorization, exact per-stream owner, Task/replay retention and authenticated remaining-window clamps.
 
 **D2:** use shared grep file/dir context caps/parser/engine, including 0, 8, 128, invalid 129 and asymmetric explicit values; avoid duplicate grep engine. Project shared Toolset titles/descriptions to MCP with host metadata overrides.
 
@@ -104,8 +106,8 @@ L5 has on occasion externally terminated large Rust test compilation, without an
 >
 > Read in **each** repo `AGENTS.md`, `.agents/plans/README.md`, `.agents/plans/TODO.md`; then AW `.agents/docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md`, dotlink `.agents/docs/DOTLINK-AW-TOOLS-NEXT-AGENT-HANDOFF-2026-11-17.md`; AW Job/output + Toolset builder + dotlink-tool-port plan DESIGN/TODOs; dotlink aw-job-output-grep-convergence DESIGN/TODO; follow linked historical handoffs for a design's origin.
 >
-> Revalidate current Git state and three exact Cargo dependency pins. Handoff baselines: AW main `7d09d5f` with uncommitted shared Job/output/wait and journal fixes (last plan: 338/250/110 tests); dotlink main `6723e3e` (one pre-existing ahead-of-origin commit) with uncommitted Job/receipt/Task refinements but AW pins still `0a6c6a0`. Those facts may change.
+> Revalidate current Git state and three exact Cargo dependency pins. Current checkpoint: AW `main` `403eb8473498454a97871702ff37aaedb1de9ee1`, reviewed implementation pin `be6d48db552fd44b9dd85364cd8734454109ce68`; dotlink signed adoption commit `d0a392234e918bd4ec9f0fbd7ab6fe771e1eb696`, with all three AW dependencies and lock entries on `be6d48d`. Revalidate rather than assuming these remain current.
 >
-> First perform a **read-only AW shared-runtime commit-readiness review** covering latest journal uncertainty, retention/owner/ACK, event-driven waits, greps and Toolset/receipt schema; resolve only a concrete confirmed defect and run focused checks if needed. Update owning plans, report code paths/tests/blockers, pause. A reviewed signed AW commit and any dotlink repin remain separately authorized future actions.
+> Continue with **D1**: review the current dotlink Job get/read/ack projections against the newly pinned shared owner/delivery/range/Finish APIs, then replace only the temporary duplicate host-side proof that can now be safely delegated to shared AW. Preserve MCP Task/replay leases and current authority fences. Qualify one coherent failure boundary, update the owning plan and pause; do not jump ahead to D2–D4 unless D1 is demonstrably complete.
 
 **Full design, chronology, all post-merge checkpoints, reference map, and precise source/testing gates:** [canonical AW handoff](../../../aw/.agents/docs/AW-DOTLINK-TOOLS-FULL-COMPREHENSIVE-HANDOFF-2026-11-17.md).

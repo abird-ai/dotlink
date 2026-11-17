@@ -6,9 +6,9 @@ Dependency: [AW plan](../../../../aw/.agents/plans/ai-native-tool-output-grep-20
 
 ## Committed
 
-None.
+- [x] `d0a392234e918bd4ec9f0fbd7ab6fe771e1eb696` — `Adopt reviewed AW Job output runtime`: commits the qualified pre-pin Job/MCP corrections, repins all three shared AW dependencies and lock entries to `be6d48db552fd44b9dd85364cd8734454109ce68`, preserves exact Task/replay ownership fences, adds the required grep-cap compatibility fields, and makes shared `journal_unknown` dominate dotlink Graph completion projection.
 
-## Uncommitted
+## Open
 
 - [x] D0. AW A–G shared checkpoint qualified; signed implementation pin `be6d48db552fd44b9dd85364cd8734454109ce68` is published and all three dotlink AW dependencies/lock entries are repinned to it.
 - [ ] D1. Dotlink MCP Job get/read/ack adapters use AW native tail/range/finish APIs; no second owner.
@@ -16,13 +16,13 @@ None.
 - [~] D3. Compact output/limit and transport response-window/replay/Task-owner integration. Independent standalone settle-only `jobs_get` wait qualified on current pin; full shared output/replay/Task adoption remains open.
 - [ ] D4. Grouped qualification, independent security review for changed replay/ACK, write handoff and checkpoint.
 
-## Reviewed AW repin checkpoint — 2026-11-17 (uncommitted dotlink tree)
+## Reviewed AW repin checkpoint — 2026-11-17 (`d0a3922`)
 
 - AW signed implementation commit `be6d48db552fd44b9dd85364cd8734454109ce68` was pushed to GitHub as the direct parent of remote `main` tip `403eb8473498454a97871702ff37aaedb1de9ee1`; remote availability was verified before changing dotlink. The HTTPS push path on L5 has a local CA-chain problem, so publication used SSH only after the observed GitHub ED25519 host key matched GitHub's published fingerprint. TLS verification was not disabled.
 - **Exact repin:** `aw-tools`, `aw-tools-fs-unix`, and `aw-tools-fs-win` in `Cargo.toml` plus all three `Cargo.lock` source records now use exactly `be6d48d`. The lockfile was reconstructed from the pre-repin lock and changed only those three source URLs; opportunistic unrelated `windows-sys` resolver churn was explicitly discarded.
 - **Required compatibility fixes:** dotlink's `SchemaCaps` projection now supplies the canonical grep context contract (`default=0`, `max=128`). `JobCompletion::from_shared_graph` now treats `Snapshot::journal_unknown` as uncertainty even when the local terminal summary is otherwise known, preventing false Completed/Cancelled publication. The existing direct `SharedSnapshot` test fixture was updated and now covers a known-summary + journal-unknown case.
 - **Qualification on the reviewed pin:** locked/offline `cargo check` passes; shared-native focused tests **17/17**; Job/MCP Job focused tests **116/116**; real stdio MCP integration **5/5**; full binary suite with explicit Bash fixture **676 passed / 1 ignored / 0 failed**. Strict `cargo clippy --offline --locked --all-targets --jobs 1 -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` pass. The first full-suite attempt had only two environment fixture failures (`Graph shell tests require bash`); rerun with `AW_BASH=$(command -v bash)` was fully green.
-- **Boundary:** this closes D0 and establishes the dependency foundation only. It does not claim D1 shared owner/tail/range/Finish adoption, D2 grep execution/schema qualification, D3 transport/Task/replay convergence, or D4 security/release completion. No dotlink commit, push, version bump, release or separate-worktree change was performed.
+- **Boundary:** this closes D0 and establishes the dependency foundation only. It does not claim D1 shared owner/tail/range/Finish adoption, D2 grep execution/schema qualification, D3 transport/Task/replay convergence, or D4 security/release completion. The implementation is signed in `d0a3922`; version bump, release and separate-worktree changes remain out of scope.
 
 ## AW dependency checkpoint — 2026-11-16
 
