@@ -3,6 +3,7 @@
 ## Active
 
 - [~] P1 DL-060 — @pvl — [details](dotlink-handoff-2026-10-01/TODO.md)
+- [~] P1 017-main-shared-consumer-backport-2026-11-18 — @pvl — Consume AW shared process/Job/Task/MCP semantics and mirror dotlink v0.17.4 with sandbox deferred — [details](017-main-shared-consumer-backport-2026-11-18/README.md)
 - [!] P2 DL-110 — @agent — Remediation committed; native Windows/macOS and Bubblewrap smoke checks blocked in connector — [details](dotlink-reliability-2026-10-26/README.md)
 - [!] P2 DL-120 — @agent — All seven review fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-recovery-2026-10-26/README.md)
 - [!] P2 DL-130 — @agent — Runtime/OAuth fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-live-credentials-2026-10-26/README.md)
@@ -12,6 +13,7 @@
 
 ## Icebox
 
+- [ ] 017-sandbox-consumer-deferred-2026-11-18 — @pvl — Designed/frozen dotlink config-v13/generic-mount consumer; do not implement until explicitly promoted — [details](017-sandbox-consumer-deferred-2026-11-18/README.md)
 - [ ] P2 DL-150 — AI-native, token-efficient tool core; v1 + v2 canonical Job/Graph/runtime design fully sealed after a second correctness/security/edge-case review, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)
 
 - [ ] P2 aw-job-output-grep-convergence-2026-11-15 — Dotlink MCP/Job/grep adapter after AW shared checkpoint — [details](aw-job-output-grep-convergence-2026-11-15/README.md)
