@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use crate::jobs::CancelOrigin;
+use crate::shell_process::{KillReason, StopCause, StopOutcome, StopTrace};
 use anyhow::{Context, Result};
 use rmcp::{
     ErrorData as McpError,
@@ -2285,12 +2287,17 @@ impl LocalMachine {
                         network: runtime.config.allow_network,
                         timeout_secs,
                     };
+                    // Built unconditionally: verbosity can be cycled at runtime, so
+                    // deciding at capture time would make the record depend on when
+                    // the operator pressed `v`. The gate stays at the log line.
+                    let stop_trace = StopTrace::new(runtime.config.log.clone(), job.id.clone());
                     let completion = LocalMachine::run_shell_job(
                         command,
                         args.stdin,
                         deadline,
                         job,
                         result_context,
+                        stop_trace,
                     )
                     .await;
                     drop(operation_guard);
@@ -2300,12 +2307,64 @@ impl LocalMachine {
         })
     }
 
+    /// The vocabulary for a cancellation: a caller who cancelled their own job
+    /// and a connector withdrawing the work are different facts in the result.
+    fn cancel_reason(origin: CancelOrigin) -> KillReason {
+        match origin {
+            CancelOrigin::Caller => KillReason::Cancel,
+            CancelOrigin::Connector => KillReason::Shutdown,
+        }
+    }
+
+    /// What a failure may say about the stop it follows. A tree that is already
+    /// stopped keeps the cause it was stopped with, so a later spool error cannot
+    /// relabel a timeout as a failure; a command that already ended is being cleaned
+    /// up, which the log names and no result claims.
+    fn failure_stop(
+        tree: &mut crate::shell_process::Guard,
+        cause: Option<StopCause>,
+        command_exited: bool,
+    ) -> Option<StopCause> {
+        // A live tree has already been stopped by whoever reported the failure —
+        // `terminate` is idempotent, so a second call could not claim anything.
+        if !command_exited {
+            return cause;
+        }
+        // Only the command's leftovers are left to tidy up, and tidy-up is not a
+        // stop of the command: the guard records it, a result never claims it.
+        tree.terminate(KillReason::Cleanup);
+        None
+    }
+
+    /// One internal failure of the output path. The command's status, the stop the
+    /// failure followed and the terminal it reached all come from the same run, and
+    /// the streams are re-read from the spool because the collector that failed
+    /// cannot be trusted. Every such site goes through here, so no surface can
+    /// carry a different subset of the facts.
+    fn spool_failure(
+        tree: &mut crate::shell_process::Guard,
+        facts: FailureFacts<'_>,
+        error: String,
+        job: &JobHandle,
+        context: JobResultContext,
+    ) -> JobCompletion {
+        let stop = Self::failure_stop(tree, facts.stop, facts.exit_status.is_some());
+        FailureFacts { stop, ..facts }
+            .apply(JobCompletion::internal_failed(
+                error,
+                stream_summary_from_file(&job.stdout_path, true),
+                stream_summary_from_file(&job.stderr_path, true),
+            ))
+            .with_context(context)
+    }
+
     async fn run_shell_job(
         mut command: Command,
         stdin_text: Option<String>,
         deadline: Instant,
         job: JobHandle,
         result_context: JobResultContext,
+        stop_trace: StopTrace,
     ) -> JobCompletion {
         if Instant::now() >= deadline {
             return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
@@ -2317,36 +2376,60 @@ impl LocalMachine {
                 return JobCompletion::failed(error.to_string()).with_context(result_context);
             }
         };
-        let mut process_tree = match crate::shell_process::Guard::attach(&child) {
+        let mut process_tree = match crate::shell_process::Guard::attach(&child, stop_trace.clone())
+        {
             Ok(group) => group,
             Err(error) => {
-                Self::terminate_child(&mut child).await;
+                // The child exists and we are about to kill it, so this is a
+                // connector stop. No guard exists yet, so the kill is the child
+                // handle's; a command that had already finished was not stopped by
+                // it, so it claims nothing.
+                let reaped = Self::terminate_child(&mut child).await;
+                let claimed = reaped.kill_alone_ended_it();
+                let outcome = if claimed {
+                    StopOutcome::Delivered
+                } else {
+                    StopOutcome::AlreadyGone
+                };
+                stop_trace.stopped(KillReason::Failed, outcome);
                 return JobCompletion::failed(format!("could not contain command tree: {error}"))
+                    .with_stop(claimed.then_some(StopCause::Failed))
                     .with_context(result_context);
             }
         };
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let claimed = process_tree.terminate(KillReason::Failed);
+                let reaped = Self::terminate_child(&mut child).await;
+                let cause = reaped.claim(claimed);
                 return JobCompletion::failed("failed to capture child stdout")
+                    .with_stop(cause)
                     .with_context(result_context);
             }
         };
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let claimed = process_tree.terminate(KillReason::Failed);
+                let reaped = Self::terminate_child(&mut child).await;
+                let cause = reaped.claim(claimed);
                 return JobCompletion::failed("failed to capture child stderr")
+                    .with_stop(cause)
                     .with_context(result_context);
             }
         };
         let Some([stdout_writer, stderr_writer]) = job.begin_spool_writers() else {
-            process_tree.terminate();
-            Self::terminate_child(&mut child).await;
+            // Only the connector seals a writer account (shutdown, restart,
+            // authority replacement): a caller's cancel just sets the token, so a
+            // command that cannot register its writers is being torn down with
+            // the connector. Reading the recorded origin here would race the
+            // seal, which deliberately happens first.
+            let claimed = process_tree.terminate(KillReason::Shutdown);
+            let reaped = Self::terminate_child(&mut child).await;
+            let cause = reaped.claim(claimed);
             return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_stop(cause)
                 .with_context(result_context);
         };
         let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
@@ -2371,10 +2454,12 @@ impl LocalMachine {
                     (Some(task), Some(rx))
                 }
                 None => {
-                    process_tree.terminate();
-                    Self::terminate_child(&mut child).await;
+                    let claimed = process_tree.terminate(KillReason::Failed);
+                    let reaped = Self::terminate_child(&mut child).await;
+                    let cause = reaped.claim(claimed);
                     abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
                     return JobCompletion::failed("failed to capture child stdin")
+                        .with_stop(cause)
                         .with_context(result_context);
                 }
             },
@@ -2426,36 +2511,89 @@ impl LocalMachine {
         let mut exit_status = None;
         let mut terminal = JobStatus::Completed;
         let mut terminal_error = None;
+        let mut stop: Option<StopCause> = None;
+        // Set when a status arrived after the execution deadline had passed, so
+        // the output-collection window is measured from now rather than from a
+        // deadline that has already fired.
+        let mut output_grace_refreshed = false;
         match outcome {
             WaitOutcome::Child(Ok(status)) => exit_status = Some(status),
             WaitOutcome::Child(Err(error)) => {
                 terminal = JobStatus::Failed;
                 terminal_error = Some(error.to_string());
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let claimed = process_tree.terminate(KillReason::Failed);
+                let reaped = Self::terminate_child(&mut child).await;
+                stop = reaped.claim(claimed);
             }
-            WaitOutcome::Timeout => {
-                terminal = JobStatus::TimedOut;
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
-            }
-            WaitOutcome::Cancelled => {
-                terminal = JobStatus::Cancelled;
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+            WaitOutcome::Timeout | WaitOutcome::Cancelled => {
+                let deadline = matches!(outcome, WaitOutcome::Timeout);
+                // The select is biased, so a command that exited in the same turn
+                // as its deadline would otherwise be reported as stopped. Its own
+                // status wins, and the output grace is refreshed because the
+                // execution deadline has already passed.
+                let finished = match child.try_wait() {
+                    Ok(Some(status)) => Some(status),
+                    _ => None,
+                };
+                let finished = match finished {
+                    Some(status) => Some(status),
+                    None => {
+                        let reason = if deadline {
+                            KillReason::Timeout
+                        } else {
+                            Self::cancel_reason(job.cancel.origin())
+                        };
+                        let claimed = process_tree.terminate(reason);
+                        let reaped = Self::terminate_child(&mut child).await;
+                        // The group signal is the stop. A status the command
+                        // produced itself overrides it: we did not stop it,
+                        // whatever the signal did to the tree behind it. Whether
+                        // the follow-up child kill was accepted is deliberately
+                        // not evidence here — the group termination already ended
+                        // that child, so on Windows the second kill is rejected
+                        // and its delivery proves nothing either way.
+                        match reaped.status {
+                            Some(status) if Self::ended_on_its_own(&status) => {
+                                stop = None;
+                                Some(status)
+                            }
+                            _ => {
+                                stop = claimed;
+                                terminal = if deadline {
+                                    JobStatus::TimedOut
+                                } else {
+                                    JobStatus::Cancelled
+                                };
+                                None
+                            }
+                        }
+                    }
+                };
+                if let Some(status) = finished {
+                    exit_status = Some(status);
+                    output_grace_refreshed = true;
+                }
             }
             WaitOutcome::StdinFailure(message) => {
                 terminal = JobStatus::Failed;
                 terminal_error = Some(message);
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let claimed = process_tree.terminate(KillReason::Failed);
+                let reaped = Self::terminate_child(&mut child).await;
+                stop = reaped.claim(claimed);
             }
         }
         if let Some(task) = stdin_task.take() {
             task.abort();
         }
+        // Everything a result may still say about how the command ended is final
+        // here, so a failure past this point reports this one set of facts.
+        let facts = FailureFacts {
+            exit_status: exit_status.as_ref(),
+            stop,
+            terminal,
+        };
 
-        let collect_deadline = if terminal == JobStatus::Completed {
+        let collect_deadline = if terminal == JobStatus::Completed && !output_grace_refreshed {
             deadline
         } else {
             Instant::now() + TIMEOUT_OUTPUT_GRACE
@@ -2471,59 +2609,59 @@ impl LocalMachine {
                 let stdout = match stdout_result {
                     Ok(Ok(summary)) => summary,
                     Ok(Err(error)) => {
-                        process_tree.terminate();
-                        return JobCompletion::internal_failed(
+                        return Self::spool_failure(
+                            &mut process_tree,
+                            facts,
                             format!("failed spooling stdout: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
-                        )
-                        .with_context(result_context);
+                            &job,
+                            result_context,
+                        );
                     }
                     Err(error) => {
-                        process_tree.terminate();
-                        return JobCompletion::internal_failed(
+                        return Self::spool_failure(
+                            &mut process_tree,
+                            facts,
                             format!("stdout spool task failed: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
-                        )
-                        .with_context(result_context);
+                            &job,
+                            result_context,
+                        );
                     }
                 };
                 let stderr = match stderr_result {
                     Ok(Ok(summary)) => summary,
                     Ok(Err(error)) => {
-                        process_tree.terminate();
-                        return JobCompletion::internal_failed(
+                        return Self::spool_failure(
+                            &mut process_tree,
+                            facts,
                             format!("failed spooling stderr: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
-                        )
-                        .with_context(result_context);
+                            &job,
+                            result_context,
+                        );
                     }
                     Err(error) => {
-                        process_tree.terminate();
-                        return JobCompletion::internal_failed(
+                        return Self::spool_failure(
+                            &mut process_tree,
+                            facts,
                             format!("stderr spool task failed: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
-                        )
-                        .with_context(result_context);
+                            &job,
+                            result_context,
+                        );
                     }
                 };
                 (stdout, stderr)
             }
             Err(_) if terminal == JobStatus::Completed => {
                 abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
-                process_tree.terminate();
-                return JobCompletion::internal_failed(
+                return Self::spool_failure(
+                    &mut process_tree,
+                    facts,
                     format!(
                         "collecting command output timed out after {} seconds",
                         result_context.timeout_secs
                     ),
-                    stream_summary_from_file(&job.stdout_path, true),
-                    stream_summary_from_file(&job.stderr_path, true),
-                )
-                .with_context(result_context);
+                    &job,
+                    result_context,
+                );
             }
             Err(_) => {
                 abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
@@ -2542,27 +2680,121 @@ impl LocalMachine {
                 // been collected successfully, matching synchronous shell.
                 process_tree.disarm();
                 JobCompletion::completed(status.code(), status.success(), stdout, stderr)
+                    .with_signal(Self::exit_signal(&status))
                     .with_context(result_context)
             }
-            JobStatus::TimedOut => {
-                JobCompletion::timed_out(stdout, stderr).with_context(result_context)
-            }
-            JobStatus::Cancelled => {
-                JobCompletion::cancelled(stdout, stderr).with_context(result_context)
-            }
+            JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)
+                .with_stop(stop)
+                .with_context(result_context),
+            JobStatus::Cancelled => JobCompletion::cancelled(stdout, stderr)
+                .with_stop(stop)
+                .with_context(result_context),
             JobStatus::Failed => JobCompletion::failed_with_output(
                 terminal_error.unwrap_or_else(|| "shell job failed".to_owned()),
                 stdout,
                 stderr,
             )
+            .with_stop(stop)
             .with_context(result_context),
             JobStatus::Running => unreachable!(),
         }
     }
 
-    async fn terminate_child(child: &mut tokio::process::Child) {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    /// Signal that ended the waited process. `code()` is `None` exactly when
+    /// this is `Some`, so callers need both to tell a kill from a crash.
+    #[cfg(unix)]
+    fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal()
+    }
+
+    #[cfg(not(unix))]
+    fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+        None
+    }
+
+    /// Whether a reaped status proves the command ended before our signal
+    /// landed, so a claim on it would be a lie.
+    ///
+    /// Unix: a signalled process has no exit code, so a code proves the stop was
+    /// not ours. Windows always carries a code — its own termination uses exit
+    /// code 1 (`TerminateJobObject`, `TerminateProcess`) — so its status can
+    /// never prove that, and the guard's claim stands.
+    #[cfg(unix)]
+    fn ended_on_its_own(status: &std::process::ExitStatus) -> bool {
+        status.code().is_some()
+    }
+
+    #[cfg(not(unix))]
+    fn ended_on_its_own(_status: &std::process::ExitStatus) -> bool {
+        false
+    }
+
+    /// Kill a child and report what that proved, so a caller can tell "we ended
+    /// it" from "it had already finished".
+    async fn terminate_child(child: &mut tokio::process::Child) -> ChildStop {
+        let delivered = child.kill().await.is_ok();
+        ChildStop {
+            delivered,
+            status: child.wait().await.ok(),
+        }
+    }
+}
+
+/// What killing the waited child proved. The two facts are separate because
+/// neither alone is portable evidence: a kill can be accepted for a process that
+/// has already exited (Unix zombies), and a kill can be rejected while a status
+/// is still readable (Windows).
+struct ChildStop {
+    /// The kill was accepted, so the process was still live when it was sent.
+    delivered: bool,
+    /// The status the process was finally reaped with, when one was readable.
+    status: Option<std::process::ExitStatus>,
+}
+
+impl ChildStop {
+    /// The claim a group signal supports, given the status the child was reaped
+    /// with. A command that ended on its own was not stopped by that signal, on
+    /// the same evidence the deadline path uses.
+    fn claim(&self, cause: Option<StopCause>) -> Option<StopCause> {
+        let ended_alone = self
+            .status
+            .as_ref()
+            .is_some_and(LocalMachine::ended_on_its_own);
+        if ended_alone { None } else { cause }
+    }
+
+    /// Whether this kill alone ended the waited process — the only fact a result
+    /// may claim. Only valid where nothing else signalled the tree first: after a
+    /// process-group termination the child is already dead, so Windows rejects
+    /// the follow-up kill and delivery cannot be observed.
+    fn kill_alone_ended_it(&self) -> bool {
+        self.delivered
+            && self
+                .status
+                .as_ref()
+                .is_none_or(|status| !LocalMachine::ended_on_its_own(status))
+    }
+}
+
+/// The termination facts an internal failure can still report: the status the
+/// command was reaped with, the stop this failure followed, and the terminal the
+/// runner had reached. Grouped so every failure site applies the same set — a
+/// subset is how a result and `job_get` start disagreeing.
+#[derive(Clone, Copy)]
+struct FailureFacts<'a> {
+    exit_status: Option<&'a std::process::ExitStatus>,
+    stop: Option<StopCause>,
+    terminal: JobStatus,
+}
+
+impl FailureFacts<'_> {
+    fn apply(self, completion: JobCompletion) -> JobCompletion {
+        completion
+            .with_exit_code(self.exit_status.and_then(|status| status.code()))
+            .with_signal(self.exit_status.and_then(LocalMachine::exit_signal))
+            .with_stop(self.stop)
+            .after_terminal(self.terminal)
     }
 }
 
@@ -2721,6 +2953,84 @@ impl LocalMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launcher's own status is the only place a signal survives: an inner
+    /// command killed by a signal reaches dotlink as exit 128 + signal instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signalled_launcher_is_reported_as_a_signal_not_an_exit_code() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("kill -9 $$");
+        let status = command.spawn().unwrap().wait().await.unwrap();
+        assert_eq!(status.signal(), Some(9));
+        assert_eq!(status.code(), None);
+        assert_eq!(LocalMachine::exit_signal(&status), Some(9));
+        // A signalled status cannot prove the command ended on its own, which is
+        // what lets the guard's claim stand.
+        assert!(!LocalMachine::ended_on_its_own(&status));
+    }
+
+    /// The two cancellations keep distinct spellings in the result and the stop
+    /// line, so neither can be folded into the other.
+    #[test]
+    fn a_cancel_names_who_asked_for_it() {
+        for (origin, reason, text) in [
+            (CancelOrigin::Caller, KillReason::Cancel, "cancel"),
+            (CancelOrigin::Connector, KillReason::Shutdown, "shutdown"),
+        ] {
+            assert_eq!(LocalMachine::cancel_reason(origin), reason);
+            assert_eq!(reason.as_str(), text);
+        }
+    }
+
+    /// Only an exit that proves itself suppresses a claim. A normal exit does;
+    /// a signalled one does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_self_proving_exit_keeps_a_claim_off_the_result() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("exit 3");
+        let status = command.spawn().unwrap().wait().await.unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert!(LocalMachine::ended_on_its_own(&status));
+    }
+
+    /// Windows kill codes are ordinary exit codes, so no status there can prove
+    /// the kill was not the cause. This pins the platform fact the predicate rests
+    /// on, not just the branch it takes.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn a_windows_kill_code_proves_nothing_about_its_cause() {
+        let mut command = tokio::process::Command::new("cmd");
+        command
+            .arg("/C")
+            .arg("ping -n 30 127.0.0.1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let delivered = child.kill().await;
+        let status = child.wait().await.unwrap();
+        assert!(delivered.is_ok(), "the child must be live for this check");
+        assert_eq!(status.code(), Some(1), "a Windows kill is exit code 1");
+        assert!(!LocalMachine::ended_on_its_own(&status));
+    }
+
+    /// A crash and an external kill must not collapse into one value.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crash_and_kill_report_different_signals() {
+        let run = |cmd: &'static str| async move {
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg(cmd);
+            LocalMachine::exit_signal(&command.spawn().unwrap().wait().await.unwrap())
+        };
+        assert_eq!(run("kill -9 $$").await, Some(9));
+        // Signal numbers are not portable: SIGBUS is 7 on Linux, 10 on macOS.
+        assert_eq!(run("kill -BUS $$").await, Some(libc::SIGBUS));
+    }
     use crate::jobs::OutputPageRequest;
     use tokio::sync::RwLock;
 
@@ -3650,6 +3960,137 @@ mod tests {
         // Zero is clamped up; a degenerate ceiling still yields a positive deadline.
         assert_eq!(resolve_shell_timeout(Some(0), 3_600), 1);
         assert_eq!(resolve_shell_timeout(None, 0), 1);
+    }
+
+    /// The decision that keeps the record honest: an already-stopped tree keeps
+    /// its cause, a command that already ended is only cleaned up, and only a
+    /// real kill is claimable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_stop_keeps_the_cause_that_actually_stopped_the_tree() {
+        let mut command = tokio::process::Command::new("sh");
+        crate::shell_process::configure(&mut command);
+        command.arg("-c").arg("sleep 5");
+        let child = command.spawn().unwrap();
+        let trace = StopTrace::new(LogConfig::default(), "failure-stop");
+        let mut tree = crate::shell_process::Guard::attach(&child, trace).unwrap();
+
+        // Already stopped: a later failure must not relabel the deadline.
+        assert_eq!(
+            tree.terminate(KillReason::Timeout),
+            Some(StopCause::Timeout)
+        );
+        assert_eq!(
+            LocalMachine::failure_stop(&mut tree, Some(StopCause::Timeout), false),
+            Some(StopCause::Timeout)
+        );
+        // Disarmed: nothing to stop, so nothing is claimed.
+        assert_eq!(
+            LocalMachine::failure_stop(&mut tree, None, true),
+            None,
+            "a disarmed tree cannot be stopped again"
+        );
+    }
+
+    /// A command that already ended leaves a tree to clean up, and cleanup is not
+    /// a stop of that command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_after_an_own_exit_is_logged_but_never_claimed() {
+        let mut command = tokio::process::Command::new("sh");
+        crate::shell_process::configure(&mut command);
+        command.arg("-c").arg("sleep 5");
+        let child = command.spawn().unwrap();
+        let trace = StopTrace::new(LogConfig::default(), "cleanup");
+        let mut tree = crate::shell_process::Guard::attach(&child, trace.clone()).unwrap();
+        assert_eq!(LocalMachine::failure_stop(&mut tree, None, true), None);
+        assert_eq!(trace.reports(), vec![KillReason::Cleanup]);
+    }
+
+    /// The wiring, not the helpers: a real signalled child must reach the wire
+    /// with its signal, no stop cause and the one sentence that explains it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signalled_shell_result_reaches_the_wire_with_its_signal() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let response = machine
+            .handle_shell_call_with(
+                &CallToolRequestParams::new("bash").with_arguments(
+                    serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                        "command": "kill -9 $$",
+                        "dir": ".",
+                        "timeout_secs": 3
+                    }))
+                    .unwrap(),
+                ),
+                Some(2_000),
+                false,
+                Some("signalled-request".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("shell is handled by the durable layer");
+        let CallToolResponse::Complete(complete) = response else {
+            panic!("a self-killed command finishes inside the window")
+        };
+        let text = serde_json::to_value(complete).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["signal"], Value::from(9), "{text}");
+        assert_eq!(payload["exit_code"], Value::Null, "{text}");
+        assert!(payload.get("stopped_by").is_none(), "{text}");
+        let next = payload["next"].as_str().unwrap_or_default();
+        assert!(next.contains("outside dotlink"), "{text}");
+    }
+
+    /// A connector stop says so, and never claims a signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_shell_result_names_the_connector_stop() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let response = machine
+            .handle_shell_call_with(
+                &CallToolRequestParams::new("bash").with_arguments(
+                    serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                        "command": "sleep 5",
+                        "dir": ".",
+                        "timeout_secs": 1
+                    }))
+                    .unwrap(),
+                ),
+                Some(4_000),
+                false,
+                Some("timeout-request".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("shell is handled by the durable layer");
+        let CallToolResponse::Complete(complete) = response else {
+            panic!("a timed-out command still returns its own result")
+        };
+        let text = serde_json::to_value(complete).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["stopped_by"], Value::from("timeout"), "{text}");
+        assert!(payload.get("signal").is_none(), "{text}");
     }
 
     #[cfg(unix)]

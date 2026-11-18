@@ -223,6 +223,23 @@ pub(crate) struct JobCompletion {
     pub(crate) completed_unix: u64,
     pub(crate) status: JobStatus,
     pub(crate) exit_code: Option<i32>,
+    /// Signal that ended the waited process, on platforms that have them. Kept
+    /// separate from `exit_code` because `code()` is `None` for a signalled
+    /// process, and losing the number hides SIGKILL from a crash. `status` still
+    /// describes the lifecycle: a signalled process is a `Completed` job whose
+    /// *process* was killed, and these fields are what say how.
+    pub(crate) signal: Option<i32>,
+    /// The terminal the runner had reached when an internal failure was recorded,
+    /// so a failure behind a deadline still reports the deadline. `status` cannot
+    /// carry it: an internal failure is always `Failed` on the surface.
+    pub(crate) terminal: Option<JobStatus>,
+    /// Set only when dotlink can prove it stopped the *waited command*: it
+    /// signalled the tree and the signal was delivered. Absent means no stop is
+    /// provable — the command ended on its own, was never spawned, was stopped
+    /// from outside the connector, or the runner died in a way this record cannot
+    /// see. The stop line is the fuller account: it names tidy-ups and the
+    /// fail-safe too. Read this beside `status`, which says how the job ended.
+    pub(crate) stopped_by: Option<crate::shell_process::StopCause>,
     pub(crate) success: bool,
     pub(crate) error: Option<String>,
     pub(crate) stdout: StreamSummary,
@@ -242,6 +259,9 @@ impl JobCompletion {
             status: JobStatus::Completed,
             completed_unix: crate::mcp::now_unix(),
             exit_code,
+            signal: None,
+            stopped_by: None,
+            terminal: None,
             success,
             error: None,
             stdout,
@@ -256,6 +276,9 @@ impl JobCompletion {
             status: JobStatus::TimedOut,
             completed_unix: crate::mcp::now_unix(),
             exit_code: None,
+            signal: None,
+            stopped_by: None,
+            terminal: None,
             success: false,
             error: Some("shell job reached its requested timeout".to_owned()),
             stdout,
@@ -270,6 +293,9 @@ impl JobCompletion {
             status: JobStatus::Cancelled,
             completed_unix: crate::mcp::now_unix(),
             exit_code: None,
+            signal: None,
+            stopped_by: None,
+            terminal: None,
             success: false,
             error: Some("shell job was cancelled".to_owned()),
             stdout,
@@ -292,6 +318,9 @@ impl JobCompletion {
             status: JobStatus::Failed,
             completed_unix: crate::mcp::now_unix(),
             exit_code: None,
+            signal: None,
+            stopped_by: None,
+            terminal: None,
             success: false,
             error: Some(bounded_job_error(message)),
             stdout,
@@ -311,6 +340,9 @@ impl JobCompletion {
             status: JobStatus::Failed,
             completed_unix: crate::mcp::now_unix(),
             exit_code: None,
+            signal: None,
+            stopped_by: None,
+            terminal: None,
             success: false,
             error: Some(message.clone()),
             stdout,
@@ -318,6 +350,36 @@ impl JobCompletion {
             context: None,
             internal_error: Some(message),
         }
+    }
+
+    /// Attach the signal that ended the waited process. Only the launcher's own
+    /// status can prove it: a signalled *inner* command reaches dotlink as a
+    /// normal exit code (128 + signal) because the sandbox re-encodes it.
+    pub(crate) fn with_signal(mut self, signal: Option<i32>) -> Self {
+        self.signal = signal;
+        self
+    }
+
+    /// Attach the exit code the waited process was reaped with. A completion built
+    /// by [`Self::internal_failed`] has none of its own, but the runner still knows
+    /// it when the command had already finished, and the envelope reports it.
+    pub(crate) fn with_exit_code(mut self, exit_code: Option<i32>) -> Self {
+        self.exit_code = exit_code;
+        self
+    }
+
+    /// Record the terminal a runner had reached before an internal failure.
+    pub(crate) fn after_terminal(mut self, terminal: JobStatus) -> Self {
+        self.terminal = Some(terminal);
+        self
+    }
+
+    /// Record that dotlink signalled the tree, and why. Every constructor starts
+    /// without a stop: a completion may be built before anything is spawned, so
+    /// only the site that actually kills may claim one.
+    pub(crate) fn with_stop(mut self, cause: Option<crate::shell_process::StopCause>) -> Self {
+        self.stopped_by = cause;
+        self
     }
 
     pub(crate) fn with_context(mut self, context: JobResultContext) -> Self {
@@ -392,6 +454,59 @@ pub(crate) enum JobHandoff {
     NativeTask(Task),
 }
 
+/// Who asked for the cancellation. A caller who cancelled their own job and a
+/// connector that is going away both cancel the same token, but they mean
+/// different things to whoever reads the result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CancelOrigin {
+    Caller,
+    Connector,
+}
+
+/// One job's cancellation: the token and who asked for it, kept together so a
+/// cancel cannot be recorded without its origin. Cancellation stays private to
+/// this module, which is what makes the attribution trustworthy.
+#[derive(Clone, Debug)]
+pub(crate) struct JobCancel {
+    token: CancellationToken,
+    connector: Arc<AtomicBool>,
+}
+
+impl JobCancel {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            connector: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Who cancelled this job, as recorded by the side that did it.
+    pub(crate) fn origin(&self) -> CancelOrigin {
+        match self.connector.load(Ordering::Acquire) {
+            true => CancelOrigin::Connector,
+            false => CancelOrigin::Caller,
+        }
+    }
+
+    /// Resolves once this job is cancelled. There is no matching `cancel`: the
+    /// manager records the origin first, so callers cannot split the two.
+    pub(crate) fn cancelled(&self) -> impl Future<Output = ()> + '_ {
+        self.token.cancelled()
+    }
+
+    /// Record the origin before the token fires; the runner reads it as soon as
+    /// its `cancelled()` resolves.
+    fn cancel_as(&self, origin: CancelOrigin) {
+        self.connector
+            .store(origin == CancelOrigin::Connector, Ordering::Release);
+        self.token.cancel();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 #[derive(Debug)]
 struct JobEntry {
     id: String,
@@ -401,7 +516,7 @@ struct JobEntry {
     timeout_secs: u64,
     result_limit: usize,
     phase: JobPhase,
-    cancel: CancellationToken,
+    cancel: JobCancel,
     runner: Option<JoinHandle<()>>,
     completion: Option<JobCompletion>,
     terminal_at: Option<Instant>,
@@ -732,7 +847,7 @@ impl Drop for JobManagerInner {
             state.closed = true;
             for entry in state.jobs.values_mut() {
                 entry.spool_account.seal_writers();
-                entry.cancel.cancel();
+                entry.cancel.cancel_as(CancelOrigin::Connector);
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
                 }
@@ -775,7 +890,7 @@ struct JobFinisher {
 #[derive(Clone, Debug)]
 pub(crate) struct JobHandle {
     pub(crate) id: String,
-    pub(crate) cancel: CancellationToken,
+    pub(crate) cancel: JobCancel,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
     spool_account: Arc<SpoolAccount>,
@@ -1225,7 +1340,7 @@ impl JobManager {
         let id = Uuid::new_v4().to_string();
         let files = PendingJobFiles::create(&self.inner.root, &id)?;
         let [stdout_path, stderr_path] = files.paths.clone();
-        let cancel = CancellationToken::new();
+        let cancel = JobCancel::new();
         let notify = Arc::new(Notify::new());
         let spool_account = SpoolAccount::new(&self.inner);
         let now = chrono::Utc::now().to_rfc3339();
@@ -1291,6 +1406,12 @@ impl JobManager {
                     // Seal/quiesce before freezing the retained prefixes so a
                     // programmer bug cannot strand a permanently-working job.
                     panic_account.seal_and_wait_writers_idle().await;
+                    // A panic unwinds the runner future, and an armed guard inside
+                    // it kills its tree on the way out — but this side cannot see
+                    // whether a guard existed, and claiming a stop it cannot
+                    // observe is the one mistake this record must not make. The
+                    // stop line stays the evidence: `reason=dropped` appears there
+                    // exactly when a tree was still armed.
                     JobCompletion::internal_failed(
                         "shell job runner panicked",
                         incomplete_stream_summary(&panic_stdout),
@@ -1332,7 +1453,7 @@ impl JobManager {
         let id = Uuid::new_v4().to_string();
         let files = PendingJobFiles::create(&self.inner.root, &id)?;
         let [stdout_path, stderr_path] = files.paths.clone();
-        let cancel = CancellationToken::new();
+        let cancel = JobCancel::new();
         let spool_account = SpoolAccount::new(&self.inner);
         let now = chrono::Utc::now().to_rfc3339();
         state.jobs.insert(
@@ -1460,7 +1581,7 @@ impl JobManager {
                 // register a new writer after shutdown has observed an idle count.
                 entry.spool_account.seal_writers();
                 spool_accounts.push(entry.spool_account.clone());
-                entry.cancel.cancel();
+                entry.cancel.cancel_as(CancelOrigin::Connector);
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
                     runners.push(handle);
@@ -1517,7 +1638,7 @@ impl JobManager {
             .available_mut(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
         if !entry.status().terminal() {
-            entry.cancel.cancel();
+            entry.cancel.cancel_as(CancelOrigin::Caller);
             entry.updated_at = chrono::Utc::now().to_rfc3339();
         }
         Ok(render_status_locked(entry).to_string())
@@ -1624,7 +1745,6 @@ impl JobManager {
             JobDisposition::Compatibility => Ok(compatibility_receipt(
                 state.jobs.get(id).expect("job validated above"),
             )),
-            #[allow(unreachable_patterns)]
             JobDisposition::Synchronous | JobDisposition::NativeTask => Err(JobError::Internal(
                 anyhow!("job {id} already committed a different response representation"),
             )),
@@ -1988,7 +2108,7 @@ impl JobManager {
             return RequestRetirement::Busy;
         }
         if !entry.status().terminal() {
-            entry.cancel.cancel();
+            entry.cancel.cancel_as(CancelOrigin::Connector);
             return RequestRetirement::Busy;
         }
 
@@ -2221,7 +2341,7 @@ impl JobManager {
 
     pub(crate) fn detailed_task(&self, id: &str) -> JobResult<DetailedTask> {
         sweep_expired(&self.inner);
-        let (task, status, internal_error, snapshot) = {
+        let (task, status, internal, snapshot) = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             let entry = state
                 .available_mut(id)
@@ -2229,14 +2349,15 @@ impl JobManager {
                 .ok_or_else(|| JobError::Unknown(format!("unknown task {id}")))?;
             let task = task_from_entry(entry, self.retention());
             let status = entry.status();
-            let internal_error = entry
+            let internal = entry
                 .completion
                 .as_ref()
-                .and_then(|completion| completion.internal_error.clone());
+                .filter(|completion| completion.internal_error.is_some())
+                .cloned();
             let snapshot = if matches!(
                 status,
                 JobStatus::Completed | JobStatus::TimedOut | JobStatus::Failed
-            ) && internal_error.is_none()
+            ) && internal.is_none()
             {
                 entry.readers += 1;
                 Some(ToolResultSnapshot {
@@ -2255,15 +2376,16 @@ impl JobManager {
             } else {
                 None
             };
-            (task, status, internal_error, snapshot)
+            (task, status, internal, snapshot)
         };
         let payload = match status {
             JobStatus::Running => TaskPayload::Working,
             JobStatus::Cancelled => TaskPayload::Cancelled,
             JobStatus::Completed | JobStatus::TimedOut | JobStatus::Failed => {
-                if let Some(message) = internal_error {
+                if let Some(completion) = internal {
+                    let message = completion.internal_error.clone().unwrap_or_default();
                     TaskPayload::Failed {
-                        error: error_object(&message),
+                        error: failure_error_object(&message, &completion),
                     }
                 } else {
                     let result = crate::blocking::run(|| {
@@ -2312,12 +2434,112 @@ fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Terminal facts a shell result carries beyond `exit_code`/`success`:
+/// the signal that ended the waited process, and whether dotlink stopped it.
+/// Both are omitted when they do not apply, so ordinary results stay unchanged.
+/// Name a signal without a lookup table the caller cannot see. Unknown numbers
+/// stay numbers: a wrong name is worse than none.
+#[cfg(unix)]
+fn signal_label(signal: i32) -> String {
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGSYS => "SIGSYS",
+        _ => return format!("signal {signal}"),
+    };
+    format!("{name} (signal {signal})")
+}
+
+/// Windows has no signals to name; `exit_code` already carries the status.
+#[cfg(not(unix))]
+fn signal_label(signal: i32) -> String {
+    format!("signal {signal}")
+}
+
+/// The only prose a signalled completion gets: what the reader has to do about it.
+/// A stop dotlink performed is excluded — that one is dotlink's own doing and
+/// already carries its reason in `stopped_by`.
+///
+/// Each surface puts it in the prose slot it has: the ordinary result and an
+/// internal failure in `next` (what to do), `job_get` in `error` (why it is not a
+/// success, since its `next` is the follow-up chain). The fact and the wording
+/// stay one, so no surface can be told a different story.
+fn external_stop_note(completion: &JobCompletion) -> Option<String> {
+    let signal = completion.signal?;
+    if completion.stopped_by.is_some() {
+        return None;
+    }
+    Some(format!(
+        "terminated by {} from outside dotlink; check what signalled it before retrying",
+        signal_label(signal)
+    ))
+}
+
+fn with_termination(mut payload: Value, completion: &JobCompletion) -> Value {
+    if let Some(signal) = completion.signal {
+        payload["signal"] = Value::from(signal);
+    }
+    if let Some(cause) = completion.stopped_by {
+        payload["stopped_by"] = Value::from(cause.as_str());
+    }
+    payload
+}
+
+/// The result a caller sees for a completion whose streams cannot be trusted.
+fn internal_failure_result(completion: &JobCompletion) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(internal_failure_payload(
+        completion,
+    ))])
+}
+
+/// The envelope for a completion whose streams cannot be trusted — an internal
+/// failure is often the spool itself, so reading it would fail again. It is still
+/// the ordinary envelope, so `job_get` and this surface cannot disagree about the
+/// stop that produced it.
+fn internal_failure_payload(completion: &JobCompletion) -> String {
+    let mut payload = serde_json::json!({
+        "ts": completion.completed_unix,
+        "exit_code": completion.exit_code,
+        "success": false,
+        // An internal failure is never `TimedOut` itself; the terminal it
+        // followed is, and that is the fact to report.
+        "timed_out": completion.terminal == Some(JobStatus::TimedOut),
+        // One key says the streams are unusable; spelling out empty ones would
+        // repeat that three more times on every such failure.
+        "streams_omitted": true,
+        "error": completion.internal_error.as_deref(),
+    });
+    // Context is absent only for completions that never ran, and a null key tells
+    // a reader nothing they cannot infer from that.
+    if let Some(context) = completion.context.as_ref() {
+        payload["dir"] = serde_json::Value::from(context.dir.as_str());
+        payload["sandboxed"] = serde_json::Value::from(context.sandboxed);
+        payload["network"] = serde_json::Value::from(context.network);
+    }
+    if let Some(note) = external_stop_note(completion) {
+        payload["next"] = serde_json::Value::from(note);
+    }
+    with_termination(payload, completion).to_string()
+}
+
 fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let completion = &snapshot.completion;
-    if let Some(message) = completion.internal_error.as_deref() {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(
-            message.to_owned(),
-        )]));
+    if completion.internal_error.is_some() {
+        return Ok(internal_failure_result(completion));
     }
     let stdout_limit = usize::try_from(completion.stdout.stored_bytes)
         .unwrap_or(usize::MAX)
@@ -2341,6 +2563,14 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
                     .unwrap_or_else(|| "shell command failed before execution".to_owned()),
             )]));
         }
+        // No execution context means no runner, so no signal and no stop: these
+        // are the pre-execution completions, and the one place the termination
+        // helper is deliberately not used. Anything else here would let this
+        // surface disagree with `job_get`.
+        debug_assert!(
+            completion.signal.is_none() && completion.stopped_by.is_none(),
+            "a completion without execution context cannot carry termination facts"
+        );
         let text = serde_json::json!({
             "ts": completion.completed_unix,
             "exit_code": completion.exit_code,
@@ -2366,7 +2596,9 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     // remedy is a larger one: `background: true` changes who waits, not how long
     // the child may run.
     let next = timed_out.then_some("retry with a larger timeout_secs");
-    let text = serde_json::json!({
+    let stop_note = external_stop_note(completion);
+    let text = with_termination(
+        serde_json::json!({
         "ts": completion.completed_unix,
         "exit_code": completion.exit_code,
         "success": completion.success,
@@ -2379,8 +2611,10 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "error": error.as_deref().or(completion.error.as_deref()),
-        "next": next,
-    })
+        "next": next.or(stop_note.as_deref()),
+        }),
+        completion,
+    )
     .to_string();
     Ok(if completion.status == JobStatus::Completed {
         CallToolResult::success(vec![ContentBlock::text(text)])
@@ -2399,6 +2633,30 @@ fn error_object(message: &str) -> JsonObject {
         .as_object()
         .expect("MCP error is an object")
         .clone()
+}
+
+/// A failed task reports the same termination facts as every other surface: the
+/// error object keeps its protocol shape and carries them in `data`, which is the
+/// one place an error may put structured detail.
+fn failure_error_object(message: &str, completion: &JobCompletion) -> JsonObject {
+    let mut error = error_object(message);
+    let mut data = serde_json::Map::new();
+    data.insert("streams_omitted".to_owned(), Value::from(true));
+    if let Some(exit_code) = completion.exit_code {
+        data.insert("exit_code".to_owned(), Value::from(exit_code));
+    }
+    if completion.terminal == Some(JobStatus::TimedOut) {
+        data.insert("timed_out".to_owned(), Value::from(true));
+    }
+    if let Some(signal) = completion.signal {
+        data.insert("signal".to_owned(), Value::from(signal));
+        data.insert("signal_name".to_owned(), Value::from(signal_label(signal)));
+    }
+    if let Some(cause) = completion.stopped_by {
+        data.insert("stopped_by".to_owned(), Value::from(cause.as_str()));
+    }
+    error.insert("data".to_owned(), Value::Object(data));
+    error
 }
 
 fn result_object(result: CallToolResult) -> JsonObject {
@@ -2652,6 +2910,24 @@ fn render_status_locked(entry: &JobEntry) -> Value {
         },
     });
     payload["unacked_bytes"] = serde_json::Value::from(unacked_bytes(entry));
+    if let Some(completion) = completion {
+        payload = with_termination(payload, completion);
+        // The explanation the synchronous result carries belongs here too, even
+        // when the failure already wrote its own error: two accounts of one event
+        // beat a signal number with no story.
+        if let Some(note) = external_stop_note(completion) {
+            payload["error"] = match payload["error"].as_str() {
+                Some(existing) => Value::from(format!("{existing}; {note}")),
+                None => Value::from(note),
+            };
+        }
+        // An internal failure is always `Failed` here, so the deadline it followed
+        // would vanish; `status` already says it for every other job.
+        if entry.status() != JobStatus::TimedOut && completion.terminal == Some(JobStatus::TimedOut)
+        {
+            payload["timed_out"] = Value::from(true);
+        }
+    }
     if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_get")) {
         payload["next"] = serde_json::Value::String(next);
     }
@@ -3383,6 +3659,310 @@ pub(crate) fn spool_limit() -> u64 {
 mod tests {
     use super::*;
 
+    fn rendered(completion: &JobCompletion) -> Value {
+        with_termination(
+            serde_json::json!({ "exit_code": completion.exit_code }),
+            completion,
+        )
+    }
+
+    #[test]
+    fn ordinary_completion_carries_no_termination_fields() {
+        let completion = JobCompletion::completed(
+            Some(0),
+            true,
+            StreamSummary::default(),
+            StreamSummary::default(),
+        );
+        let payload = rendered(&completion);
+        assert_eq!(payload["exit_code"], Value::from(0));
+        assert!(payload.get("signal").is_none(), "{payload}");
+        assert!(payload.get("stopped_by").is_none(), "{payload}");
+    }
+
+    #[test]
+    fn externally_signalled_launcher_reports_the_signal_and_no_stop_cause() {
+        // What an external SIGKILL to the sandbox launcher looks like: the
+        // waited process has no exit code, it has a signal, and dotlink never
+        // asked for a stop. That combination is the whole diagnosis.
+        let completion = JobCompletion::completed(
+            None,
+            false,
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_signal(Some(9));
+        let payload = rendered(&completion);
+        assert_eq!(payload["exit_code"], Value::Null);
+        assert_eq!(payload["signal"], Value::from(9));
+        assert!(payload.get("stopped_by").is_none(), "{payload}");
+    }
+
+    #[test]
+    fn a_completion_claims_no_stop_until_a_site_kills_the_tree() {
+        // Built before anything is spawned: cancelled, timed out and failed all
+        // reach this point without a process tree to signal, so none may claim a
+        // stop. That is what makes an absent `stopped_by` mean "not us".
+        for completion in [
+            JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default()),
+            JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default()),
+            JobCompletion::failed("spawn refused"),
+        ] {
+            let payload = rendered(&completion);
+            assert!(payload.get("stopped_by").is_none(), "{payload}");
+            assert!(payload.get("signal").is_none(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn a_site_that_kills_names_the_reason_and_still_never_claims_a_signal() {
+        for (reason, text) in [
+            (crate::shell_process::StopCause::Timeout, "timeout"),
+            (crate::shell_process::StopCause::Cancel, "cancel"),
+            (crate::shell_process::StopCause::Shutdown, "shutdown"),
+            (crate::shell_process::StopCause::Failed, "failed"),
+        ] {
+            let completion =
+                JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
+                    .with_stop(Some(reason));
+            let payload = rendered(&completion);
+            assert_eq!(payload["stopped_by"], Value::from(text), "{payload}");
+            assert!(payload.get("signal").is_none(), "{payload}");
+        }
+    }
+
+    /// Naming is Unix-only, so the portable half of this surface is asserted
+    /// separately: Windows has no signal names to report.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_failed_native_task_still_carries_the_numbers_on_non_unix() {
+        let completion = JobCompletion::internal_failed(
+            "failed spooling stderr: disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_signal(Some(11))
+        .with_stop(Some(crate::shell_process::StopCause::Failed));
+        let error = failure_error_object("failed spooling stderr: disk full", &completion);
+        let data = error.get("data").expect("error carries structured detail");
+        assert_eq!(data["signal"], Value::from(11), "{data}");
+        assert_eq!(data["signal_name"], Value::from("signal 11"), "{data}");
+        assert_eq!(data["stopped_by"], Value::from("failed"), "{data}");
+    }
+
+    /// The failed-native-task surface is the newest place these facts appear, so
+    /// it needs its own assertion rather than riding on the others.
+    /// The surface a caller really reaches: `tool_result`, not the payload helper.
+    /// Reverting the renderer to a plain message would fail here.
+    #[test]
+    fn tool_result_renders_an_internal_failure_as_the_ordinary_envelope() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::internal_failed(
+                "failed spooling stdout: disk full",
+                StreamSummary::default(),
+                StreamSummary::default(),
+            )
+            .with_stop(Some(crate::shell_process::StopCause::Failed)),
+        );
+        let result = manager
+            .tool_result(&job.id, None)
+            .unwrap()
+            .expect("an internal failure still has a result");
+        let text = serde_json::to_value(&result).unwrap();
+        let payload: Value =
+            serde_json::from_str(text["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["stopped_by"], Value::from("failed"), "{payload}");
+        assert_eq!(payload["streams_omitted"], Value::from(true), "{payload}");
+        assert_eq!(payload["success"], Value::from(false), "{payload}");
+    }
+
+    /// The result a caller actually receives for an internal failure, not just
+    /// the payload helper underneath it.
+    #[test]
+    fn an_internal_failure_result_is_an_error_carrying_its_stop() {
+        let completion = JobCompletion::internal_failed(
+            "failed spooling stdout: disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_stop(Some(crate::shell_process::StopCause::Failed));
+        let result = internal_failure_result(&completion);
+        let text = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            text["isError"],
+            Value::from(true),
+            "an internal failure is a tool error"
+        );
+        let payload: Value =
+            serde_json::from_str(text["content"][0]["text"].as_str().expect("text content"))
+                .unwrap();
+        assert_eq!(payload["stopped_by"], Value::from("failed"), "{payload}");
+        assert_eq!(payload["streams_omitted"], Value::from(true), "{payload}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_native_task_carries_the_termination_facts_in_its_error_data() {
+        let completion = JobCompletion::internal_failed(
+            "failed spooling stderr: disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_exit_code(Some(3))
+        .with_signal(Some(11))
+        .with_stop(Some(crate::shell_process::StopCause::Failed))
+        .after_terminal(JobStatus::TimedOut);
+        let error = failure_error_object("failed spooling stderr: disk full", &completion);
+        let data = error.get("data").expect("error carries structured detail");
+        assert_eq!(data["exit_code"], Value::from(3), "{data}");
+        assert_eq!(data["timed_out"], Value::from(true), "{data}");
+        assert_eq!(data["signal"], Value::from(11), "{data}");
+        assert_eq!(
+            data["signal_name"],
+            Value::from("SIGSEGV (signal 11)"),
+            "{data}"
+        );
+        assert_eq!(data["stopped_by"], Value::from("failed"), "{data}");
+        assert_eq!(data["streams_omitted"], Value::from(true), "{data}");
+    }
+
+    #[test]
+    fn an_internal_failure_renders_the_same_termination_fields() {
+        // The spool failed, so the streams cannot be trusted, but the stop claim
+        // must still render here — otherwise `job_get` and this result would
+        // describe one completion differently.
+        let completion = JobCompletion::internal_failed(
+            "failed spooling stdout: disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_stop(Some(crate::shell_process::StopCause::Failed));
+        let payload: Value = serde_json::from_str(&internal_failure_payload(&completion)).unwrap();
+        assert_eq!(payload["stopped_by"], Value::from("failed"), "{payload}");
+        assert_eq!(payload["streams_omitted"], Value::from(true), "{payload}");
+        assert!(payload.get("signal").is_none(), "{payload}");
+        // One key announces the omitted streams; spelling out empty ones would
+        // repeat it, and a null context key carries no information.
+        assert!(payload.get("stdout").is_none(), "{payload}");
+        assert!(payload.get("dir").is_none(), "{payload}");
+        assert_eq!(payload["success"], Value::from(false), "{payload}");
+        assert_eq!(payload["timed_out"], Value::from(false), "{payload}");
+
+        // A failure behind a deadline reports the deadline, from the terminal it
+        // followed — even when the signal found an empty group and claims nothing.
+        let timed_out = JobCompletion::internal_failed(
+            "failed spooling stdout: disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_stop(None)
+        .after_terminal(JobStatus::TimedOut);
+        let payload: Value = serde_json::from_str(&internal_failure_payload(&timed_out)).unwrap();
+        assert_eq!(payload["timed_out"], Value::from(true), "{payload}");
+        assert!(payload.get("stopped_by").is_none(), "{payload}");
+
+        // A signal the connector did not send is explained here in the same prose
+        // slot the ordinary result uses, so no surface shows a bare number.
+        let signalled = JobCompletion::internal_failed(
+            "failed spooling stdout: disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_signal(Some(9))
+        .after_terminal(JobStatus::Completed);
+        let payload: Value = serde_json::from_str(&internal_failure_payload(&signalled)).unwrap();
+        assert_eq!(payload["signal"], Value::from(9), "{payload}");
+        assert!(
+            payload["next"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SIGKILL"),
+            "{payload}"
+        );
+    }
+
+    fn signalled_completion() -> JobCompletion {
+        JobCompletion::completed(
+            None,
+            false,
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_signal(Some(9))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_stop_note_names_the_signal_it_reports() {
+        let note = external_stop_note(&signalled_completion()).unwrap();
+        assert!(note.contains("SIGKILL (signal 9)"), "{note}");
+        assert!(note.contains("outside dotlink"), "{note}");
+    }
+
+    #[test]
+    fn external_stop_note_never_contradicts_a_connector_stop() {
+        // dotlink's own stop is already explained by `stopped_by`; two accounts of
+        // one event would be worse than none.
+        let stopped =
+            signalled_completion().with_stop(Some(crate::shell_process::StopCause::Timeout));
+        assert!(external_stop_note(&stopped).is_none());
+        assert_eq!(
+            stopped.stopped_by,
+            Some(crate::shell_process::StopCause::Timeout)
+        );
+    }
+
+    #[test]
+    fn unknown_signal_numbers_stay_numbers_and_the_fail_safe_never_reports() {
+        let odd = JobCompletion::completed(
+            None,
+            false,
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_signal(Some(42));
+        assert!(external_stop_note(&odd).unwrap().contains("signal 42"));
+
+        let ordinary = JobCompletion::completed(
+            Some(0),
+            true,
+            StreamSummary::default(),
+            StreamSummary::default(),
+        );
+        assert!(external_stop_note(&ordinary).is_none());
+
+        // The fail-safe is not even expressible as a claim any more: `StopCause`
+        // has no `Dropped` variant, so the type system holds what this used to.
+        assert_eq!(ordinary.stopped_by, None);
+    }
+
+    #[test]
+    fn a_crash_signal_is_distinguishable_from_a_kill() {
+        let killed = rendered(
+            &JobCompletion::completed(
+                None,
+                false,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            )
+            .with_signal(Some(9)),
+        );
+        let crashed = rendered(
+            &JobCompletion::completed(
+                None,
+                false,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            )
+            .with_signal(Some(11)),
+        );
+        assert_eq!(killed["signal"], Value::from(9));
+        assert_eq!(crashed["signal"], Value::from(11));
+    }
+
     #[test]
     fn follow_up_names_every_job_tool_once() {
         let all = shell_job_follow_up(None);
@@ -3420,6 +4000,102 @@ mod tests {
             unacked: false,
         };
         assert_eq!(job_follow_up(released, Some("job_get")), None);
+    }
+
+    /// A caller cancelling their own job and the connector withdrawing the work
+    /// are different facts, and the record must not blame the caller for the
+    /// connector's decision. Teardown aborts runners as well as cancelling them,
+    /// so a runner may never observe the cancel; the attribution is recorded on
+    /// the token before it fires, which is what the runner reads either way.
+    #[test]
+    fn cancellation_records_who_asked_for_it() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        assert_eq!(job.cancel.origin(), CancelOrigin::Caller);
+        manager.cancel(&job.id).unwrap();
+        assert_eq!(job.cancel.origin(), CancelOrigin::Caller);
+        assert!(job.cancel.is_cancelled());
+
+        let teardown = JobCancel::new();
+        teardown.cancel_as(CancelOrigin::Connector);
+        assert_eq!(teardown.origin(), CancelOrigin::Connector);
+    }
+
+    #[test]
+    fn job_status_reports_the_termination_facts_of_its_completion() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+
+        let signalled = manager.create_for_test(30).unwrap();
+        manager.finish(
+            &signalled.id,
+            JobCompletion::completed(
+                None,
+                false,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            )
+            .with_signal(Some(9)),
+        );
+        let payload: Value = serde_json::from_str(&manager.status(&signalled.id).unwrap()).unwrap();
+        assert_eq!(payload["signal"], Value::from(9), "{payload}");
+        assert!(payload.get("stopped_by").is_none(), "{payload}");
+        // The poller sees the same sentence the synchronous result carried.
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SIGKILL"),
+            "{payload}"
+        );
+
+        let stopped = manager.create_for_test(30).unwrap();
+        manager.finish(
+            &stopped.id,
+            JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
+                .with_stop(Some(crate::shell_process::StopCause::Timeout)),
+        );
+        let payload: Value = serde_json::from_str(&manager.status(&stopped.id).unwrap()).unwrap();
+        assert_eq!(payload["stopped_by"], Value::from("timeout"), "{payload}");
+        assert!(payload.get("signal").is_none(), "{payload}");
+        // The deadline keeps its own explanation instead of the signal note.
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("requested timeout"),
+            "{payload}"
+        );
+        // `status` already says the deadline, so the boolean is not repeated.
+        assert_eq!(payload["status"], Value::from("timed_out"), "{payload}");
+        assert!(payload.get("timed_out").is_none(), "{payload}");
+    }
+
+    /// The poller's surface must tell both halves when a failure and an outside
+    /// signal meet: the failure's own error, and the one sentence that explains
+    /// the number. That is the case the synchronous result and the task already
+    /// covered, and it is the one an append-only guard could silently drop.
+    #[test]
+    fn job_status_keeps_its_own_error_and_appends_the_signal_note() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::internal_failed(
+                "failed spooling stdout: disk full",
+                StreamSummary::default(),
+                StreamSummary::default(),
+            )
+            .with_signal(Some(9))
+            .after_terminal(JobStatus::TimedOut),
+        );
+        let payload: Value = serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        let error = payload["error"].as_str().unwrap_or_default();
+        assert!(error.contains("failed spooling stdout"), "{payload}");
+        assert!(error.contains("SIGKILL (signal 9)"), "{payload}");
+        // An internal failure is `failed` here, so the deadline it followed has
+        // to travel as its own key.
+        assert_eq!(payload["status"], Value::from("failed"), "{payload}");
+        assert_eq!(payload["timed_out"], Value::from(true), "{payload}");
     }
 
     #[test]
@@ -3550,6 +4226,13 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("runner panicked"))
         );
+        // No guard was ever armed here, so nothing may claim a stop: a false
+        // "dotlink stopped it" would hide an external kill.
+        assert!(
+            status.get("stopped_by").is_none(),
+            "a panic without an armed guard must not claim a stop: {status}"
+        );
+        assert!(status.get("signal").is_none(), "{status}");
         drop(started);
         manager.shutdown().await.unwrap();
     }

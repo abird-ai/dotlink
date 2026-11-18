@@ -358,11 +358,13 @@ impl LogConfig {
     }
 
     /// A message-aligned continuation of the line above it, with no timestamp or
-    /// scope of its own. One `eprintln!` per line, so concurrent calls cannot
-    /// splice into each other.
+    /// scope of its own. One write per line, so concurrent calls cannot splice
+    /// into each other.
     fn continuation(&self, message: &str, color_code: &str) {
+        use std::io::Write as _;
         let message = self.style(color_code, message);
-        eprintln!("{:width$}{message}", "", width = MESSAGE_COLUMN);
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{:width$}{message}", "", width = MESSAGE_COLUMN);
     }
 
     /// One notification the transport accepted, so progress delivery is provable
@@ -387,19 +389,27 @@ impl LogConfig {
         }
     }
 
+    /// Writing never panics: a closed stderr must not take the process down,
+    /// least of all from `Drop`, where a panic would abort while unwinding and
+    /// kill every live job. A write that fails mid-line can leave a partial line;
+    /// stderr is already broken at that point.
     fn line(&self, level: &str, scope: &str, message: &str, color_code: &str) {
+        use std::io::Write as _;
         let timestamp = Local::now().format("%H:%M:%S%.3f");
         let scope = sanitize_log_scope(scope);
-        if self.color {
-            eprintln!(
+        let mut stderr = std::io::stderr().lock();
+        let _ = if self.color {
+            writeln!(
+                stderr,
                 "\x1b[2m[{timestamp}]\x1b[0m \x1b[{color_code}m{level:<4}\x1b[0m \x1b[1m{scope:<10}\x1b[0m {message}"
-            );
+            )
         } else {
-            eprintln!(
+            writeln!(
+                stderr,
                 "{}",
                 plain_line(&timestamp.to_string(), level, &scope, message)
-            );
-        }
+            )
+        };
     }
 }
 

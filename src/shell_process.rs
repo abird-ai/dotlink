@@ -7,6 +7,158 @@
 use std::io;
 use tokio::process::{Child, Command};
 
+/// Why a tree was signalled. This is the log vocabulary: it is wider than what a
+/// result may claim, because a tree is sometimes cleaned up rather than stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KillReason {
+    /// The command reached its requested `timeout_secs`.
+    Timeout,
+    /// The caller cancelled.
+    Cancel,
+    /// The connector withdrew the work: shutdown, restart, or authority
+    /// replacement.
+    Shutdown,
+    /// Launch, stdin delivery, wait or output capture failed.
+    Failed,
+    /// The command had already ended; the tree behind it was cleaned up.
+    Cleanup,
+    /// The guard was dropped without a caller-requested stop: the fail-safe.
+    Dropped,
+}
+
+/// What a result may claim: dotlink stopped the waited command. A separate type
+/// because "we signalled a tree" and "we ended your command" are different
+/// statements, and only the second belongs on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StopCause {
+    Timeout,
+    Cancel,
+    /// The connector ended the work, not the caller: a result that says
+    /// `cancel` here would blame a user who did nothing.
+    Shutdown,
+    Failed,
+}
+
+impl KillReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Cancel => "cancel",
+            Self::Shutdown => "shutdown",
+            Self::Failed => "failed",
+            Self::Cleanup => "cleanup",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    /// The claim this kill supports, if any. Tidy-up and the fail-safe end a tree,
+    /// not the command, so they support none.
+    fn claim(self) -> Option<StopCause> {
+        match self {
+            Self::Timeout => Some(StopCause::Timeout),
+            Self::Cancel => Some(StopCause::Cancel),
+            Self::Shutdown => Some(StopCause::Shutdown),
+            Self::Failed => Some(StopCause::Failed),
+            Self::Cleanup | Self::Dropped => None,
+        }
+    }
+}
+
+impl StopCause {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Cancel => "cancel",
+            Self::Shutdown => "shutdown",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What the signal actually did. Only a delivered signal is a stop: a group that
+/// is already gone was not stopped by us, and a failed signal left it running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StopOutcome {
+    Delivered,
+    AlreadyGone,
+    Failed,
+}
+
+impl StopOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::AlreadyGone => "gone",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The stop line is the only proof that dotlink ended a command, so the guard
+/// carries what it needs to report: the shared log, the job it belongs to, and —
+/// in tests — what it reported.
+#[derive(Clone)]
+pub(crate) struct StopTrace {
+    log: crate::logging::LogConfig,
+    label: String,
+    #[cfg(test)]
+    reports: std::sync::Arc<std::sync::Mutex<Vec<(KillReason, StopOutcome)>>>,
+}
+
+impl StopTrace {
+    pub(crate) fn new(log: crate::logging::LogConfig, label: impl Into<String>) -> Self {
+        Self {
+            log,
+            label: label.into(),
+            #[cfg(test)]
+            reports: std::sync::Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports(&self) -> Vec<KillReason> {
+        self.reports
+            .lock()
+            .expect("report list")
+            .iter()
+            .map(|(reason, _)| *reason)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outcomes(&self) -> Vec<StopOutcome> {
+        self.reports
+            .lock()
+            .expect("report list")
+            .iter()
+            .map(|(_, outcome)| *outcome)
+            .collect()
+    }
+
+    pub(crate) fn stopped(&self, reason: KillReason, outcome: StopOutcome) {
+        // A stop is rare and is the only proof of what the connector did, so it
+        // is a lifecycle line: visible whatever verbosity the operator chose,
+        // including quiet, because silence here would read as "not us".
+        #[cfg(test)]
+        self.reports
+            .lock()
+            .expect("report list")
+            .push((reason, outcome));
+        self.log
+            .notice("job", stop_message(&self.label, reason, outcome));
+    }
+}
+
+/// One line, fixed field order, no prose. The outcome is part of it: a signal that
+/// was not delivered must never read as a stop.
+fn stop_message(label: &str, reason: KillReason, outcome: StopOutcome) -> String {
+    format!(
+        "stop id={label} reason={} outcome={}",
+        reason.as_str(),
+        outcome.as_str()
+    )
+}
+
 #[cfg(unix)]
 pub(crate) fn configure(command: &mut Command) {
     use std::os::unix::process::CommandExt as _;
@@ -74,6 +226,7 @@ fn resume_new_process(pid: u32) -> io::Result<()> {
 
 pub(crate) struct Guard {
     active: bool,
+    trace: StopTrace,
     #[cfg(unix)]
     group: libc::pid_t,
     #[cfg(windows)]
@@ -81,7 +234,8 @@ pub(crate) struct Guard {
 }
 
 impl Guard {
-    pub(crate) fn attach(child: &Child) -> io::Result<Self> {
+    /// Attach, and remember who to tell if this guard ends up killing the tree.
+    pub(crate) fn attach(child: &Child, trace: StopTrace) -> io::Result<Self> {
         #[cfg(unix)]
         {
             let group = child
@@ -90,6 +244,7 @@ impl Guard {
                 .ok_or_else(|| io::Error::other("spawned shell has no process group"))?;
             Ok(Self {
                 active: true,
+                trace,
                 group,
             })
         }
@@ -120,26 +275,81 @@ impl Guard {
                     .id()
                     .ok_or_else(|| io::Error::other("missing process ID"))?,
             )?;
-            Ok(Self { active: true, job })
+            Ok(Self {
+                active: true,
+                trace,
+                job,
+            })
         }
     }
 
-    pub(crate) fn terminate(&mut self) {
+    /// Signal the tree and say why. Idempotent: only the first caller reports, and
+    /// the return value is the claim the outcome supports — nothing at all when
+    /// the signal was not delivered, so a later failure cannot relabel an
+    /// already-stopped tree and a failed signal cannot pass for a stop.
+    pub(crate) fn terminate(&mut self, reason: KillReason) -> Option<StopCause> {
         if !self.active {
-            return;
+            return None;
         }
-        self.active = false;
-        #[cfg(unix)]
-        {
-            // SAFETY: negative PID addresses only the shell's own process group.
-            unsafe { libc::kill(-self.group, libc::SIGKILL) };
+        let outcome = self.signal_tree();
+        // A signal that failed leaves the tree running, so stay armed: the
+        // fail-safe drop gets one more attempt.
+        self.active = outcome == StopOutcome::Failed;
+        self.trace.stopped(reason, outcome);
+        matches!(outcome, StopOutcome::Delivered)
+            .then(|| reason.claim())
+            .flatten()
+    }
+
+    #[cfg(unix)]
+    fn signal_tree(&self) -> StopOutcome {
+        // SAFETY: negative PID addresses only the shell's own process group.
+        if unsafe { libc::kill(-self.group, libc::SIGKILL) } == 0 {
+            return StopOutcome::Delivered;
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-            // SAFETY: the job belongs to this invocation.
-            unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) };
+        // An empty group is the state the caller wanted, but it is not a stop we
+        // performed: the command may have ended on its own, or left the group.
+        if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            StopOutcome::AlreadyGone
+        } else {
+            StopOutcome::Failed
+        }
+    }
+
+    #[cfg(windows)]
+    fn signal_tree(&self) -> StopOutcome {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject, TerminateJobObject,
+        };
+        // An empty job reports success for a termination too, so ask first: a
+        // group that is already gone is not a stop we performed.
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the job belongs to this invocation and the struct matches the
+        // class the call was asked for.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.job.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried != 0 && accounting.ActiveProcesses == 0 {
+            return StopOutcome::AlreadyGone;
+        }
+        // Always terminate, even when the count is unavailable: failing closed
+        // must not leave descendants running. The outcome is unproven then, so
+        // nothing may be claimed for it.
+        let terminated = unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } != 0;
+        match (queried != 0, terminated) {
+            // Terminating an empty job succeeds too, so without the count a
+            // success proves nothing about whether we were the one who stopped it.
+            (false, _) => StopOutcome::Failed,
+            (true, true) => StopOutcome::Delivered,
+            (true, false) => StopOutcome::Failed,
         }
     }
 
@@ -150,13 +360,129 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.terminate();
+        // Reaching here while still armed means a path returned without
+        // disarming; the kill is right, and `reason=dropped` makes it visible.
+        let _ = self.terminate(KillReason::Dropped);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn guarded_sleep() -> (tokio::process::Child, Guard, StopTrace) {
+        let mut command = Command::new("sh");
+        configure(&mut command);
+        command.arg("-c").arg("sleep 5");
+        let child = command.spawn().unwrap();
+        let trace = StopTrace::new(
+            crate::logging::LogConfig::new(2, false, crate::logging::ColorMode::Never),
+            "job-1",
+        );
+        let guard = Guard::attach(&child, trace.clone()).unwrap();
+        (child, guard, trace)
+    }
+
+    /// The headline invariant: a stop reports itself exactly once, and the reason
+    /// says which kind of stop it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_reports_once_and_the_fail_safe_names_itself() {
+        let (mut child, mut guard, trace) = guarded_sleep();
+        assert_eq!(
+            guard.terminate(KillReason::Timeout),
+            Some(StopCause::Timeout)
+        );
+        assert_eq!(guard.terminate(KillReason::Cancel), None);
+        assert_eq!(trace.reports(), vec![KillReason::Timeout]);
+        assert_eq!(trace.outcomes(), vec![StopOutcome::Delivered]);
+        let _ = child.kill().await;
+    }
+
+    /// Dropping an armed guard is the fail-safe; it must be visible rather than a
+    /// silent kill, because it means a path returned without disarming.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_an_armed_guard_reports_the_fail_safe() {
+        let (_child, guard, trace) = guarded_sleep();
+        drop(guard);
+        assert_eq!(trace.reports(), vec![KillReason::Dropped]);
+        assert_eq!(trace.outcomes(), vec![StopOutcome::Delivered]);
+    }
+
+    /// A group that is already empty is not a stop we performed: claiming one
+    /// would read as "dotlink killed your command" when the command had ended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_group_is_reported_as_gone_and_claims_nothing() {
+        let mut command = Command::new("sh");
+        configure(&mut command);
+        command.arg("-c").arg("exit 0");
+        let mut child = command.spawn().unwrap();
+        let trace = StopTrace::new(
+            crate::logging::LogConfig::new(1, false, crate::logging::ColorMode::Never),
+            "gone",
+        );
+        let mut guard = Guard::attach(&child, trace.clone()).unwrap();
+        child.wait().await.unwrap();
+        // A claimable reason on an empty group still claims nothing: the signal
+        // never reached the command, so dotlink did not stop it.
+        assert_eq!(guard.terminate(KillReason::Timeout), None);
+        assert_eq!(trace.reports(), vec![KillReason::Timeout]);
+        assert_eq!(trace.outcomes(), vec![StopOutcome::AlreadyGone]);
+    }
+
+    /// A command that finished is disarmed first, so nothing is reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disarmed_guard_reports_nothing() {
+        let mut child = {
+            let mut command = Command::new("sh");
+            configure(&mut command);
+            command.arg("-c").arg("exit 0");
+            command.spawn().unwrap()
+        };
+        let trace = StopTrace::new(
+            crate::logging::LogConfig::new(2, false, crate::logging::ColorMode::Never),
+            "job-2",
+        );
+        let mut guard = Guard::attach(&child, trace.clone()).unwrap();
+        guard.disarm();
+        drop(guard);
+        let _ = child.wait().await;
+        assert!(trace.reports().is_empty(), "{:?}", trace.reports());
+    }
+
+    #[test]
+    fn stop_line_names_the_job_and_the_reason() {
+        assert_eq!(
+            stop_message(
+                "3f0c9d1e-0d6f-4a0e-9a4e-1a2b3c4d5e6f",
+                KillReason::Timeout,
+                StopOutcome::Delivered
+            ),
+            "stop id=3f0c9d1e-0d6f-4a0e-9a4e-1a2b3c4d5e6f reason=timeout outcome=delivered"
+        );
+        for reason in [
+            KillReason::Timeout,
+            KillReason::Cancel,
+            KillReason::Shutdown,
+            KillReason::Failed,
+            KillReason::Cleanup,
+            KillReason::Dropped,
+        ] {
+            let delivered = stop_message("job", reason, StopOutcome::Delivered);
+            assert!(delivered.starts_with("stop "), "{delivered}");
+            assert!(delivered.contains(&format!("reason={}", reason.as_str())));
+            // A signal that did not reach the tree must not read as a stop.
+            for outcome in [StopOutcome::AlreadyGone, StopOutcome::Failed] {
+                let line = stop_message("job", reason, outcome);
+                assert!(line.contains("outcome="), "{line}");
+                assert!(!line.contains("outcome=delivered"), "{line}");
+            }
+        }
+    }
 
     #[cfg(windows)]
     #[tokio::test]
@@ -166,7 +492,11 @@ mod tests {
         configure(&mut command);
         command.arg("/C").arg("exit 0").stdout(Stdio::null());
         let mut child = command.spawn().unwrap();
-        let mut job = Guard::attach(&child).unwrap();
+        let mut job = Guard::attach(
+            &child,
+            StopTrace::new(crate::logging::LogConfig::default(), "test"),
+        )
+        .unwrap();
         let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
             .await
             .unwrap()
@@ -190,9 +520,13 @@ mod tests {
             ))
             .kill_on_drop(true);
         let mut child = command.spawn().unwrap();
-        let mut tree = Guard::attach(&child).unwrap();
+        let mut tree = Guard::attach(
+            &child,
+            StopTrace::new(crate::logging::LogConfig::default(), "test"),
+        )
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        tree.terminate();
+        let _ = tree.terminate(KillReason::Timeout);
         let _ = child.wait().await;
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         assert!(!output.exists(), "killed descendant must not run later");
