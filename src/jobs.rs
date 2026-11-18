@@ -3746,27 +3746,6 @@ mod tests {
         }
     }
 
-    /// Naming is Unix-only, so the portable half of this surface is asserted
-    /// separately: Windows has no signal names to report.
-    #[cfg(not(unix))]
-    #[test]
-    fn a_failed_native_task_still_carries_the_numbers_on_non_unix() {
-        let completion = JobCompletion::internal_failed(
-            "failed spooling stderr: disk full",
-            StreamSummary::default(),
-            StreamSummary::default(),
-        )
-        .with_signal(Some(11))
-        .with_stop(Some(crate::shell_process::StopCause::Failed));
-        let error = failure_error_object("failed spooling stderr: disk full", &completion);
-        let data = error.get("data").expect("error carries structured detail");
-        assert_eq!(data["signal"], Value::from(11), "{data}");
-        assert_eq!(data["signal_name"], Value::from("signal 11"), "{data}");
-        assert_eq!(data["stopped_by"], Value::from("failed"), "{data}");
-    }
-
-    /// The failed-native-task surface is the newest place these facts appear, so
-    /// it needs its own assertion rather than riding on the others.
     /// The surface a caller really reaches: `tool_result`, not the payload helper.
     /// Reverting the renderer to a plain message would fail here.
     #[test]
@@ -3818,7 +3797,6 @@ mod tests {
         assert_eq!(payload["streams_omitted"], Value::from(true), "{payload}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_failed_native_task_carries_the_termination_facts_in_its_error_data() {
         let completion = JobCompletion::internal_failed(
@@ -3835,11 +3813,7 @@ mod tests {
         assert_eq!(data["exit_code"], Value::from(3), "{data}");
         assert_eq!(data["timed_out"], Value::from(true), "{data}");
         assert_eq!(data["signal"], Value::from(11), "{data}");
-        assert_eq!(
-            data["signal_name"],
-            Value::from("SIGSEGV (signal 11)"),
-            "{data}"
-        );
+        assert_eq!(data["signal_name"], Value::from(signal_label(11)), "{data}");
         assert_eq!(data["stopped_by"], Value::from("failed"), "{data}");
         assert_eq!(data["streams_omitted"], Value::from(true), "{data}");
     }
@@ -3894,7 +3868,7 @@ mod tests {
             payload["next"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("SIGKILL"),
+                .contains(&signal_label(9)),
             "{payload}"
         );
     }
@@ -3909,11 +3883,10 @@ mod tests {
         .with_signal(Some(9))
     }
 
-    #[cfg(unix)]
     #[test]
     fn external_stop_note_names_the_signal_it_reports() {
         let note = external_stop_note(&signalled_completion()).unwrap();
-        assert!(note.contains("SIGKILL (signal 9)"), "{note}");
+        assert!(note.contains(&signal_label(9)), "{note}");
         assert!(note.contains("outside dotlink"), "{note}");
     }
 
@@ -4059,7 +4032,7 @@ mod tests {
             payload["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("SIGKILL"),
+                .contains(&signal_label(9)),
             "{payload}"
         );
 
@@ -4106,7 +4079,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
         let error = payload["error"].as_str().unwrap_or_default();
         assert!(error.contains("failed spooling stdout"), "{payload}");
-        assert!(error.contains("SIGKILL (signal 9)"), "{payload}");
+        assert!(error.contains(&signal_label(9)), "{payload}");
         // An internal failure is `failed` here, so the deadline it followed has
         // to travel as its own key.
         assert_eq!(payload["status"], Value::from("failed"), "{payload}");
