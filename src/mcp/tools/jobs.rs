@@ -46,20 +46,17 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
             .get_mut("max_output_bytes")
             .and_then(serde_json::Value::as_object_mut)
     {
+        // The page is a size request, not a response ceiling: one byte still
+        // renders with the fixed envelope, so only the profile maximum bounds it.
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Serialized MCP result budget for this page. Defaults to {} and is capped at {}; must be at least {}.",
+                "Serialized MCP result budget for this page. Defaults to {} and is capped at {}.",
                 super::human_bytes(
                     (crate::limits::DEFAULT_OUTPUT_PAGE_BYTES.min(max_output_bytes)) as u64
                 ),
                 super::human_bytes(max_output_bytes as u64),
-                crate::limits::MIN_BYTE_LIMIT,
             )),
-        );
-        property.insert(
-            "minimum".to_owned(),
-            serde_json::Value::from(crate::limits::MIN_BYTE_LIMIT),
         );
         property.insert(
             "maximum".to_owned(),
@@ -263,7 +260,11 @@ impl LocalMachine {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let ceiling = resolve_output_page(args.max_output_bytes, self.config.max_output_bytes);
-        let response_ceiling = self.request_result_budget(&context).unwrap_or(ceiling);
+        // The page and the response ceiling are separate: a small page must not
+        // shrink the envelope a transport is allowed to answer in.
+        let response_ceiling = self
+            .request_result_budget(&context)
+            .unwrap_or(self.config.max_output_bytes);
         let stream = args.stream.into();
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
@@ -390,6 +391,13 @@ mod tests {
         let output_limit = &output.input_schema["properties"]["max_output_bytes"];
         assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
         let output_description = output_limit["description"].as_str().unwrap();
+        // A page is a size request the handler clamps to the profile, so the
+        // description states the default and the maximum, never a floor that the
+        // page path does not apply (the transport response ceiling owns that).
+        assert!(
+            !output_description.contains("at least"),
+            "{output_description}"
+        );
         assert!(output_description.contains("8 MiB"), "{output_description}");
         assert!(
             output_description.contains("256 KiB"),
