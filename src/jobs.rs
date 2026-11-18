@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -73,9 +73,22 @@ pub(crate) const DOTLINK_JOB_PROFILE: JobProfile = JobProfile {
     get_tail_default: 512,
     get_tail_max: 1024,
     get_wait_max_ms: 30_000,
+    read_page_default_bytes: 256 * 1024,
+    read_page_max_bytes: aw_tools::toolset::MAX_JOB_READ_PAGE_BYTES,
     read_wait_max_ms: 30_000,
     list_page_max: 256,
 };
+
+pub(crate) fn dotlink_job_profile(max_output_bytes: usize) -> JobProfile {
+    let read_page_max_bytes = max_output_bytes.min(DOTLINK_JOB_PROFILE.read_page_max_bytes);
+    JobProfile {
+        read_page_default_bytes: DOTLINK_JOB_PROFILE
+            .read_page_default_bytes
+            .min(read_page_max_bytes),
+        read_page_max_bytes,
+        ..DOTLINK_JOB_PROFILE
+    }
+}
 const SHARED_MAX_RETAINED_JOBS: usize = MAX_RETAINED_JOBS + MAX_REQUEST_REPLAYS;
 /// Transport-owned hidden state is separate from ordinary user-visible job
 /// retention. Request-key replay mappings plus positive-delivery cleanup-only
@@ -514,6 +527,9 @@ struct JobEntry {
     cancel: CancellationToken,
     runner: Option<JoinHandle<()>>,
     completion: Option<JobCompletion>,
+    /// First successful materialization time of the immutable native MCP Task
+    /// result. Exact Task replay reuses this timestamp.
+    task_result_ts: Option<u64>,
     terminal_at: Option<Instant>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -2185,6 +2201,7 @@ impl JobManager {
                 cancel: cancel.clone(),
                 runner: None,
                 completion: None,
+                task_result_ts: None,
                 terminal_at: None,
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
@@ -2324,6 +2341,7 @@ impl JobManager {
                 cancel: cancel.clone(),
                 runner: None,
                 completion: None,
+                task_result_ts: None,
                 terminal_at: None,
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
@@ -4882,6 +4900,27 @@ impl JobManager {
         Ok(render_status_locked(&self.inner, entry))
     }
 
+    fn finalize_task_result_ts(&self, id: &str) -> JobResult<u64> {
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available_mut(id)
+            .filter(|entry| entry.disposition.native_task())
+            .ok_or_else(|| JobError::Unknown(format!("unknown task {id}")))?;
+        if let Some(ts) = entry.task_result_ts {
+            return Ok(ts);
+        }
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                JobError::Internal(anyhow!(
+                    "cannot finalize native Task result timestamp: {error}"
+                ))
+            })?
+            .as_secs();
+        entry.task_result_ts = Some(ts);
+        Ok(ts)
+    }
+
     pub(crate) fn detailed_task(&self, id: &str) -> JobResult<DetailedTask> {
         sweep_expired(&self.inner);
         let (task, status, internal_error, snapshot) = {
@@ -4941,10 +4980,13 @@ impl JobManager {
                         error: error_object(&message),
                     }
                 } else {
-                    let result = crate::blocking::run(|| {
+                    let mut result = crate::blocking::run(|| {
                         render_tool_result(snapshot.as_ref().expect("terminal task snapshot"))
                     })
                     .map_err(JobError::Internal)?;
+                    let ts = self.finalize_task_result_ts(id)?;
+                    crate::mcp::set_stored_receipt_ts(&mut result, ts);
+                    crate::mcp::ensure_visible_receipt_ts(&mut result, ts);
                     TaskPayload::Completed {
                         result: result_object(result),
                     }

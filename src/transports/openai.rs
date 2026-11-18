@@ -4713,6 +4713,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hosted_batch_wire_carries_scoped_receipt_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("receipt.txt"), "hosted-receipt").unwrap();
+        let machine = crate::mcp::test_machine(root);
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let transport_token = mcp.machine.transport_context_token().to_owned();
+        let mut command = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{
+                "name":"batch",
+                "arguments":{
+                    "ops":[["read",{"path":"receipt.txt","numbered":false}]],
+                    "background":true
+                }
+            }
+        });
+        assert_eq!(
+            annotate_response_context(
+                &mut command,
+                Duration::from_secs(90),
+                crate::limits::OPENAI_TUNNEL_DELIVERY_RESERVE,
+                "receipt-wire-request",
+                &transport_token,
+            ),
+            Ok(None)
+        );
+        let response = mcp.dispatch(&BTreeMap::new(), &command).await.unwrap();
+        assert_eq!(response.status, 200);
+        let message = response.messages.into_iter().next().expect("MCP response");
+        assert_ne!(message["result"]["isError"], true, "{message}");
+        let ts = message["result"]["_meta"]["io.abird/receipt"]["ts"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("missing hosted receipt timestamp: {message}"));
+        let marker = format!("ts={ts}");
+        assert!(
+            message["result"]["content"]
+                .as_array()
+                .is_some_and(|content| content.iter().any(|block| {
+                    block["text"]
+                        .as_str()
+                        .is_some_and(|text| text.lines().any(|line| line.trim() == marker))
+                })),
+            "missing hosted visible receipt timestamp {marker}: {message}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mcp_shells_are_parallel_by_default_and_serial_when_requested() {

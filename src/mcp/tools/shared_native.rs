@@ -10,7 +10,7 @@ use aw_tools::{
     },
     media::MediaKind,
     operation::OperationId,
-    toolset::{ReceiptProfile, Toolset},
+    toolset::{ReceiptCategory, ReceiptProfile, ReceiptScope, Toolset},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
@@ -82,11 +82,18 @@ pub(crate) fn caps(max_read: usize, max_write: usize) -> Result<SchemaCaps, &'st
 /// Dotlink-selected shared catalog profile. Receipt timestamps/checkpoint
 /// guidance stay disabled until dotlink has a typed shared receipt projection;
 /// never decorate existing free-form MCP results by parsing text.
-pub(crate) fn toolset(caps: SchemaCaps) -> Toolset {
+pub(crate) fn toolset(caps: SchemaCaps, max_output_bytes: usize) -> Toolset {
     Toolset::builder()
         .filesystem(caps)
-        .jobs(crate::jobs::DOTLINK_JOB_PROFILE)
-        .receipts(ReceiptProfile::default())
+        .jobs(crate::jobs::dotlink_job_profile(max_output_bytes))
+        .receipts(ReceiptProfile {
+            unix_ts: true,
+            checkpoint_minutes: Some(30),
+            scope: ReceiptScope::none()
+                .with_category(ReceiptCategory::Process)
+                .with_category(ReceiptCategory::Batch)
+                .with_category(ReceiptCategory::Jobs),
+        })
         .build()
         .expect("dotlink shared Toolset profile is valid")
 }
@@ -848,7 +855,7 @@ mod tests {
     #[test]
     fn projected_default_schemas_and_metadata_are_exact_shared_toolset() {
         let caps = SchemaCaps::default();
-        let toolset = toolset(caps);
+        let toolset = toolset(caps, crate::limits::DEFAULT_TRANSFER_BYTES);
         for core in CoreTool::ALL {
             let projected = projected_tool(core, &toolset);
             let canonical = toolset.filesystem_descriptor(core).unwrap();
@@ -871,9 +878,18 @@ mod tests {
                 Some(canonical.title.as_str())
             );
         }
-        assert!(!toolset.receipt_profile().unix_ts);
-        assert_eq!(toolset.receipt_profile().checkpoint_minutes, None);
-        assert_eq!(toolset.jobs_profile(), crate::jobs::DOTLINK_JOB_PROFILE);
+        assert!(toolset.receipt_profile().unix_ts);
+        assert_eq!(toolset.receipt_profile().checkpoint_minutes, Some(30));
+        assert!(
+            !toolset
+                .receipt_profile()
+                .scope
+                .contains(aw_tools::OperationId::Fs(CoreTool::Read))
+        );
+        assert_eq!(
+            toolset.jobs_profile(),
+            crate::jobs::dotlink_job_profile(crate::limits::DEFAULT_TRANSFER_BYTES)
+        );
     }
 
     #[test]

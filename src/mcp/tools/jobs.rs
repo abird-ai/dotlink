@@ -14,10 +14,10 @@ use serde::Deserialize;
 
 use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
 
-use super::{LocalMachine, graph, ok_text, resolve_capped, tool_error};
+use super::{LocalMachine, graph, ok_text, tool_error};
 use crate::jobs::{
     DOTLINK_JOB_PROFILE, JobHandoff, JobOutputStream, JobWait, ProcessInput, RemoteStartDecision,
-    RemoteStartReceipt,
+    RemoteStartGuard, RemoteStartReceipt,
 };
 
 /// Host-verified transport response windows may only narrow a caller's wait.
@@ -100,9 +100,36 @@ fn bounded_replayed_job_handoff(cached: CallToolResult, budget: Option<usize>) -
     let Some(reference) = status.split_whitespace().next() else {
         return tool_error("Cached Job receipt has no continuation; list Jobs, do not rerun");
     };
+    let meta = cached.meta.clone();
+    let fits = |result: &CallToolResult| {
+        budget.is_none_or(|limit| {
+            crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
+        })
+    };
     match parse_ref(reference) {
-        Ok(StandaloneRef { id, node: None }) => bounded_job_handoff(&id, status.to_owned(), budget),
-        _ => tool_error("Cached Job reference is invalid; list Jobs, do not rerun"),
+        Ok(StandaloneRef { id, node: None }) => {
+            let mut full = ok_text(status.to_owned());
+            full.meta = meta.clone();
+            if fits(&full) {
+                return full;
+            }
+            let mut concise = ok_text(format!("j:{id} next=jobs_get no-rerun"));
+            concise.meta = meta.clone();
+            if fits(&concise) {
+                concise
+            } else {
+                let mut error = tool_error(
+                    "Job is already admitted, but its replay handoff exceeds the response budget; list Jobs to recover it without rerunning",
+                );
+                error.meta = meta;
+                error
+            }
+        }
+        _ => {
+            let mut error = tool_error("Cached Job reference is invalid; list Jobs, do not rerun");
+            error.meta = meta;
+            error
+        }
     }
 }
 
@@ -168,7 +195,31 @@ fn bounded_control_replay(
     if status.split_whitespace().next() != Some(expected.as_str()) {
         return tool_error("Cached Control Job identity differs; inspect the Job before retrying");
     }
-    bounded_control_success(reference, status.to_owned(), effect, budget)
+    if budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(&cached).is_some_and(|size| size <= limit)
+    }) {
+        return cached;
+    }
+    let receipt = match effect {
+        ControlReceipt::AckThrough(through) => {
+            format!("{expected} ack=through:{through} next=jobs_get no-rerun")
+        }
+        ControlReceipt::Finish => format!("{expected} ack=finish next=jobs_get no-rerun"),
+        ControlReceipt::Cancel => format!("{expected} cancel=accepted next=jobs_get no-rerun"),
+    };
+    let mut compact = ok_text(receipt);
+    compact.meta = cached.meta.clone();
+    if budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(&compact).is_some_and(|size| size <= limit)
+    }) {
+        compact
+    } else {
+        let mut error = tool_error(format!(
+            "{expected} Job Control effect already applied, but its replay receipt exceeds the response budget; inspect with jobs_get before retrying"
+        ));
+        error.meta = cached.meta;
+        error
+    }
 }
 
 /// A completed stdin write must never become an ambiguously truncated
@@ -233,7 +284,48 @@ fn bounded_send_replay(
     if !valid {
         return tool_error("Cached stdin outcome is unverified; inspect Job, do not resend");
     }
-    bounded_send_result(reference, cached, budget)
+    if budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(&cached).is_some_and(|size| size <= limit)
+    }) {
+        return cached;
+    }
+    let mut compact = ok_text(format!("{expected} sent"));
+    compact.meta = cached.meta.clone();
+    if budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(&compact).is_some_and(|size| size <= limit)
+    }) {
+        compact
+    } else {
+        let mut error = tool_error(format!(
+            "{expected} stdin was already accepted, but its replay receipt exceeds the response budget; inspect with jobs_get, do not resend"
+        ));
+        error.meta = cached.meta;
+        error
+    }
+}
+
+fn complete_remote_start_result(
+    machine: &LocalMachine,
+    operation: aw_tools::OperationId,
+    guard: Option<RemoteStartGuard>,
+    mut result: CallToolResult,
+) -> CallToolResult {
+    let Some(guard) = guard else {
+        return result;
+    };
+    if let Err(error) = machine.stamp_cached_mcp_receipt(operation, &mut result) {
+        let fallback = tool_error(format!(
+            "remote Start effect completed but its timestamp receipt could not be finalized: {error}; inspect the Job before retrying"
+        ));
+        return match guard.mark_ready(RemoteStartReceipt::Mcp(fallback.clone())) {
+            Ok(()) => fallback,
+            Err(cache_error) => tool_error(cache_error),
+        };
+    }
+    match guard.mark_ready(RemoteStartReceipt::Mcp(result.clone())) {
+        Ok(()) => result,
+        Err(error) => tool_error(error),
+    }
 }
 
 pub(crate) fn canonicalize_graph_router(
@@ -598,10 +690,12 @@ impl LocalMachine {
                 }
             };
             let result = bounded_job_handoff(&started.id, status, result_budget);
-            if let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone())) {
-                return tool_error(error);
-            }
-            return result;
+            return complete_remote_start_result(
+                self,
+                aw_tools::OperationId::Batch,
+                Some(guard),
+                result,
+            );
         }
 
         let prepared = match graph::prepare(self, args.ops).await {
@@ -753,7 +847,17 @@ impl LocalMachine {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
-        let ceiling = resolve_capped(args.limit, self.config.max_output_bytes);
+        let profile = crate::jobs::dotlink_job_profile(self.config.max_output_bytes);
+        let ceiling = match args.limit {
+            Some(limit) if limit > profile.read_page_max_bytes => {
+                return tool_error(format!(
+                    "jobs_read limit exceeds {}",
+                    profile.read_page_max_bytes
+                ));
+            }
+            Some(limit) => limit,
+            None => profile.read_page_default_bytes,
+        };
         let response_ceiling = self.request_result_budget(&context).unwrap_or(ceiling);
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
@@ -883,21 +987,11 @@ impl LocalMachine {
         match outcome {
             Ok(text) => {
                 let result = bounded_control_success(&reference, text, effect, result_budget);
-                if let Some(guard) = guard
-                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                {
-                    return tool_error(error);
-                }
-                result
+                complete_remote_start_result(self, aw_tools::OperationId::JobsAck, guard, result)
             }
             Err(text) => {
                 let result = tool_error(text);
-                if let Some(guard) = guard
-                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                {
-                    return tool_error(error);
-                }
-                result
+                complete_remote_start_result(self, aw_tools::OperationId::JobsAck, guard, result)
             }
         }
     }
@@ -992,23 +1086,12 @@ impl LocalMachine {
                     crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
                 ));
                 let result = bounded_send_result(&reference, full, result_budget);
-                if let Some(guard) = guard
-                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                {
-                    return tool_error(error);
-                }
-                result
+                complete_remote_start_result(self, aw_tools::OperationId::JobsSend, guard, result)
             }
             Err(error) => {
                 let text = error.to_string();
                 let result = tool_error(text);
-                if let Some(guard) = guard
-                    && let Err(replay_error) =
-                        guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                {
-                    return tool_error(replay_error);
-                }
-                result
+                complete_remote_start_result(self, aw_tools::OperationId::JobsSend, guard, result)
             }
         }
     }
@@ -1056,26 +1139,24 @@ impl LocalMachine {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     let result = tool_error(error);
-                    if let Some(guard) = guard
-                        && let Err(replay_error) =
-                            guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                    {
-                        return tool_error(replay_error);
-                    }
-                    return result;
+                    return complete_remote_start_result(
+                        self,
+                        aw_tools::OperationId::JobsCancel,
+                        guard,
+                        result,
+                    );
                 }
             };
             if expected != current {
                 let result = tool_error(format!(
                     "stale Job revision: expected {expected}, current {current}"
                 ));
-                if let Some(guard) = guard
-                    && let Err(replay_error) =
-                        guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                {
-                    return tool_error(replay_error);
-                }
-                return result;
+                return complete_remote_start_result(
+                    self,
+                    aw_tools::OperationId::JobsCancel,
+                    guard,
+                    result,
+                );
             }
         }
         let outcome = match self.jobs.cancel(&reference.id) {
@@ -1094,21 +1175,11 @@ impl LocalMachine {
                     ControlReceipt::Cancel,
                     result_budget,
                 );
-                if let Some(guard) = guard
-                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                {
-                    return tool_error(error);
-                }
-                result
+                complete_remote_start_result(self, aw_tools::OperationId::JobsCancel, guard, result)
             }
             Err(text) => {
                 let result = tool_error(text);
-                if let Some(guard) = guard
-                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
-                {
-                    return tool_error(error);
-                }
-                result
+                complete_remote_start_result(self, aw_tools::OperationId::JobsCancel, guard, result)
             }
         }
     }
@@ -1146,15 +1217,19 @@ impl LocalMachine {
 mod tests {
     use super::*;
 
-    fn test_toolset() -> aw_tools::toolset::Toolset {
+    fn test_toolset(max_output_bytes: usize) -> aw_tools::toolset::Toolset {
         crate::mcp::tools::shared_native::toolset(
             aw_tools::filesystem::schema::SchemaCaps::default(),
+            max_output_bytes,
         )
     }
 
     fn project_job_tool(mut tool: Tool, max_output_bytes: usize) -> Tool {
         with_job_limits(&mut tool, max_output_bytes);
-        crate::mcp::tools::shared_native::apply_operation_metadata(&mut tool, &test_toolset());
+        crate::mcp::tools::shared_native::apply_operation_metadata(
+            &mut tool,
+            &test_toolset(max_output_bytes),
+        );
         tool
     }
 
@@ -1871,10 +1946,14 @@ mod tests {
             .await
             .unwrap();
         let (_, status) = machine.jobs.standalone_status(&started.id, None).unwrap();
-        let first = ok_text(status);
-        guard
-            .mark_ready(RemoteStartReceipt::Mcp(first.clone()))
-            .unwrap();
+        let first = complete_remote_start_result(
+            &machine,
+            aw_tools::OperationId::Batch,
+            Some(guard),
+            ok_text(status),
+        );
+        let first_ts =
+            crate::mcp::stored_receipt_ts(&first).expect("cached Batch receipt timestamp");
         machine.jobs.wait_until(&started.id, None).await.unwrap();
         assert!(!root.join("a.txt").exists());
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
@@ -1884,10 +1963,13 @@ mod tests {
             _ => panic!("duplicate Graph Start must replay the first receipt"),
         };
         assert_eq!(replay, first);
+        assert_eq!(crate::mcp::stored_receipt_ts(&replay), Some(first_ts));
         // A replay under a smaller envelope keeps the original ledger result
         // and returns a complete ref instead of a clipped success receipt.
         let concise = format!("j:{} next=jobs_get no-rerun", started.id);
-        let small_budget = crate::mcp::serialized_json_len(&ok_text(concise.clone())).unwrap();
+        let mut concise_result = ok_text(concise.clone());
+        concise_result.meta = replay.meta.clone();
+        let small_budget = crate::mcp::serialized_json_len(&concise_result).unwrap();
         // This particular one-node receipt may already fit that smaller
         // budget; verify its exact replay before exercising the forced-large
         // projection case.
@@ -1898,17 +1980,19 @@ mod tests {
             if fits {
                 replay.clone()
             } else {
-                ok_text(concise.clone())
+                concise_result.clone()
             }
         );
-        let long_cached = ok_text(format!(
+        let mut long_cached = ok_text(format!(
             "j:{} graph waiting rev=1 {}",
             started.id,
             "node waiting ".repeat(100)
         ));
+        long_cached.meta = replay.meta.clone();
         let projected = bounded_replayed_job_handoff(long_cached, Some(small_budget));
         assert!(!projected.is_error.unwrap_or(false));
         assert_eq!(projected.content[0].as_text().unwrap().text, concise);
+        assert_eq!(crate::mcp::stored_receipt_ts(&projected), Some(first_ts));
         assert!(crate::mcp::serialized_json_len(&projected).unwrap() <= small_budget);
         let original = match machine.jobs.claim_remote_start(&start).unwrap() {
             RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => result,
@@ -2045,10 +2129,16 @@ mod tests {
             replay, first,
             "duplicate remote Start must replay the original cancel receipt"
         );
-        let minimal = ok_text(format!(
+        let first_ts =
+            crate::mcp::stored_receipt_ts(&first).expect("cached cancel receipt timestamp");
+        let mut minimal = ok_text(format!(
             "j:{} cancel=accepted next=jobs_get no-rerun",
             started.id
         ));
+        minimal.meta = first.meta.clone();
+        minimal
+            .content
+            .push(rmcp::model::ContentBlock::text(format!("ts={first_ts}")));
         let budget = crate::mcp::serialized_json_len(&minimal).unwrap();
         let narrow = machine
             .jobs_cancel_impl(
@@ -2106,6 +2196,7 @@ mod tests {
         );
         let output_limit = &read.input_schema["properties"]["limit"];
         assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
+        assert_eq!(output_limit["default"], 256 * 1024);
         assert!(
             !read.input_schema["properties"]
                 .as_object()

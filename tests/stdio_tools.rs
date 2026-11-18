@@ -158,6 +158,24 @@ fn text_of(response: &Value) -> &str {
         .unwrap_or_else(|| panic!("no text content: {response}"))
 }
 
+fn assert_receipt_ts(response: &Value) -> u64 {
+    let ts = response["result"]["_meta"]["io.abird/receipt"]["ts"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("missing receipt timestamp: {response}"));
+    let marker = format!("ts={ts}");
+    assert!(
+        response["result"]["content"]
+            .as_array()
+            .is_some_and(|content| content.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.lines().any(|line| line.trim() == marker))
+            })),
+        "missing visible receipt timestamp {marker}: {response}"
+    );
+    ts
+}
+
 #[test]
 fn stdio_serializes_concurrent_mutations_of_one_file() {
     let temp = tempfile::tempdir().unwrap();
@@ -353,6 +371,51 @@ fn stdio_job_read_cannot_authorize_ack_across_an_unread_prefix() {
         json!({"ref":node_ref,"view":"result","offset":through}),
     ));
     assert_ne!(acknowledged["result"]["isError"], true, "{acknowledged}");
+    probe.finish();
+}
+
+#[test]
+fn stdio_jobs_read_serializes_scoped_receipt_timestamp() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("receipt.txt"), "receipt-wire").unwrap();
+    let mut probe = Probe::start(&root);
+    let init = probe.request(&initialize_request(1));
+    assert_eq!(init["result"]["serverInfo"]["name"], "dotlink");
+
+    let batch = probe.request(&call_request(
+        2,
+        "batch",
+        json!({
+            "ops":[["read", {"path":"receipt.txt","numbered":false}]],
+            "background":true
+        }),
+    ));
+    assert_ne!(batch["result"]["isError"], true, "{batch}");
+    assert!(assert_receipt_ts(&batch) > 1_700_000_000);
+    let job_ref = text_of(&batch)
+        .split_whitespace()
+        .next()
+        .expect("background batch Job ref")
+        .to_owned();
+    let node_ref = format!("{job_ref}/n:1");
+
+    let terminal = probe.request(&call_request(
+        3,
+        "jobs_get",
+        json!({"ref":job_ref,"wait_ms":1000}),
+    ));
+    assert_ne!(terminal["result"]["isError"], true, "{terminal}");
+    assert_receipt_ts(&terminal);
+
+    let page = probe.request(&call_request(
+        4,
+        "jobs_read",
+        json!({"ref":node_ref,"view":"result","offset":0}),
+    ));
+    assert_ne!(page["result"]["isError"], true, "{page}");
+    assert_receipt_ts(&page);
+    assert!(text_of(&page).contains("receipt-wire"), "{page}");
     probe.finish();
 }
 

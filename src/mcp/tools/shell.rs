@@ -139,6 +139,7 @@ impl ShellCallArgs {
 
 /// Salvage window for partial output after a killed child.
 const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+const DEFAULT_SHELL_OUTPUT_BYTES: usize = 256 * 1024;
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
@@ -147,8 +148,9 @@ fn shell_timeout_description(max_secs: u64) -> String {
 }
 
 fn shell_output_description(max_bytes: usize) -> String {
+    let default_bytes = DEFAULT_SHELL_OUTPUT_BYTES.min(max_bytes);
     format!(
-        "Ordinary shell-result byte limit per stream. Defaults to {max_bytes} and is capped there. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same j:<handle> and retained output is paged with jobs_read."
+        "Ordinary shell-result byte limit per stream. Defaults to {default_bytes} and is capped at {max_bytes}. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same j:<handle> and retained output is paged with jobs_read."
     )
 }
 
@@ -168,6 +170,12 @@ pub(crate) fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usiz
     ] {
         if let Some(Value::Object(property)) = properties.get_mut(key) {
             property.insert("description".to_owned(), Value::String(description));
+            if key == "max_output_bytes" {
+                property.insert(
+                    "default".to_owned(),
+                    Value::from(DEFAULT_SHELL_OUTPUT_BYTES.min(max_bytes) as u64),
+                );
+            }
             property.insert(
                 "maximum".to_owned(),
                 Value::from(if key == "timeout_secs" {
@@ -1656,7 +1664,12 @@ impl ShellRuntime {
     }
 
     pub(crate) fn output_limit(&self, requested: Option<usize>) -> usize {
-        resolve_capped(requested, self.config.max_output_bytes)
+        resolve_capped(
+            requested.or(Some(
+                DEFAULT_SHELL_OUTPUT_BYTES.min(self.config.max_output_bytes),
+            )),
+            self.config.max_output_bytes,
+        )
     }
 
     pub(crate) fn job_result_context(
@@ -2294,7 +2307,19 @@ impl LocalMachine {
                 return Err(error.into_mcp());
             }
         };
-        let result = ok_text(status);
+        let operation = aw_tools::OperationId::from_model_name(name).ok_or_else(|| {
+            McpError::internal_error("shell operation metadata unavailable", None)
+        })?;
+        let mut result = ok_text(status);
+        if let Err(error) = self.stamp_cached_mcp_receipt(operation, &mut result) {
+            let fallback = tool_error(format!(
+                "remote Start shell effect completed but its timestamp receipt could not be finalized: {error}; inspect the Job before retrying"
+            ));
+            guard
+                .mark_ready(RemoteStartReceipt::Mcp(fallback.clone()))
+                .map_err(|cache_error| McpError::internal_error(cache_error.to_string(), None))?;
+            return Ok(CallToolResponse::Complete(fallback));
+        }
         guard
             .mark_ready(RemoteStartReceipt::Mcp(result.clone()))
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
@@ -4065,6 +4090,7 @@ mod tests {
         assert!(timeout.contains("42"), "{timeout}");
         assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
         assert!(output.contains("2048"), "{output}");
+        assert_eq!(properties["max_output_bytes"]["default"], 2048);
         // Non-shell product routes keep their static schemas. Canonical
         // filesystem routes are merged separately from aw-tools.
         let jobs_get = LocalMachine::all_tools().get("jobs_get").cloned().unwrap();
@@ -4098,13 +4124,21 @@ mod tests {
 
     #[test]
     fn output_limits_are_client_controlled_under_a_policy_ceiling() {
-        // Omitted -> the profile ceiling.
-        assert_eq!(resolve_capped(None, 1_048_576_usize), 1_048_576);
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let machine = direct_shell_machine(temp.path().canonicalize().unwrap(), bash, 1_048_576);
+        // Omitted -> 256 KiB product default, not the full profile ceiling.
+        assert_eq!(machine.shell_runtime().output_limit(None), 256 * 1024);
         // Caller lowers it freely.
-        assert_eq!(resolve_capped(Some(4_096_usize), 1_048_576), 4_096);
+        assert_eq!(machine.shell_runtime().output_limit(Some(4_096)), 4_096);
         // Caller cannot exceed the ceiling.
-        assert_eq!(resolve_capped(Some(8_388_608_usize), 1_048_576), 1_048_576);
-        assert_eq!(resolve_capped(Some(0_usize), 1_048_576), 1);
+        assert_eq!(
+            machine.shell_runtime().output_limit(Some(8_388_608)),
+            1_048_576
+        );
+        assert_eq!(machine.shell_runtime().output_limit(Some(0)), 1);
     }
 
     #[test]
@@ -4800,11 +4834,17 @@ mod tests {
             panic!("native task did not complete with a tool result")
         };
         let task_result: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
+        assert_eq!(task_result.is_error, expected.is_error);
+        assert_eq!(task_result.structured_content, expected.structured_content);
         assert_eq!(
-            serde_json::to_value(&task_result).unwrap(),
-            serde_json::to_value(&expected).unwrap(),
-            "SEP-2663 tasks/get must inline the original tools/call result"
+            &task_result.content[..expected.content.len()],
+            expected.content.as_slice(),
+            "SEP-2663 tasks/get must preserve the original tools/call payload"
         );
+        let task_ts = crate::mcp::stored_receipt_ts(&task_result)
+            .expect("native Task result must carry its first-finalization timestamp");
+        assert!(crate::mcp::has_visible_receipt_ts(&task_result, task_ts));
+        assert_eq!(task_result.content.len(), expected.content.len() + 1);
 
         // Full durable output remains pageable beyond the ordinary result's
         // per-stream limit, and acknowledgement cannot delete the source needed
@@ -4845,9 +4885,11 @@ mod tests {
         };
         let replayed: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
         assert_eq!(
-            serde_json::to_value(replayed).unwrap(),
-            serde_json::to_value(expected).unwrap()
+            serde_json::to_value(&replayed).unwrap(),
+            serde_json::to_value(&task_result).unwrap(),
+            "native Task replay must preserve the original receipt timestamp"
         );
+        assert_eq!(crate::mcp::stored_receipt_ts(&replayed), Some(task_ts));
     }
 
     #[cfg(unix)]

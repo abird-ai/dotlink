@@ -18,6 +18,7 @@ use std::{
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
     sync::{Arc, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -306,21 +307,7 @@ pub(crate) fn serialized_text_tool_result_len(text: &str) -> usize {
     serialized_text_tool_result_fixed_len().saturating_add(serialized_text_content_len(text))
 }
 
-fn serialized_error_text_tool_result_fixed_len() -> usize {
-    static EMPTY_ERROR_BYTES: OnceLock<usize> = OnceLock::new();
-    *EMPTY_ERROR_BYTES.get_or_init(|| {
-        serde_json::to_vec(&CallToolResult::error(vec![ContentBlock::text("")]))
-            .expect("empty error tool result serializes")
-            .len()
-    })
-}
-
-fn fitted_tool_result_text(text: &str, budget: usize, is_error: bool, suffix: &str) -> String {
-    let fixed = if is_error {
-        serialized_error_text_tool_result_fixed_len()
-    } else {
-        serialized_text_tool_result_fixed_len()
-    };
+fn fitted_tool_result_text(text: &str, budget: usize, fixed: usize, suffix: &str) -> String {
     if fixed.saturating_add(serialized_text_content_len(text)) <= budget {
         return text.to_owned();
     }
@@ -365,6 +352,7 @@ fn fit_call_tool_response_to_budget(
     }
 
     let is_error = result.is_error.unwrap_or(false);
+    let meta = result.meta.clone();
     let original_text = result
         .content
         .iter()
@@ -379,17 +367,84 @@ fn fit_call_tool_response_to_budget(
     } else {
         "\n… detailed result omitted because it exceeded the transport response budget"
     };
-    let text = fitted_tool_result_text(original_text, budget, is_error, suffix);
-    if is_error {
-        CallToolResponse::Complete(CallToolResult::error(vec![ContentBlock::text(text)]))
+    let mut empty = if is_error {
+        CallToolResult::error(vec![ContentBlock::text("")])
+    } else {
+        CallToolResult::success(vec![ContentBlock::text("")])
+    };
+    empty.meta = meta.clone();
+    let fixed = serialized_json_len(&empty).unwrap_or(usize::MAX);
+    let text = fitted_tool_result_text(original_text, budget, fixed, suffix);
+    let mut fitted = if is_error {
+        CallToolResult::error(vec![ContentBlock::text(text)])
     } else {
         tracing::error!(
             tool,
             budget,
             "tool success result exceeded its transport response budget"
         );
-        CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(text)]))
+        CallToolResult::success(vec![ContentBlock::text(text)])
+    };
+    fitted.meta = meta;
+    CallToolResponse::Complete(fitted)
+}
+
+const RECEIPT_META_KEY: &str = "io.abird/receipt";
+
+fn unix_ts_now() -> Result<u64, McpError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| McpError::internal_error("system clock is before Unix epoch", None))
+}
+
+fn stored_receipt_ts(result: &CallToolResult) -> Option<u64> {
+    result
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.0.get(RECEIPT_META_KEY))
+        .and_then(|receipt| receipt.get("ts"))
+        .and_then(Value::as_u64)
+}
+
+fn has_visible_receipt_ts(result: &CallToolResult, ts: u64) -> bool {
+    let marker = format!("ts={ts}");
+    result.content.iter().any(|block| {
+        block
+            .as_text()
+            .is_some_and(|text| text.text.lines().any(|line| line.trim() == marker.as_str()))
+    })
+}
+
+pub(crate) fn set_stored_receipt_ts(result: &mut CallToolResult, ts: u64) {
+    let mut meta = result.meta.take().unwrap_or_default();
+    meta.0
+        .insert(RECEIPT_META_KEY.to_owned(), serde_json::json!({"ts": ts}));
+    result.meta = Some(meta);
+}
+
+pub(crate) fn ensure_visible_receipt_ts(result: &mut CallToolResult, ts: u64) {
+    if !has_visible_receipt_ts(result, ts) {
+        result.content.push(ContentBlock::text(format!("ts={ts}")));
     }
+}
+
+fn stamp_receipt_metadata(
+    toolset: &aw_tools::toolset::Toolset,
+    operation: aw_tools::OperationId,
+    result: &mut CallToolResult,
+) -> Result<Option<u64>, McpError> {
+    let profile = toolset.receipt_profile();
+    if !profile.unix_ts || !profile.scope.contains(operation) {
+        return Ok(None);
+    }
+    let ts = stored_receipt_ts(result).unwrap_or(unix_ts_now()?);
+    let metadata = toolset
+        .receipt_metadata(operation, Some(ts))
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        .ok_or_else(|| McpError::internal_error("receipt profile lost selected operation", None))?;
+    set_stored_receipt_ts(result, metadata.ts);
+    Ok(Some(metadata.ts))
 }
 
 fn fit_mcp_error_to_budget(error: McpError, budget: Option<usize>) -> McpError {
@@ -2170,6 +2225,81 @@ impl LocalMachine {
 }
 
 impl LocalMachine {
+    fn shared_toolset(&self) -> aw_tools::toolset::Toolset {
+        tools::shared_native::toolset(self.config.shared_caps, self.config.max_output_bytes)
+    }
+
+    pub(crate) fn stamp_cached_mcp_receipt(
+        &self,
+        operation: aw_tools::OperationId,
+        result: &mut CallToolResult,
+    ) -> Result<(), McpError> {
+        let toolset = self.shared_toolset();
+        let _ = stamp_receipt_metadata(&toolset, operation, result)?;
+        Ok(())
+    }
+
+    fn decorate_and_fit_tool_response(
+        &self,
+        name: &str,
+        response: CallToolResponse,
+        budget: Option<usize>,
+    ) -> Result<CallToolResponse, McpError> {
+        let Some(operation) = aw_tools::OperationId::from_model_name(name) else {
+            return Ok(fit_call_tool_response_to_budget(name, response, budget));
+        };
+        let CallToolResponse::Complete(mut result) = response else {
+            return Ok(response);
+        };
+        let toolset = self.shared_toolset();
+        let Some(ts) = stamp_receipt_metadata(&toolset, operation, &mut result)? else {
+            return Ok(fit_call_tool_response_to_budget(
+                name,
+                CallToolResponse::Complete(result),
+                budget,
+            ));
+        };
+        let marker = format!("ts={ts}");
+        if has_visible_receipt_ts(&result, ts) {
+            return Ok(fit_call_tool_response_to_budget(
+                name,
+                CallToolResponse::Complete(result),
+                budget,
+            ));
+        }
+
+        let Some(budget) = budget else {
+            ensure_visible_receipt_ts(&mut result, ts);
+            return Ok(CallToolResponse::Complete(result));
+        };
+        let base_size = serialized_json_len(&result).unwrap_or(usize::MAX);
+        let mut candidate = result.clone();
+        candidate.content.push(ContentBlock::text(marker.clone()));
+        let candidate_size = serialized_json_len(&candidate).unwrap_or(usize::MAX);
+        if candidate_size <= budget {
+            return Ok(CallToolResponse::Complete(candidate));
+        }
+
+        let receipt_reserve = candidate_size.saturating_sub(base_size);
+        let fitted = fit_call_tool_response_to_budget(
+            name,
+            CallToolResponse::Complete(result),
+            Some(budget.saturating_sub(receipt_reserve)),
+        );
+        let CallToolResponse::Complete(mut fitted) = fitted else {
+            return Ok(fitted);
+        };
+        fitted.content.push(ContentBlock::text(marker));
+        if serialized_json_len(&fitted).is_some_and(|size| size <= budget) {
+            Ok(CallToolResponse::Complete(fitted))
+        } else {
+            Err(McpError::internal_error(
+                "tool receipt timestamp cannot fit the transport response budget",
+                None,
+            ))
+        }
+    }
+
     /// Product-owned non-filesystem routes. The canonical filesystem surface is
     /// added separately from `aw-tools`; compatibility lives only at input and
     /// projection boundaries, never in a second native filesystem engine.
@@ -2184,7 +2314,7 @@ impl LocalMachine {
         caps: aw_tools::filesystem::schema::SchemaCaps,
         shell_tool: Option<aw_tools::filesystem::batch::NodeTool>,
     ) -> ToolRouter<Self> {
-        let toolset = tools::shared_native::toolset(caps);
+        let toolset = tools::shared_native::toolset(caps, crate::limits::DEFAULT_TRANSFER_BYTES);
         let mut router = Self::all_tools();
         // Add/replace the complete canonical filesystem surface BEFORE policy
         // filtering so new shared tools can never bypass dotlink visibility.
@@ -2440,7 +2570,7 @@ impl LocalMachine {
             crate::limits::DEFAULT_TRANSFER_BYTES,
         )
         .expect("built-in transfer ceilings fit shared tool limits");
-        let toolset = tools::shared_native::toolset(caps);
+        let toolset = tools::shared_native::toolset(caps, crate::limits::DEFAULT_TRANSFER_BYTES);
         Ok(Self::describe_tools(
             Self::tool_router_for_policy_with_caps(
                 capabilities,
@@ -2514,7 +2644,7 @@ impl rmcp::ServerHandler for LocalMachine {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
-        let toolset = tools::shared_native::toolset(self.config.shared_caps);
+        let toolset = self.shared_toolset();
         Ok(ListToolsResult {
             result_type: Some(ResultType::COMPLETE),
             tools: self
@@ -2531,7 +2661,7 @@ impl rmcp::ServerHandler for LocalMachine {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        let toolset = tools::shared_native::toolset(self.config.shared_caps);
+        let toolset = self.shared_toolset();
         self.policy_tool_router()
             .get(name)
             .cloned()
@@ -2539,6 +2669,11 @@ impl rmcp::ServerHandler for LocalMachine {
     }
 
     fn get_info(&self) -> ServerConfig {
+        let base_instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline.";
+        let instructions = self.shared_toolset().model_instructions().map_or_else(
+            || base_instructions.to_owned(),
+            |extra| format!("{base_instructions} {extra}"),
+        );
         ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -2546,7 +2681,7 @@ impl rmcp::ServerHandler for LocalMachine {
                 .build(),
         )
         .with_server_info(Implementation::new("dotlink", env!("CARGO_PKG_VERSION")))
-        .with_instructions("Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline.".to_owned())
+        .with_instructions(instructions)
     }
 
     async fn get_task(
@@ -2673,11 +2808,9 @@ impl rmcp::ServerHandler for LocalMachine {
             let started = self.config.log.activity_start(&name, detail);
 
             let shell_result = match self.handle_shell_call(&request, &context).await {
-                Ok(Some(response)) => Some(Ok(fit_call_tool_response_to_budget(
-                    &name,
-                    response,
-                    result_budget,
-                ))),
+                Ok(Some(response)) => {
+                    Some(self.decorate_and_fit_tool_response(&name, response, result_budget))
+                }
                 Ok(None) => None,
                 Err(error) => Some(Err(fit_mcp_error_to_budget(error, result_budget))),
             };
@@ -2722,7 +2855,9 @@ impl rmcp::ServerHandler for LocalMachine {
             };
 
             let result = result
-                .map(|response| fit_call_tool_response_to_budget(&name, response, result_budget))
+                .and_then(|response| {
+                    self.decorate_and_fit_tool_response(&name, response, result_budget)
+                })
                 .map_err(|error| fit_mcp_error_to_budget(error, result_budget));
             self.config
                 .log
@@ -2772,7 +2907,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let toolset = tools::shared_native::toolset(machine.config.shared_caps);
+        let toolset = tools::shared_native::toolset(
+            machine.config.shared_caps,
+            machine.config.max_output_bytes,
+        );
         assert_eq!(
             inspect,
             LocalMachine::describe_tools(
@@ -3611,8 +3749,10 @@ mod tests {
     fn tool_table_matches_the_advertised_router() {
         // One table drives visibility; prove it covers every route exactly once.
         let mut router = LocalMachine::all_tools();
-        let toolset =
-            tools::shared_native::toolset(aw_tools::filesystem::schema::SchemaCaps::default());
+        let toolset = tools::shared_native::toolset(
+            aw_tools::filesystem::schema::SchemaCaps::default(),
+            crate::limits::DEFAULT_TRANSFER_BYTES,
+        );
         tools::shared_native::canonicalize_router(&mut router, &toolset);
         let all: Vec<String> = router
             .list_all()
@@ -3647,8 +3787,10 @@ mod tests {
 
     #[test]
     fn shared_toolset_metadata_preserves_shell_and_batch_host_contracts() {
-        let toolset =
-            tools::shared_native::toolset(aw_tools::filesystem::schema::SchemaCaps::default());
+        let toolset = tools::shared_native::toolset(
+            aw_tools::filesystem::schema::SchemaCaps::default(),
+            crate::limits::DEFAULT_TRANSFER_BYTES,
+        );
         let router = LocalMachine::all_tools();
 
         let shell_name = shell_tool_name();
@@ -3665,7 +3807,15 @@ mod tests {
             shell.annotations.as_ref().and_then(|a| a.title.as_deref()),
             Some(shell_title)
         );
-        assert_eq!(shell.description, shell_description);
+        assert!(shell.description.as_deref().is_some_and(|description| {
+            description.starts_with(shell_description.as_deref().unwrap_or(""))
+        }));
+        assert!(
+            shell
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("receipt ts"))
+        );
         assert_eq!(
             shell.input_schema["properties"]["timeout_secs"]["maximum"],
             42
@@ -3685,8 +3835,151 @@ mod tests {
             batch.annotations.as_ref().and_then(|a| a.title.as_deref()),
             Some("Run tool Graph")
         );
-        assert_eq!(batch.description, batch_description);
+        assert!(batch.description.as_deref().is_some_and(|description| {
+            description.starts_with(batch_description.as_deref().unwrap_or(""))
+        }));
+        assert!(
+            batch
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("receipt ts"))
+        );
         assert_eq!(batch.input_schema, batch_schema);
+    }
+
+    #[test]
+    fn scoped_receipt_metadata_is_visible_replay_stable_and_payload_preserving() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine =
+            crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
+
+        let mut original = CallToolResult::success(vec![ContentBlock::text("chunk")]);
+        original.structured_content = Some(serde_json::json!({"kind":"page","offset":0}));
+        let structured = original.structured_content.clone();
+        let response = machine
+            .decorate_and_fit_tool_response("jobs_read", CallToolResponse::Complete(original), None)
+            .unwrap();
+        let CallToolResponse::Complete(result) = response else {
+            panic!("jobs_read must complete")
+        };
+        let ts = stored_receipt_ts(&result).expect("selected Jobs result timestamp");
+        assert!(ts > 1_700_000_000);
+        assert!(has_visible_receipt_ts(&result, ts));
+        assert_eq!(result.structured_content, structured);
+        assert_eq!(result.content[0].as_text().unwrap().text, "chunk");
+
+        let typed_blocks = vec![
+            ContentBlock::image("aW1hZ2U=", "image/png"),
+            ContentBlock::audio("YXVkaW8=", "audio/wav"),
+            ContentBlock::resource(rmcp::model::ResourceContents::text(
+                "resource-body",
+                "test://receipt/resource",
+            )),
+        ];
+        let typed = machine
+            .decorate_and_fit_tool_response(
+                "jobs_read",
+                CallToolResponse::Complete(CallToolResult::success(typed_blocks.clone())),
+                None,
+            )
+            .unwrap();
+        let CallToolResponse::Complete(typed) = typed else {
+            panic!("typed jobs_read fixture must complete")
+        };
+        assert_eq!(
+            &typed.content[..typed_blocks.len()],
+            typed_blocks.as_slice()
+        );
+        assert_eq!(typed.content.len(), typed_blocks.len() + 1);
+        let typed_ts = stored_receipt_ts(&typed).expect("typed receipt timestamp");
+        assert!(has_visible_receipt_ts(&typed, typed_ts));
+
+        let mut replay = result.clone();
+        replay.content.retain(|block| {
+            block
+                .as_text()
+                .is_none_or(|text| text.text.trim() != format!("ts={ts}"))
+        });
+        let replay = machine
+            .decorate_and_fit_tool_response("jobs_read", CallToolResponse::Complete(replay), None)
+            .unwrap();
+        let CallToolResponse::Complete(replay) = replay else {
+            panic!("replayed jobs_read must complete")
+        };
+        assert_eq!(stored_receipt_ts(&replay), Some(ts));
+        assert!(has_visible_receipt_ts(&replay, ts));
+
+        let excluded = machine
+            .decorate_and_fit_tool_response(
+                "read",
+                CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(
+                    "filesystem",
+                )])),
+                None,
+            )
+            .unwrap();
+        let CallToolResponse::Complete(excluded) = excluded else {
+            panic!("filesystem read must complete")
+        };
+        assert_eq!(stored_receipt_ts(&excluded), None);
+        assert_eq!(excluded.content.len(), 1);
+
+        for name in [
+            shell_tool_name(),
+            "batch",
+            "jobs_list",
+            "jobs_get",
+            "jobs_read",
+            "jobs_ack",
+            "jobs_send",
+            "jobs_cancel",
+            "jobs_subscribe",
+        ] {
+            let selected = machine
+                .decorate_and_fit_tool_response(
+                    name,
+                    CallToolResponse::Complete(CallToolResult::error(vec![ContentBlock::text(
+                        "error",
+                    )])),
+                    None,
+                )
+                .unwrap();
+            let CallToolResponse::Complete(selected) = selected else {
+                panic!("{name} must complete")
+            };
+            let selected_ts =
+                stored_receipt_ts(&selected).unwrap_or_else(|| panic!("{name} missing receipt ts"));
+            assert!(has_visible_receipt_ts(&selected, selected_ts), "{name}");
+            assert_eq!(selected.is_error, Some(true), "{name}");
+        }
+
+        let tight = machine
+            .decorate_and_fit_tool_response(
+                "jobs_get",
+                CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(
+                    "x".repeat(4096),
+                )])),
+                Some(1024),
+            )
+            .unwrap();
+        let CallToolResponse::Complete(tight) = tight else {
+            panic!("bounded jobs_get must complete")
+        };
+        let tight_ts = stored_receipt_ts(&tight).expect("bounded receipt timestamp");
+        assert!(has_visible_receipt_ts(&tight, tight_ts));
+        assert!(serialized_json_len(&tight).is_some_and(|size| size <= 1024));
+    }
+
+    #[test]
+    fn server_instructions_include_shared_thirty_minute_checkpoint_guidance_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine =
+            crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
+        let info = <LocalMachine as rmcp::ServerHandler>::get_info(&machine);
+        let instructions = info.instructions.as_deref().expect("instructions");
+        assert!(instructions.contains("30 minutes"));
+        assert!(instructions.contains("ts=UTC Unix seconds"));
+        assert_eq!(instructions.matches("30 minutes").count(), 1);
     }
 
     /// Both HTTP entry points must use the ceiling derived from the profile, not
