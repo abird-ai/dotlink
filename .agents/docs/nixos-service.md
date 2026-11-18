@@ -83,16 +83,16 @@ services.dotlink = {
     # Optional durable-job tuning from the normal profile schema:
     job_retention_secs = 3600;
     job_spool_bytes = 536870912;
-  };
-
-  extraPackages = with pkgs; [ git ripgrep fd ];
     logging.verbosity = "tools";
   };
+
+  extraPackages = with pkgs;
+    [git ripgrep fd];
 };
 ```
 
-A read-only JSON document with schema version 10 is generated in the Nix store
-and passed to dotlink through `DOTLINK_CONFIG_FILE`. This *only* overrides the
+A read-only JSON document at the current profile schema version is generated in
+the Nix store and passed to dotlink through `DOTLINK_CONFIG_FILE`. This *only* overrides the
 profile JSON; unless explicitly overridden, dotlink still loads the selected
 user's own saved `runtime.key` and OAuth state. The schema is dotlink's
 existing JSONC schema, not a second independently maintained config format.

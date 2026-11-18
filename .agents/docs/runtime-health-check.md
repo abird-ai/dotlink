@@ -236,7 +236,18 @@ Check these explicitly. Each has a known-good value in the baseline.
 | poll failures / restarts | 0 / 0 | any — transport instability |
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
+| `stop id=` lines | rare: `reason=timeout`/`cancel`/`failed` matches a completion that shows the stop, `reason=shutdown` is connector teardown (the revoked job publishes none), and `cleanup`/`dropped` are tidy-ups with no claim | `outcome=failed`, or a `timeout`/`cancel`/`failed` claim that no completion shows |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
+
+A stop line written while the runtime restarts has no completion to match: the
+connector revokes those jobs before they can publish one, so a `shutdown` or
+`dropped` line standing alone is expected, not evidence of a lost result.
+
+The `id=` of a stop line is the durable job handle: when the call returned one
+(`background: true`, or a handoff receipt under a cap) it is the id `job_get` and
+`job_output` use. A synchronous call returns no handle, so match its line by time
+— the line's timestamp and the result's `ts` are the same call — and compare the
+line's reason with the status the caller actually saw.
 
 ## 5. Benign classes — do not chase
 
@@ -249,6 +260,27 @@ Check these explicitly. Each has a known-good value in the baseline.
 - **`job_get` at the 90 s ceiling.** That is the caller asking for the maximum wait on a job
   that never finished inside it. Not a transport cap.
 - **`bash` at the 90 s ceiling with a handle returned.** The sync hold did its job.
+
+## 5a. Reading silence
+
+A session's idle time is a verdict on the *turn*, not on the bridge. The bands
+below are an operator's rule of thumb from watching live sessions, not a
+measurement; treat them as a prior to check against the log, not a finding:
+
+| idle | reading |
+| --- | --- |
+| < 5 min | active — the model is between calls |
+| 5–10 min | unclear — a turn that finished cleanly (commit, cleanup, handoff) sits quiet this long, and a new turn may still arrive |
+| 10–20 min | usually over — the turn has most likely ended |
+| 20 min + | presumed inactive until a new user turn arrives |
+
+So a long idle column is not a fault signal by itself. Check the last call's *shape*
+first: a session that went quiet right after a 90 s handoff, a commit, or a
+cleanup command finished its work; one that went quiet mid-sequence with a job
+still running needs the job checked separately.
+
+Corollary: never infer "the model is stuck" from idleness. The bridge reports lost
+requests (`open requests`), failed polls and restarts — those are the fault signals.
 
 ## 6. Open questions carried across versions
 

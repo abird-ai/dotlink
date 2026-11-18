@@ -6,6 +6,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Shell and job results report `signal` when the waited process was terminated
+  by a signal, and `stopped_by` (`timeout`, `cancel`, `shutdown`, `failed`) when
+  dotlink stopped it — `cancel` when the caller cancelled, `shutdown` when the
+  connector withdrew the work (shutdown, restart, authority replacement), so a
+  result never blames a user who did nothing. Both are omitted otherwise, and the pair is self-describing: a
+  signal with no `stopped_by` is an event the connector did not cause. The
+  surface's prose field says so — `next` on a result, `error` on `job_get` —
+  naming the signal (SIGKILL, SIGSEGV, …) rather than leaving a bare number.
+  `exit_code: null` alone could not tell an external kill from a crash, and the
+  two need different responses. A sandboxed
+  run reports signals the same way, but a signal to the *inner* command still
+  arrives as exit `128 + signal`, because the sandbox re-encodes it.
+
+- Every signal dotlink sends to a command tree is reported as one line:
+  `LOG job stop id=<id> reason=<timeout|cancel|shutdown|failed|cleanup|dropped> outcome=<delivered|gone|failed>`.
+  It is emitted where the signal is sent, as a lifecycle line rather than a
+  debug line, because it is the forensic record: it appears at every verbosity,
+  so its absence is evidence that nothing was signalled. The outcome is part of
+  the line — a signal that was not delivered, or a group that was already gone,
+  never reads as a stop. `timeout`, `cancel`, `shutdown` and `failed` are result
+  vocabulary; `cleanup` is a tree tidied up behind a command that already ended,
+  and `dropped` is the fail-safe for a runner that ended while still armed.
+
+- `stopped_by` is set only by the site that signals the tree, from the cause that
+  guard actually reported and only when that signal was delivered, so a later
+  failure cannot relabel a timeout as a failure and a result built before
+  anything was spawned claims nothing. Absent means no stop is provable — never
+  that nothing was signalled, since a tidy-up can follow a command that already
+  ended and a runner that dies while armed stops a tree the record cannot see.
+  Every surface that can carry the facts renders them the same way: the ordinary
+  result, `job_get`, an internal failure (`streams_omitted` instead of empty
+  streams, the reaped `exit_code`, context only when it exists), and a native
+  task failure, whose error object's `data` carries the same set, including the
+  reaped status and the deadline it followed.
+
+### Fixed
+
+- A caller-supplied job id is bounded before it appears in a diagnostic, on every
+  transport. `JobError` quotes the id and the job tools rendered it with
+  `Display`, so on stdio and local HTTP — where no transport response budget
+  exists — a very long id came back as a very long tool error.
+- `job_output`'s `max_output_bytes` states the page bound the handler enforces
+  (default and maximum) instead of a 1024 floor that belonged to the transport
+  response ceiling, a different knob. The page path clamped from one byte while
+  the schema claimed a minimum, so a small page was rejected.
+- A failed native task reports the same termination facts as every other surface,
+  including the reaped `exit_code` and the deadline the failure followed.
+
+### Changed
+
+- The NixOS module refuses the `DOTLINK_*` keys it owns inside `environment`:
+  identity, config file, credential files, the SSH agent socket, stdio, colour
+  and supervision. A configuration that spelled any of them there now fails to
+  evaluate instead of being silently overridden or becoming a second source of
+  truth; the typed options are the replacements. This matters because the module
+  must never emit CLI flags, and an environment key is the only other way to
+  disagree with it.
+
 ## [0.17.3] - 2026-11-16
 
 ### Fixed

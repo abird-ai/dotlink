@@ -10,6 +10,8 @@
 
 ## Icebox
 
+- [ ] dotlink-017-backport — Lane `release/0.17` onto `main`; carries `ProcessExit::Signal(i32)`, `stopped_by`, the stop log line and the 0.17.x surface — [details](dotlink-017-backport-2026-11-17/README.md)
+
 ## Closed
 
 - [x] DL-100 — `716ad06` + follow-ups through `dc7f59b` — 2026-10-26 — MCP modularization, safe writes, transport hardening, and regression coverage — [details](dotlink-tool-review-2026-10-26/README.md)
