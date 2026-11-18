@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-11-18
+
 ### Added
 
 - Shell and job results report `signal` when the waited process was terminated
@@ -784,7 +786,8 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.3...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.4...HEAD
+[0.17.4]: https://github.com/abird-ai/dotlink/compare/v0.17.3...v0.17.4
 [0.17.3]: https://github.com/abird-ai/dotlink/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/abird-ai/dotlink/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/abird-ai/dotlink/compare/v0.17.0...v0.17.1
