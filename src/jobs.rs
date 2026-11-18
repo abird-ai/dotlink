@@ -1001,20 +1001,23 @@ pub(crate) enum JobError {
 
 impl JobError {
     pub(crate) fn into_mcp(self) -> McpError {
+        let message = self.to_string();
         match self {
-            Self::Unknown(message) => McpError::invalid_params(bounded_job_error(message), None),
-            Self::Internal(error) => {
-                McpError::internal_error(bounded_job_error(error.to_string()), None)
-            }
+            Self::Unknown(_) => McpError::invalid_params(message, None),
+            Self::Internal(_) => McpError::internal_error(message, None),
         }
     }
 }
 
 impl fmt::Display for JobError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Both variants quote a caller-supplied job id, and the job tools render
+        // their error through `Display` rather than `into_mcp`. Bounding here is
+        // the one place that keeps every diagnostic — protocol error or tool
+        // error, on any transport — inside the completion-error ceiling.
         match self {
-            Self::Unknown(message) => f.write_str(message),
-            Self::Internal(error) => fmt::Display::fmt(error, f),
+            Self::Unknown(message) => f.write_str(&bounded_job_error(message.as_str())),
+            Self::Internal(error) => f.write_str(&bounded_job_error(error.to_string())),
         }
     }
 }
@@ -3664,6 +3667,18 @@ mod tests {
             serde_json::json!({ "exit_code": completion.exit_code }),
             completion,
         )
+    }
+
+    /// A job id is caller input and both job-tool errors and protocol errors
+    /// quote it. One giant id must not become one giant diagnostic.
+    #[test]
+    fn a_job_error_bounds_the_caller_id_it_echoes() {
+        let id = "x".repeat(64 * 1024);
+        let error = JobError::Unknown(format!("unknown job {id}"));
+        assert_eq!(error.to_string().len(), MAX_JOB_ERROR_BYTES);
+        assert!(error.to_string().ends_with('…'));
+        let protocol = JobError::Unknown(format!("unknown job {id}")).into_mcp();
+        assert_eq!(protocol.message.len(), MAX_JOB_ERROR_BYTES);
     }
 
     #[test]
