@@ -220,6 +220,61 @@
       user = "alice";
     };
   };
+  # The module writes these keys from typed options; a second spelling in
+  # `environment` is refused rather than silently overridden.
+  # Every owned key is refused, so dropping one from the list cannot pass.
+  reservedKeysRefused =
+    lib.all
+    (key:
+      !(valid (eval {
+        services.dotlink = {
+          enable = true;
+          user = "alice";
+          workingDirectory = "/home/alice/projects";
+          environment = {${key} = "x";};
+        };
+      })))
+    [
+      "DOTLINK_PROFILE"
+      "DOTLINK_CONFIG_FILE"
+      "DOTLINK_API_KEY_FILE"
+      "NGROK_AUTHTOKEN_FILE"
+      "DOTLINK_STDIO"
+      "DOTLINK_COLOR"
+      "DOTLINK_SUPERVISOR"
+      "DOTLINK_SSH_AGENT_SOCKET"
+    ];
+  reservedEnvironment = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      environment.DOTLINK_PROFILE = "work";
+    };
+  };
+  reservedInstanceEnvironment = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      instances.work = {
+        workingDirectory = "/home/alice/work";
+        environment.DOTLINK_API_KEY_FILE = "/run/secrets/key";
+      };
+    };
+  };
+  # Other environment keys stay available: only what the module owns is closed.
+  supportedEnvironment = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      environment = {
+        DOTLINK_VERBOSITY = "tools";
+        RUST_LOG = "warn";
+      };
+    };
+  };
 
   managedUnitText = managed.config.systemd.units."dotlink.service".text;
   # The same writeText name and content hash to the same store path, so this is
@@ -367,6 +422,12 @@
     (!(autoDetectedGcrAgent.config.systemd.services.dotlink.environment ? SSH_AUTH_SOCK))
     (!valid stdioEnabled)
     (!valid invalidWorkingDirectory)
+    (!valid reservedEnvironment)
+    (!valid reservedInstanceEnvironment)
+    reservedKeysRefused
+    (valid supportedEnvironment)
+    (supportedEnvironment.config.systemd.services.dotlink.environment.DOTLINK_VERBOSITY == "tools")
+    (supportedEnvironment.config.systemd.services.dotlink.environment.RUST_LOG == "warn")
   ];
 in
   assert lib.all (x: x) checks;

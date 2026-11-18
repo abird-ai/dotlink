@@ -14,6 +14,22 @@
   cfg = config.services.dotlink;
   systemdVersion = lib.getVersion config.systemd.package;
 
+  # Keys the module owns: identity, config file, credential files and the SSH
+  # agent socket come from typed options; stdio, colour and supervision are
+  # deployment facts the module sets. Accepting any of them in `environment` would
+  # either be silently overridden or become a second source of truth, so the
+  # module refuses the value instead of picking a winner.
+  reservedEnvironment = [
+    "DOTLINK_PROFILE"
+    "DOTLINK_CONFIG_FILE"
+    "DOTLINK_STDIO"
+    "DOTLINK_COLOR"
+    "DOTLINK_SUPERVISOR"
+    "DOTLINK_API_KEY_FILE"
+    "NGROK_AUTHTOKEN_FILE"
+    "DOTLINK_SSH_AGENT_SOCKET"
+  ];
+
   commonOptions = {
     enableDefault,
     userDefault,
@@ -143,7 +159,10 @@
       example = {XDG_CONFIG_HOME = "/home/alice/.config";};
       description = ''
         Additional non-secret environment variables, such as custom XDG paths
-        or RUST_LOG. Do not place credentials here or in settings.
+        or RUST_LOG. Do not place credentials here or in settings. The keys the
+        module owns are refused: identity, config file, credential files and the
+        SSH agent socket come from their typed options, and stdio, color and
+        supervision are deployment facts the module sets.
       '';
     };
   };
@@ -399,6 +418,15 @@ in {
       ++ (lib.mapAttrsToList (name: instance: {
           assertion = instance.settings == null || instance.configFile == null;
           message = "dotlink ${name}: settings and configFile are mutually exclusive.";
+        })
+        active)
+      ++ (lib.mapAttrsToList (name: instance: {
+          assertion = !(lib.any (key: builtins.hasAttr key instance.environment) reservedEnvironment);
+          message = "services.dotlink${
+            if name == "default"
+            then ""
+            else ".instances.${name}"
+          }.environment must not set ${lib.concatStringsSep ", " reservedEnvironment}: the module owns those values — identity, config file, credential files and the SSH agent socket come from their typed options, and stdio, color and supervision are deployment facts.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
