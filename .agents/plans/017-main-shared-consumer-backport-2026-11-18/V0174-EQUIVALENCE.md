@@ -142,9 +142,10 @@ not a protocol/runtime timeout. It must never be conflated with:
 ## Final equivalence qualification
 
 The v0.17.x → current-main **semantic matrix is fully green** for every
-non-deferred behavior through local release `0.17.5`. The reviewed signed
-implementation checkpoint is
-`fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`.
+non-deferred behavior through local release `0.17.5`. A fresh independent review
+found and remediated the final-envelope/replay-cache boundary issues described
+below. The latest reviewed signed source checkpoint is
+`d32a3196ec18ada7f85176a9feed42667e5f2d6b`.
 
 Closing checkpoint on x86_64 Linux:
 
@@ -158,7 +159,11 @@ Closing checkpoint on x86_64 Linux:
   working tree and pinned inputs;
 - executable native Linux closeout: hardware discovery/policy **4/4**,
   process-tree timeout containment **1/1**, and real signal/timeout lifecycle
-  **2/2**.
+  **2/2**;
+- fresh-review cache/final-envelope regressions: **8/8**, including narrow-first
+  Graph/Cancel replay recovering canonical cached success, final-decorated
+  Control/Send sizing, irreversible stdin preflight, and D5 page-credit text
+  remaining byte-identical after D6 receipt decoration.
 
 Runtime/deployment gates unavailable on this host do not weaken the semantic
 result: the connector exposes Bubblewrap only through a direct Nix-store path,

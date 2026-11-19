@@ -1,6 +1,6 @@
 # D4-D7 exact source cutover map
 
-Status: **repin + D1-D7 source cutover + final semantic equivalence complete and committed at `fa01e18`**
+Status: **D1-D7 cutover + final equivalence + fresh replay/envelope review complete; latest source `d32a319`**
 
 Parent:
 [README.md](README.md)

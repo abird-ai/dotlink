@@ -46,11 +46,14 @@ that final SHA with no sibling/path dependency and no registry package/version
 churn.
 
 D1-D7 convergence and the closing v0.17.x semantic equivalence gate are
-complete and reviewed. The signed implementation checkpoint is
-`fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`
-(`Complete D4-D7 shared consumer convergence`). Do not reintroduce compatibility
-copies; the remaining unavailable runtime/deployment smokes are
-platform/connector external, not open semantic work.
+complete and freshly reviewed. The latest signed source checkpoint is
+`d32a3196ec18ada7f85176a9feed42667e5f2d6b`
+(`Harden Jobs replay and response budget boundaries`), on top of D4-D7 source
+checkpoint `fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`. The fresh review fixed
+canonical Remote Start cache-before-projection ordering and made Jobs fit/
+preflight decisions measure the final D6-decorated MCP result. Do not
+reintroduce compatibility copies; the remaining unavailable runtime/deployment
+smokes are platform/connector external, not open semantic work.
 
 The independent product-only D8 Nix hardening is implemented now: module-owned
 environment keys are rejected through one generic assertion and regression

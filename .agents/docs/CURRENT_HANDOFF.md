@@ -18,20 +18,25 @@ Repo: `/home/pvl/spaces/abird/src/dotlink`
 > [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
 > It preserves this unified-runtime implementation and is not a release/tag.
 
-## LIVE 0.17 shared-consumer checkpoint — D1-D7 reviewed, qualified and committed 2026-11-19
+## LIVE 0.17 shared-consumer checkpoint — D1-D7 fresh-reviewed, remediated and qualified 2026-11-19
 
 This section supersedes older dependency/state details below where they conflict.
 
 Current Git / dependency boundary:
 
-- signed final D4-D7 source checkpoint:
+- signed fresh-review remediation checkpoint:
+  `d32a3196ec18ada7f85176a9feed42667e5f2d6b`
+  (`Harden Jobs replay and response budget boundaries`);
+- preceding signed D4-D7 implementation checkpoint:
   `fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`
   (`Complete D4-D7 shared consumer convergence`);
+- preceding signed equivalence/docs checkpoint:
+  `8b77bae48633d8c609b44ccec7291e5e20ab5624`
+  (`Record final 0.17 equivalence checkpoint`);
 - prior signed/pushed D1-D3 docs checkpoint remains
   `4c3b96fd5ba9e6772bc159f10a3ad893c9729887`
   (`Record repinned D1-D3 convergence checkpoint`);
 - `origin/main` remains `4c3b96fd...` because push has not been authorized;
-- this handoff/plan closeout is committed separately on top of `fa01e18...`;
 - pre-repin signed checkpoints remain `46215fe` product parity and `0aea1f4` consumer docs;
 - AW final published implementation pin:
   AW_IMPL_SHA = 1a5d0f65208e4a05b737c804a55a3aaad3e2fa59;
@@ -277,6 +282,51 @@ for `waiting`. No source was changed; the exact test passed **3/3** in isolation
 and the complete second full run passed **701/0/1**. Treat this as timing noise,
 not a D7 behavior change.
 
+### Fresh independent review remediation — complete
+
+A fresh review from the clean `fa01e18` + `8b77bae` stack found two related
+correctness defects at the D4/D5/D6 boundary:
+
+1. Remote Start Job/Graph completion could apply a request-specific narrow
+   projection before `RemoteStartReceipt::JobMcp` was stored. A narrow first
+   Batch/ACK/Cancel/Send response could therefore replace the richer canonical
+   replay receipt. `complete_remote_start_result` now stamps and stores one
+   canonical typed receipt first, then derives only the current response from
+   that immutable cache state. Narrow-first Graph and Cancel regressions prove a
+   later wide duplicate recovers canonical success without a second effect.
+2. Several Jobs fit/preflight decisions measured the bare `CallToolResult`
+   before D6 added receipt metadata and visible `ts=`. Most importantly,
+   `jobs_send` could accept irreversible stdin when the bare `j:<ref> sent`
+   receipt fit but the required final decorated receipt did not. One
+   `LocalMachine::exact_decorated_result_len` helper now uses the shared
+   `aw-mcp-protocol` decorator as the sizing oracle for Batch/List/Get/
+   ACK/Send/Cancel. `jobs_send` preflights that exact final shape before stdin
+   leaves the owner.
+
+The D5 page algorithm remains intentionally separate and raw-byte based. Its
+existing response reserve was freshly regression-tested through the D6
+`JobsRead` decorator: the final decorated result stays within the same ceiling
+and the page text is byte-for-byte unchanged after delivery credit, so
+`next_offset` remains exactly the ACKable raw prefix.
+
+The review also corrected the stale `shared_native.rs` comment that still said
+receipt timestamps were disabled. Shared-native filesystem Remote Start was
+reviewed but intentionally not changed: its budget is part of canonical shared
+filesystem execution, and a post-effect enforcement failure is retained as an
+unknown replay outcome rather than caching a request-specific projection.
+
+Fresh-review qualification after `d32a319...`:
+
+- focused cache/final-envelope suite: **8/8** green;
+- full main binary: **701 passed / 0 failed / 1 intentional ignored**;
+- integrations: **42/42**;
+- locked all-target/all-feature check + strict Clippy `-D warnings`: green;
+- rustfmt and `git diff --check`: green;
+- one L5 compile invocation was externally SIGKILLed without Rust diagnostics;
+  the same focused slice then passed cleanly on the warmed build;
+- no Nix files changed, so the prior real flake NixOS/native closeout remains
+  the applicable Nix/platform evidence.
+
 ### Final qualified checkpoint
 
 D4-D7 consumer cutover and the full v0.17.x semantic equivalence gate are
@@ -285,11 +335,11 @@ The only unavailable runtime/deployment smokes are explicitly host/platform
 external: trusted-selector Bubblewrap on this connector and native
 Windows/macOS.
 
-The implementation source is committed as `fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`;
-this documentation closeout is committed separately on top. No push, version,
-tag, release or deployment was performed. The next repository action is only an
-explicitly authorized push (and, separately, any release bookkeeping the user
-requests).
+The latest reviewed source is committed as
+`d32a3196ec18ada7f85176a9feed42667e5f2d6b`; this fresh-review documentation
+closeout is committed separately on top. No push, version, tag, release or
+deployment was performed. The next repository action is only an explicitly
+authorized push (and, separately, any release bookkeeping the user requests).
 
 Frozen sandbox/config-v13 work remains deferred and untouched.
 

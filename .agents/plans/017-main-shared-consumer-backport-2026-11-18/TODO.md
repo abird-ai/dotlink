@@ -292,8 +292,15 @@ Exact post-repin D4-D7 edit/deletion/test order is frozen in
       gates green, real NixOS flake module check green, and executable Linux
       native gates green. Trusted-selector Bubblewrap runtime smoke is connector-
       gated; Windows/macOS runtime/deployment validation remains external.
-- [x] Final pre-commit review found no D4-D7 correctness defect; removed one
-      unnecessary token-checked heartbeat `expect` and archived stale handoff
-      material so old AW pins/test totals cannot masquerade as current state.
-      Signed implementation commit:
+- [x] Initial pre-commit review removed one unnecessary token-checked heartbeat
+      `expect` and archived stale handoff material. Signed D4-D7 implementation:
       `fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`.
+- [x] Fresh independent review found and fixed two D4/D5/D6 integration defects:
+      canonical Remote Start Job/Graph receipts are now stamped+cached before
+      request-specific projection, and Jobs fit/preflight checks now measure the
+      final shared decorated MCP envelope. `jobs_send` refuses stdin unless the
+      complete timestamped minimal receipt fits; D5 `jobs_read` regression proves
+      D6 decoration leaves credited page text unchanged. Fresh focused suite
+      **8/8**, full **701/0/1 + 42/42**, locked check/strict Clippy/fmt/diff green.
+      Signed remediation:
+      `d32a3196ec18ada7f85176a9feed42667e5f2d6b`.
