@@ -103,6 +103,8 @@ pub(crate) struct StopTrace {
     label: String,
     #[cfg(test)]
     reports: std::sync::Arc<std::sync::Mutex<Vec<(KillReason, StopOutcome)>>>,
+    #[cfg(test)]
+    exits: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl StopTrace {
@@ -112,6 +114,8 @@ impl StopTrace {
             label: label.into(),
             #[cfg(test)]
             reports: std::sync::Arc::default(),
+            #[cfg(test)]
+            exits: std::sync::Arc::default(),
         }
     }
 
@@ -135,6 +139,11 @@ impl StopTrace {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn exits(&self) -> Vec<String> {
+        self.exits.lock().expect("exit list").clone()
+    }
+
     pub(crate) fn stopped(&self, reason: KillReason, outcome: StopOutcome) {
         // A stop is rare and is the only proof of what the connector did, so it
         // is a lifecycle line: visible whatever verbosity the operator chose,
@@ -147,6 +156,23 @@ impl StopTrace {
         self.log
             .notice("job", stop_message(&self.label, reason, outcome));
     }
+
+    /// The other ending: a process that died on a signal dotlink did not deliver.
+    /// Paired with [`Self::stopped`] so a job carries exactly one of the two
+    /// lines, and a `signal` nobody can account for is still on the record.
+    /// `from=outside` states only that the signal was not ours.
+    ///
+    /// Lifecycle level for the same reason a stop is: its absence has to mean
+    /// nothing was signalled, which no verbosity setting may be able to fake.
+    pub(crate) fn exited(&self, signal_name: &str) {
+        #[cfg(test)]
+        self.exits
+            .lock()
+            .expect("exit list")
+            .push(signal_name.to_owned());
+        self.log
+            .notice("job", exit_message(&self.label, signal_name));
+    }
 }
 
 /// One line, fixed field order, no prose. The outcome is part of it: a signal that
@@ -157,6 +183,12 @@ fn stop_message(label: &str, reason: KillReason, outcome: StopOutcome) -> String
         reason.as_str(),
         outcome.as_str()
     )
+}
+
+/// The other line, same shape. `from=outside` states the signal was not ours; it
+/// does not claim who sent it.
+fn exit_message(label: &str, signal_name: &str) -> String {
+    format!("exit id={label} signal={signal_name} from=outside")
 }
 
 #[cfg(unix)]
@@ -409,6 +441,18 @@ mod tests {
         drop(guard);
         assert_eq!(trace.reports(), vec![KillReason::Dropped]);
         assert_eq!(trace.outcomes(), vec![StopOutcome::Delivered]);
+    }
+
+    /// The other half of the record, and the reason it is separate: an exit names
+    /// a signal the guard never sent, so it can never pass for a stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exit_names_the_signal_and_never_claims_a_stop() {
+        let trace = StopTrace::new(crate::logging::LogConfig::default(), "test");
+        assert!(trace.exits().is_empty());
+        trace.exited("SIGKILL");
+        assert_eq!(trace.exits(), vec!["SIGKILL".to_owned()]);
+        assert!(trace.reports().is_empty(), "an exit is not a stop");
     }
 
     /// A group that is already empty is not a stop we performed: claiming one

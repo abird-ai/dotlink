@@ -237,6 +237,7 @@ Check these explicitly. Each has a known-good value in the baseline.
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
 | `stop id=` lines | rare: `reason=timeout`/`cancel`/`failed` matches a completion that shows the stop, `reason=shutdown` is connector teardown (the revoked job publishes none), and `cleanup`/`dropped` are tidy-ups with no claim | `outcome=failed`, or a `timeout`/`cancel`/`failed` claim that no completion shows |
+| `exit id=… signal=… from=outside` lines | rare, and never on the same job as a `stop` line: this is a process that died on a signal dotlink did not deliver | two lines for one job; or a `signal` in a result whose job wrote neither line |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
 
 A stop line written while the runtime restarts has no completion to match: the
@@ -248,6 +249,13 @@ The `id=` of a stop line is the durable job handle: when the call returned one
 `job_output` use. A synchronous call returns no handle, so match its line by time
 — the line's timestamp and the result's `ts` are the same call — and compare the
 line's reason with the status the caller actually saw.
+
+**The record now has two halves, and every job gets exactly one.** `stop` is a
+signal dotlink sent; `exit … from=outside` is a signal it did not. So the
+question "who killed it?" is answered by which line is present, and a job with
+neither was never signalled at all. `from=outside` names the absence of our
+signal only — a crash and a stranger's SIGKILL read the same, and the signal
+names distinguish them (`SIGSEGV` did not come from an operator's `kill -9`).
 
 ## 5. Benign classes — do not chase
 

@@ -2437,14 +2437,11 @@ fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Terminal facts a shell result carries beyond `exit_code`/`success`:
-/// the signal that ended the waited process, and whether dotlink stopped it.
-/// Both are omitted when they do not apply, so ordinary results stay unchanged.
 /// Name a signal without a lookup table the caller cannot see. Unknown numbers
 /// stay numbers: a wrong name is worse than none.
 #[cfg(unix)]
-fn signal_label(signal: i32) -> String {
-    let name = match signal {
+fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
         libc::SIGHUP => "SIGHUP",
         libc::SIGINT => "SIGINT",
         libc::SIGQUIT => "SIGQUIT",
@@ -2462,15 +2459,31 @@ fn signal_label(signal: i32) -> String {
         libc::SIGUSR2 => "SIGUSR2",
         libc::SIGXCPU => "SIGXCPU",
         libc::SIGSYS => "SIGSYS",
-        _ => return format!("signal {signal}"),
-    };
-    format!("{name} (signal {signal})")
+        _ => return None,
+    })
 }
 
 /// Windows has no signals to name; `exit_code` already carries the status.
 #[cfg(not(unix))]
-fn signal_label(signal: i32) -> String {
-    format!("signal {signal}")
+fn signal_name(_signal: i32) -> Option<&'static str> {
+    None
+}
+
+/// Prose: the name with its number, for a reader who may know neither.
+pub(crate) fn signal_label(signal: i32) -> String {
+    match signal_name(signal) {
+        Some(name) => format!("{name} (signal {signal})"),
+        None => format!("signal {signal}"),
+    }
+}
+
+/// One token, no spaces: the lifecycle line is key=value and a value may not
+/// open a field of its own.
+pub(crate) fn signal_token(signal: i32) -> String {
+    match signal_name(signal) {
+        Some(name) => name.to_owned(),
+        None => signal.to_string(),
+    }
 }
 
 /// The only prose a signalled completion gets: what the reader has to do about it.
@@ -2482,16 +2495,27 @@ fn signal_label(signal: i32) -> String {
 /// success, since its `next` is the follow-up chain). The fact and the wording
 /// stay one, so no surface can be told a different story.
 fn external_stop_note(completion: &JobCompletion) -> Option<String> {
-    let signal = completion.signal?;
-    if completion.stopped_by.is_some() {
-        return None;
-    }
+    let signal = external_signal(completion)?;
     Some(format!(
         "terminated by {} from outside dotlink; check what signalled it before retrying",
         signal_label(signal)
     ))
 }
 
+/// The one ending dotlink cannot attribute to itself: the process died on a
+/// signal it did not deliver. `from outside` names the *absence* of our signal,
+/// not a culprit — a crash and a stranger's SIGKILL both land here.
+///
+/// The result sentence and the exit line both read this, so the journal and the
+/// reply cannot disagree about the same job.
+pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
+    let signal = completion.signal?;
+    completion.stopped_by.is_none().then_some(signal)
+}
+
+/// Terminal facts a shell result carries beyond `exit_code`/`success`: the signal
+/// that ended the waited process, and whether dotlink stopped it. Both are omitted
+/// when they do not apply, so ordinary results stay unchanged.
 fn with_termination(mut payload: Value, completion: &JobCompletion) -> Value {
     if let Some(signal) = completion.signal {
         payload["signal"] = Value::from(signal);
@@ -3925,6 +3949,19 @@ mod tests {
         // The fail-safe is not even expressible as a claim any more: `StopCause`
         // has no `Dropped` variant, so the type system holds what this used to.
         assert_eq!(ordinary.stopped_by, None);
+    }
+
+    #[test]
+    fn a_signal_token_never_opens_a_field_of_its_own() {
+        // The lifecycle line is `key=value`; a value carrying a space would read
+        // as two fields, so the token drops the prose number `signal_label` adds.
+        #[cfg(unix)]
+        assert_eq!(signal_token(9), "SIGKILL");
+        assert_eq!(signal_token(42), "42", "an unknown number stays a number");
+        for signal in [1, 9, 11, 15, 42] {
+            let token = signal_token(signal);
+            assert!(!token.contains(char::is_whitespace), "{signal}: {token}");
+        }
     }
 
     #[test]

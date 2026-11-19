@@ -2358,7 +2358,35 @@ impl LocalMachine {
             .with_context(context)
     }
 
+    /// Run one shell command and close its record. The record has two halves and
+    /// each job gets exactly one: [`StopTrace::stopped`] inside the run when
+    /// dotlink ends the tree, and the exit line here when something else did.
+    /// This wrapper is the single place that sees every completion, including the
+    /// failure paths, so the choice cannot depend on how the run ended.
     async fn run_shell_job(
+        command: Command,
+        stdin_text: Option<String>,
+        deadline: Instant,
+        job: JobHandle,
+        result_context: JobResultContext,
+        stop_trace: StopTrace,
+    ) -> JobCompletion {
+        let completion = Self::run_shell_job_inner(
+            command,
+            stdin_text,
+            deadline,
+            job,
+            result_context,
+            stop_trace.clone(),
+        )
+        .await;
+        if let Some(signal) = crate::jobs::external_signal(&completion) {
+            stop_trace.exited(&crate::jobs::signal_token(signal));
+        }
+        completion
+    }
+
+    async fn run_shell_job_inner(
         mut command: Command,
         stdin_text: Option<String>,
         deadline: Instant,
