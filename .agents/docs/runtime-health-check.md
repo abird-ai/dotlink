@@ -255,9 +255,10 @@ dotlink sent — every delivered kill records one, and the tidy-up and fail-safe
 kills that end a tree rather than a command record `reason=leftovers`/`fail-safe` with
 `stopped_by: teardown` in the reply. `exit … from=outside` is a signal it did not.
 So "who killed it?" is answered by which line is present, and a job with neither
-was never signalled at all. A signal that reached nothing is `outcome=empty`, and
-one the kernel refused is `outcome=refused` — only `outcome=sent` says a live
-process in the group took the signal. `from=outside` names the absence of our signal only —
+was never signalled at all. `outcome=killed` means SIGKILL reached a live process
+in the group (a sweep of leftovers is still a kill), `outcome=none` means there was
+nothing left to signal, and `outcome=refused` means the kernel would not take it and
+the guard stayed armed. `from=outside` names the absence of our signal only —
 a crash and a stranger's SIGKILL read the same, and the signal names distinguish
 them (`SIGSEGV` did not come from an operator's `kill -9`).
 

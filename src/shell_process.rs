@@ -101,11 +101,11 @@ pub(crate) enum StopOutcome {
 impl StopOutcome {
     fn as_str(self) -> &'static str {
         match self {
-            // The signal was handed to a live process in the group. "delivered"
-            // read as "the command was stopped", which is a different claim.
-            Self::Delivered => "sent",
-            // Nothing was left in the group to signal: nothing happened.
-            Self::AlreadyGone => "empty",
+            // SIGKILL reached a live process in the group. The verb is the act,
+            // not the command's fate: a sweep of leftovers is still a kill.
+            Self::Delivered => "killed",
+            // There was nothing in the group to signal, so nothing happened.
+            Self::AlreadyGone => "none",
             // The kernel would not take the signal; the guard stays armed.
             Self::Failed => "refused",
         }
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(guard.terminate(KillReason::Timeout), None);
         assert_eq!(trace.reports(), vec![KillReason::Timeout]);
         assert_eq!(trace.outcomes(), vec![StopOutcome::AlreadyGone]);
-        assert_eq!(StopOutcome::AlreadyGone.as_str(), "empty");
+        assert_eq!(StopOutcome::AlreadyGone.as_str(), "none");
     }
 
     /// A command that finished is disarmed first, so nothing is reported.
@@ -638,7 +638,7 @@ mod tests {
                 KillReason::Timeout,
                 StopOutcome::Delivered
             ),
-            "stop id=3f0c9d1e-0d6f-4a0e-9a4e-1a2b3c4d5e6f reason=timeout outcome=sent"
+            "stop id=3f0c9d1e-0d6f-4a0e-9a4e-1a2b3c4d5e6f reason=timeout outcome=killed"
         );
         for reason in [
             KillReason::Timeout,
@@ -651,12 +651,12 @@ mod tests {
             let delivered = stop_message("job", reason, StopOutcome::Delivered);
             assert!(delivered.starts_with("stop "), "{delivered}");
             assert!(delivered.contains(&format!("reason={}", reason.as_str())));
-            assert!(delivered.contains("outcome=sent"), "{delivered}");
+            assert!(delivered.contains("outcome=killed"), "{delivered}");
             // A signal that did not reach a live process must not read as sent.
             for outcome in [StopOutcome::AlreadyGone, StopOutcome::Failed] {
                 let line = stop_message("job", reason, outcome);
                 assert!(line.contains("outcome="), "{line}");
-                assert!(!line.contains("outcome=sent"), "{line}");
+                assert!(!line.contains("outcome=killed"), "{line}");
             }
         }
     }

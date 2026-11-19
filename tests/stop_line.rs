@@ -127,7 +127,7 @@ fn the_stop_line_survives_every_verbosity() {
         assert_eq!(lines.len(), 1, "one stop line at {flags:?}, got {lines:?}");
         let line = &lines[0];
         assert!(line.contains("reason=timeout"), "{line}");
-        assert!(line.contains("outcome=sent"), "{line}");
+        assert!(line.contains("outcome=killed"), "{line}");
         assert!(line.contains("stop id="), "{line}");
     }
 }
