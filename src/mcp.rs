@@ -2791,6 +2791,16 @@ impl LocalMachine {
     }
 }
 
+/// The one place the turn horizon is stated. A tool description hands back
+/// `ts` as a fact; this is the advisory that makes it actionable — the anchor,
+/// the horizon, and what to do at it — so no surface restates a bare number.
+pub(crate) fn server_instructions() -> String {
+    format!(
+        "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline. Shell and job results carry `ts` (UTC epoch seconds): take the first `ts` of the current turn as your anchor and keep one user turn to about {} minutes. When you reach it, stop at the next coherent boundary, state what is done and what remains, and hand back instead of starting another step. File-tool results are paged and carry no clock, so read the anchor from the shell or job result around them.",
+        crate::limits::TURN_CHECKPOINT_MINUTES
+    )
+}
+
 impl rmcp::ServerHandler for LocalMachine {
     async fn list_tools(
         &self,
@@ -2830,7 +2840,7 @@ impl rmcp::ServerHandler for LocalMachine {
                 .build(),
         )
         .with_server_info(Implementation::new("dotlink", env!("CARGO_PKG_VERSION")))
-        .with_instructions(format!("Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline. Shell and job results carry `ts` (UTC epoch seconds): take the first `ts` of the current turn as your anchor and keep one user turn to about {} minutes. When you reach it, stop at the next coherent boundary, state what is done and what remains, and hand back instead of starting another step. File-tool results are paged and carry no clock, so read the anchor from the shell or job result around them.", crate::limits::TURN_CHECKPOINT_MINUTES).to_owned())
+        .with_instructions(server_instructions())
     }
 
     async fn get_task(
@@ -2925,6 +2935,28 @@ mod tests {
     use super::*;
 
     use crate::mcp::tools::test_support::access;
+
+    /// The turn horizon lives here and nowhere else: a tool description states
+    /// `ts` as a fact, while the anchor, the horizon and the hand-back rule are
+    /// one advisory. Dropping it here would silently remove the only guidance a
+    /// long turn gets.
+    #[test]
+    fn the_turn_horizon_is_stated_once_with_its_rule() {
+        let instructions = server_instructions();
+        assert!(
+            instructions.contains(&format!(
+                "about {} minutes",
+                crate::limits::TURN_CHECKPOINT_MINUTES
+            )),
+            "{instructions}"
+        );
+        // A horizon without an action is a number nobody can act on.
+        assert!(instructions.contains("coherent boundary"), "{instructions}");
+        // It is a checkpoint over results, not a cap on execution: the horizon
+        // never arrives as the execution deadline, which stays the caller's.
+        assert!(instructions.contains("`ts`"), "{instructions}");
+        assert!(!instructions.contains("timeout_secs"), "{instructions}");
+    }
 
     #[tokio::test]
     async fn inspection_and_runtime_advertise_the_same_policy_tool_surface() {

@@ -25,10 +25,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   returned — and the command itself is the right place to say how long its tree
   lives: `wait` is ordinary shell, visible in the call, and needs no second
   lifetime flag.
-- The turn-clock note is hosted-only. `ts` is stamped on every surface, but
-  pacing a turn is a hosted horizon: a local stdio/HTTP caller has no user turn
-  to measure against, so its description now says only that `ts` is epoch
-  seconds instead of advertising a clock it never had.
+- The turn horizon is stated once, in the server instructions, with the rule
+  that makes it actionable: anchor on the first `ts` of the turn, and at the
+  horizon stop at a coherent boundary and hand back. Tool descriptions now say
+  only that `ts` is epoch seconds — a bare number per tool was both a second
+  copy and a shorter one, since the actionable half stayed in the instructions.
 
 ### Fixed
 

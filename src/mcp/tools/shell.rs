@@ -123,17 +123,17 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     // The clause teaches the idiom; the bounds it used to repeat are already
     // stated above as `timeout_secs` and in the follow-up as `job_cancel`.
     let lifetime = "Background processes die with the command; keep one with `wait` in a durable call (`server & wait`).";
-    // `ts` is a fact on every surface; the turn clock is not. A hosted caller
-    // has a user turn to pace against, a local one has no such horizon, so
-    // advertising one there would be a claim about a clock it never had.
+    // `ts` is a fact of the result. The turn horizon is an advisory, and the
+    // server instructions carry it once with the rule that goes with it, so no
+    // tool description restates a bare number without that rule.
+    let tail = format!("{lifetime} `ts` = epoch seconds.");
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. Waits, then after at most {}s of response window returns a job handle and keeps running; `background: true` returns that handle at once; `timeout_secs` kills it; {follow_up}. {lifetime} `ts` = epoch seconds; {}-minute turn clock.",
-            hold.as_secs(),
-            crate::limits::TURN_CHECKPOINT_MINUTES
+            "Run a {shell} command. Waits, then after at most {}s of response window returns a job handle and keeps running; `background: true` returns that handle at once; `timeout_secs` kills it; {follow_up}. {tail}",
+            hold.as_secs()
         ),
         None => format!(
-            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` returns that execution's handle at once: {follow_up}. {lifetime} `ts` = epoch seconds."
+            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` returns that execution's handle at once: {follow_up}. {tail}"
         ),
     }
 }
@@ -3978,15 +3978,12 @@ mod tests {
         );
         assert!(tunnel.contains("`ts`"), "{tunnel}");
         assert!(tunnel.contains("kills it"), "{tunnel}");
-        // The turn clock is a hosted horizon: a local caller has no user turn
-        // to pace against, so the stamp stands alone there.
+        // `ts` is a fact of the result; the turn horizon is an advisory the
+        // server instructions own, with the "stop at a coherent boundary" rule
+        // that makes it actionable. A description carries no bare number.
+        assert!(!tunnel.contains("turn clock"), "{tunnel}");
         assert!(
-            !description.contains("turn clock"),
-            "a local surface must not advertise a turn clock: {description}"
-        );
-        assert!(tunnel.contains("turn clock"), "{tunnel}");
-        assert!(
-            tunnel.contains(&crate::limits::TURN_CHECKPOINT_MINUTES.to_string()),
+            !tunnel.contains(&crate::limits::TURN_CHECKPOINT_MINUTES.to_string()),
             "{tunnel}"
         );
         // A local transport never hands off early, and must not claim a window.
