@@ -96,7 +96,7 @@ const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
-        "Execution timeout in seconds. Defaults to {max_secs} and is capped there. Transport response windows do not shorten execution: a command that is still running when the caller's synchronous window closes continues as the same durable job/task."
+        "Hard execution deadline in seconds: on expiry the command tree is killed and the result reports stopped_by: \"timeout\". Defaults to {max_secs} (the ceiling). Not how long the caller waits — `background: true` returns at once and the command keeps running."
     )
 }
 
@@ -120,12 +120,12 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
+            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; reaching `timeout_secs` kills it; {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command; waits until the command finishes or timeout_secs expires. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
+            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
     }
@@ -3919,6 +3919,10 @@ mod tests {
             .unwrap();
         assert!(timeout.contains("42"), "{timeout}");
         assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
+        // The one fact a caller must not have to infer: the deadline ends the
+        // command, and it is not the wait before the reply.
+        assert!(timeout.contains("killed"), "{timeout}");
+        assert!(!timeout.contains("response window"), "{timeout}");
         // Prose is human-readable; the exact number stays machine-readable.
         assert!(output.contains("2 KiB"), "{output}");
         assert_eq!(properties["max_output_bytes"]["maximum"], 2048);
@@ -3947,6 +3951,7 @@ mod tests {
             "{tunnel}"
         );
         assert!(tunnel.contains("`ts`"), "{tunnel}");
+        assert!(tunnel.contains("kills it"), "{tunnel}");
         assert!(
             tunnel.contains(&crate::limits::TURN_CHECKPOINT_MINUTES.to_string()),
             "{tunnel}"
@@ -3954,7 +3959,7 @@ mod tests {
         // A local transport never hands off early, and must not claim a window.
         assert!(!description.contains("after "), "{description}");
         assert!(
-            description.contains("waits until the command finishes"),
+            description.contains("waits until it finishes, or kills it at"),
             "{description}"
         );
         // Non-shell tools keep their static schemas.
