@@ -96,18 +96,21 @@ All paths and validation commands below are relative to the repository root.
   exists) and a failed native task (`failure_error_object`, the same set in the
   error's `data`, because the task payload has no field for them). An internal
   failure trims keys that say nothing, but its stop facts and `next` stay exactly
-  what the ordinary result carries. Every job writes exactly one lifecycle line,
-  `LOG job id=… end=… end_src=…`, at every verbosity: `end=` says what ended it
-  (`exit`, `signal`, `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and
-  `end_src=` says who (`command`, `dotlink`, `caller`, `connector`, `outside`), so
-  one line answers what two lines used to leave the reader to infer. A work-still-
-  running sweep rides on the same line as `also_killed=processes|unsent`; an empty
-  group adds nothing, and a job is written once because every completion path
-  disarms the guard, whose `Drop` is the only other writer (`abandoned`).
-  Attribution lives in the journal, not on the wire — a sweep claims no cause — so
-  `external_signal` (`stopped_by.is_none()` over a signal no cause claims) is the
-  single predicate behind both the reply's sentence and the classification, and
-  `end_src=outside` claims only that the signal was not ours, never who sent it.
+  what the ordinary result carries. A job writes at most one lifecycle line,
+  `LOG job id=… end=… by=… [tree=…]`, at every verbosity and only when it has
+  something to say: `end=` says what ended it (`exit`, `signal`, `timeout`,
+  `cancel`, `shutdown`, `error`, `abandoned`) and `by=` says who (`command`,
+  `dotlink`, `caller`, `connector`, `external`). A command that simply ended writes
+  nothing — an ordinary exit needs no reconstruction — while anything dotlink did,
+  any foreign signal, and any sweep writes a line. A sweep of work still running
+  rides on the same line as `tree=killed`, or `tree=alive` when the kernel refused,
+  which is the one place where saying it is an alarm; an empty group adds nothing.
+  A job is written once because every completion path disarms the guard, whose
+  `Drop` is the only other writer (`abandoned`). Attribution lives in the journal,
+  not on the wire — a sweep claims no cause — so `external_signal`
+  (`stopped_by.is_none()` over a signal no cause claims) is the single predicate
+  behind both the reply's sentence and the classification, and `by=external` claims
+  only that the signal was not ours, never who sent it.
 - Shell mounts are one layer in `src/mounts.rs`: `SandboxMount { source, target, writable, env, origin }`, keyed by sandbox target with last declaration winning over builtin caches, profile `mounts`, `DOTLINK_MOUNTS` and `--mount` (in that order, as an ordered layer slice). Targets stay below `/tmp/home`, must not nest, and are conflict-checked against fixed host integrations; mount `env` may not set the variables the sandbox owns and may not disagree with another mount. Layout is validated before environment wiring, and only on the set the binder will actually bind. Configuration mistakes are `CONFIG`; a declared source that is not usable yet is host state and retries the runtime, while a discovered cache that cannot be prepared is skipped with a warning. A declared mount is never skipped silently, and `-vv` lists the resolved set.
 - Linux native file IO must stay descriptor-rooted with openat2 and fail closed on unsupported resolution. Shared traversal errno comparisons use OS-native libc constants, never Linux numeric literals. Directory discovery reads child metadata under the same descriptor and mount-resolution authority as actual opens (Linux `openat2` O_PATH nofollow; macOS `fstatat` plus device check). Pathname metadata or unchecked mountpoint metadata must never be reintroduced after pinning. Linux/macOS native tools are concurrent by default; `-s/--serialize` opts into one-at-a-time MCP calls. Windows retains a conservative operation gate. Never reintroduce pathname IO following authorization for Linux tools.
 - Logging is quiet by default: `-v` = TOOL, `-vv` = TOOL + REQ. `LOG` lines are

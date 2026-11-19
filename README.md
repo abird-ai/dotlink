@@ -421,24 +421,26 @@ With `-vv`, transport diagnostics are added:
 including `-q` — so `-q` is not silence:
 
 ~~~text
-[01:07:12.031] LOG  job        id=<job id> end=timeout end_src=dotlink
-[01:07:12.884] LOG  job        id=<job id> end=exit code=0 end_src=command
-[01:07:13.117] LOG  job        id=<job id> end=signal signal=SIGKILL end_src=outside
+[01:07:12.031] LOG  job        id=<job id> end=timeout by=dotlink
+[01:07:13.117] LOG  job        id=<job id> end=signal signal=SIGKILL by=external
+[01:07:13.884] LOG  job        id=<job id> end=exit code=0 by=command tree=killed
 ~~~
 
-They cover startup, restart, verbosity changes, and how a shell job ended. Every job
-writes exactly one line, and every word on it can be read without a legend: `end=`
-says what ended it (`exit`, `signal`, `timeout`, `cancel`, `shutdown`, `error`, or
-`abandoned` when dotlink dropped the job without a result), and `end_src=` says who
-that was — `command` for its own status, `dotlink` for a deadline or an internal
-error, `caller` for a cancelled call, `connector` when the connector withdrew the
-work, and `outside` when something else signalled it. `outside` names only the
-absence of our signal, never a culprit: a crash and a stranger's `kill -9` read the
-same there, and the printed signal name is what separates them.
+They cover startup, restart, verbosity changes, and how a shell job ended. A job
+writes a line only when there is something to say, so a command that simply ended —
+successful or not — writes nothing, and the record stays short enough to read. Every
+word on the line can be read without a legend: `end=` says what ended it (`exit`,
+`signal`, `timeout`, `cancel`, `shutdown`, `error`, or `abandoned` when dotlink
+dropped the job without a result), and `by=` says who that was — `dotlink` for a
+deadline or an internal error, `caller` for a cancelled call, `connector` when the
+connector withdrew the work, `external` when something else signalled it, and
+`command` for its own status. `external` names only the absence of our signal, never
+a culprit: a crash and a stranger's `kill -9` read the same there, and the printed
+signal name is what separates them.
 
-When the command had returned while processes it started were still running, dotlink
-kills them and the same line says so with `also_killed=processes` (`also_killed=unsent`
-if the kernel refused). That is a verdict, not housekeeping: the invocation did not
+When the command returned while processes it started were still running, dotlink
+kills them and the same line says `tree=killed` (`tree=alive` when the kernel refused,
+which is a real alarm). That is a verdict, not housekeeping: the invocation did not
 finish, so the result is a failure — `success: false`, the tool result marked as an
 error, and `error` naming the work — while the command's own exit status is still
 reported, because that fact did not change. A command that leaves work running should

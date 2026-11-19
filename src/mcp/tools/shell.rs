@@ -2412,23 +2412,30 @@ impl LocalMachine {
             stop_trace.clone(),
         )
         .await;
-        let (end, src) = Self::ending(&completion);
-        let killed = match completion.leftovers {
+        let (end, by) = Self::ending(&completion);
+        let tree = match completion.leftovers {
             None => None,
-            Some(crate::shell_process::StopOutcome::Delivered) => Some("processes"),
-            // The kernel would not take the signal: the work may still be running,
-            // which is the one thing this line must never hide.
-            Some(crate::shell_process::StopOutcome::Failed) => Some("unsent"),
+            Some(crate::shell_process::StopOutcome::Delivered) => Some("killed"),
+            // The kernel would not take the signal, so work may still be running.
+            // This is the one place where saying so is an alarm, not noise.
+            Some(crate::shell_process::StopOutcome::Failed) => Some("alive"),
             Some(crate::shell_process::StopOutcome::AlreadyGone) => None,
         };
-        stop_trace.ended(&end, src, killed);
+        // A command that simply ended is the expected case, so it writes nothing: the
+        // record is for what an operator would otherwise have to reconstruct, and a
+        // line per ordinary exit is noise that hides those. A sweep is never silent,
+        // because it changed the verdict.
+        if by != "command" || tree.is_some() {
+            stop_trace.ended(&end, by, tree);
+        }
         completion
     }
 
     /// How this job ended and who ended it — two words per job, and neither needs a
     /// legend. A cause dotlink recorded is dotlink's, and the two cancel origins stay
     /// apart because a caller and the connector are not the same actor. A signal no
-    /// cause claims is somebody else's; a plain status is the command's own.
+    /// cause claims came from outside the connector; a plain status is the command's
+    /// own, which is the one ending that needs no line.
     fn ending(completion: &JobCompletion) -> (String, &'static str) {
         use crate::shell_process::StopCause;
         match completion.stopped_by {
@@ -2439,7 +2446,7 @@ impl LocalMachine {
             None => match completion.signal {
                 Some(signal) => (
                     format!("signal signal={}", crate::jobs::signal_token(signal)),
-                    "outside",
+                    "external",
                 ),
                 None => match completion.exit_code {
                     Some(code) => (format!("exit code={code}"), "command"),

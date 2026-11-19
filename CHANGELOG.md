@@ -8,16 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- One lifecycle line per job, in words that need no legend:
-  `LOG job id=… end=… end_src=…`. `end=` says what ended the job (`exit`, `signal`,
-  `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and `end_src=` says who
-  (`command`, `dotlink`, `caller`, `connector`, `outside`). The previous pair of
-  lines — `stop … reason=… outcome=…` and `exit … from=outside` — each needed the
-  other to be read, and a job could carry both, which is exactly the confusion a
-  record exists to prevent. Nothing on the line claims a process is still running.
+- One lifecycle line per job, in words that need no legend, and only when there is
+  something to say: `LOG job id=… end=… by=… [tree=…]`. `end=` says what ended the
+  job (`exit`, `signal`, `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and
+  `by=` says who (`command`, `dotlink`, `caller`, `connector`, `external`). A command
+  that simply ended writes nothing — an ordinary exit needs no reconstruction — so
+  the record stays short enough to read. The previous pair of lines — `stop …
+  reason=… outcome=…` and `exit … from=outside` — each needed the other to be read,
+  and a job could carry both, which is exactly the confusion a record exists to
+  prevent.
 - A command that returns while its own process group is still running did not
-  finish: dotlink kills that work and the same line says so with
-  `also_killed=processes` (`unsent` if the kernel refused). The invocation is a
+  finish: dotlink kills that work and the same line says `tree=killed`, or
+  `tree=alive` when the kernel refused and the processes may still be running. The invocation is a
   failure — `success: false`, the tool result marked as an error, and `error` naming
   the work — while the command's own exit status is still reported, because that fact
   did not change. The sweep is also what ends the leftover writer that used to hold

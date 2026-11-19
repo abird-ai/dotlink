@@ -172,27 +172,27 @@ impl StopTrace {
     }
 
     /// The one line a job gets, written where its ending is known.
-    pub(crate) fn ended(&self, end: &str, src: &str, killed: Option<&str>) {
+    pub(crate) fn ended(&self, end: &str, by: &str, tree: Option<&str>) {
         self.log
-            .notice("job", end_message(&self.label, end, src, killed));
+            .notice("job", end_message(&self.label, end, by, tree));
     }
 
     /// The same line for a guard dropped before a completion existed: dotlink
     /// abandoned the job and swept whatever was left. This is the only writer that
     /// runs without a completion, which is why it cannot be a second line for a job
     /// that already published one — every completion path disarms the guard.
-    pub(crate) fn abandoned(&self, killed: Option<&str>) {
-        self.ended("abandoned", "dotlink", killed);
+    pub(crate) fn abandoned(&self, tree: Option<&str>) {
+        self.ended("abandoned", "dotlink", tree);
     }
 }
 
-/// One lifecycle line per job: how it ended, who ended it, and whether dotlink also
-/// killed work the command had left running. Every field is a word a reader does not
-/// have to look up, and none of them claims a process is still alive.
-pub(crate) fn end_message(label: &str, end: &str, src: &str, killed: Option<&str>) -> String {
-    match killed {
-        Some(killed) => format!("id={label} end={end} end_src={src} also_killed={killed}"),
-        None => format!("id={label} end={end} end_src={src}"),
+/// One lifecycle line per job, written only when there is something to say: how it
+/// ended, who ended it, and what became of the process group it left behind. Every
+/// field is a word a reader does not have to look up.
+pub(crate) fn end_message(label: &str, end: &str, by: &str, tree: Option<&str>) -> String {
+    match tree {
+        Some(tree) => format!("id={label} end={end} by={by} tree={tree}"),
+        None => format!("id={label} end={end} by={by}"),
     }
 }
 
@@ -422,12 +422,14 @@ impl Drop for Guard {
         // Reaching here while still armed means a path returned without
         // disarming. The kill is right; so is saying so, and this is the one
         // ending no completion can report.
-        let killed = match self.signal_and_record(KillReason::Dropped) {
-            StopOutcome::Delivered => Some("processes"),
-            StopOutcome::Failed => Some("unsent"),
+        let tree = match self.signal_and_record(KillReason::Dropped) {
+            StopOutcome::Delivered => Some("killed"),
+            // The kernel refused: these may still be running, and this is the one
+            // place where saying so is an alarm rather than noise.
+            StopOutcome::Failed => Some("alive"),
             StopOutcome::AlreadyGone => None,
         };
-        self.trace.abandoned(killed);
+        self.trace.abandoned(tree);
     }
 }
 
@@ -621,23 +623,23 @@ mod tests {
     fn the_end_line_names_how_it_ended_and_who_ended_it() {
         assert_eq!(
             end_message("3f0c9d1e", "exit code=0", "command", None),
-            "id=3f0c9d1e end=exit code=0 end_src=command"
+            "id=3f0c9d1e end=exit code=0 by=command"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "signal signal=SIGKILL", "outside", None),
-            "id=3f0c9d1e end=signal signal=SIGKILL end_src=outside"
+            end_message("3f0c9d1e", "signal signal=SIGKILL", "external", None),
+            "id=3f0c9d1e end=signal signal=SIGKILL by=external"
         );
         assert_eq!(
             end_message("3f0c9d1e", "timeout", "dotlink", None),
-            "id=3f0c9d1e end=timeout end_src=dotlink"
+            "id=3f0c9d1e end=timeout by=dotlink"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "exit code=0", "command", Some("processes")),
-            "id=3f0c9d1e end=exit code=0 end_src=command also_killed=processes"
+            end_message("3f0c9d1e", "exit code=0", "command", Some("killed")),
+            "id=3f0c9d1e end=exit code=0 by=command tree=killed"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "abandoned", "dotlink", Some("processes")),
-            "id=3f0c9d1e end=abandoned end_src=dotlink also_killed=processes"
+            end_message("3f0c9d1e", "abandoned", "dotlink", Some("alive")),
+            "id=3f0c9d1e end=abandoned by=dotlink tree=alive"
         );
     }
 

@@ -127,6 +127,6 @@ fn the_stop_line_survives_every_verbosity() {
         assert_eq!(lines.len(), 1, "one stop line at {flags:?}, got {lines:?}");
         let line = &lines[0];
         assert!(line.contains("end=timeout"), "{line}");
-        assert!(line.contains("end_src=dotlink"), "{line}");
+        assert!(line.contains("by=dotlink"), "{line}");
     }
 }

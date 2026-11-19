@@ -149,8 +149,8 @@ fn a_finished_command_does_not_wait_for_its_leftovers() {
     assert_eq!(lines.len(), 1, "one line per job: {journal}");
     let line = lines[0];
     assert!(line.contains("end=exit code=0"), "{line}");
-    assert!(line.contains("end_src=command"), "{line}");
-    assert!(line.contains("also_killed=processes"), "{line}");
+    assert!(line.contains("by=command"), "{line}");
+    assert!(line.contains("tree=killed"), "{line}");
 }
 
 #[cfg(unix)]
@@ -178,6 +178,6 @@ fn a_command_killed_by_someone_else_keeps_its_own_ending() {
     assert_eq!(lines.len(), 1, "one line per job: {journal}");
     let line = lines[0];
     assert!(line.contains("end=signal signal=SIGKILL"), "{line}");
-    assert!(line.contains("end_src=outside"), "{line}");
-    assert!(line.contains("also_killed=processes"), "{line}");
+    assert!(line.contains("by=external"), "{line}");
+    assert!(line.contains("tree=killed"), "{line}");
 }
