@@ -375,6 +375,177 @@ fn stdio_job_read_cannot_authorize_ack_across_an_unread_prefix() {
 }
 
 #[test]
+fn stdio_bread_mcp_preserves_typed_media_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let fixtures: [(&str, &[u8], &str, &str); 3] = [
+        (
+            "small.png",
+            b"\x89PNG\r\n\x1a\nbinary-payload",
+            "image",
+            "image/png",
+        ),
+        (
+            "small.wav",
+            b"RIFF\0\0\0\0WAVEbinary-payload",
+            "audio",
+            "audio/wav",
+        ),
+        (
+            "small.pdf",
+            b"%PDF-1.4\nbinary-payload",
+            "resource",
+            "application/pdf",
+        ),
+    ];
+    for (path, bytes, _, _) in fixtures {
+        std::fs::write(root.join(path), bytes).unwrap();
+    }
+
+    let mut probe = Probe::start(&root);
+    let init = probe.request(&initialize_request(1));
+    assert_eq!(init["result"]["serverInfo"]["name"], "dotlink");
+
+    for (index, (path, bytes, kind, mime)) in fixtures.into_iter().enumerate() {
+        let response = probe.request(&call_request(
+            index as u64 + 2,
+            "bread",
+            json!({"path":path,"format":"mcp"}),
+        ));
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let content = response["result"]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing typed content: {response}"));
+        assert_eq!(content.len(), 1, "{response}");
+        assert_eq!(content[0]["type"], kind, "{response}");
+        match kind {
+            "image" | "audio" => {
+                assert_eq!(content[0]["mimeType"], mime, "{response}");
+                assert_eq!(content[0]["data"], BASE64.encode(bytes), "{response}");
+                assert!(content[0].get("text").is_none(), "{response}");
+            }
+            "resource" => {
+                let resource = &content[0]["resource"];
+                assert_eq!(resource["mimeType"], mime, "{response}");
+                assert_eq!(resource["blob"], BASE64.encode(bytes), "{response}");
+                assert!(
+                    resource["uri"]
+                        .as_str()
+                        .is_some_and(|uri| uri.ends_with("/small.pdf")),
+                    "{response}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    probe.finish();
+}
+
+#[test]
+fn stdio_huge_job_ref_is_rejected_without_reflection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut probe = Probe::start(&root);
+    let init = probe.request(&initialize_request(1));
+    assert_eq!(init["result"]["serverInfo"]["name"], "dotlink");
+
+    let huge = format!("j:{}", "x".repeat(32 * 1024));
+    let response = probe.request(&call_request(
+        2,
+        "jobs_get",
+        json!({"ref":huge,"wait_ms":0}),
+    ));
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let encoded = serde_json::to_vec(&response).unwrap();
+    assert!(
+        encoded.len() < 4096,
+        "oversized diagnostic: {} bytes",
+        encoded.len()
+    );
+    assert!(
+        !String::from_utf8_lossy(&encoded).contains(&"x".repeat(256)),
+        "caller-controlled ref leaked into response"
+    );
+
+    probe.finish();
+}
+
+#[test]
+fn stdio_jobs_read_one_byte_page_has_independent_response_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("tiny.txt"), "abcdef").unwrap();
+
+    let mut probe = Probe::start(&root);
+    let init = probe.request(&initialize_request(1));
+    assert_eq!(init["result"]["serverInfo"]["name"], "dotlink");
+
+    let batch = probe.request(&call_request(
+        2,
+        "batch",
+        json!({
+            "ops":[["read", {"path":"tiny.txt","numbered":false}]],
+            "background":true
+        }),
+    ));
+    assert_ne!(batch["result"]["isError"], true, "{batch}");
+    let job_ref = text_of(&batch)
+        .split_whitespace()
+        .next()
+        .expect("background batch Job ref")
+        .to_owned();
+    let node_ref = format!("{job_ref}/n:1");
+
+    let terminal = probe.request(&call_request(
+        3,
+        "jobs_get",
+        json!({"ref":job_ref,"wait_ms":1000}),
+    ));
+    assert_ne!(terminal["result"]["isError"], true, "{terminal}");
+    assert!(text_of(&terminal).contains("settled"), "{terminal}");
+
+    let page = probe.request(&call_request(
+        4,
+        "jobs_read",
+        json!({"ref":node_ref,"view":"result","offset":0,"limit":1}),
+    ));
+    assert_ne!(page["result"]["isError"], true, "{page}");
+    assert_receipt_ts(&page);
+    let rendered: Value = serde_json::from_str(text_of(&page)).unwrap();
+    assert_eq!(rendered["offset"], 0, "{rendered}");
+    assert_eq!(rendered["next_offset"], 1, "{rendered}");
+    assert_eq!(
+        rendered["data"].as_str().map(str::len),
+        Some(1),
+        "{rendered}"
+    );
+
+    let acknowledged = probe.request(&call_request(
+        5,
+        "jobs_ack",
+        json!({"ref":node_ref,"view":"result","offset":1}),
+    ));
+    assert_ne!(
+        acknowledged["result"]["isError"], true,
+        "one delivered byte must be ACKable: {acknowledged}"
+    );
+
+    let second = probe.request(&call_request(
+        6,
+        "jobs_read",
+        json!({"ref":node_ref,"view":"result","offset":1,"limit":1}),
+    ));
+    assert_ne!(second["result"]["isError"], true, "{second}");
+    let second: Value = serde_json::from_str(text_of(&second)).unwrap();
+    assert_eq!(second["offset"], 1, "{second}");
+    assert_eq!(second["next_offset"], 2, "{second}");
+    assert_eq!(second["data"].as_str().map(str::len), Some(1), "{second}");
+
+    probe.finish();
+}
+
+#[test]
 fn stdio_jobs_read_serializes_scoped_receipt_timestamp() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

@@ -4714,6 +4714,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_bread_mcp_preserves_typed_media_identity() {
+        use base64::{Engine as _, prelude::BASE64_STANDARD};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let fixtures: [(&str, &[u8], &str, &str); 3] = [
+            (
+                "small.png",
+                b"\x89PNG\r\n\x1a\nbinary-payload",
+                "image",
+                "image/png",
+            ),
+            (
+                "small.wav",
+                b"RIFF\0\0\0\0WAVEbinary-payload",
+                "audio",
+                "audio/wav",
+            ),
+            (
+                "small.pdf",
+                b"%PDF-1.4\nbinary-payload",
+                "resource",
+                "application/pdf",
+            ),
+        ];
+        for (path, bytes, _, _) in fixtures {
+            std::fs::write(root.join(path), bytes).unwrap();
+        }
+
+        let machine = crate::mcp::test_machine(root);
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+        let transport_token = mcp.machine.transport_context_token().to_owned();
+
+        for (index, (path, bytes, kind, mime)) in fixtures.into_iter().enumerate() {
+            let mut command = json!({
+                "jsonrpc":"2.0",
+                "id":index + 1,
+                "method":"tools/call",
+                "params":{
+                    "name":"bread",
+                    "arguments":{"path":path,"format":"mcp"}
+                }
+            });
+            assert_eq!(
+                annotate_response_context(
+                    &mut command,
+                    Duration::from_secs(90),
+                    crate::limits::OPENAI_TUNNEL_DELIVERY_RESERVE,
+                    "typed-media-wire-request",
+                    &transport_token,
+                ),
+                Ok(None)
+            );
+
+            let response = mcp.dispatch(&BTreeMap::new(), &command).await.unwrap();
+            assert_eq!(response.status, 200);
+            let message = response.messages.into_iter().next().expect("MCP response");
+            assert_ne!(message["result"]["isError"], true, "{message}");
+            let content = message["result"]["content"]
+                .as_array()
+                .unwrap_or_else(|| panic!("missing typed content: {message}"));
+            assert_eq!(content.len(), 1, "{message}");
+            assert_eq!(content[0]["type"], kind, "{message}");
+            match kind {
+                "image" | "audio" => {
+                    assert_eq!(content[0]["mimeType"], mime, "{message}");
+                    assert_eq!(
+                        content[0]["data"],
+                        BASE64_STANDARD.encode(bytes),
+                        "{message}"
+                    );
+                    assert!(content[0].get("text").is_none(), "{message}");
+                }
+                "resource" => {
+                    let resource = &content[0]["resource"];
+                    assert_eq!(resource["mimeType"], mime, "{message}");
+                    assert_eq!(resource["blob"], BASE64_STANDARD.encode(bytes), "{message}");
+                    assert!(
+                        resource["uri"]
+                            .as_str()
+                            .is_some_and(|uri| uri.ends_with("/small.pdf")),
+                        "{message}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn hosted_batch_wire_carries_scoped_receipt_timestamp() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();

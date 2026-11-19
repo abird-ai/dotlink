@@ -364,14 +364,10 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Maximum retained raw bytes for this page. Defaults to the profile output ceiling, must be at least {} and is capped at {max_output_bytes}.",
-                crate::mcp::MIN_BYTE_LIMIT,
+                "Maximum retained raw bytes for this page. Defaults to the profile output ceiling, may be as small as 1 byte and is capped at {max_output_bytes}."
             )),
         );
-        property.insert(
-            "minimum".to_owned(),
-            serde_json::Value::from(crate::mcp::MIN_BYTE_LIMIT),
-        );
+        property.insert("minimum".to_owned(), serde_json::Value::from(1));
         property.insert(
             "maximum".to_owned(),
             serde_json::Value::from(max_output_bytes),
@@ -858,7 +854,14 @@ impl LocalMachine {
             Some(limit) => limit,
             None => profile.read_page_default_bytes,
         };
-        let response_ceiling = self.request_result_budget(&context).unwrap_or(ceiling);
+        // Raw page bytes and serialized response bytes are independent
+        // budgets. In particular, a one-byte raw page still needs room for its
+        // JSON/MCP envelope. Trusted transports may narrow the serialized
+        // result; local/stdio callers fall back to the same profile-derived
+        // response capacity used by the transport configuration.
+        let response_ceiling = self
+            .request_result_budget(&context)
+            .unwrap_or_else(|| self.max_response_body_bytes());
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
         let wait_ms = bounded_wait_ms(
@@ -2195,6 +2198,7 @@ mod tests {
             8 * 1024 * 1024,
         );
         let output_limit = &read.input_schema["properties"]["limit"];
+        assert_eq!(output_limit["minimum"], 1);
         assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
         assert_eq!(output_limit["default"], 256 * 1024);
         assert!(

@@ -4985,7 +4985,8 @@ impl JobManager {
                     })
                     .map_err(JobError::Internal)?;
                     let ts = self.finalize_task_result_ts(id)?;
-                    crate::mcp::set_stored_receipt_ts(&mut result, ts);
+                    crate::mcp::set_stored_receipt_ts(&mut result, ts)
+                        .map_err(|error| JobError::Internal(anyhow!(error)))?;
                     crate::mcp::ensure_visible_receipt_ts(&mut result, ts);
                     TaskPayload::Completed {
                         result: result_object(result),

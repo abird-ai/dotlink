@@ -125,9 +125,30 @@ pub(crate) async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
     }
 }
 
+/// Poll the operation while one advisory notification is in flight. Completion
+/// owns the call: if the wait becomes ready while progress delivery is blocked,
+/// drop the delivery future and return immediately rather than charging the
+/// operation up to one send-budget interval.
+async fn await_wait_or_delivery<F, D>(
+    wait: std::pin::Pin<&mut F>,
+    delivery: D,
+) -> Result<F::Output, ()>
+where
+    F: Future,
+    D: Future<Output = ()>,
+{
+    tokio::pin!(delivery);
+    tokio::select! {
+        biased;
+        output = wait => Ok(output),
+        () = &mut delivery => Err(()),
+    }
+}
+
 /// Awaits a window-bounded wait while reporting progress. Without a progress
 /// token this is exactly `wait`; with one, the caller keeps receiving ticks for
-/// as long as the wait blocks.
+/// as long as the wait blocks. Progress delivery never suspends polling the
+/// operation itself.
 pub(crate) async fn await_with_heartbeat<F: Future>(
     heartbeat: Option<ProgressHeartbeat>,
     deadline: Option<Instant>,
@@ -142,7 +163,13 @@ pub(crate) async fn await_with_heartbeat<F: Future>(
         tokio::select! {
             biased;
             output = &mut wait => return output,
-            () = heartbeat_tick(Some(&heartbeat)) => heartbeat.report(deadline).await,
+            () = heartbeat_tick(Some(&heartbeat)) => {
+                if let Ok(output) =
+                    await_wait_or_delivery(wait.as_mut(), heartbeat.report(deadline)).await
+                {
+                    return output;
+                }
+            }
         }
     }
 }
@@ -170,7 +197,41 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_capped;
+    use super::{await_wait_or_delivery, resolve_capped};
+
+    #[tokio::test]
+    async fn pending_progress_delivery_never_delays_or_outlives_ready_operation() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (delivery_started, wait_for_delivery) = tokio::sync::oneshot::channel();
+        let (delivery_dropped, dropped) = tokio::sync::oneshot::channel();
+        let wait = async {
+            wait_for_delivery.await.expect("delivery started");
+            42_u8
+        };
+        tokio::pin!(wait);
+
+        let delivery = async move {
+            let _drop_signal = DropSignal(Some(delivery_dropped));
+            let _ = delivery_started.send(());
+            std::future::pending::<()>().await;
+        };
+        assert_eq!(
+            await_wait_or_delivery(wait.as_mut(), delivery).await,
+            Ok(42)
+        );
+        dropped
+            .await
+            .expect("pending progress delivery must be dropped with the call");
+    }
 
     #[test]
     fn capped_values_keep_host_floor_and_ceiling() {

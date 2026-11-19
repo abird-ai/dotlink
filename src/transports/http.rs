@@ -1396,6 +1396,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_http_huge_job_ref_is_rejected_without_reflection() {
+        use tower::ServiceExt as _;
+
+        const VERSION: &str = "2026-07-28";
+        let temp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::test_machine(temp.path().canonicalize().unwrap());
+        let router = mcp_router(
+            machine,
+            "/mcp",
+            LogConfig::default(),
+            None,
+            trusted_http_hosts("127.0.0.1:3000".parse().unwrap(), None),
+            CancellationToken::new(),
+        )
+        .layer(MockConnectInfo(RequesterId::Local));
+
+        let huge = format!("j:{}", "x".repeat(32 * 1024));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "jobs_get",
+                "arguments": {"ref": huge, "wait_ms": 0},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": VERSION,
+                    "io.modelcontextprotocol/clientInfo": {"name":"http-probe","version":"1"},
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(HOST, "127.0.0.1:3000")
+                    .header("MCP-Protocol-Version", VERSION)
+                    .header("Mcp-Method", "tools/call")
+                    .header("Mcp-Name", "jobs_get")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            body.len() < 4096,
+            "oversized diagnostic: {} bytes",
+            body.len()
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("isError"), "{text}");
+        assert!(
+            !text.contains(&"x".repeat(256)),
+            "caller-controlled ref leaked into response: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_operations_race_cancellation() {
         let active = CancellationToken::new();
         assert_eq!(startup_or_cancelled(&active, async { 42 }).await, Some(42));
