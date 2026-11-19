@@ -2495,11 +2495,27 @@ pub(crate) fn signal_token(signal: i32) -> String {
 /// success, since its `next` is the follow-up chain). The fact and the wording
 /// stay one, so no surface can be told a different story.
 fn external_stop_note(completion: &JobCompletion) -> Option<String> {
-    let signal = external_signal(completion)?;
+    let signal = outside_command_signal(completion)?;
     Some(format!(
         "terminated by {} from outside dotlink; check what signalled it before retrying",
         signal_label(signal)
     ))
+}
+
+/// The signal that ended the *command*, when dotlink did not end it. This is the
+/// sentence's question, and it differs from [`external_signal`]'s by exactly one
+/// cause: a [`crate::shell_process::StopCause::Teardown`] stop ends the tree
+/// *behind* a command that had already exited, so the command's own signal is
+/// still somebody else's and still needs naming. Without this the reply would
+/// carry `signal` and `stopped_by: teardown` with no prose at all — a bare
+/// number, which is the one thing that sentence exists to prevent.
+fn outside_command_signal(completion: &JobCompletion) -> Option<i32> {
+    let signal = completion.signal?;
+    let ours = matches!(
+        completion.stopped_by,
+        None | Some(crate::shell_process::StopCause::Teardown)
+    );
+    ours.then_some(signal)
 }
 
 /// The one ending dotlink cannot attribute to itself: the process died on a
@@ -3765,12 +3781,13 @@ mod tests {
     /// hunting for a host process over a kill this process performed.
     #[test]
     fn a_signal_dotlink_delivered_is_never_reported_as_external() {
+        // The four causes that end the command: dotlink's signal is the story, so
+        // neither the exit line nor the outside-stop sentence applies.
         for cause in [
             crate::shell_process::StopCause::Timeout,
             crate::shell_process::StopCause::Cancel,
             crate::shell_process::StopCause::Shutdown,
             crate::shell_process::StopCause::Failed,
-            crate::shell_process::StopCause::Teardown,
         ] {
             let completion = signalled_completion().with_stop(Some(cause));
             assert_eq!(external_signal(&completion), None, "{cause:?}");
@@ -3779,6 +3796,13 @@ mod tests {
             assert_eq!(payload["stopped_by"], Value::from(cause.as_str()));
             assert_eq!(payload["signal"], Value::from(9));
         }
+        // `teardown` ends the tree behind a command that had already exited, so
+        // the journal is silent about the command — the exit line would be wrong —
+        // while the reply still has to name who ended it.
+        let tidied =
+            signalled_completion().with_stop(Some(crate::shell_process::StopCause::Teardown));
+        assert_eq!(external_signal(&tidied), None);
+        assert!(external_stop_note(&tidied).is_some(), "the command's story");
         // The one ending that is genuinely not ours keeps both surfaces.
         let external = signalled_completion();
         assert_eq!(external_signal(&external), Some(9));
@@ -3786,6 +3810,30 @@ mod tests {
         let payload = rendered(&external);
         assert!(payload.get("stopped_by").is_none(), "{payload}");
         assert_eq!(payload["signal"], Value::from(9));
+    }
+
+    /// A tidy-up behind an externally signalled command is the one completion
+    /// that carries both facts: dotlink ended the leftover tree (`teardown`) and
+    /// somebody else ended the command (`signal`). The journal says the first with
+    /// a stop line, so it writes no exit line; the reply must still name the second,
+    /// or the reader is left with a bare number.
+    #[test]
+    fn a_tidy_up_keeps_the_external_signal_story_without_claiming_it() {
+        let completion = JobCompletion::failed_with_output(
+            "failed spooling stdout: disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_signal(Some(9))
+        .with_stop(Some(crate::shell_process::StopCause::Teardown));
+        // The journal already recorded a kill of ours, so nothing is external.
+        assert_eq!(external_signal(&completion), None);
+        // The command's own ending is still not ours, and still gets its sentence.
+        let note = external_stop_note(&completion).expect("the command's signal needs a story");
+        assert!(note.contains("SIGKILL (signal 9)"), "{note}");
+        let payload = rendered(&completion);
+        assert_eq!(payload["signal"], Value::from(9));
+        assert_eq!(payload["stopped_by"], Value::from("teardown"));
     }
 
     #[test]
