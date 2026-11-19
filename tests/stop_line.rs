@@ -1,5 +1,5 @@
-//! The stop line is the branch's forensic record: it must appear at every
-//! verbosity, because its absence is meant to mean nothing was signalled.
+//! A lifecycle line is the branch's forensic record: it must appear at every
+//! verbosity, because its absence is meant to mean the command ended on its own.
 //!
 //! Driven against the real binary with a piped stderr, since `LOG` lines are not
 //! captured by the in-process tests.

@@ -253,21 +253,11 @@ pub(crate) struct JobCompletion {
 }
 
 impl JobCompletion {
-    /// The command returned, but the work it started did not: dotlink ended it. The
-    /// command's own status stays exactly as the process reported it — this is not a
-    /// dotlink failure — while `success` says the invocation did not finish. A caller
-    /// that reads `success` must not read "done" here, and `error` is why.
-    /// The sweep's finding, recorded beside the completion so the lifecycle line can
-    /// say what dotlink also killed. It never changes which field a result carries:
-    /// the verdict travels in `error`, and the journal carries the kill.
-    pub(crate) fn with_leftovers(mut self, leftovers: crate::shell_process::StopOutcome) -> Self {
-        self.leftovers = Some(leftovers);
-        self
-    }
-
-    /// The sweep a failure performed, when it performed one. `None` leaves the field
-    /// as it was, so a path that never touched a tree says nothing about one.
-    pub(crate) fn with_leftovers_found(
+    /// What the sweep of this command's group found — `None` when no sweep ran. The
+    /// lifecycle line reads it to say `tree=killed`/`tree=alive`; it never changes which
+    /// field a result carries, because the verdict travels in `error`. One setter, so a
+    /// caller cannot leave a sweep unrecorded by reaching for another.
+    pub(crate) fn with_leftovers(
         mut self,
         leftovers: Option<crate::shell_process::StopOutcome>,
     ) -> Self {
@@ -277,6 +267,10 @@ impl JobCompletion {
         self
     }
 
+    /// The command returned, but the work it started did not: dotlink ended it. The
+    /// command's own status stays exactly as the process reported it — this is not a
+    /// dotlink failure — while `success` says the invocation did not finish. A caller
+    /// that reads `success` must not read "done" here, and `error` is why.
     pub(crate) fn did_not_finish(mut self, message: impl Into<String>) -> Self {
         self.success = false;
         self.error = Some(message.into());
@@ -4169,8 +4163,8 @@ mod tests {
 
     #[test]
     fn a_signal_token_never_opens_a_field_of_its_own() {
-        // The lifecycle line is `key=value`; a value carrying a space would read
-        // as two fields, so the token drops the prose number `signal_label` adds.
+        // The token is one word with no spaces: the lifecycle line and the result share
+        // it, and a number would be a second representation to keep in step.
         #[cfg(unix)]
         assert_eq!(signal_token(9), "SIGKILL");
         assert_eq!(signal_token(42), "42", "an unknown number stays a number");

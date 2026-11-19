@@ -157,6 +157,55 @@ fn a_finished_command_does_not_wait_for_its_leftovers() {
     assert!(line.contains("tree=killed"), "{line}");
 }
 
+/// A `setsid` descendant leaves the group, so the sweep cannot reach it and it holds
+/// the inherited pipe. That is out of contract, and the answer must be the collected
+/// prefix marked truncated — not an internal failure claiming the execution deadline
+/// elapsed, which is what it used to say after two seconds of a thirty-second budget.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_escaped_writer_costs_the_drain_window_not_the_deadline() {
+    if std::process::Command::new("setsid")
+        .arg("true")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let workdir = tempfile::tempdir().unwrap();
+    let (payload, journal, elapsed) = one_call(
+        workdir.path(),
+        "setsid sh -c 'sleep 3; echo late' & sleep 0.3; echo ok",
+    );
+
+    // The command finished in a moment; the escaped writer must not hold the reply
+    // until `timeout_secs` (30 in this profile).
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the drain waited {elapsed:?} instead of its own window"
+    );
+    // And the command's own success is what the reply carries.
+    assert_eq!(payload["exit_code"], 0, "{payload}");
+    assert_eq!(payload["success"], true, "{payload}");
+    assert!(
+        payload["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ok"),
+        "the command's output must survive an escaped writer: {payload}"
+    );
+    assert!(
+        payload.get("error").is_none(),
+        "an escaped writer is not an execution failure: {payload}"
+    );
+    // A cut stream says so rather than pretending it was complete.
+    assert_eq!(payload["stdout_truncated"], true, "{payload}");
+    // No line: the escaped writer left the group, so the sweep found nothing to kill.
+    assert!(
+        !journal.contains("end="),
+        "nothing was signalled, so nothing is recorded: {journal}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_command_killed_by_someone_else_keeps_its_own_ending() {

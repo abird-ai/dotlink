@@ -113,8 +113,10 @@ All paths and validation commands below are relative to the repository root.
   signal, and any sweep writes a line. A sweep of work still running
   rides on the same line as `tree=killed`, or `tree=alive` when the kernel refused,
   which is the one place where saying it is an alarm; an empty group adds nothing.
-  A job is written once because every completion path disarms the guard, whose
-  `Drop` is the only other writer (`abandoned`). Attribution lives in the journal,
+  A job is written once because the run path disarms the guard on every path that
+  publishes a completion — carrying an unproven signal onto the line as `tree=alive`
+  first — so the `Drop` writer (`end=abandoned`) speaks only for a guard dropped
+  without a completion. Attribution lives in the journal,
   not on the wire — a sweep claims no cause — so `external_signal`
   (`stopped_by.is_none()` over a signal no cause claims) is the single predicate
   behind both the reply's sentence and the classification, and `by=external` claims

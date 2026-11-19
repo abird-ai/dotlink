@@ -58,11 +58,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   value above it still loads and is capped, and the cap is reported at startup only
   when the value was the operator's own rather than the default.
 
+- `end=` names the terminal the runner reached, so an internal failure behind a
+  deadline still logs `end=timeout` rather than `end=error`, matching the `timed_out`
+  the reply carries. A line is written for every ending that is not the command's own,
+  including one whose kill the kernel refused and one that never started.
+
 - Results carry only what applies. A null, a flag that is false because nothing
-  happened (`timed_out`, `*_truncated`, `cancelling`), an empty stream, and a
-  per-stream `truncated`/`released` that is not true are now omitted rather than
-  rendered: an absence costs nothing, while a rendered false costs tokens on every
-  call. A clean shell result drops from 211 to 106 characters, a timeout from 312 to
+  happened (`timed_out`, `*_truncated`, `cancelling`, `released`), an empty stream, and
+  a `truncated` that is not true are now omitted at any depth by one shared rule rather
+  than rendered: an absence costs nothing, while a rendered false costs tokens on every
+  call. An empty stream loses its key even beside `*_truncated: true` — an empty string
+  says nothing, and the truncation flag already says the tail was cut. A clean shell result drops from 211 to 106 characters, a timeout from 312 to
   215, and the externally-signalled case from 463 to 307. `sandboxed`, `network` and
   `success` stay always-rendered because their false is information, not absence, and
   a running job omits `success`/`exit_code` it does not have yet.
@@ -87,10 +93,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   kill (`KillReason::Failed`). It previously left the tree armed and returned,
   which deferred the kill to the guard's fail-safe; the failure was recorded as
   an unattributed drop even though its cause was known at the call site.
-- A failure behind an already-finished command now reports the sweep it performed.
-  `failure_stop` swept the tree and dropped the outcome, so a spool error after a
-  successful sweep recorded nothing at all: the one path where a sweep happened was
-  the one path that could not say so.
+- A failure behind an already-finished command now reports the sweep that already
+  happened. The run path owns the sweep and puts its outcome on the completion, so a
+  later spool error carries it instead of re-sweeping a disarmed guard and concluding
+  that nothing was found — which is how a recorded sweep became an unrecorded one.
+  A refused signal is likewise carried as `tree=alive` before the guard is disarmed,
+  so the run path can never leave the fail-safe to add a second line.
 - A guard dropped without a completion writes the job's only line, `end=abandoned`,
   so a job that never published a result is still on the record — and a job that did
   publish one is never written twice.

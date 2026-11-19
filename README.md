@@ -422,7 +422,7 @@ including `-q` — so `-q` is not silence:
 
 ~~~text
 [01:07:12.031] LOG  job        id=<job id> end=timeout by=dotlink
-[01:07:13.117] LOG  job        id=<job id> end=signal signal=SIGKILL by=external
+[01:07:13.117] LOG  job        id=<job id> end=signal SIGKILL by=external
 [01:07:13.884] LOG  job        id=<job id> end=exit code=0 tree=killed
 ~~~
 

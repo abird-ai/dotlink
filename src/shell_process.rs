@@ -268,6 +268,10 @@ fn resume_new_process(pid: u32) -> io::Result<()> {
 
 pub(crate) struct Guard {
     active: bool,
+    /// Set when the kernel refused a signal, so the group's fate is unproven. Distinct
+    /// from `active`, which only says the guard has not been disarmed: a fresh guard is
+    /// armed without anything having been refused.
+    refused: bool,
     trace: StopTrace,
     #[cfg(unix)]
     group: libc::pid_t,
@@ -286,6 +290,7 @@ impl Guard {
                 .ok_or_else(|| io::Error::other("spawned shell has no process group"))?;
             Ok(Self {
                 active: true,
+                refused: false,
                 trace,
                 group,
             })
@@ -319,6 +324,7 @@ impl Guard {
             )?;
             Ok(Self {
                 active: true,
+                refused: false,
                 trace,
                 job,
             })
@@ -333,6 +339,13 @@ impl Guard {
         matches!(self.signal_and_record(reason), StopOutcome::Delivered)
             .then(|| reason.claim())
             .flatten()
+    }
+
+    /// Whether the last signal is unproven: the kernel refused it and this guard is
+    /// still armed for the retry that no longer exists once the run path disarms it.
+    /// Read it before disarming, so the alarm outlives the guard that holds it.
+    pub(crate) fn may_still_run(&self) -> bool {
+        self.refused
     }
 
     /// End the tree behind a command that has already returned, and report what
@@ -352,9 +365,10 @@ impl Guard {
             return StopOutcome::AlreadyGone;
         }
         let outcome = self.signal_tree();
+        self.refused = outcome == StopOutcome::Failed;
         // A signal that failed leaves the tree running, so stay armed: the
         // fail-safe drop gets one more attempt.
-        self.active = outcome == StopOutcome::Failed;
+        self.active = self.refused;
         // The job's line is written once, by whoever knows its ending; this is only
         // the attempt, kept for tests.
         #[cfg(test)]

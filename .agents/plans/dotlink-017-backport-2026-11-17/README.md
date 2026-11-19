@@ -16,8 +16,10 @@ each item is ported deliberately.
 ### 1. Signal identity — `ProcessExit::Signal` has no payload
 
 `aw-tools`' `ProcessExit::Signal` records *that* the waited process died by a
-signal but not *which*. `release/0.17` now carries the number (`ca7dd5a`), so the
-shared type should too: `Signal(i32)`, fed from `ExitStatus::signal()`.
+signal but not *which*. `release/0.17` keeps the number internally (`ca7dd5a`) and
+renders it as a name — `signal: "SIGKILL"`, never `signal: 9` — so the shared type
+should carry `Signal(i32)` fed from `ExitStatus::signal()` and convert at the edge.
+One representation on the wire: do not add a second numeric field beside the name.
 
 Why it matters: SIGKILL (an external kill) and SIGSEGV (a crash) currently render
 identically, and they call for opposite responses. A day of investigation went
@@ -50,9 +52,11 @@ or `tree=alive` rides on the same line when the command left its group running a
 dotlink swept it. One line, because two lines each needing the other to be read is
 how a record stops being evidence.
 
-The port must keep the writer single: the completion writes it, and the fail-safe
-`Drop` writes `end=abandoned` only when no completion exists — every completion path
-disarms the guard, so a job is never written twice.
+The port must keep the writer single: the completion writes the line, and the
+fail-safe `Drop` writes `end=abandoned` only when no completion exists. Every path
+that publishes a completion disarms the guard first, carrying an unproven signal onto
+the line as `tree=alive`, so a job is never written twice and a refused kill is still
+recorded.
 
 ### 4. Result fields
 

@@ -2358,15 +2358,18 @@ impl LocalMachine {
     /// fail-safe, which records `dropped` and cannot say why — the reason was
     /// known at this point and must not be lost.
     fn failure_stop(tree: &mut crate::shell_process::Guard, facts: &mut FailureFacts<'_>) {
+        // Only a live command needs stopping; the sweep behind a finished one already
+        // ran on the path that watches the command end, and its outcome is in `facts`.
+        // Sweeping a second time would find the guard disarmed and report nothing.
         if facts.exit_status.is_none() {
-            // The command is still live, so this failure ends it and owns the kill.
             facts.stop = facts.stop.or_else(|| tree.terminate(KillReason::Failed));
-            return;
         }
-        // Only the command's leftovers are left. A sweep ends a tree, not a command,
-        // so it claims no cause — but what it found is a fact this failure must
-        // carry, or the one sweep that happened would be the one nobody recorded.
-        facts.leftovers = Some(tree.sweep());
+        // A refused signal leaves the group unproven; carry that before disarming, so
+        // the alarm survives the guard that would otherwise retry it.
+        if tree.may_still_run() {
+            facts.leftovers = Some(StopOutcome::Failed);
+        }
+        tree.disarm();
     }
 
     /// One internal failure of the output path. The command's status, the stop the
@@ -2417,9 +2420,11 @@ impl LocalMachine {
             .and_then(crate::shell_process::tree_word);
         // A command that simply ended is the expected case, so it writes nothing: the
         // record is for what an operator would otherwise have to reconstruct, and a
-        // line per ordinary exit is noise that hides those. A sweep is never silent,
-        // because it changed the verdict.
-        if by.is_some() || tree.is_some() {
+        // line per ordinary exit is noise that hides those. Everything else records —
+        // including an ending that names no actor, because a deadline or an internal
+        // error is an event whether or not its kill landed.
+        let own_ending = end.starts_with("exit code=");
+        if !own_ending || tree.is_some() {
             stop_trace.ended(&end, by, tree);
         }
         completion
@@ -2440,7 +2445,10 @@ impl LocalMachine {
             None if completion.signal.is_some() => Some("external"),
             None => None,
         };
-        let end = match completion.status {
+        // The terminal a failure followed, not the `Failed` it is rendered as: an
+        // internal failure behind a deadline is still a deadline, and the reply says
+        // `timed_out` for exactly that reason.
+        let end = match completion.terminal.unwrap_or(completion.status) {
             JobStatus::TimedOut => "timeout".to_owned(),
             JobStatus::Cancelled => "cancel".to_owned(),
             JobStatus::Failed => "error".to_owned(),
@@ -2610,7 +2618,7 @@ impl LocalMachine {
         let mut stop: Option<StopCause> = None;
         // What the sweep found when the command ended: anything but `AlreadyGone`
         // means it returned while its own group was still running.
-        let mut leftovers = StopOutcome::AlreadyGone;
+        let mut leftovers = Some(StopOutcome::AlreadyGone);
         match outcome {
             WaitOutcome::Child(Ok(status)) => {
                 exit_status = Some(status);
@@ -2621,7 +2629,7 @@ impl LocalMachine {
                 // here is what lets the collector finish now instead of at the
                 // deadline. The sweep claims no cause: the command's own status
                 // already said how it ended. What it found is the verdict below.
-                leftovers = process_tree.sweep();
+                leftovers = Some(process_tree.sweep());
             }
             WaitOutcome::Child(Err(error)) => {
                 terminal = JobStatus::Failed;
@@ -2684,7 +2692,7 @@ impl LocalMachine {
                     // deadline and turn a successful command into a collection
                     // failure. Ending it here is what makes one contract hold in
                     // both modes: descendants die when the command returns.
-                    leftovers = process_tree.sweep();
+                    leftovers = Some(process_tree.sweep());
                 }
             }
             WaitOutcome::StdinFailure(message) => {
@@ -2703,7 +2711,11 @@ impl LocalMachine {
         let facts = FailureFacts {
             exit_status: exit_status.as_ref(),
             stop,
-            leftovers: None,
+            // The sweep that already ran owns this fact. Re-sweeping here would find a
+            // disarmed guard and report that nothing happened, which is how a recorded
+            // sweep became an unrecorded one.
+            // The sweep that already ran owns this fact; only the sweep sets it.
+            leftovers,
             terminal,
         };
 
@@ -2780,13 +2792,19 @@ impl LocalMachine {
             }
         };
 
+        // A refused signal leaves the group unproven, and the fail-safe is about to be
+        // disarmed — so the alarm has to travel on the completion or die with the guard.
+        if process_tree.may_still_run() {
+            leftovers = Some(StopOutcome::Failed);
+        }
+        // Nothing will signal this tree again on any path that publishes a result, so
+        // the fail-safe must not add a second line to a job that already has one. A
+        // guard dropped without a completion is the only case it still speaks for.
+        process_tree.disarm();
+
         match terminal {
             JobStatus::Completed => {
                 let status = exit_status.expect("completed job has an exit status");
-                // The group was swept when the command returned, so there is
-                // nothing left for the fail-safe to report. Disarm instead of
-                // leaving a second, silent kill authority behind.
-                process_tree.disarm();
                 let completion =
                     JobCompletion::completed(status.code(), status.success(), stdout, stderr)
                         .with_signal(Self::exit_signal(&status))
@@ -2799,9 +2817,9 @@ impl LocalMachine {
                 // children were being killed behind the reply.
                 let completion = completion.with_leftovers(leftovers);
                 match leftovers {
-                    StopOutcome::AlreadyGone => completion,
-                    StopOutcome::Delivered => completion.did_not_finish(LEFTOVERS_KILLED),
-                    StopOutcome::Failed => completion.did_not_finish(LEFTOVERS_UNKILLED),
+                    None | Some(StopOutcome::AlreadyGone) => completion,
+                    Some(StopOutcome::Delivered) => completion.did_not_finish(LEFTOVERS_KILLED),
+                    Some(StopOutcome::Failed) => completion.did_not_finish(LEFTOVERS_UNKILLED),
                 }
             }
             JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)
@@ -2919,7 +2937,7 @@ impl FailureFacts<'_> {
             .with_signal(self.exit_status.and_then(LocalMachine::exit_signal))
             .with_stop(self.stop)
             .after_terminal(self.terminal)
-            .with_leftovers_found(self.leftovers)
+            .with_leftovers(self.leftovers)
     }
 }
 
@@ -4180,14 +4198,16 @@ mod tests {
         let child = command.spawn().unwrap();
         let trace = StopTrace::new(LogConfig::default(), "cleanup");
         let mut tree = crate::shell_process::Guard::attach(&child, trace.clone()).unwrap();
-        // A status proves the command ended, so only its leftovers remain.
+        // The run path sweeps when the command ends, so by the time a failure is built
+        // the finding is already a fact of the completion. A failure must carry it, not
+        // sweep a disarmed guard and report that nothing happened.
         let ended = std::process::Command::new("true")
             .status()
             .expect("a status to carry");
         let mut facts = FailureFacts {
             exit_status: Some(&ended),
             stop: None,
-            leftovers: None,
+            leftovers: Some(StopOutcome::Delivered),
             terminal: JobStatus::Completed,
         };
         LocalMachine::failure_stop(&mut tree, &mut facts);
@@ -4197,7 +4217,11 @@ mod tests {
             Some("killed"),
             "the sweep's finding must survive the failure"
         );
-        assert_eq!(trace.reports(), vec![KillReason::Cleanup]);
+        assert!(
+            trace.reports().is_empty(),
+            "a disarmed guard is not swept a second time: {:?}",
+            trace.reports()
+        );
     }
 
     /// The wiring, not the helpers: a real signalled child must reach the wire

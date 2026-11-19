@@ -236,7 +236,7 @@ Check these explicitly. Each has a known-good value in the baseline.
 | poll failures / restarts | 0 / 0 | any — transport instability |
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
-| `end=` lines | only when there is something to say: `end=` names what ended it, `by=` names who | any line for an ordinary exit; a second line for one job; `by=external` or `by=caller` with a completion that claims no `stopped_by` |
+| `end=` lines | only when there is something to say: `end=` names what ended it, `by=` names who | any line for an ordinary exit; a second line for one job; a missing line for a deadline, cancel or internal error |
 | `by=external` | rare: something else signalled the command; `end=signal` prints the signal name, and `tree=killed` may follow | `by=external` on a job whose result claims `stopped_by`, or a `signal` in a result whose job wrote no line |
 | `"left processes running"` in a shell `error` | the command left its own group running, so dotlink killed that work and failed the invocation while still reporting the command's status | a clean command reporting this, or a `success: true` beside a `tree=killed` line |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
@@ -260,7 +260,9 @@ sweep changed the verdict — so the record only holds events worth reconstructi
 `tree=killed` — or `tree=alive` when the kernel refused, which is the one case that is
 an alarm — and it is also what makes the invocation a failure; an empty group adds
 nothing. Because the line is written once — from the completion, or by the fail-safe
-when there is none — a second line for one job is a bug.
+when there is none — a second line for one job is a bug. A refused signal appears as
+`tree=alive`: the run path records it before disarming, so the alarm never depends on
+the guard surviving.
 
 ## 5. Benign classes — do not chase
 

@@ -1,11 +1,7 @@
 //! A job's lifecycle line says how it ended and who ended it, in one line and two
-//! words an operator does not have to look up: `by=dotlink|caller|connector` is
-//! ours, `by=external` is not, and a command that simply ended writes no line at all
-//! itself. Exactly one line appears per job, so its absence is still evidence.
-//!
-//! Driven against the real binary with a piped stderr, since `LOG` lines are not
-//! captured by the in-process tests. Signals are a Unix concept here; on Windows
-//! `exit_code` already carries everything the platform reports.
+//! words an operator does not have to look up: `by=dotlink|caller|connector` is ours,
+//! `by=external` is not, and a command that simply ended writes no line at all. At
+//! most one line appears per job, so a line always means something happened.
 
 #![cfg(unix)]
 
