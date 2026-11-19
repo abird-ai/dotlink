@@ -2506,6 +2506,12 @@ fn external_stop_note(completion: &JobCompletion) -> Option<String> {
 /// signal it did not deliver. `from outside` names the *absence* of our signal,
 /// not a culprit — a crash and a stranger's SIGKILL both land here.
 ///
+/// The predicate is `stopped_by.is_none()`, which is exactly "dotlink never
+/// signalled this tree": every delivered kill records a cause, including the
+/// tidy-up and fail-safe kills that claim [`crate::shell_process::StopCause::Teardown`].
+/// Reading "no cause" as "not ours" is what turned dotlink's own teardown kills
+/// into reports of a stranger's SIGKILL.
+///
 /// The result sentence and the exit line both read this, so the journal and the
 /// reply cannot disagree about the same job.
 pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
@@ -3753,6 +3759,35 @@ mod tests {
         }
     }
 
+    /// Attribution, stated as a property: a signal is external only when dotlink
+    /// never signalled that tree. A delivered teardown is still our signal, so it
+    /// must never surface as a stranger's SIGKILL — that misreading sent a caller
+    /// hunting for a host process over a kill this process performed.
+    #[test]
+    fn a_signal_dotlink_delivered_is_never_reported_as_external() {
+        for cause in [
+            crate::shell_process::StopCause::Timeout,
+            crate::shell_process::StopCause::Cancel,
+            crate::shell_process::StopCause::Shutdown,
+            crate::shell_process::StopCause::Failed,
+            crate::shell_process::StopCause::Teardown,
+        ] {
+            let completion = signalled_completion().with_stop(Some(cause));
+            assert_eq!(external_signal(&completion), None, "{cause:?}");
+            assert_eq!(external_stop_note(&completion), None, "{cause:?}");
+            let payload = rendered(&completion);
+            assert_eq!(payload["stopped_by"], Value::from(cause.as_str()));
+            assert_eq!(payload["signal"], Value::from(9));
+        }
+        // The one ending that is genuinely not ours keeps both surfaces.
+        let external = signalled_completion();
+        assert_eq!(external_signal(&external), Some(9));
+        assert!(external_stop_note(&external).is_some());
+        let payload = rendered(&external);
+        assert!(payload.get("stopped_by").is_none(), "{payload}");
+        assert_eq!(payload["signal"], Value::from(9));
+    }
+
     #[test]
     fn a_site_that_kills_names_the_reason_and_still_never_claims_a_signal() {
         for (reason, text) in [
@@ -3760,6 +3795,7 @@ mod tests {
             (crate::shell_process::StopCause::Cancel, "cancel"),
             (crate::shell_process::StopCause::Shutdown, "shutdown"),
             (crate::shell_process::StopCause::Failed, "failed"),
+            (crate::shell_process::StopCause::Teardown, "teardown"),
         ] {
             let completion =
                 JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())

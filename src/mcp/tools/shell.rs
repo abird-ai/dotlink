@@ -2267,6 +2267,13 @@ impl LocalMachine {
                         })
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
+                        // Reaper only, never the authority: `process_tree` is
+                        // declared after `child`, so Rust drops the guard first,
+                        // which kills the group through `Guard::terminate` and
+                        // records the reason and outcome. This flag then reaps the
+                        // already-dead leader instead of leaving a zombie. Do not
+                        // read it as the kill path — a kill that never reaches the
+                        // guard can never be attributed.
                         .kill_on_drop(true);
                     if !job.mark_running(shell_guard_generation) {
                         return JobCompletion::cancelled(
@@ -2318,20 +2325,22 @@ impl LocalMachine {
 
     /// What a failure may say about the stop it follows. A tree that is already
     /// stopped keeps the cause it was stopped with, so a later spool error cannot
-    /// relabel a timeout as a failure; a command that already ended is being cleaned
-    /// up, which the log names and no result claims.
+    /// relabel a timeout as a failure.
+    ///
+    /// A tree that is still live is stopped here and the failure owns the kill.
+    /// Leaving it armed and returning would defer the kill to the guard's
+    /// fail-safe, which records `dropped` and cannot say why — the reason was
+    /// known at this point and must not be lost.
     fn failure_stop(
         tree: &mut crate::shell_process::Guard,
         cause: Option<StopCause>,
         command_exited: bool,
     ) -> Option<StopCause> {
-        // A live tree has already been stopped by whoever reported the failure —
-        // `terminate` is idempotent, so a second call could not claim anything.
         if !command_exited {
-            return cause;
+            return cause.or_else(|| tree.terminate(KillReason::Failed));
         }
-        // Only the command's leftovers are left to tidy up, and tidy-up is not a
-        // stop of the command: the guard records it, a result never claims it.
+        // Only the command's leftovers are left to tidy up. Tidy-up ends a tree,
+        // not a command, so it claims teardown rather than a cause.
         tree.terminate(KillReason::Cleanup);
         None
     }

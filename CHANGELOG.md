@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Every delivered kill is now attributed. `KillReason::Cleanup` and
+  `KillReason::Dropped` used to claim no cause, so `stopped_by` stayed absent and
+  `external_signal` reported the kill as `signal=SIGKILL from=outside` — dotlink
+  telling a caller that a stranger signalled a tree it had killed itself. Tidy-up
+  and the fail-safe now claim `StopCause::Teardown`: they still name no cause,
+  because none applies, but they record that the signal was ours. Attribution is
+  now one property — `stopped_by` is present exactly when dotlink signalled the
+  tree — instead of two readings of one empty field.
+- A failure that finds the process tree still live now stops it and owns that
+  kill (`KillReason::Failed`). It previously left the tree armed and returned,
+  which deferred the kill to the guard's fail-safe; the failure was recorded as
+  an unattributed drop even though its cause was known at the call site.
+
 ## [0.17.5] - 2026-11-19
 
 ### Added

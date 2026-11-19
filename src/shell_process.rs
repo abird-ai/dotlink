@@ -37,6 +37,11 @@ pub(crate) enum StopCause {
     /// `cancel` here would blame a user who did nothing.
     Shutdown,
     Failed,
+    /// dotlink ended the tree without ending the command: tidy-up after the
+    /// command had already exited, or the guard's fail-safe. It names no cause
+    /// because none applies, but it must still record that the signal was ours —
+    /// otherwise a kill we performed reads as a stranger's SIGKILL.
+    Teardown,
 }
 
 impl KillReason {
@@ -51,15 +56,18 @@ impl KillReason {
         }
     }
 
-    /// The claim this kill supports, if any. Tidy-up and the fail-safe end a tree,
-    /// not the command, so they support none.
+    /// The cause this kill records. Every delivered kill records one, because
+    /// "dotlink signalled this tree" and "no cause applies" are different facts:
+    /// the first decides attribution, the second only decides wording. Tidy-up
+    /// and the fail-safe end a tree rather than the command, so they claim
+    /// [`StopCause::Teardown`] instead of a cause.
     fn claim(self) -> Option<StopCause> {
         match self {
             Self::Timeout => Some(StopCause::Timeout),
             Self::Cancel => Some(StopCause::Cancel),
             Self::Shutdown => Some(StopCause::Shutdown),
             Self::Failed => Some(StopCause::Failed),
-            Self::Cleanup | Self::Dropped => None,
+            Self::Cleanup | Self::Dropped => Some(StopCause::Teardown),
         }
     }
 }
@@ -71,6 +79,7 @@ impl StopCause {
             Self::Cancel => "cancel",
             Self::Shutdown => "shutdown",
             Self::Failed => "failed",
+            Self::Teardown => "teardown",
         }
     }
 }
@@ -496,6 +505,49 @@ mod tests {
         drop(guard);
         let _ = child.wait().await;
         assert!(trace.reports().is_empty(), "{:?}", trace.reports());
+    }
+
+    /// Every delivered kill is dotlink's, so every delivered kill must be able to
+    /// say so — including the two that end a tree rather than a command. Reading
+    /// "no cause" as "not ours" is how dotlink's own teardown became a report of a
+    /// stranger's SIGKILL.
+    #[test]
+    fn a_teardown_kill_records_itself_instead_of_looking_external() {
+        for reason in [KillReason::Cleanup, KillReason::Dropped] {
+            assert_eq!(reason.claim(), Some(StopCause::Teardown), "{reason:?}");
+        }
+        // The four that end the command keep their own claim.
+        for (reason, cause) in [
+            (KillReason::Timeout, StopCause::Timeout),
+            (KillReason::Cancel, StopCause::Cancel),
+            (KillReason::Shutdown, StopCause::Shutdown),
+            (KillReason::Failed, StopCause::Failed),
+        ] {
+            assert_eq!(reason.claim(), Some(cause), "{reason:?}");
+        }
+    }
+
+    /// The fail-safe is the last authority: dropping an armed guard kills the
+    /// group and records it. A guard that killed nothing claims nothing.
+    #[tokio::test]
+    async fn an_armed_guard_that_is_dropped_records_a_signal() {
+        let mut command = Command::new("sh");
+        configure(&mut command);
+        command.arg("-c").arg("sleep 30");
+        let mut child = command.spawn().unwrap();
+        let trace = StopTrace::new(
+            crate::logging::LogConfig::new(0, false, crate::logging::ColorMode::Never),
+            "job-dropped",
+        );
+        let guard = Guard::attach(&child, trace.clone()).unwrap();
+        drop(guard);
+        assert_eq!(
+            trace.reports(),
+            vec![KillReason::Dropped],
+            "a dropped armed guard must record the kill it performed"
+        );
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 
     #[test]
