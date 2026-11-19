@@ -1587,6 +1587,17 @@ async fn prepare_runtime(
         tracing::warn!("shell mounts are inactive: {hint}");
     }
 
+    if setup.config.max_shell_timeout_secs > crate::limits::MAX_SHELL_TIMEOUT_SECS {
+        // Accepted, so an upgrade never becomes a refusal to start, but never
+        // silently: the deadline a caller is told about is the capped one.
+        tracing::warn!(
+            "max_shell_timeout_secs={} exceeds the {} minute turn horizon; commands are capped at {} s",
+            setup.config.max_shell_timeout_secs,
+            crate::limits::TURN_CHECKPOINT_MINUTES,
+            crate::limits::MAX_SHELL_TIMEOUT_SECS
+        );
+    }
+
     let retention = std::time::Duration::from_secs(setup.config.job_retention_secs);
     let spool_limit = setup.config.job_spool_bytes;
     let machine_config = MachineConfig {

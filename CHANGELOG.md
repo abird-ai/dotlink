@@ -30,6 +30,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   horizon stop at a coherent boundary and hand back. Tool descriptions now say
   only that `ts` is epoch seconds — a bare number per tool was both a second
   copy and a shorter one, since the actionable half stayed in the instructions.
+- One command no longer runs longer than one turn horizon. `timeout_secs` is
+  bounded above by 2100 s (35 min) instead of defaulting to an hour, so the
+  deadline a call is given always matches the horizon the instructions ask it
+  to report by: a longer deadline can only promise an execution no turn gets to
+  see. The bound is the same on every transport — it is the profile ceiling that
+  cannot buy more, not a transport window rewriting an execution. A profile
+  written before the bound still loads; its shell deadline is capped and the
+  cap is reported at startup, so an upgrade is never a refusal to start.
 
 ### Fixed
 

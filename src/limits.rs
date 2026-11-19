@@ -46,6 +46,11 @@ pub(crate) const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(DEFAULT_JOB_WA
 /// it stamps `ts` and the caller keeps its own clock.
 pub(crate) const TURN_CHECKPOINT_MINUTES: u64 = 35;
 
+/// The longest any single command may run: one turn horizon. A deadline beyond
+/// the horizon would promise an execution no turn can report on, so the profile
+/// ceiling cannot buy one.
+pub(crate) const MAX_SHELL_TIMEOUT_SECS: u64 = TURN_CHECKPOINT_MINUTES * 60;
+
 /// OpenAI Secure MCP Tunnel's serialized request/response message ceiling.
 pub(crate) const OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Reserve between the complete embedded MCP message and the hosted tunnel

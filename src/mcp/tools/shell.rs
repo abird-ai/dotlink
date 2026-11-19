@@ -61,7 +61,12 @@ use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
 /// it and is the fallback when omitted. Transport response windows never
 /// rewrite this execution lifetime.
 fn resolve_shell_timeout(requested: Option<u64>, ceiling: u64) -> u64 {
-    resolve_capped(requested, ceiling)
+    // The profile ceiling, bounded by the turn horizon. A profile written
+    // before that bound existed keeps loading; this is where it takes effect.
+    resolve_capped(
+        requested,
+        ceiling.min(crate::limits::MAX_SHELL_TIMEOUT_SECS),
+    )
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -149,6 +154,8 @@ pub(crate) fn with_profile_limits(
     if !crate::mcp::is_shell_tool(tool.name.as_ref()) {
         return tool;
     }
+    // Advertise what `resolve_shell_timeout` enforces, horizon bound included.
+    let max_secs = max_secs.min(crate::limits::MAX_SHELL_TIMEOUT_SECS);
     let shell = if tool.name.as_ref() == "powershell" {
         "PowerShell"
     } else {
@@ -4014,15 +4021,37 @@ mod tests {
     #[test]
     fn shell_timeout_is_client_controlled_under_a_policy_ceiling() {
         // Omitted -> the profile ceiling, not a hidden 30 s default.
-        assert_eq!(resolve_shell_timeout(None, 3_600), 3_600);
+        assert_eq!(resolve_shell_timeout(None, 1_800), 1_800);
         // Explicit caller values are honored inside the ceiling.
-        assert_eq!(resolve_shell_timeout(Some(600), 3_600), 600);
-        assert_eq!(resolve_shell_timeout(Some(1), 3_600), 1);
+        assert_eq!(resolve_shell_timeout(Some(600), 1_800), 600);
+        assert_eq!(resolve_shell_timeout(Some(1), 1_800), 1);
         // The caller cannot exceed the ceiling.
-        assert_eq!(resolve_shell_timeout(Some(7_200), 3_600), 3_600);
+        assert_eq!(resolve_shell_timeout(Some(7_200), 1_800), 1_800);
         // Zero is clamped up; a degenerate ceiling still yields a positive deadline.
-        assert_eq!(resolve_shell_timeout(Some(0), 3_600), 1);
+        assert_eq!(resolve_shell_timeout(Some(0), 1_800), 1);
         assert_eq!(resolve_shell_timeout(None, 0), 1);
+    }
+
+    /// A stored profile may still say an hour. It keeps loading, and the
+    /// deadline it actually gets is one turn horizon — the same number the
+    /// schema advertises, so the tool never promises what it will not run.
+    #[test]
+    fn a_ceiling_above_the_turn_horizon_is_capped_not_honoured() {
+        let horizon = crate::limits::MAX_SHELL_TIMEOUT_SECS;
+        assert_eq!(horizon, crate::limits::TURN_CHECKPOINT_MINUTES * 60);
+        assert_eq!(resolve_shell_timeout(None, 3_600), horizon);
+        assert_eq!(resolve_shell_timeout(Some(7_200), 3_600), horizon);
+
+        let shell = LocalMachine::all_tools()
+            .get(crate::mcp::shell_tool_name())
+            .cloned()
+            .unwrap();
+        let patched = with_profile_limits(shell, 3_600, 1_048_576, Some(Duration::from_secs(90)));
+        let timeout = patched.input_schema["properties"]["timeout_secs"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(timeout.contains(&horizon.to_string()), "{timeout}");
+        assert!(!timeout.contains("3600"), "{timeout}");
     }
 
     /// The decision that keeps the record honest: an already-stopped tree keeps
