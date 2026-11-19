@@ -25,6 +25,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   returned — and the command itself is the right place to say how long its tree
   lives: `wait` is ordinary shell, visible in the call, and needs no second
   lifetime flag.
+- The turn-clock note is hosted-only. `ts` is stamped on every surface, but
+  pacing a turn is a hosted horizon: a local stdio/HTTP caller has no user turn
+  to measure against, so its description now says only that `ts` is epoch
+  seconds instead of advertising a clock it never had.
 
 ### Fixed
 

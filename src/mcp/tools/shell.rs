@@ -121,17 +121,17 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     // Said once, on every surface: the command owns its tree's lifetime, not the
     // flag, and the script says how long that is.
     let lifetime = "Background processes die with the command; keep one with `wait` inside a durable call (`server & wait`) — it runs until that exits, `timeout_secs`, or job_cancel.";
-    let tail = format!(
-        "{lifetime} `ts` = epoch seconds, {}-minute turn clock.",
-        crate::limits::TURN_CHECKPOINT_MINUTES
-    );
+    // `ts` is a fact on every surface; the turn clock is not. A hosted caller
+    // has a user turn to pace against, a local one has no such horizon, so
+    // advertising one there would be a claim about a clock it never had.
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. Waits, then after at most {}s of response window returns a job handle and keeps running; `background: true` returns that handle at once; `timeout_secs` kills it; {follow_up}. {tail}",
-            hold.as_secs()
+            "Run a {shell} command. Waits, then after at most {}s of response window returns a job handle and keeps running; `background: true` returns that handle at once; `timeout_secs` kills it; {follow_up}. {lifetime} `ts` = epoch seconds; {}-minute turn clock.",
+            hold.as_secs(),
+            crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` returns that execution's handle at once: {follow_up}. {tail}"
+            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` returns that execution's handle at once: {follow_up}. {lifetime} `ts` = epoch seconds."
         ),
     }
 }
@@ -3976,6 +3976,13 @@ mod tests {
         );
         assert!(tunnel.contains("`ts`"), "{tunnel}");
         assert!(tunnel.contains("kills it"), "{tunnel}");
+        // The turn clock is a hosted horizon: a local caller has no user turn
+        // to pace against, so the stamp stands alone there.
+        assert!(
+            !description.contains("turn clock"),
+            "a local surface must not advertise a turn clock: {description}"
+        );
+        assert!(tunnel.contains("turn clock"), "{tunnel}");
         assert!(
             tunnel.contains(&crate::limits::TURN_CHECKPOINT_MINUTES.to_string()),
             "{tunnel}"
