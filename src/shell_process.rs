@@ -44,6 +44,9 @@ pub(crate) enum StopCause {
 }
 
 impl KillReason {
+    /// Test-facing names. The lifecycle line speaks about the job's ending instead:
+    /// `end=` names what ended it, so a reason is no longer a wire word.
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
@@ -97,14 +100,16 @@ pub(crate) enum StopOutcome {
 impl StopOutcome {
     /// Did anything happen to the tree? A signal that found an empty group did
     /// not, and a line saying so would be pure noise.
+    #[cfg(test)]
     fn is_event(self) -> bool {
         self != Self::AlreadyGone
     }
 
+    /// Test-facing names. The lifecycle line says `also_killed=processes|unsent`,
+    /// which is the reader's word for the same three facts.
+    #[cfg(test)]
     fn as_str(self) -> &'static str {
         match self {
-            // SIGKILL reached a live process in the group. The verb is the act,
-            // not the command's fate: a sweep of leftovers is still a kill.
             Self::Delivered => "killed",
             // There was nothing in the group to signal, so nothing happened.
             Self::AlreadyGone => "none",
@@ -123,8 +128,6 @@ pub(crate) struct StopTrace {
     label: String,
     #[cfg(test)]
     reports: std::sync::Arc<std::sync::Mutex<Vec<(KillReason, StopOutcome)>>>,
-    #[cfg(test)]
-    exits: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl StopTrace {
@@ -134,8 +137,6 @@ impl StopTrace {
             label: label.into(),
             #[cfg(test)]
             reports: std::sync::Arc::default(),
-            #[cfg(test)]
-            exits: std::sync::Arc::default(),
         }
     }
 
@@ -159,62 +160,40 @@ impl StopTrace {
             .collect()
     }
 
+    /// Record one attempt, for tests only. A job's lifecycle line is written once,
+    /// when its ending is known, by whoever knows it: the run path for a completion
+    /// and the fail-safe for a guard dropped before one existed.
     #[cfg(test)]
-    pub(crate) fn exits(&self) -> Vec<String> {
-        self.exits.lock().expect("exit list").clone()
-    }
-
     pub(crate) fn stopped(&self, reason: KillReason, outcome: StopOutcome) {
-        #[cfg(test)]
         self.reports
             .lock()
             .expect("report list")
             .push((reason, outcome));
-        // Only something that happened belongs on the record. A group with
-        // nothing left in it writes no line: otherwise every sandboxed command,
-        // whose tree the namespace already took, would log a sweep of nothing.
-        if !outcome.is_event() {
-            return;
-        }
-        // A stop is rare and is the only proof of what dotlink did to a tree, so
-        // it is a lifecycle line: visible whatever verbosity the operator chose,
-        // including quiet, because silence here would read as "not us".
-        self.log
-            .notice("job", stop_message(&self.label, reason, outcome));
     }
 
-    /// The other ending: a process that died on a signal dotlink did not deliver.
-    /// Paired with [`Self::stopped`] so a job carries exactly one of the two
-    /// lines, and a `signal` nobody can account for is still on the record.
-    /// `from=outside` states only that the signal was not ours.
-    ///
-    /// Lifecycle level for the same reason a stop is: its absence has to mean
-    /// nothing was signalled, which no verbosity setting may be able to fake.
-    pub(crate) fn exited(&self, signal_name: &str) {
-        #[cfg(test)]
-        self.exits
-            .lock()
-            .expect("exit list")
-            .push(signal_name.to_owned());
+    /// The one line a job gets, written where its ending is known.
+    pub(crate) fn ended(&self, end: &str, src: &str, killed: Option<&str>) {
         self.log
-            .notice("job", exit_message(&self.label, signal_name));
+            .notice("job", end_message(&self.label, end, src, killed));
+    }
+
+    /// The same line for a guard dropped before a completion existed: dotlink
+    /// abandoned the job and swept whatever was left. This is the only writer that
+    /// runs without a completion, which is why it cannot be a second line for a job
+    /// that already published one — every completion path disarms the guard.
+    pub(crate) fn abandoned(&self, killed: Option<&str>) {
+        self.ended("abandoned", "dotlink", killed);
     }
 }
 
-/// One line, fixed field order, no prose. The outcome is part of it: a signal that
-/// was not delivered must never read as a stop.
-fn stop_message(label: &str, reason: KillReason, outcome: StopOutcome) -> String {
-    format!(
-        "stop id={label} reason={} outcome={}",
-        reason.as_str(),
-        outcome.as_str()
-    )
-}
-
-/// The other line, same shape. `from=outside` states the signal was not ours; it
-/// does not claim who sent it.
-fn exit_message(label: &str, signal_name: &str) -> String {
-    format!("exit id={label} signal={signal_name} from=outside")
+/// One lifecycle line per job: how it ended, who ended it, and whether dotlink also
+/// killed work the command had left running. Every field is a word a reader does not
+/// have to look up, and none of them claims a process is still alive.
+pub(crate) fn end_message(label: &str, end: &str, src: &str, killed: Option<&str>) -> String {
+    match killed {
+        Some(killed) => format!("id={label} end={end} end_src={src} also_killed={killed}"),
+        None => format!("id={label} end={end} end_src={src}"),
+    }
 }
 
 #[cfg(unix)]
@@ -360,7 +339,10 @@ impl Guard {
     }
 
     /// One attempt, one record. Disarmed guards signal nothing.
-    fn signal_and_record(&mut self, reason: KillReason) -> StopOutcome {
+    fn signal_and_record(
+        &mut self,
+        #[cfg_attr(not(test), allow(unused_variables))] reason: KillReason,
+    ) -> StopOutcome {
         if !self.active {
             return StopOutcome::AlreadyGone;
         }
@@ -368,6 +350,9 @@ impl Guard {
         // A signal that failed leaves the tree running, so stay armed: the
         // fail-safe drop gets one more attempt.
         self.active = outcome == StopOutcome::Failed;
+        // The job's line is written once, by whoever knows its ending; this is only
+        // the attempt, kept for tests.
+        #[cfg(test)]
         self.trace.stopped(reason, outcome);
         outcome
     }
@@ -431,9 +416,18 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         // Reaching here while still armed means a path returned without
-        // disarming; the kill is right, and `reason=dropped` makes it visible.
-        let _ = self.terminate(KillReason::Dropped);
+        // disarming. The kill is right; so is saying so, and this is the one
+        // ending no completion can report.
+        let killed = match self.signal_and_record(KillReason::Dropped) {
+            StopOutcome::Delivered => Some("processes"),
+            StopOutcome::Failed => Some("unsent"),
+            StopOutcome::AlreadyGone => None,
+        };
+        self.trace.abandoned(killed);
     }
 }
 
@@ -480,18 +474,6 @@ mod tests {
         drop(guard);
         assert_eq!(trace.reports(), vec![KillReason::Dropped]);
         assert_eq!(trace.outcomes(), vec![StopOutcome::Delivered]);
-    }
-
-    /// The other half of the record, and the reason it is separate: an exit names
-    /// a signal the guard never sent, so it can never pass for a stop.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_exit_names_the_signal_and_never_claims_a_stop() {
-        let trace = StopTrace::new(crate::logging::LogConfig::default(), "test");
-        assert!(trace.exits().is_empty());
-        trace.exited("SIGKILL");
-        assert_eq!(trace.exits(), vec!["SIGKILL".to_owned()]);
-        assert!(trace.reports().is_empty(), "an exit is not a stop");
     }
 
     /// Two facts, two homes: a kill that ended the command claims a cause on the
@@ -632,35 +614,31 @@ mod tests {
         }
     }
 
+    /// The whole vocabulary, in one place: how it ended, who ended it, and whether
+    /// dotlink also killed work the command left running. No token here may read as
+    /// "something is still running".
     #[test]
-    fn stop_line_names_the_job_and_the_reason() {
+    fn the_end_line_names_how_it_ended_and_who_ended_it() {
         assert_eq!(
-            stop_message(
-                "3f0c9d1e-0d6f-4a0e-9a4e-1a2b3c4d5e6f",
-                KillReason::Timeout,
-                StopOutcome::Delivered
-            ),
-            "stop id=3f0c9d1e-0d6f-4a0e-9a4e-1a2b3c4d5e6f reason=timeout outcome=killed"
+            end_message("3f0c9d1e", "exit code=0", "command", None),
+            "id=3f0c9d1e end=exit code=0 end_src=command"
         );
-        for reason in [
-            KillReason::Timeout,
-            KillReason::Cancel,
-            KillReason::Shutdown,
-            KillReason::Failed,
-            KillReason::Cleanup,
-            KillReason::Dropped,
-        ] {
-            let delivered = stop_message("job", reason, StopOutcome::Delivered);
-            assert!(delivered.starts_with("stop "), "{delivered}");
-            assert!(delivered.contains(&format!("reason={}", reason.as_str())));
-            assert!(delivered.contains("outcome=killed"), "{delivered}");
-            // A signal that did not reach a live process must not read as sent.
-            for outcome in [StopOutcome::AlreadyGone, StopOutcome::Failed] {
-                let line = stop_message("job", reason, outcome);
-                assert!(line.contains("outcome="), "{line}");
-                assert!(!line.contains("outcome=killed"), "{line}");
-            }
-        }
+        assert_eq!(
+            end_message("3f0c9d1e", "signal signal=SIGKILL", "outside", None),
+            "id=3f0c9d1e end=signal signal=SIGKILL end_src=outside"
+        );
+        assert_eq!(
+            end_message("3f0c9d1e", "timeout", "dotlink", None),
+            "id=3f0c9d1e end=timeout end_src=dotlink"
+        );
+        assert_eq!(
+            end_message("3f0c9d1e", "exit code=0", "command", Some("processes")),
+            "id=3f0c9d1e end=exit code=0 end_src=command also_killed=processes"
+        );
+        assert_eq!(
+            end_message("3f0c9d1e", "abandoned", "dotlink", Some("processes")),
+            "id=3f0c9d1e end=abandoned end_src=dotlink also_killed=processes"
+        );
     }
 
     #[cfg(windows)]

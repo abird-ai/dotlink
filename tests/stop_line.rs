@@ -114,7 +114,7 @@ fn stop_lines(workdir: &Path, flags: &[&str]) -> Vec<String> {
     );
     lines
         .lines()
-        .filter(|line| line.contains("stop id="))
+        .filter(|line| line.contains("LOG") && line.contains("job") && line.contains("end="))
         .map(str::to_owned)
         .collect()
 }
@@ -126,8 +126,7 @@ fn the_stop_line_survives_every_verbosity() {
         let lines = stop_lines(workdir.path(), &flags);
         assert_eq!(lines.len(), 1, "one stop line at {flags:?}, got {lines:?}");
         let line = &lines[0];
-        assert!(line.contains("reason=timeout"), "{line}");
-        assert!(line.contains("outcome=killed"), "{line}");
-        assert!(line.contains("stop id="), "{line}");
+        assert!(line.contains("end=timeout"), "{line}");
+        assert!(line.contains("end_src=dotlink"), "{line}");
     }
 }

@@ -421,33 +421,29 @@ With `-vv`, transport diagnostics are added:
 including `-q` — so `-q` is not silence:
 
 ~~~text
-[01:07:12.031] LOG  job        stop id=<job id> reason=timeout outcome=killed
-[01:07:12.884] LOG  job        exit id=<job id> signal=SIGKILL from=outside
+[01:07:12.031] LOG  job        id=<job id> end=timeout end_src=dotlink
+[01:07:12.884] LOG  job        id=<job id> end=exit code=0 end_src=command
+[01:07:13.117] LOG  job        id=<job id> end=signal signal=SIGKILL end_src=outside
 ~~~
 
-They cover startup, restart, verbosity changes, and what became of a shell job's
-processes: a `stop` line records a signal dotlink sent to the tree, an `exit` line
-a signal it did not. For `stop`, `reason` is `timeout`, `cancel` (the caller
-cancelled), `shutdown` (the connector is being torn down), `failed`, `leftovers`
-(the command had already ended and its tree was swept) or `fail-safe` (a guard was
-dropped while still armed), and `outcome` says what the signal did: `killed`
-reached a live process in the group, `refused` the kernel would not take it, and a
-group with nothing left in it writes no line at all. `exit` reports `from=outside`
-because the signal was not ours; it names no culprit, and a crash and a stranger's
-`kill -9` read the same there, which is why the signal name is printed.
+They cover startup, restart, verbosity changes, and how a shell job ended. Every job
+writes exactly one line, and every word on it can be read without a legend: `end=`
+says what ended it (`exit`, `signal`, `timeout`, `cancel`, `shutdown`, `error`, or
+`abandoned` when dotlink dropped the job without a result), and `end_src=` says who
+that was — `command` for its own status, `dotlink` for a deadline or an internal
+error, `caller` for a cancelled call, `connector` when the connector withdrew the
+work, and `outside` when something else signalled it. `outside` names only the
+absence of our signal, never a culprit: a crash and a stranger's `kill -9` read the
+same there, and the printed signal name is what separates them.
 
-The two lines answer different questions, so one job may carry one of each: `stop`
-says what dotlink did to a tree, `exit` says the command's own ending was somebody
-else's signal. A job with neither ended on its own, and no signal is unaccounted
-for. The reply keeps the same split — `stopped_by` names what dotlink *ended*
-(`timeout`/`cancel`/`shutdown`/`failed`) and is absent when the command decided its
-own fate, including after a sweep, while `signal` names what something else did.
-
-That sweep is a verdict, not housekeeping: a command whose process group was still
-running when it returned did not finish, so the result is a failure (`success:
-false`, `error` naming the leftovers) with the command's own exit status still
-reported. A command that leaves work running should `wait` for it — that is what
-makes `server & wait` the idiom for a process that must outlive the call.
+When the command had returned while processes it started were still running, dotlink
+kills them and the same line says so with `also_killed=processes` (`also_killed=unsent`
+if the kernel refused). That is a verdict, not housekeeping: the invocation did not
+finish, so the result is a failure — `success: false`, the tool result marked as an
+error, and `error` naming the work — while the command's own exit status is still
+reported, because that fact did not change. A command that leaves work running should
+`wait` for it, which is what makes `server & wait` the idiom for a process that must
+outlive the call.
 
 TOOL logs include bounded command previews plus complete path labels, methods, status, and latency; file contents, binary payloads, Runtime keys, and raw request bodies are not intentionally logged. Interactive `V` removes the command-preview cap while TOOL logging is active, so use it only when command text is safe to retain.
 

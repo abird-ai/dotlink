@@ -142,17 +142,15 @@ fn a_finished_command_does_not_wait_for_its_leftovers() {
         !workdir.path().join("marker.txt").exists(),
         "the leftover writer outlived the command's group"
     );
-    let stops: Vec<&str> = journal
+    let lines: Vec<&str> = journal
         .lines()
-        .filter(|line| line.contains("stop id="))
+        .filter(|line| line.contains("LOG") && line.contains("end="))
         .collect();
-    assert_eq!(stops.len(), 1, "one sweep line: {journal}");
-    assert!(stops[0].contains("reason=leftovers"), "{}", stops[0]);
-    assert!(stops[0].contains("outcome=killed"), "{}", stops[0]);
-    assert!(
-        !journal.contains("exit id="),
-        "nothing was killed from outside: {journal}"
-    );
+    assert_eq!(lines.len(), 1, "one line per job: {journal}");
+    let line = lines[0];
+    assert!(line.contains("end=exit code=0"), "{line}");
+    assert!(line.contains("end_src=command"), "{line}");
+    assert!(line.contains("also_killed=processes"), "{line}");
 }
 
 #[cfg(unix)]
@@ -171,19 +169,15 @@ fn a_command_killed_by_someone_else_keeps_its_own_ending() {
     let next = payload["next"].as_str().unwrap_or_default();
     assert!(next.contains("outside dotlink"), "{next}");
 
-    // Two records, two different facts: the sweep is a stop line, the command's
-    // own death is an exit line. Merging them made one field mean two things.
-    let stops: Vec<&str> = journal
+    // One line carries both facts, so they cannot read as a contradiction: the
+    // command was killed from outside, and dotlink also killed what it left running.
+    let lines: Vec<&str> = journal
         .lines()
-        .filter(|line| line.contains("stop id="))
+        .filter(|line| line.contains("LOG") && line.contains("end="))
         .collect();
-    assert_eq!(stops.len(), 1, "one sweep line: {journal}");
-    assert!(stops[0].contains("reason=leftovers"), "{}", stops[0]);
-    let exits: Vec<&str> = journal
-        .lines()
-        .filter(|line| line.contains("exit id="))
-        .collect();
-    assert_eq!(exits.len(), 1, "one exit line: {journal}");
-    assert!(exits[0].contains("signal=SIGKILL"), "{}", exits[0]);
-    assert!(exits[0].contains("from=outside"), "{}", exits[0]);
+    assert_eq!(lines.len(), 1, "one line per job: {journal}");
+    let line = lines[0];
+    assert!(line.contains("end=signal signal=SIGKILL"), "{line}");
+    assert!(line.contains("end_src=outside"), "{line}");
+    assert!(line.contains("also_killed=processes"), "{line}");
 }

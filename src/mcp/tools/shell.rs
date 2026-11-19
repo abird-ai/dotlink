@@ -2392,11 +2392,9 @@ impl LocalMachine {
             .with_context(context)
     }
 
-    /// Run one shell command and close its record. The record has two halves and
-    /// each job gets exactly one: [`StopTrace::stopped`] inside the run when
-    /// dotlink ends the tree, and the exit line here when something else did.
-    /// This wrapper is the single place that sees every completion, including the
-    /// failure paths, so the choice cannot depend on how the run ended.
+    /// Run one shell command and write its one lifecycle line. This wrapper sees
+    /// every completion, including the failure paths, so how a job is recorded
+    /// cannot depend on which path ended it.
     async fn run_shell_job(
         command: Command,
         stdin_text: Option<String>,
@@ -2414,10 +2412,42 @@ impl LocalMachine {
             stop_trace.clone(),
         )
         .await;
-        if let Some(signal) = crate::jobs::external_signal(&completion) {
-            stop_trace.exited(&crate::jobs::signal_token(signal));
-        }
+        let (end, src) = Self::ending(&completion);
+        let killed = match completion.leftovers {
+            None => None,
+            Some(crate::shell_process::StopOutcome::Delivered) => Some("processes"),
+            // The kernel would not take the signal: the work may still be running,
+            // which is the one thing this line must never hide.
+            Some(crate::shell_process::StopOutcome::Failed) => Some("unsent"),
+            Some(crate::shell_process::StopOutcome::AlreadyGone) => None,
+        };
+        stop_trace.ended(&end, src, killed);
         completion
+    }
+
+    /// How this job ended and who ended it — two words per job, and neither needs a
+    /// legend. A cause dotlink recorded is dotlink's, and the two cancel origins stay
+    /// apart because a caller and the connector are not the same actor. A signal no
+    /// cause claims is somebody else's; a plain status is the command's own.
+    fn ending(completion: &JobCompletion) -> (String, &'static str) {
+        use crate::shell_process::StopCause;
+        match completion.stopped_by {
+            Some(StopCause::Timeout) => ("timeout".to_owned(), "dotlink"),
+            Some(StopCause::Cancel) => ("cancel".to_owned(), "caller"),
+            Some(StopCause::Shutdown) => ("shutdown".to_owned(), "connector"),
+            Some(StopCause::Failed) => ("error".to_owned(), "dotlink"),
+            None => match completion.signal {
+                Some(signal) => (
+                    format!("signal signal={}", crate::jobs::signal_token(signal)),
+                    "outside",
+                ),
+                None => match completion.exit_code {
+                    Some(code) => (format!("exit code={code}"), "command"),
+                    // No status and no cause: dotlink never got the command running.
+                    None => ("error".to_owned(), "dotlink"),
+                },
+            },
+        }
     }
 
     async fn run_shell_job_inner(
@@ -2448,12 +2478,8 @@ impl LocalMachine {
                 // it, so it claims nothing.
                 let reaped = Self::terminate_child(&mut child).await;
                 let claimed = reaped.kill_alone_ended_it();
-                let outcome = if claimed {
-                    StopOutcome::Delivered
-                } else {
-                    StopOutcome::AlreadyGone
-                };
-                stop_trace.stopped(KillReason::Failed, outcome);
+                // The wrapper writes this job's line from the completion, so this path
+                // only has to return the facts. `claimed` says whether the kill landed.
                 return JobCompletion::failed(format!("could not contain command tree: {error}"))
                     .with_stop(claimed.then_some(StopCause::Failed))
                     .with_context(result_context);
@@ -2770,6 +2796,7 @@ impl LocalMachine {
                 // reported, but the invocation did not finish — otherwise a script
                 // that backgrounds work and returns would read as complete while its
                 // children were being killed behind the reply.
+                let completion = completion.with_leftovers(leftovers);
                 match leftovers {
                     StopOutcome::AlreadyGone => completion,
                     StopOutcome::Delivered => completion.did_not_finish(LEFTOVERS_KILLED),

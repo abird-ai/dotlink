@@ -240,6 +240,11 @@ pub(crate) struct JobCompletion {
     /// see. The stop line is the fuller account: it names tidy-ups and the
     /// fail-safe too. Read this beside `status`, which says how the job ended.
     pub(crate) stopped_by: Option<crate::shell_process::StopCause>,
+    /// What the sweep found when the command ended: `Some(Delivered)` means work the
+    /// command started was still running and dotlink killed it, `Some(Failed)` means
+    /// it could not, and `None` means there was nothing left to kill. The journal
+    /// says so on the same line, because only a completion knows it.
+    pub(crate) leftovers: Option<crate::shell_process::StopOutcome>,
     pub(crate) success: bool,
     pub(crate) error: Option<String>,
     pub(crate) stdout: StreamSummary,
@@ -253,6 +258,14 @@ impl JobCompletion {
     /// command's own status stays exactly as the process reported it — this is not a
     /// dotlink failure — while `success` says the invocation did not finish. A caller
     /// that reads `success` must not read "done" here, and `error` is why.
+    /// The sweep's finding, recorded beside the completion so the lifecycle line can
+    /// say what dotlink also killed. It never changes which field a result carries:
+    /// the verdict travels in `error`, and the journal carries the kill.
+    pub(crate) fn with_leftovers(mut self, leftovers: crate::shell_process::StopOutcome) -> Self {
+        self.leftovers = Some(leftovers);
+        self
+    }
+
     pub(crate) fn did_not_finish(mut self, message: impl Into<String>) -> Self {
         self.success = false;
         self.error = Some(message.into());
@@ -271,6 +284,7 @@ impl JobCompletion {
             exit_code,
             signal: None,
             stopped_by: None,
+            leftovers: None,
             terminal: None,
             success,
             error: None,
@@ -288,6 +302,7 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
+            leftovers: None,
             terminal: None,
             success: false,
             error: Some("shell job reached its requested timeout".to_owned()),
@@ -305,6 +320,7 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
+            leftovers: None,
             terminal: None,
             success: false,
             error: Some("shell job was cancelled".to_owned()),
@@ -330,6 +346,7 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
+            leftovers: None,
             terminal: None,
             success: false,
             error: Some(bounded_job_error(message)),
@@ -352,6 +369,7 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
+            leftovers: None,
             terminal: None,
             success: false,
             error: Some(message.clone()),

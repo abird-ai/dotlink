@@ -8,51 +8,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- One lifetime contract: a command's process group does not outlive it. The group
-  is swept when the command returns, and a command that returned while that group
-  was still running is reported as a failed invocation — `success: false`, the
-  tool result marked as an error, and an error naming the leftovers and `wait` —
-  while its own exit status is still reported, because that fact did not change. A
-  script that backgrounds work and returns is therefore not silently accepted: the
-  work it started was killed, so the invocation did not finish. A sandboxed group
-  is already gone with its namespace, so the sweep finds nothing there and the
-  command's own status stands. Unsandboxed, this also ends the leftover writer that
-  used to hold the spool reader open until the execution deadline and turn a
-  successful command into a collection failure; output collection now has its own
-  short window rather than borrowing the execution deadline, so an hour-long
+- One lifecycle line per job, in words that need no legend:
+  `LOG job id=… end=… end_src=…`. `end=` says what ended the job (`exit`, `signal`,
+  `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and `end_src=` says who
+  (`command`, `dotlink`, `caller`, `connector`, `outside`). The previous pair of
+  lines — `stop … reason=… outcome=…` and `exit … from=outside` — each needed the
+  other to be read, and a job could carry both, which is exactly the confusion a
+  record exists to prevent. Nothing on the line claims a process is still running.
+- A command that returns while its own process group is still running did not
+  finish: dotlink kills that work and the same line says so with
+  `also_killed=processes` (`unsent` if the kernel refused). The invocation is a
+  failure — `success: false`, the tool result marked as an error, and `error` naming
+  the work — while the command's own exit status is still reported, because that fact
+  did not change. The sweep is also what ends the leftover writer that used to hold
+  the spool reader open until the execution deadline, so collection now finishes at
+  once and has its own short window instead of borrowing the deadline; an hour-long
   `timeout_secs` can no longer mean an hour-long collection. A `setsid` descendant
   leaves the group and is out of reach — the contract is the group, and the
-  descriptions say so instead of implying full containment.
+  descriptions say so instead of implying full containment. A sandboxed group is
+  already gone with its namespace, so the sweep finds nothing there and the command's
+  own status stands.
 - `stopped_by` answers one question: did dotlink end this command. It carries
-  `timeout`/`cancel`/`shutdown`/`failed`, and is absent when the command decided
-  its own fate — including after a sweep. Attribution moved to the journal, where
-  a sweep is its own `stop` line (`reason=leftovers`/`fail-safe`) instead of a
-  claim on the wire. The previous `stopped_by: "teardown"` described a tree while
-  the field's documented meaning was a command, and it was reachable only through
-  a scheduler race, so two identical commands could report different shapes. The
-  reply's sentence and the exit line now read one predicate, so a swept tree can
-  no longer hide a command's real ending behind a bare signal number.
-- Job lifecycle lines say what the signal did, not whether the command was
-  stopped: `outcome=killed` (SIGKILL reached a live process in the group — a sweep
-  of leftovers is still a kill), `outcome=refused` (the kernel would not take it,
-  so the guard stays armed), and no line at all when the group was empty. A `stop`
-  line therefore always means dotlink did something to a tree, and a job may carry
-  one `stop` and one `exit` line when dotlink swept a tree whose command somebody
-  else had killed. The two reasons that name a tree rather than a command are
-  `reason=leftovers` and `reason=fail-safe`.
+  `timeout`/`cancel`/`shutdown`/`failed`, and is absent when the command decided its
+  own fate — including after a sweep. The `teardown` value is gone: it described a
+  tree in a field documented as a command, and it was reachable only through a
+  scheduler race, so two identical commands could report different shapes. The
+  reply's sentence and the journal line now read one predicate, so a swept tree can
+  no longer hide a command's real ending.
 - Tool descriptions now say it: the command's process group is killed when it
-  returns (a `setsid` descendant can escape it), and a long-lived process is kept
-  by waiting for it inside a durable call (`background: true`, e.g. `server &
-  wait`), bounded by `timeout_secs` and ended by `job_cancel`. `background: true`
-  was never a way to detach work — it only decides whether the caller waits before
-  the handle is returned — and the command itself is the right place to say how
-  long its tree lives: `wait` is ordinary shell, visible in the call, and needs no
-  second lifetime flag.
+  returns (a `setsid` descendant can escape it), and leaving work running there fails
+  the call; a long-lived process is kept by waiting for it inside a durable call
+  (`background: true`, e.g. `server & wait`), bounded by `timeout_secs` and ended by
+  `job_cancel`. `background: true` was never a way to detach work — it only decides
+  whether the caller waits before the handle is returned.
 - The turn horizon is stated once, in the server instructions, with the rule that
-  makes it actionable: anchor on the first `ts` of the turn, and at the horizon stop
-  at a coherent boundary and hand back. It is stated only where a conversation turn
-  exists — a stdio or local HTTP client has none, so it is given none of that text.
-  Tool descriptions say only that `ts` is epoch seconds.
+  makes it actionable, and only where a conversation turn exists: a stdio or local
+  HTTP client has none, so it is given none of that text. Tool descriptions say only
+  that `ts` is epoch seconds.
 - With a hosted transport active, a command no longer runs longer than one turn
   horizon: the `timeout_secs` ceiling is 2100 s (35 min), while a stdio-only bridge
   keeps the profile's 3600 s default. The bound is its own constant rather than the
@@ -66,18 +58,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - A command that finished no longer reports a collection failure because a
-  backgrounded writer inherited stdout. The group is swept when the command
-  returns, so the writer dies with it and the drain finishes at once; the verdict is
-  now about the work that was still running, named as such, instead of a collection
-  error that arrived seconds later — and a command that returned in milliseconds can
-  no longer be reported as successful while its children were being killed.
+  backgrounded writer inherited stdout: the verdict is about the work that was still
+  running, named as such, instead of a collection error that arrived seconds later.
 - A failure that finds the process tree still live now stops it and owns that
   kill (`KillReason::Failed`). It previously left the tree armed and returned,
   which deferred the kill to the guard's fail-safe; the failure was recorded as
   an unattributed drop even though its cause was known at the call site.
-- The guard's stop line is a real record again: a signal that found an empty group
-  writes no line, so a sandboxed command's teardown no longer logs a sweep of
-  nothing, and a line means something happened to a tree.
+- A guard dropped without a completion writes the job's only line, `end=abandoned`,
+  so a job that never published a result is still on the record — and a job that did
+  publish one is never written twice.
 
 ## [0.17.5] - 2026-11-19
 

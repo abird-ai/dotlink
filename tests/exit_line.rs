@@ -1,7 +1,7 @@
-//! The exit line is the other half of the record. A stop line proves what dotlink
-//! signalled; an exit line proves when something else ended the process. Exactly
-//! one of the two appears per job, so an operator can read the pair without
-//! knowing the code: `stop` is ours, `exit … from=outside` is not.
+//! A job's lifecycle line says how it ended and who ended it, in one line and two
+//! words an operator does not have to look up: `end_src=dotlink|caller|connector` is
+//! ours, `end_src=outside` is not, and `end_src=command` means the command ended
+//! itself. Exactly one line appears per job, so its absence is still evidence.
 //!
 //! Driven against the real binary with a piped stderr, since `LOG` lines are not
 //! captured by the in-process tests. Signals are a Unix concept here; on Windows
@@ -121,7 +121,7 @@ impl Session {
         let _ = self.child.wait();
         lines
             .lines()
-            .filter(|line| line.contains("stop id=") || line.contains("exit id="))
+            .filter(|line| line.contains("LOG") && line.contains("job") && line.contains("end="))
             .map(str::to_owned)
             .collect()
     }
@@ -171,15 +171,10 @@ fn an_externally_signalled_job_records_its_exit_at_every_verbosity() {
         let text = result_text(&response);
         assert!(text.contains("\"signal\":9"), "{text}");
         assert!(!text.contains("stopped_by"), "no stop to report: {text}");
-        assert_eq!(
-            lines.len(),
-            1,
-            "one exit line and no stop line at {flags:?}, got {lines:?}"
-        );
+        assert_eq!(lines.len(), 1, "one line per job at {flags:?}: {lines:?}");
         let line = &lines[0];
-        assert!(line.contains("exit id="), "{line}");
-        assert!(line.contains("signal=SIGKILL"), "{line}");
-        assert!(line.contains("from=outside"), "{line}");
+        assert!(line.contains("end=signal signal=SIGKILL"), "{line}");
+        assert!(line.contains("end_src=outside"), "{line}");
     }
 }
 
@@ -195,10 +190,14 @@ fn a_stop_dotlink_performed_is_not_an_exit() {
         result_text(&response).contains("\"stopped_by\":\"timeout\""),
         "{response}"
     );
-    assert_eq!(lines.len(), 1, "one stop line, got {lines:?}");
-    assert!(lines[0].contains("stop id="), "{}", lines[0]);
+    assert_eq!(lines.len(), 1, "one line per job, got {lines:?}");
     assert!(
-        !lines[0].contains("exit id="),
+        lines[0].contains("end=timeout end_src=dotlink"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        !lines[0].contains("end_src=outside"),
         "our own stop is not an outside ending: {}",
         lines[0]
     );

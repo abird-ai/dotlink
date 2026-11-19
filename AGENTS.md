@@ -96,22 +96,18 @@ All paths and validation commands below are relative to the repository root.
   exists) and a failed native task (`failure_error_object`, the same set in the
   error's `data`, because the task payload has no field for them). An internal
   failure trims keys that say nothing, but its stop facts and `next` stay exactly
-  what the ordinary result carries. Every signal dotlink sends is one `LOG job
-  stop id=… reason=… outcome=…` line from the guard, at every verbosity including
-  the fail-safe `Drop`; a group with nothing left in it writes no line, so a
-  `stop` line always means dotlink did something to a tree. The same record names
-  the other ending, because an unattributed signal is the one an operator most
-  needs attributed: a command that died on a signal no cause claims gets one
-  `LOG job exit id=… signal=SIGKILL from=outside` line, also at every verbosity,
-  emitted once at terminal publication. A job therefore carries at most one `stop`
-  line and at most one `exit` line, and both may appear when dotlink swept a tree
-  whose command somebody else had killed: they answer different questions, and
-  merging them is what once made one field mean two things. Attribution lives in
-  the journal, not on the wire — a sweep claims no cause — so `external_signal` is
-  the single predicate (`stopped_by.is_none()` over a signal that no cause claims)
-  that both the exit line and the reply's sentence read, and a tidied-up tree can
-  no longer hide a command's real ending behind a bare signal number.
-  `from=outside` claims only that the signal was not ours, never who sent it.
+  what the ordinary result carries. Every job writes exactly one lifecycle line,
+  `LOG job id=… end=… end_src=…`, at every verbosity: `end=` says what ended it
+  (`exit`, `signal`, `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and
+  `end_src=` says who (`command`, `dotlink`, `caller`, `connector`, `outside`), so
+  one line answers what two lines used to leave the reader to infer. A work-still-
+  running sweep rides on the same line as `also_killed=processes|unsent`; an empty
+  group adds nothing, and a job is written once because every completion path
+  disarms the guard, whose `Drop` is the only other writer (`abandoned`).
+  Attribution lives in the journal, not on the wire — a sweep claims no cause — so
+  `external_signal` (`stopped_by.is_none()` over a signal no cause claims) is the
+  single predicate behind both the reply's sentence and the classification, and
+  `end_src=outside` claims only that the signal was not ours, never who sent it.
 - Shell mounts are one layer in `src/mounts.rs`: `SandboxMount { source, target, writable, env, origin }`, keyed by sandbox target with last declaration winning over builtin caches, profile `mounts`, `DOTLINK_MOUNTS` and `--mount` (in that order, as an ordered layer slice). Targets stay below `/tmp/home`, must not nest, and are conflict-checked against fixed host integrations; mount `env` may not set the variables the sandbox owns and may not disagree with another mount. Layout is validated before environment wiring, and only on the set the binder will actually bind. Configuration mistakes are `CONFIG`; a declared source that is not usable yet is host state and retries the runtime, while a discovered cache that cannot be prepared is skipped with a warning. A declared mount is never skipped silently, and `-vv` lists the resolved set.
 - Linux native file IO must stay descriptor-rooted with openat2 and fail closed on unsupported resolution. Shared traversal errno comparisons use OS-native libc constants, never Linux numeric literals. Directory discovery reads child metadata under the same descriptor and mount-resolution authority as actual opens (Linux `openat2` O_PATH nofollow; macOS `fstatat` plus device check). Pathname metadata or unchecked mountpoint metadata must never be reintroduced after pinning. Linux/macOS native tools are concurrent by default; `-s/--serialize` opts into one-at-a-time MCP calls. Windows retains a conservative operation gate. Never reintroduce pathname IO following authorization for Linux tools.
 - Logging is quiet by default: `-v` = TOOL, `-vv` = TOOL + REQ. `LOG` lines are

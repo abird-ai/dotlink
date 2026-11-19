@@ -236,8 +236,8 @@ Check these explicitly. Each has a known-good value in the baseline.
 | poll failures / restarts | 0 / 0 | any — transport instability |
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
-| `stop id=` lines | rare: `reason=timeout`/`cancel`/`failed` matches a completion that shows the stop, `reason=shutdown` is connector teardown (the revoked job publishes none), and `leftovers`/`fail-safe` are sweeps that ended no command | `outcome=refused`, or a `timeout`/`cancel`/`failed` claim that no completion shows |
-| `exit id=… signal=… from=outside` lines | rare: the command died on a signal dotlink did not deliver; a job may also carry a `stop` line for the sweep, since the two answer different questions | an `exit` line for a job whose result claims `stopped_by`, or a `signal` in a result whose job wrote neither line |
+| `end=` lines | one per job: `end=` names what ended it, `end_src=` names who | a second line for one job; `end_src=dotlink` with a completion that shows no `stopped_by` |
+| `end_src=outside` | rare: something else signalled the command; `end=signal` prints the signal name, and `also_killed=processes` may follow | `end_src=outside` on a job whose result claims `stopped_by`, or a `signal` in a result whose job wrote no line |
 | `"still running"` in a shell `error` | a command returned while its own group was still running, so dotlink killed the leftovers and failed the invocation while still reporting its exit status | a clean command reporting this, or a `success: true` beside a `reason=leftovers` line |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
 
@@ -251,17 +251,16 @@ The `id=` of a stop line is the durable job handle: when the call returned one
 — the line's timestamp and the result's `ts` are the same call — and compare the
 line's reason with the status the caller actually saw.
 
-**Two records, two questions.** `stop` says what dotlink did to a tree; `exit …
-from=outside` says the command's own ending was a signal it did not deliver. A job
-may carry one of each — a sweep of leftovers beside a command somebody else killed
-— because merging them is what once made one field answer both. A job with neither
-ended on its own. `outcome=killed` means SIGKILL reached a live process in the group
-(a sweep of leftovers is still a kill) and `outcome=refused` means the kernel would
-not take it, so the guard stayed armed; an empty group writes no line, or every
-sandboxed command would log a sweep of nothing. A sweep never appears in the reply:
-`stopped_by` is absent because the command's own status already said how it ended. `from=outside` names the absence of our signal only —
-a crash and a stranger's SIGKILL read the same, and the signal names distinguish
-them (`SIGSEGV` did not come from an operator's `kill -9`).
+**One line per job, two words to read it.** `end=` says what ended the job and
+`end_src=` says who. `end_src=command` is the command's own status,
+`end_src=dotlink` a deadline or an internal error, `end_src=caller` a cancelled call,
+`end_src=connector` a withdrawn one, `end_src=outside` something else entirely, and
+`end=abandoned` a job dotlink dropped without publishing a result. A sweep of work the
+command left running rides on the same line as `also_killed=processes` (or `unsent`
+when the kernel refused), which is also what makes the invocation a failure; an empty
+group adds nothing, so a bare line means nothing was left behind. Because the line is
+written once — from the completion, or by the fail-safe when there is none — a second
+line for one job is a bug, and its absence still means nothing was signalled.
 
 ## 5. Benign classes — do not chase
 
