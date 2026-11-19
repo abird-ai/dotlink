@@ -1587,14 +1587,16 @@ async fn prepare_runtime(
         tracing::warn!("shell mounts are inactive: {hint}");
     }
 
-    if setup.config.max_shell_timeout_secs > crate::limits::MAX_SHELL_TIMEOUT_SECS {
+    if transports.constraints().sync_hold.is_some()
+        && setup.config.max_shell_timeout_secs > crate::limits::TURN_HORIZON_SECS
+    {
         // Accepted, so an upgrade never becomes a refusal to start, but never
-        // silently: the deadline a caller is told about is the capped one.
+        // silently: a hosted caller is told the capped number, not the profile.
         tracing::warn!(
-            "max_shell_timeout_secs={} exceeds the {} minute turn horizon; commands are capped at {} s",
+            "max_shell_timeout_secs={} exceeds the {} minute turn horizon; hosted commands are capped at {} s",
             setup.config.max_shell_timeout_secs,
             crate::limits::TURN_CHECKPOINT_MINUTES,
-            crate::limits::MAX_SHELL_TIMEOUT_SECS
+            crate::limits::TURN_HORIZON_SECS
         );
     }
 

@@ -61,12 +61,7 @@ use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
 /// it and is the fallback when omitted. Transport response windows never
 /// rewrite this execution lifetime.
 fn resolve_shell_timeout(requested: Option<u64>, ceiling: u64) -> u64 {
-    // The profile ceiling, bounded by the turn horizon. A profile written
-    // before that bound existed keeps loading; this is where it takes effect.
-    resolve_capped(
-        requested,
-        ceiling.min(crate::limits::MAX_SHELL_TIMEOUT_SECS),
-    )
+    resolve_capped(requested, ceiling)
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -154,8 +149,8 @@ pub(crate) fn with_profile_limits(
     if !crate::mcp::is_shell_tool(tool.name.as_ref()) {
         return tool;
     }
-    // Advertise what `resolve_shell_timeout` enforces, horizon bound included.
-    let max_secs = max_secs.min(crate::limits::MAX_SHELL_TIMEOUT_SECS);
+    // Advertise what the call site enforces, the surface's bound included.
+    let max_secs = crate::limits::shell_timeout_ceiling(max_secs, sync_hold.is_some());
     let shell = if tool.name.as_ref() == "powershell" {
         "PowerShell"
     } else {
@@ -2223,8 +2218,14 @@ impl LocalMachine {
         if args.command.trim().is_empty() {
             anyhow::bail!("command must not be empty");
         }
-        let timeout_secs =
-            resolve_shell_timeout(args.timeout_secs, self.config.max_shell_timeout_secs);
+        // The surface decides the ceiling; `background` and handoff do not.
+        let timeout_secs = resolve_shell_timeout(
+            args.timeout_secs,
+            crate::limits::shell_timeout_ceiling(
+                self.config.max_shell_timeout_secs,
+                self.config.sync_hold.is_some(),
+            ),
+        );
         let runtime = self.shell_runtime();
         let operation_gate = (self.serialize || cfg!(windows)).then(|| self.operation_gate.clone());
         let output_limit = runtime.output_limit(args.max_output_bytes);
@@ -4032,26 +4033,35 @@ mod tests {
         assert_eq!(resolve_shell_timeout(None, 0), 1);
     }
 
-    /// A stored profile may still say an hour. It keeps loading, and the
-    /// deadline it actually gets is one turn horizon — the same number the
-    /// schema advertises, so the tool never promises what it will not run.
+    /// The horizon bounds a hosted caller, whose turn has to report the result,
+    /// and not a caller with no turn to pace: one profile, two surfaces, and the
+    /// schema states whichever ceiling that surface will actually run.
     #[test]
-    fn a_ceiling_above_the_turn_horizon_is_capped_not_honoured() {
-        let horizon = crate::limits::MAX_SHELL_TIMEOUT_SECS;
+    fn the_turn_horizon_bounds_the_hosted_surface_only() {
+        let horizon = crate::limits::TURN_HORIZON_SECS;
         assert_eq!(horizon, crate::limits::TURN_CHECKPOINT_MINUTES * 60);
-        assert_eq!(resolve_shell_timeout(None, 3_600), horizon);
-        assert_eq!(resolve_shell_timeout(Some(7_200), 3_600), horizon);
+        assert_eq!(crate::limits::shell_timeout_ceiling(3_600, true), horizon);
+        assert_eq!(crate::limits::shell_timeout_ceiling(3_600, false), 3_600);
+        // A profile already under the horizon is untouched on either surface.
+        assert_eq!(crate::limits::shell_timeout_ceiling(600, true), 600);
 
         let shell = LocalMachine::all_tools()
             .get(crate::mcp::shell_tool_name())
             .cloned()
             .unwrap();
-        let patched = with_profile_limits(shell, 3_600, 1_048_576, Some(Duration::from_secs(90)));
-        let timeout = patched.input_schema["properties"]["timeout_secs"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(timeout.contains(&horizon.to_string()), "{timeout}");
-        assert!(!timeout.contains("3600"), "{timeout}");
+        let described = |hold: Option<Duration>| {
+            with_profile_limits(shell.clone(), 3_600, 1_048_576, hold).input_schema["properties"]
+                ["timeout_secs"]["description"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let hosted = described(Some(Duration::from_secs(90)));
+        assert!(hosted.contains(&horizon.to_string()), "{hosted}");
+        assert!(!hosted.contains("3600"), "{hosted}");
+        let local = described(None);
+        assert!(local.contains("3600"), "{local}");
+        assert!(!local.contains(&horizon.to_string()), "{local}");
     }
 
     /// The decision that keeps the record honest: an already-stopped tree keeps

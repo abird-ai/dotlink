@@ -32,14 +32,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   turn to pace, so it is given none of that text. Tool descriptions say only
   that `ts` is epoch seconds — a bare number per tool was both a second copy and
   a shorter one, since the actionable half stayed in the instructions.
-- One command no longer runs longer than one turn horizon. `timeout_secs` is
-  bounded above by 2100 s (35 min) instead of defaulting to an hour, so the
-  deadline a call is given always matches the horizon the instructions ask it
-  to report by: a longer deadline can only promise an execution no turn gets to
-  see. The bound is the same on every transport — it is the profile ceiling that
-  cannot buy more, not a transport window rewriting an execution. A profile
-  written before the bound still loads; its shell deadline is capped and the
-  cap is reported at startup, so an upgrade is never a refusal to start.
+- A hosted command no longer runs longer than one turn horizon: on the OpenAI
+  tunnel the `timeout_secs` ceiling is 2100 s (35 min), so the deadline a call
+  is given matches the horizon its instructions ask it to report by — a longer
+  one can only promise an execution no turn gets to see. A stdio or local HTTP
+  caller has no turn and keeps the profile's full 3600 s default. The schema
+  states whichever ceiling that surface will run, and a profile stored above
+  the horizon still loads: it is capped on the hosted surface and the cap is
+  reported at startup, so an upgrade is never a refusal to start.
 
 ### Fixed
 

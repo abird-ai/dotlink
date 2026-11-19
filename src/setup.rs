@@ -27,7 +27,7 @@ use crate::{
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3000";
-const DEFAULT_MAX_SHELL_TIMEOUT_SECS: u64 = crate::limits::MAX_SHELL_TIMEOUT_SECS;
+const DEFAULT_MAX_SHELL_TIMEOUT_SECS: u64 = 3_600;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 const DEFAULT_MAX_FILE_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 
@@ -4129,11 +4129,8 @@ mod tests {
     }
 
     #[test]
-    fn shell_timeout_ceiling_defaults_to_one_turn_horizon() {
-        assert_eq!(
-            default_shell_timeout(),
-            crate::limits::TURN_CHECKPOINT_MINUTES * 60
-        );
+    fn shell_timeout_ceiling_defaults_to_one_hour() {
+        assert_eq!(default_shell_timeout(), 3_600);
         let config = AppConfig {
             max_shell_timeout_secs: default_shell_timeout(),
             ..example_config()
