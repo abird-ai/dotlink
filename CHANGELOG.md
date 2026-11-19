@@ -55,6 +55,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   kill (`KillReason::Failed`). It previously left the tree armed and returned,
   which deferred the kill to the guard's fail-safe; the failure was recorded as
   an unattributed drop even though its cause was known at the call site.
+- A command killed from outside whose leftovers dotlink then cleaned up keeps its
+  explanation. `stopped_by: "teardown"` describes the tree, so it no longer takes
+  the sentence that names the command's signal — without it that reply carried a
+  bare signal number and nothing saying where it came from. The journal keeps its
+  own rule (one `stop` **or** one `exit` line per job), because the two ask
+  different questions: whether dotlink signalled anything, and whether it ended
+  this command.
 
 ## [0.17.5] - 2026-11-19
 
