@@ -421,7 +421,7 @@ With `-vv`, transport diagnostics are added:
 including `-q` — so `-q` is not silence:
 
 ~~~text
-[01:07:12.031] LOG  job        id=<job id> end=timeout by=dotlink
+[01:07:12.031] LOG  job        id=<job id> end=timeout
 [01:07:13.117] LOG  job        id=<job id> end=signal SIGKILL by=external
 [01:07:13.884] LOG  job        id=<job id> end=exit code=0 tree=killed
 ~~~
@@ -430,14 +430,13 @@ They cover startup, restart, verbosity changes, and how a shell job ended. A job
 writes a line only when there is something to say, so a command that simply ended —
 successful or not — writes nothing, and the record stays short enough to read. Every
 word on the line can be read without a legend: `end=` says what ended it (`exit code=N`,
-`signal SIGKILL`, `timeout`, `cancel`, `shutdown`, `error`, or `abandoned` when
-dotlink dropped the job without a result), and `by=` names another actor when there
-was one — `dotlink` for a deadline or an internal error, `caller` for a cancelled
-call, `connector` when the connector withdrew the work, `external` when something
-else signalled it. A command that ended on its own names no actor, because the line
-exists only for what needs reconstructing. `external` claims only the absence of our
-signal, never a culprit: a crash and a stranger's `kill -9` read the same there, and
-the signal name is what separates them.
+`signal SIGKILL`, `timeout`, `cancel`, `error`, or `abandoned` when dotlink dropped
+the job without a result). `by=` appears only where the actor is a choice: `caller`
+or `connector` on a cancel, and `external` on a signal. A deadline, an internal error
+and the fail-safe are dotlink by definition and name nobody, and a command that ended
+on its own names no actor at all. `external` claims only the absence of our signal,
+never a culprit: a crash and a stranger's `kill -9` read the same there, and the signal
+name is what separates them.
 
 When the command left processes running — it returned, or was killed, with its group
 still live — dotlink kills them and the same line says `tree=killed` (`tree=alive` when the kernel refused,

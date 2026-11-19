@@ -91,6 +91,29 @@ pub(crate) struct ShellArgs {
     pub(crate) background: bool,
 }
 
+/// One stream's drain. Three outcomes, because a cut window and a failed spool are
+/// different facts and only one of them is a failure.
+enum Drained {
+    Ready(StreamSummary),
+    /// The window closed with a writer still holding the pipe.
+    Cut,
+    Failed(String),
+}
+
+impl Drained {
+    fn of(
+        name: &str,
+        ready: Option<Result<Result<StreamSummary, std::io::Error>, tokio::task::JoinError>>,
+    ) -> Self {
+        match ready {
+            Some(Ok(Ok(summary))) => Self::Ready(summary),
+            Some(Ok(Err(error))) => Self::Failed(format!("failed spooling {name}: {error}")),
+            Some(Err(error)) => Self::Failed(format!("{name} spool task failed: {error}")),
+            None => Self::Cut,
+        }
+    }
+}
+
 /// Salvage window for partial output after a killed child.
 const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 /// Drain window after a command that ended on its own. Its output is already in
@@ -134,7 +157,13 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     // flag, and the script says how long that is.
     // The clause teaches the idiom; the bounds it used to repeat are already
     // stated above as `timeout_secs` and in the follow-up as `job_cancel`.
-    let lifetime = "The command's process group is killed when it returns (a `setsid` descendant can escape it), and leaving work running there fails the call; keep one with `wait` inside a durable call (`server & wait`).";
+    let lifetime = if shell == "PowerShell" {
+        // Windows has no process groups and no `setsid`: the job object holds the tree,
+        // so the escape caveat would describe a hazard that does not exist here.
+        "The command's process tree is killed when it returns, and leaving work running there fails the call; keep one with `Wait-Process` inside a durable call."
+    } else {
+        "The command's process group is killed when it returns (a `setsid` descendant can escape it), and leaving work running there fails the call; keep one with `wait` inside a durable call (`server & wait`)."
+    };
     // `ts` is a fact of the result. The turn horizon is an advisory, and the
     // server instructions carry it once with the rule that goes with it, so no
     // tool description restates a bare number without that rule.
@@ -2231,19 +2260,18 @@ impl LocalMachine {
             anyhow::bail!("command must not be empty");
         }
         // The surface decides the ceiling; `background` and handoff do not.
-        let timeout_secs = resolve_shell_timeout(
-            args.timeout_secs,
-            crate::limits::shell_timeout_ceiling(
-                self.config.max_shell_timeout_secs,
-                self.config.sync_hold.is_some(),
-            ),
+        let ceiling = crate::limits::shell_timeout_ceiling(
+            self.config.max_shell_timeout_secs,
+            self.config.sync_hold.is_some(),
         );
+        let timeout_secs = resolve_shell_timeout(args.timeout_secs, ceiling);
         let runtime = self.shell_runtime();
         let operation_gate = (self.serialize || cfg!(windows)).then(|| self.operation_gate.clone());
         let output_limit = runtime.output_limit(args.max_output_bytes);
         crate::blocking::run(|| {
             self.jobs.spawn(
                 timeout_secs,
+                ceiling,
                 output_limit,
                 request_key,
                 move |job| async move {
@@ -2441,8 +2469,7 @@ impl LocalMachine {
         // line per ordinary exit is noise that hides those. Everything else records —
         // including an ending that names no actor, because a deadline or an internal
         // error is an event whether or not its kill landed.
-        let own_ending = end.starts_with("exit code=");
-        if !own_ending || tree.is_some() {
+        if !end.is_own() || tree.is_some() {
             stop_trace.ended(&end, by, tree);
         }
         completion
@@ -2454,12 +2481,15 @@ impl LocalMachine {
     /// a deadline that could not signal is still a deadline. `by=` names an actor only
     /// when one is known — an own ending names none, and a cancelled job whose kill was
     /// refused cannot say whether a caller or the connector asked, so it claims neither.
-    fn ending(completion: &JobCompletion) -> (String, Option<&'static str>) {
-        use crate::shell_process::StopCause;
+    fn ending(completion: &JobCompletion) -> (crate::shell_process::End, Option<&'static str>) {
+        use crate::shell_process::{End, StopCause};
+        // A dotlink ending needs no actor: the deadline, the internal error and the
+        // fail-safe are this process by definition. Only a cancel has a choice of who
+        // asked, and a signal is never ours.
         let by = match completion.stopped_by {
-            Some(StopCause::Timeout | StopCause::Failed) => Some("dotlink"),
             Some(StopCause::Cancel) => Some("caller"),
             Some(StopCause::Shutdown) => Some("connector"),
+            Some(StopCause::Timeout | StopCause::Failed) => None,
             None if completion.signal.is_some() => Some("external"),
             None => None,
         };
@@ -2467,26 +2497,24 @@ impl LocalMachine {
         // internal failure behind a deadline is still a deadline, and the reply says
         // `timed_out` for exactly that reason.
         let end = match completion.terminal.unwrap_or(completion.status) {
-            JobStatus::TimedOut => "timeout".to_owned(),
-            JobStatus::Cancelled => "cancel".to_owned(),
-            JobStatus::Failed => "error".to_owned(),
-            // A completion always carries a terminal; `Running` here would mean a
-            // result was published before anything finished, which no path does.
+            JobStatus::TimedOut => End::Timeout,
+            JobStatus::Cancelled => End::Cancel,
+            JobStatus::Failed => End::Error,
+            // A completion always carries a terminal; `Running` here would mean a result
+            // was published before anything finished, which no path does.
             JobStatus::Running | JobStatus::Completed => {
                 if completion.internal_error.is_some() {
-                    // The command's own status is on the result; the failure that lost
-                    // its output is what a reader cannot reconstruct, so it is what the
-                    // line names — and naming it forces a line the own-ending rule would
+                    // The command's own status is on the result; the failure that lost its
+                    // output is what a reader cannot reconstruct, so it is what the line
+                    // names — and naming it forces a line the own-ending rule would
                     // otherwise suppress.
-                    "error".to_owned()
+                    End::Error
                 } else {
-                    match completion.signal {
-                        Some(signal) => format!("signal {}", crate::jobs::signal_token(signal)),
+                    match (completion.signal, completion.exit_code) {
+                        (Some(signal), _) => End::Signal(signal),
                         // A completed job without a status and without a signal never ran.
-                        None => match completion.exit_code {
-                            Some(code) => format!("exit code={code}"),
-                            None => "error".to_owned(),
-                        },
+                        (None, Some(code)) => End::Exit(code),
+                        (None, None) => End::Error,
                     }
                 }
             }
@@ -2708,6 +2736,10 @@ impl LocalMachine {
                         match reaped.status {
                             Some(status) if Self::ended_on_its_own(&status) => {
                                 stop = None;
+                                // The command ended on its own, so no cause is claimed —
+                                // but the kill just made did end the tree behind it, and
+                                // the record would otherwise say nothing happened.
+                                leftovers = process_tree.last_outcome();
                                 Some(status)
                             }
                             _ => {
@@ -2765,74 +2797,37 @@ impl LocalMachine {
             JobStatus::Completed => Instant::now() + COMPLETED_OUTPUT_GRACE,
             _ => Instant::now() + TIMEOUT_OUTPUT_GRACE,
         };
-        let collected = timeout_at(collect_deadline, async {
-            let stdout = (&mut stdout_task).await;
-            let stderr = (&mut stderr_task).await;
-            (stdout, stderr)
-        })
-        .await;
-        let (stdout, stderr) = match collected {
-            Ok((stdout_result, stderr_result)) => {
-                let stdout = match stdout_result {
-                    Ok(Ok(summary)) => summary,
-                    Ok(Err(error)) => {
-                        return Self::spool_failure(
-                            &mut process_tree,
-                            facts,
-                            format!("failed spooling stdout: {error}"),
-                            &job,
-                            result_context,
-                        );
-                    }
-                    Err(error) => {
-                        return Self::spool_failure(
-                            &mut process_tree,
-                            facts,
-                            format!("stdout spool task failed: {error}"),
-                            &job,
-                            result_context,
-                        );
-                    }
-                };
-                let stderr = match stderr_result {
-                    Ok(Ok(summary)) => summary,
-                    Ok(Err(error)) => {
-                        return Self::spool_failure(
-                            &mut process_tree,
-                            facts,
-                            format!("failed spooling stderr: {error}"),
-                            &job,
-                            result_context,
-                        );
-                    }
-                    Err(error) => {
-                        return Self::spool_failure(
-                            &mut process_tree,
-                            facts,
-                            format!("stderr spool task failed: {error}"),
-                            &job,
-                            result_context,
-                        );
-                    }
-                };
-                (stdout, stderr)
-            }
-            // The drain window closed with a writer still holding the pipe — a
-            // `setsid` descendant, which the contract does not cover. The command
-            // itself already ended, and everything it wrote is in the spool, so the
-            // answer is the retained prefix marked truncated, not a failure: the
-            // execution did not fail, and the deadline is not what elapsed.
-            Err(_) => {
-                abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
-                (
-                    stream_summary_from_file(&job.stdout_path, true),
-                    stream_summary_from_file(&job.stderr_path, true),
-                )
-            }
+        // Each stream gets its own window, so a writer holding one pipe open cannot
+        // cancel the other stream's answer.
+        let stdout_ready = timeout_at(collect_deadline, &mut stdout_task).await.ok();
+        let stderr_ready = timeout_at(collect_deadline, &mut stderr_task).await.ok();
+        let stdout = Drained::of("stdout", stdout_ready);
+        let stderr = Drained::of("stderr", stderr_ready);
+        // A storage failure is the failure, whichever stream reported it and even when
+        // the other window never closed: a cut stream is no reason to lose an error.
+        if let Some(error) = [&stdout, &stderr]
+            .into_iter()
+            .find_map(|drained| match drained {
+                Drained::Failed(error) => Some(error.clone()),
+                _ => None,
+            })
+        {
+            return Self::spool_failure(&mut process_tree, facts, error, &job, result_context);
+        }
+        // A window that closed with the writer still holding the pipe is out of contract
+        // — a `setsid` descendant — so the answer is the retained prefix, marked cut.
+        if matches!(stdout, Drained::Cut) || matches!(stderr, Drained::Cut) {
+            abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
+        }
+        let settle = |drained: Drained, path: &std::path::Path| match drained {
+            Drained::Ready(summary) => summary,
+            _ => stream_summary_from_file(path, true),
         };
+        let (stdout, stderr) = (
+            settle(stdout, &job.stdout_path),
+            settle(stderr, &job.stderr_path),
+        );
 
-        // Every terminal finishes through the same finalizer, so a refused signal is
-        // carried as `tree=alive` here exactly as it is on the paths that never run.
         match terminal {
             JobStatus::Completed => {
                 let status = exit_status.expect("completed job has an exit status");
@@ -3318,7 +3313,7 @@ mod tests {
                 .unwrap();
         let (path_tx, path_rx) = tokio::sync::oneshot::channel();
         let started = manager
-            .spawn(30, 4096, None, move |job| async move {
+            .spawn(30, 30, 4096, None, move |job| async move {
                 let _ = path_tx.send(job.stdout_path.clone());
                 // Four bytes model retained state owned by another stream/job.
                 assert_eq!(job.reserve_spool(4), 4);
@@ -5449,20 +5444,26 @@ mod tests {
         let request_key = "retirement-guard-revocation".to_owned();
         let started = machine
             .jobs
-            .spawn(30, 4096, Some(request_key.clone()), move |job| async move {
-                assert!(job.mark_running(Some(generation)));
-                std::fs::write(&job.stdout_path, b"secret").unwrap();
-                crate::jobs::JobCompletion::completed(
-                    Some(0),
-                    true,
-                    crate::jobs::StreamSummary {
-                        total_bytes: 6,
-                        stored_bytes: 6,
-                        truncated: false,
-                    },
-                    crate::jobs::StreamSummary::default(),
-                )
-            })
+            .spawn(
+                30,
+                30,
+                4096,
+                Some(request_key.clone()),
+                move |job| async move {
+                    assert!(job.mark_running(Some(generation)));
+                    std::fs::write(&job.stdout_path, b"secret").unwrap();
+                    crate::jobs::JobCompletion::completed(
+                        Some(0),
+                        true,
+                        crate::jobs::StreamSummary {
+                            total_bytes: 6,
+                            stored_bytes: 6,
+                            truncated: false,
+                        },
+                        crate::jobs::StreamSummary::default(),
+                    )
+                },
+            )
             .unwrap();
         let id = started.id.clone();
         assert!(matches!(

@@ -6,108 +6,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- `signal` is the signal's name, not its number: `{"signal":"SIGKILL"}` rather than
+  `{"signal":9}`, and the failed-native-task error no longer carries a separate
+  `signal_name`. A structured client that parses the number must read the name, or
+  both surfaces would disagree about the same job.
+- `stopped_by` no longer carries `teardown`: it answers one question — did dotlink end
+  this command — so a sweep of a finished command's leftovers claims nothing.
+- Results omit what only says "no": nulls, flags that are false because nothing
+  happened, empty streams, and a `truncated`/`released` that is not true. A client that
+  expects a key to exist for every result must treat absence as the negative case.
+- The journal writes one lifecycle line per job and only when something happened:
+  `LOG job id=… end=… [by=…] [tree=…]`. A command that ends on its own writes nothing,
+  `end=shutdown` is gone (a withdrawn job is `end=cancel by=connector`), and `by=`
+  appears only where the actor is a choice. Anything grepping for `stop id=` or
+  `exit id=` must read `end=` instead.
+
 ### Changed
 
-- One lifecycle line per job, in words that need no legend, and only when there is
-  something to say: `LOG job id=… end=… [by=…] [tree=…]`. `end=` says what ended the
-  job (`exit code=N`, `signal SIGKILL`, `timeout`, `cancel`, `shutdown`, `error`,
-  `abandoned`) and `by=` names another actor only when there was one (`dotlink`,
-  `caller`, `connector`, `external`) — a command's own ending names none. A command
-  that simply ended writes nothing — an ordinary exit needs no reconstruction — so
-  the record stays short enough to read. The previous pair of lines — `stop …
-  reason=… outcome=…` and `exit … from=outside` — each needed the other to be read,
-  and a job could carry both, which is exactly the confusion a record exists to
-  prevent.
-- A command that returns while its own process group is still running did not
-  finish: dotlink kills that work and the same line says `tree=killed`, or
-  `tree=alive` when the kernel refused and the processes may still be running. The invocation is a
-  failure — `success: false`, the tool result marked as an error, and `error` naming
-  the work — while the command's own exit status is still reported, because that fact
-  did not change. The sweep is also what ends the leftover writer that used to hold
-  the spool reader open until the execution deadline, so collection now finishes at
-  once and has its own short window instead of borrowing the deadline; an hour-long
-  `timeout_secs` can no longer mean an hour-long collection. A `setsid` descendant
-  leaves the group and is out of reach — the contract is the group, and the
-  descriptions say so instead of implying full containment. A sandboxed group is
-  already gone with its namespace, so the sweep finds nothing there and the command's
-  own status stands.
-- `stopped_by` answers one question: did dotlink end this command. It carries
-  `timeout`/`cancel`/`shutdown`/`failed`, and is absent when the command decided its
-  own fate — including after a sweep. The `teardown` value is gone: it described a
-  tree in a field documented as a command, and it was reachable only through a
-  scheduler race, so two identical commands could report different shapes. The
-  reply's sentence and the journal line now read one predicate, so a swept tree can
-  no longer hide a command's real ending.
-- Tool descriptions now say it: the command's process group is killed when it
-  returns (a `setsid` descendant can escape it), and leaving work running there fails
-  the call; a long-lived process is kept by waiting for it inside a durable call
-  (`background: true`, e.g. `server & wait`), bounded by `timeout_secs` and ended by
-  `job_cancel`. `background: true` was never a way to detach work — it only decides
-  whether the caller waits before the handle is returned.
-- The turn horizon is stated once, in the server instructions, with the rule that
-  makes it actionable, and only where a conversation turn exists: a stdio or local
-  HTTP client has none, so it is given none of that text. Tool descriptions say only
-  that `ts` is epoch seconds.
-- With a hosted transport active, a command no longer runs longer than one turn
-  horizon: the `timeout_secs` ceiling is 2100 s (35 min), while a stdio-only bridge
-  keeps the profile's 3600 s default. The bound is its own constant rather than the
-  advisory's, so re-tuning prompt text cannot move an execution limit or the
-  job-authority fingerprint, and a test keeps the two in step. One machine serves
-  every transport on the socket and advertises one schema, so the ceiling is the
-  tightest active transport — exactly as the response window already is. A stored
-  value above it still loads and is capped, and the cap is reported at startup only
-  when the value was the operator's own rather than the default.
-
-- `end=` names the terminal the runner reached, so an internal failure behind a
-  deadline still logs `end=timeout` rather than `end=error`, matching the `timed_out`
-  the reply carries. A line is written for every ending that is not the command's own,
-  including one whose kill the kernel refused and one that never started.
-
-- Results carry only what applies. A null, a flag that is false because nothing
-  happened (`timed_out`, `*_truncated`, `cancelling`, `released`), an empty stream, and
-  a `truncated` that is not true are now omitted at any depth by one shared rule rather
-  than rendered: an absence costs nothing, while a rendered false costs tokens on every
-  call. An empty stream loses its key even beside `*_truncated: true` — an empty string
-  says nothing, and the truncation flag already says the tail was cut. A clean shell result drops from 211 to 106 characters, a timeout from 312 to
-  215, and the externally-signalled case from 463 to 307. `sandboxed`, `network` and
-  `success` stay always-rendered because their false is information, not absence, and
-  a running job omits `success`/`exit_code` it does not have yet.
-- The journal line names no actor when the command ended itself, so a line that exists
-  because of a sweep reads `end=exit code=0 tree=killed` and needs no legend.
-- A drain that closes with a writer still holding the pipe is no longer an internal
-  failure. The command had ended and everything it wrote was in the spool, so the
-  reply is that prefix marked truncated; previously the reply claimed the *execution*
-  deadline had elapsed (`collecting command output timed out after 3600 seconds` after
-  two seconds), hid the output the command had produced, and left no record at all.
+- The sweep asks the group, not the kernel. `kill(-pgid, SIGKILL)` succeeds against a
+  group of zombies, so a command that left nothing running was being reported as a
+  failed invocation — deterministically, for anything that backgrounds a short-lived
+  child (`true & exec sleep 0.05` failed 5 times out of 5). The sweep now samples the
+  members' state before signalling, so "left processes running" means one was alive.
+  With that, the contract finally holds on every surface: a command that leaves work
+  running fails the call, and one that leaves nothing running does not.
+- Output collection gives each stream its own window. One window for both let a writer
+  holding one pipe open discard the other stream's spool error, reporting a storage
+  failure as a truncated success.
+- A timeout states its deadline and only advises a larger one when a larger one exists:
+  `timeout_secs` is on the payload, and `next` is omitted once the deadline equals the
+  ceiling. Before, a capped call said "retry with a larger timeout_secs" with no number
+  and no way to know the ceiling had been reached — a model could loop forever.
+- A kill made during the deadline race is recorded. When the command exited just as the
+  deadline fired, its own status cleared the stop while the signal had ended the tree
+  behind it, so the line said nothing happened.
+- The PowerShell tool no longer carries Unix advice: no process groups, no `setsid`
+  escape, and `Wait-Process` instead of `server & wait`.
+- `end=` is a type, not a string, so "is this the command's own ending" is a match the
+  compiler checks rather than a prefix comparison.
 
 ### Fixed
 
-- `signal` is the signal's name rather than its number: `{"signal":"SIGKILL"}` instead
-  of `{"signal":9}`, and the sentence no longer spells both. The name is what a reader
-  and a model both know; the number needed a mapping only this process had.
-
-- A command that finished no longer reports a collection failure because a
-  backgrounded writer inherited stdout: the verdict is about the work that was still
-  running, named as such, instead of a collection error that arrived seconds later.
-- A failure that finds the process tree still live now stops it and owns that
-  kill (`KillReason::Failed`). It previously left the tree armed and returned,
-  which deferred the kill to the guard's fail-safe; the failure was recorded as
-  an unattributed drop even though its cause was known at the call site.
-- A failure behind an already-finished command now reports the sweep that already
-  happened. The run path owns the sweep and puts its outcome on the completion, so a
-  later spool error carries it instead of re-sweeping a disarmed guard and concluding
-  that nothing was found — which is how a recorded sweep became an unrecorded one.
-  A refused signal is likewise carried as `tree=alive` before the guard is disarmed, on
-  every terminal and on the paths that fail before a run starts, so the run path can
-  never leave the fail-safe to add a second line. One `finish()` finalizer owns that
-  carry-and-disarm, so a new return path cannot forget it.
-- A failure that loses a command's output is itself the recorded ending: an internal
-  failure behind a completed command logs `end=error` instead of the command's exit
-  code, which named the wrong event and — when nothing had been swept — wrote no line
-  at all.
-- A guard dropped without a completion writes the job's only line, `end=abandoned`,
-  so a job that never published a result is still on the record — and a job that did
-  publish one is never written twice.
+- A drain that closes with a writer still holding the pipe is not an internal failure.
+  The command had ended and its output was in the spool, so the reply is that prefix
+  marked truncated; before, it claimed the *execution* deadline had elapsed and hid the
+  output the command had produced.
+- A failure behind an already-finished command reports the sweep that already happened,
+  through one `finish()` finalizer that every path uses, so a recorded sweep cannot
+  become an unrecorded one.
+- A refused signal is carried as `tree=alive` before the guard is disarmed, on every
+  terminal and on the paths that fail before a run starts.
+- An internal failure that loses a command's output is itself the recorded ending:
+  `end=error`, not the command's exit code.
+- One lifetime line per published job: the fail-safe speaks only for a job that never
+  published a result.
 
 ## [0.17.5] - 2026-11-19
 

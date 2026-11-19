@@ -174,8 +174,9 @@ fn a_deadline_records_dotlink_at_every_verbosity() {
         );
         assert_eq!(lines.len(), 1, "one line per job at {flags:?}: {lines:?}");
         let line = &lines[0];
+        // A deadline is dotlink's by definition, so it names no actor.
         assert!(line.contains("end=timeout"), "{line}");
-        assert!(line.contains("by=dotlink"), "{line}");
+        assert!(!line.contains("by="), "{line}");
         assert!(
             !line.contains("by=external"),
             "our own stop is not an outside ending: {line}"

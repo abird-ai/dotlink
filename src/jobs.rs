@@ -548,6 +548,10 @@ struct JobEntry {
     created_at: String,
     updated_at: String,
     timeout_secs: u64,
+    /// The ceiling `timeout_secs` was resolved against. Equal means the deadline is the
+    /// most this runtime will allow, so advising a larger one would send a caller in
+    /// circles.
+    timeout_ceiling: u64,
     result_limit: usize,
     phase: JobPhase,
     cancel: JobCancel,
@@ -1320,6 +1324,7 @@ impl JobManager {
     pub(crate) fn spawn<F, Fut>(
         &self,
         timeout_secs: u64,
+        timeout_ceiling: u64,
         result_limit: usize,
         request_key: Option<String>,
         runner: F,
@@ -1400,6 +1405,7 @@ impl JobManager {
                 created_at: now.clone(),
                 updated_at: now,
                 timeout_secs,
+                timeout_ceiling,
                 result_limit,
                 phase: JobPhase::Queued,
                 cancel: cancel.clone(),
@@ -1512,6 +1518,7 @@ impl JobManager {
                 created_at: now.clone(),
                 updated_at: now,
                 timeout_secs,
+                timeout_ceiling: timeout_secs,
                 result_limit: crate::limits::DEFAULT_TRANSFER_BYTES,
                 phase: JobPhase::Running,
                 cancel: cancel.clone(),
@@ -2002,6 +2009,8 @@ impl JobManager {
                     .completion
                     .clone()
                     .ok_or_else(|| JobError::Internal(anyhow!("job {id} has no completion")))?,
+                timeout_secs: entry.timeout_secs,
+                timeout_ceiling: entry.timeout_ceiling,
                 result_limit: entry.result_limit,
                 stdout_path: entry.stdout_path.clone(),
                 stderr_path: entry.stderr_path.clone(),
@@ -2411,6 +2420,8 @@ impl JobManager {
                     completion: entry.completion.clone().ok_or_else(|| {
                         JobError::Internal(anyhow!("task {id} has no completion"))
                     })?,
+                    timeout_secs: entry.timeout_secs,
+                    timeout_ceiling: entry.timeout_ceiling,
                     result_limit: entry.result_limit,
                     stdout_path: entry.stdout_path.clone(),
                     stderr_path: entry.stderr_path.clone(),
@@ -2460,6 +2471,10 @@ struct OutputSnapshot {
 
 struct ToolResultSnapshot {
     completion: JobCompletion,
+    /// The deadline this job ran under, and the ceiling it was resolved against: a
+    /// timeout must say what it was, and whether a larger one is even available.
+    timeout_secs: u64,
+    timeout_ceiling: u64,
     result_limit: usize,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -2706,13 +2721,13 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     };
 
     let timed_out = completion.status == JobStatus::TimedOut;
-    // `timeout_secs` is already on the payload, so the sentence does not repeat it;
-    // it says the one thing the number cannot: the tree was killed.
+    // The sentence says the one thing the number cannot; `timeout_secs` below says the
+    // number, because a caller cannot tell "too slow" from "capped" without it.
     let error = timed_out.then_some("command timed out; the process tree was killed");
-    // A timed-out command was killed at its own `timeout_secs`, so the only
-    // remedy is a larger one: `background: true` changes who waits, not how long
-    // the child may run.
-    let next = timed_out.then_some("retry with a larger timeout_secs");
+    // A deadline smaller than the ceiling can be raised; one that already equals it
+    // cannot, and saying otherwise sends a caller in circles forever.
+    let next = (timed_out && snapshot.timeout_secs < snapshot.timeout_ceiling)
+        .then_some("retry with a larger timeout_secs");
     let stop_note = external_stop_note(completion);
     let mut payload = with_termination(
         serde_json::json!({
@@ -2720,6 +2735,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "exit_code": completion.exit_code,
         "success": completion.success,
         "timed_out": completion.status == JobStatus::TimedOut,
+        "timeout_secs": timed_out.then_some(snapshot.timeout_secs),
         "dir": context.dir,
         "sandboxed": context.sandboxed,
         "network": context.network,
@@ -4414,6 +4430,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 None,
                 |_job| async { std::future::pending::<JobCompletion>().await },
@@ -4441,6 +4458,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 None,
@@ -4479,6 +4497,7 @@ mod tests {
         let (writer_tx, writer_rx) = tokio::sync::oneshot::channel();
         let started = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 None,
@@ -5394,6 +5413,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("cleanup-only".to_owned()),
                 |_job| async {
@@ -5568,7 +5588,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let request_key = "revoked-sync".to_owned();
         let started = manager
-            .spawn(30, 1024, Some(request_key.clone()), |job| async move {
+            .spawn(30, 30, 1024, Some(request_key.clone()), |job| async move {
                 assert!(job.mark_running(Some([7; 32])));
                 JobCompletion::completed(
                     Some(0),
@@ -5610,7 +5630,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let request_key = "revoked-running".to_owned();
         let started = manager
-            .spawn(30, 1024, Some(request_key.clone()), |job| async move {
+            .spawn(30, 30, 1024, Some(request_key.clone()), |job| async move {
                 assert!(job.mark_running(Some([8; 32])));
                 job.cancel.cancelled().await;
                 JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
@@ -5657,6 +5677,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("request-key".to_owned()),
                 move |job| async move {
@@ -5702,6 +5723,7 @@ mod tests {
 
         let duplicate = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("request-key".to_owned()),
@@ -5751,6 +5773,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("abandoned-request".to_owned()),
                 |_job| async {
@@ -5781,6 +5804,7 @@ mod tests {
         let replay = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("abandoned-request".to_owned()),
                 |_job| async { panic!("redelivery must reuse the abandoned execution") },
@@ -5806,6 +5830,7 @@ mod tests {
         let first = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("concurrent-attempts".to_owned()),
                 |_job| async { std::future::pending::<JobCompletion>().await },
@@ -5813,6 +5838,7 @@ mod tests {
             .unwrap();
         let duplicate = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("concurrent-attempts".to_owned()),
@@ -5854,6 +5880,7 @@ mod tests {
             let started = manager
                 .spawn(
                     30,
+                    30,
                     crate::limits::DEFAULT_TRANSFER_BYTES,
                     Some(format!("abandoned-{index}")),
                     |_job| async {
@@ -5894,6 +5921,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 None,
                 |_job| async { std::future::pending::<JobCompletion>().await },
@@ -5918,6 +5946,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let exposed = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("exposure-wins".to_owned()),
@@ -5953,6 +5982,7 @@ mod tests {
         let synchronous = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("sync-wins".to_owned()),
                 |_job| async {
@@ -5986,6 +6016,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("delayed-receipt".to_owned()),
@@ -6047,6 +6078,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("delayed-task".to_owned()),
                 |_job| async {
@@ -6094,6 +6126,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("late-redelivery".to_owned()),
                 |_job| async {
@@ -6133,6 +6166,7 @@ mod tests {
         let duplicate = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("late-redelivery".to_owned()),
                 |_job| async { panic!("late redelivery must not launch another runner") },
@@ -6159,6 +6193,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 None,
                 |_job| async { std::future::pending::<JobCompletion>().await },
@@ -6180,6 +6215,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 None,
@@ -6261,6 +6297,7 @@ mod tests {
             let started = manager
                 .spawn(
                     30,
+                    30,
                     crate::limits::DEFAULT_TRANSFER_BYTES,
                     Some(key),
                     |_job| async {
@@ -6296,6 +6333,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("pending-delivery".to_owned()),
@@ -6350,6 +6388,7 @@ mod tests {
         let started = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("original-key".to_owned()),
                 |_job| async {
@@ -6387,6 +6426,7 @@ mod tests {
             let key = format!("recover-{index}");
             let started = manager
                 .spawn(
+                    30,
                     30,
                     crate::limits::DEFAULT_TRANSFER_BYTES,
                     Some(key),
@@ -6442,6 +6482,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("handoff-slot".to_owned()),
@@ -6506,6 +6547,7 @@ mod tests {
         let replay = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("replay-transition".to_owned()),
                 |_job| async {
@@ -6551,6 +6593,7 @@ mod tests {
         let error = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("replay-transition".to_owned()),
                 |_job| async { panic!("redelivery must never launch a second runner") },
@@ -6575,6 +6618,7 @@ mod tests {
             .unwrap();
         let duplicate = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("replay-transition".to_owned()),
@@ -6606,6 +6650,7 @@ mod tests {
             let started = manager
                 .spawn(
                     30,
+                    30,
                     crate::limits::DEFAULT_TRANSFER_BYTES,
                     Some(key.clone()),
                     |_job| async {
@@ -6635,6 +6680,7 @@ mod tests {
         let first = manager
             .spawn(
                 30,
+                30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("request-1".to_owned()),
                 move |_job| async move {
@@ -6654,6 +6700,7 @@ mod tests {
         let duplicate_starts = starts.clone();
         let duplicate = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("request-1".to_owned()),
@@ -6695,6 +6742,7 @@ mod tests {
                 creator_barrier.wait().await;
                 creator_manager.spawn(
                     30,
+                    30,
                     crate::limits::DEFAULT_TRANSFER_BYTES,
                     None,
                     move |_job| async move {
@@ -6731,6 +6779,7 @@ mod tests {
                 manager
                     .spawn(
                         30,
+                        30,
                         crate::limits::DEFAULT_TRANSFER_BYTES,
                         None,
                         |_job| async {
@@ -6753,6 +6802,7 @@ mod tests {
         for _ in 0..128 {
             let started = manager
                 .spawn(
+                    30,
                     30,
                     crate::limits::DEFAULT_TRANSFER_BYTES,
                     None,
@@ -6851,6 +6901,7 @@ mod tests {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let started = manager
             .spawn(
+                30,
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("request-reader".to_owned()),

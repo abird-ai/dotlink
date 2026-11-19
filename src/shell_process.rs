@@ -104,6 +104,37 @@ pub(crate) enum StopOutcome {
     Failed,
 }
 
+/// How a job ended, as the record names it. A type, so "is this the command's own
+/// ending" is a match rather than a string prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum End {
+    Exit(i32),
+    Signal(i32),
+    Timeout,
+    Cancel,
+    Error,
+    Abandoned,
+}
+
+impl End {
+    fn describe(self) -> String {
+        match self {
+            Self::Exit(code) => format!("exit code={code}"),
+            Self::Signal(signal) => format!("signal {}", crate::jobs::signal_token(signal)),
+            Self::Timeout => "timeout".to_owned(),
+            Self::Cancel => "cancel".to_owned(),
+            Self::Error => "error".to_owned(),
+            Self::Abandoned => "abandoned".to_owned(),
+        }
+    }
+
+    /// The command decided its own fate, so nothing about it is dotlink's to report
+    /// unless a sweep changed the verdict.
+    pub(crate) fn is_own(self) -> bool {
+        matches!(self, Self::Exit(_))
+    }
+}
+
 /// What became of the tree, as the one word a record uses — or nothing, because a
 /// group already empty had nothing happen to it and a line saying so is noise. One
 /// mapping serves the completion's line and the fail-safe's, so the two cannot
@@ -171,9 +202,9 @@ impl StopTrace {
     }
 
     /// The one line a job gets, written where its ending is known.
-    pub(crate) fn ended(&self, end: &str, by: Option<&str>, tree: Option<&str>) {
+    pub(crate) fn ended(&self, end: &End, by: Option<&str>, tree: Option<&str>) {
         self.log
-            .notice("job", end_message(&self.label, end, by, tree));
+            .notice("job", end_message(&self.label, &end.describe(), by, tree));
     }
 
     /// The same line for a guard dropped before a completion existed: dotlink
@@ -181,7 +212,7 @@ impl StopTrace {
     /// runs without a completion, which is why it cannot be a second line for a job
     /// that already published one — every completion path disarms the guard.
     pub(crate) fn abandoned(&self, tree: Option<&str>) {
-        self.ended("abandoned", Some("dotlink"), tree);
+        self.ended(&End::Abandoned, None, tree);
     }
 }
 
@@ -272,6 +303,9 @@ pub(crate) struct Guard {
     /// from `active`, which only says the guard has not been disarmed: a fresh guard is
     /// armed without anything having been refused.
     refused: bool,
+    /// The outcome of the most recent signal, so a path that cannot sweep can still say
+    /// what its own kill found.
+    last: Option<StopOutcome>,
     trace: StopTrace,
     #[cfg(unix)]
     group: libc::pid_t,
@@ -291,6 +325,7 @@ impl Guard {
             Ok(Self {
                 active: true,
                 refused: false,
+                last: None,
                 trace,
                 group,
             })
@@ -325,6 +360,7 @@ impl Guard {
             Ok(Self {
                 active: true,
                 refused: false,
+                last: None,
                 trace,
                 job,
             })
@@ -341,6 +377,13 @@ impl Guard {
             .flatten()
     }
 
+    /// What the last signal did, for a path that ends the command without sweeping it.
+    /// A kill made during the deadline race ends no command but does end the tree
+    /// behind it, and without this the record would say nothing happened.
+    pub(crate) fn last_outcome(&self) -> Option<StopOutcome> {
+        self.last
+    }
+
     /// Whether the last signal is unproven: the kernel refused it and this guard is
     /// still armed for the retry that no longer exists once the run path disarms it.
     /// Read it before disarming, so the alarm outlives the guard that holds it.
@@ -348,12 +391,80 @@ impl Guard {
         self.refused
     }
 
-    /// End the tree behind a command that has already returned, and report what
-    /// the signal did to it. A sweep claims no cause, because the command's own
-    /// status is what ended it; but whether anything was still running is a fact a
-    /// completion must report, so the outcome is kept rather than reduced to a claim.
+    /// End the tree behind a command that has already returned, and report what the
+    /// signal found. A sweep claims no cause, because the command's own status is what
+    /// ended it; whether anything was still *running* is the fact a completion reports.
     pub(crate) fn sweep(&mut self) -> StopOutcome {
-        self.signal_and_record(KillReason::Cleanup)
+        if !self.active {
+            return StopOutcome::AlreadyGone;
+        }
+        // Sample before signalling: SIGKILL turns a live member into a zombie, which
+        // erases the very distinction this asks about.
+        let live = self.group_has_live_member();
+        match self.signal_and_record(KillReason::Cleanup) {
+            // A group of zombies takes SIGKILL too, so a delivered signal is not proof
+            // that anything was running. Nothing was, so nothing happened.
+            StopOutcome::Delivered if !live => StopOutcome::AlreadyGone,
+            outcome => outcome,
+        }
+    }
+
+    /// Whether the group holds a process that is not already a zombie.
+    ///
+    /// `kill(-pgid, 0)` only proves the group is non-empty, and a member that has exited
+    /// but not been collected by its parent still occupies it — which is the normal
+    /// state for a moment after any command that leaves a child behind, and how a
+    /// command that left nothing running came to be reported as a failure. Only the
+    /// members' own state answers the question. Linux reads it exactly; elsewhere the
+    /// signal's own outcome stands, which errs toward recording a sweep rather than
+    /// inventing one.
+    #[cfg(target_os = "linux")]
+    fn group_has_live_member(&self) -> bool {
+        // An empty group needs no scan: the fast path for every sandboxed command,
+        // whose tree died with its namespace.
+        // SAFETY: signal 0 performs the error check and delivers nothing.
+        if unsafe { libc::kill(-self.group, 0) } != 0 {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return true;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            // `<pid> (<comm>) <state> <ppid> <pgrp> …`, and `comm` may itself contain
+            // spaces and parentheses, so the numeric fields start after the last `)`.
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            let Some(fields) = stat.rfind(')').map(|end| &stat[end + 1..]) else {
+                continue;
+            };
+            let mut fields = fields.split_whitespace();
+            let (Some(state), Some(_ppid), Some(pgrp)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if pgrp.parse::<libc::pid_t>().ok() != Some(self.group) {
+                continue;
+            }
+            // `Z` is exited-not-yet-collected, `X` already gone.
+            if state != "Z" && state != "X" {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn group_has_live_member(&self) -> bool {
+        true
     }
 
     /// One attempt, one record. Disarmed guards signal nothing.
@@ -365,6 +476,7 @@ impl Guard {
             return StopOutcome::AlreadyGone;
         }
         let outcome = self.signal_tree();
+        self.last = Some(outcome);
         self.refused = outcome == StopOutcome::Failed;
         // A signal that failed leaves the tree running, so stay armed: the
         // fail-safe drop gets one more attempt.

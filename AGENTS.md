@@ -106,9 +106,10 @@ All paths and validation commands below are relative to the repository root.
   what the ordinary result carries. A job writes at most one lifecycle line,
   `LOG job id=… end=… by=… [tree=…]`, at every verbosity and only when it has
   something to say: `end=` says what ended it (`exit code=N`, `signal SIGKILL`,
-  `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and `by=` names another actor
-  only when there was one (`dotlink`, `caller`, `connector`, `external`), because an
-  own ending has none to name. A command that simply ended writes nothing — an
+  `timeout`, `cancel`, `error`, `abandoned`) and `by=` names an actor only where the
+  actor is a choice: `caller`/`connector` on a cancel, `external` on a signal. A
+  dotlink ending names nobody, because it is this process by definition, and an own
+  ending names nobody either. A command that simply ended writes nothing — an
   ordinary exit needs no reconstruction — while anything dotlink did, any foreign
   signal, and any sweep writes a line. A sweep of work still running
   rides on the same line as `tree=killed`, or `tree=alive` when the kernel refused,

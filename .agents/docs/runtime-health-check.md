@@ -252,10 +252,9 @@ the line's timestamp and the result's `ts` are the same call — and compare `en
 with the status the caller actually saw.
 
 **One line per job, when there is one to write.** `end=` says what ended the job and
-`by=` names another actor when there was one: `by=dotlink` a deadline or an internal
-error, `by=caller` a cancelled call, `by=connector` a withdrawn one, `by=external`
-something else entirely, and `end=abandoned` a job dotlink dropped without publishing
-a result. A command that ended on its own names no actor, and writes no line unless a
+`by=` appears only where the actor is a choice: `by=caller`/`by=connector` on a cancel,
+`by=external` on a signal. A deadline, an internal error and `end=abandoned` are dotlink
+by definition and name nobody. A command that ended on its own names no actor, and writes no line unless a
 sweep changed the verdict — so the record only holds events worth reconstructing. A sweep of work the command left running rides on the same line as
 `tree=killed` — or `tree=alive` when the kernel refused, which is the one case that is
 an alarm — and it is also what makes the invocation a failure; an empty group adds

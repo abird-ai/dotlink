@@ -2527,7 +2527,7 @@ mod tests {
         let before = execution_authority_fingerprint([63; 32], &before).unwrap();
 
         let started = manager
-            .spawn(30, 1024, None, |_job| async {
+            .spawn(30, 30, 1024, None, |_job| async {
                 jobs::JobCompletion::completed(
                     Some(0),
                     true,
