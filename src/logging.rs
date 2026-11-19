@@ -128,6 +128,29 @@ fn plain_line(timestamp: &str, level: &str, scope: &str, message: &str) -> Strin
     format!("{}{message}", message_prefix(timestamp, level, scope))
 }
 
+fn write_continuation(writer: &mut impl io::Write, message: &str) -> io::Result<()> {
+    writeln!(writer, "{:width$}{message}", "", width = MESSAGE_COLUMN)
+}
+
+fn write_log_line(
+    writer: &mut impl io::Write,
+    color: bool,
+    timestamp: &str,
+    level: &str,
+    scope: &str,
+    message: &str,
+    color_code: &str,
+) -> io::Result<()> {
+    if color {
+        writeln!(
+            writer,
+            "\x1b[2m[{timestamp}]\x1b[0m \x1b[{color_code}m{level:<4}\x1b[0m \x1b[1m{scope:<10}\x1b[0m {message}"
+        )
+    } else {
+        writeln!(writer, "{}", plain_line(timestamp, level, scope, message))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LogConfig {
     state: Arc<LogState>,
@@ -257,7 +280,26 @@ impl LogConfig {
     }
 
     pub fn notice(&self, scope: &str, message: impl AsRef<str>) {
-        self.line("LOG", scope, message.as_ref(), "33");
+        self.lifecycle(scope, message);
+    }
+
+    /// Always-visible lifecycle/operator evidence. Unlike TOOL/REQ diagnostics,
+    /// this channel is never gated by verbosity or quiet activity.
+    pub fn lifecycle(&self, scope: &str, message: impl AsRef<str>) {
+        let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
+        let scope = sanitize_log_scope(scope);
+        let mut stderr = io::stderr().lock();
+        let _ = self.write_lifecycle(&mut stderr, &timestamp, &scope, message.as_ref());
+    }
+
+    fn write_lifecycle(
+        &self,
+        writer: &mut impl io::Write,
+        timestamp: &str,
+        scope: &str,
+        message: &str,
+    ) -> io::Result<()> {
+        write_log_line(writer, self.color, timestamp, "LOG", scope, message, "33")
     }
 
     pub fn developer(&self, scope: &str, message: impl AsRef<str>) {
@@ -362,11 +404,13 @@ impl LogConfig {
     }
 
     /// A message-aligned continuation of the line above it, with no timestamp or
-    /// scope of its own. One `eprintln!` per line, so concurrent calls cannot
-    /// splice into each other.
+    /// scope of its own. One locked write per line, so concurrent calls cannot
+    /// splice into each other. Broken stderr is best-effort telemetry, never a
+    /// process failure.
     fn continuation(&self, message: &str, color_code: &str) {
         let message = self.style(color_code, message);
-        eprintln!("{:width$}{message}", "", width = MESSAGE_COLUMN);
+        let mut stderr = io::stderr().lock();
+        let _ = write_continuation(&mut stderr, &message);
     }
 
     /// One notification the transport accepted, so progress delivery is provable
@@ -391,19 +435,22 @@ impl LogConfig {
         }
     }
 
+    /// Structured lifecycle/tool/request logging is best effort. In particular,
+    /// this path may be called from a future process-guard Drop observer, where
+    /// panicking on a closed stderr could abort an already-unwinding process.
     fn line(&self, level: &str, scope: &str, message: &str, color_code: &str) {
-        let timestamp = Local::now().format("%H:%M:%S%.3f");
+        let timestamp = Local::now().format("%H:%M:%S%.3f").to_string();
         let scope = sanitize_log_scope(scope);
-        if self.color {
-            eprintln!(
-                "\x1b[2m[{timestamp}]\x1b[0m \x1b[{color_code}m{level:<4}\x1b[0m \x1b[1m{scope:<10}\x1b[0m {message}"
-            );
-        } else {
-            eprintln!(
-                "{}",
-                plain_line(&timestamp.to_string(), level, &scope, message)
-            );
-        }
+        let mut stderr = io::stderr().lock();
+        let _ = write_log_line(
+            &mut stderr,
+            self.color,
+            &timestamp,
+            level,
+            &scope,
+            message,
+            color_code,
+        );
     }
 }
 
@@ -784,6 +831,92 @@ mod tests {
             "{line:?}"
         );
         assert!(line[..MESSAGE_COLUMN].ends_with(' '), "{line:?}");
+    }
+
+    struct BrokenWriter;
+
+    impl io::Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+    }
+
+    #[test]
+    fn structured_log_writes_report_broken_stderr_without_panicking() {
+        let mut writer = BrokenWriter;
+        assert!(
+            write_log_line(
+                &mut writer,
+                false,
+                "12:00:00.000",
+                "LOG",
+                "job",
+                "stop id=j reason=timeout outcome=delivered",
+                "33",
+            )
+            .is_err()
+        );
+        assert!(write_continuation(&mut writer, "·").is_err());
+    }
+
+    #[test]
+    fn lifecycle_log_is_fixed_shape_and_verbosity_independent() {
+        let expected = format!(
+            "{}\n",
+            plain_line(
+                "12:00:00.000",
+                "LOG",
+                "job",
+                "stop id=j reason=timeout outcome=delivered",
+            )
+        );
+
+        for log in [
+            LogConfig::new(0, false, ColorMode::Never),
+            LogConfig::new(1, false, ColorMode::Never),
+            LogConfig::new(2, false, ColorMode::Never),
+            LogConfig::new(2, true, ColorMode::Never),
+        ] {
+            let mut output = Vec::new();
+            log.write_lifecycle(
+                &mut output,
+                "12:00:00.000",
+                "job",
+                "stop id=j reason=timeout outcome=delivered",
+            )
+            .unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn failed_lifecycle_write_is_safe_during_unwinding() {
+        struct LogOnDrop;
+
+        impl Drop for LogOnDrop {
+            fn drop(&mut self) {
+                let mut writer = BrokenWriter;
+                let _ = write_log_line(
+                    &mut writer,
+                    false,
+                    "12:00:00.000",
+                    "LOG",
+                    "job",
+                    "stop id=j reason=dropped outcome=failed",
+                    "33",
+                );
+            }
+        }
+
+        let unwind = std::panic::catch_unwind(|| {
+            let _guard = LogOnDrop;
+            panic!("primary failure");
+        });
+        assert!(unwind.is_err());
     }
 
     #[test]
