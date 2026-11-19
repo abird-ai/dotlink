@@ -2791,14 +2791,24 @@ impl LocalMachine {
     }
 }
 
-/// The one place the turn horizon is stated. A tool description hands back
-/// `ts` as a fact; this is the advisory that makes it actionable — the anchor,
-/// the horizon, and what to do at it — so no surface restates a bare number.
-pub(crate) fn server_instructions() -> String {
-    format!(
-        "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline. Shell and job results carry `ts` (UTC epoch seconds): take the first `ts` of the current turn as your anchor and keep one user turn to about {} minutes. When you reach it, stop at the next coherent boundary, state what is done and what remains, and hand back instead of starting another step. No single command may run longer than that horizon. File-tool results are paged and carry no clock, so read the anchor from the shell or job result around them.",
-        crate::limits::TURN_CHECKPOINT_MINUTES
-    )
+/// Instructions for the transports actually serving this bridge. The turn
+/// horizon belongs to the hosted surface alone: it paces a conversation turn,
+/// and a stdio or local HTTP client has no such turn to pace. `hosted` is the
+/// same fact the shell description reads — a transport that imposes a response
+/// window — so the two cannot disagree about which surface this is.
+pub(crate) fn server_instructions(hosted: bool) -> String {
+    let mut text = String::from(
+        "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline.",
+    );
+    if hosted {
+        // The one place the horizon is stated, with the rule that makes it
+        // actionable. A tool description hands back `ts` as a fact instead.
+        text.push_str(&format!(
+            " Shell and job results carry `ts` (UTC epoch seconds): take the first `ts` of the current turn as your anchor and keep one user turn to about {} minutes. When you reach it, stop at the next coherent boundary, state what is done and what remains, and hand back instead of starting another step. No single command may run longer than that horizon. File-tool results are paged and carry no clock, so read the anchor from the shell or job result around them.",
+            crate::limits::TURN_CHECKPOINT_MINUTES
+        ));
+    }
+    text
 }
 
 impl rmcp::ServerHandler for LocalMachine {
@@ -2840,7 +2850,7 @@ impl rmcp::ServerHandler for LocalMachine {
                 .build(),
         )
         .with_server_info(Implementation::new("dotlink", env!("CARGO_PKG_VERSION")))
-        .with_instructions(server_instructions())
+        .with_instructions(server_instructions(self.config.sync_hold.is_some()))
     }
 
     async fn get_task(
@@ -2936,13 +2946,23 @@ mod tests {
 
     use crate::mcp::tools::test_support::access;
 
-    /// The turn horizon lives here and nowhere else: a tool description states
-    /// `ts` as a fact, while the anchor, the horizon and the hand-back rule are
-    /// one advisory. Dropping it here would silently remove the only guidance a
-    /// long turn gets.
+    /// The turn horizon lives here and nowhere else, and only on the hosted
+    /// surface: a tool description states `ts` as a fact, while the anchor, the
+    /// horizon and the hand-back rule are one advisory. A client with no turn
+    /// must not be handed a clock to pace.
     #[test]
     fn the_turn_horizon_is_stated_once_with_its_rule() {
-        let instructions = server_instructions();
+        let local = server_instructions(false);
+        assert!(!local.contains("turn"), "{local}");
+        assert!(!local.contains("`ts`"), "{local}");
+        assert!(
+            !local.contains(&crate::limits::TURN_CHECKPOINT_MINUTES.to_string()),
+            "{local}"
+        );
+        // The bridge description itself is surface-independent.
+        assert!(local.contains("Bubblewrap-sandboxed"), "{local}");
+
+        let instructions = server_instructions(true);
         assert!(
             instructions.contains(&format!(
                 "about {} minutes",

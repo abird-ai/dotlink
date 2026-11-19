@@ -27,9 +27,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   lifetime flag.
 - The turn horizon is stated once, in the server instructions, with the rule
   that makes it actionable: anchor on the first `ts` of the turn, and at the
-  horizon stop at a coherent boundary and hand back. Tool descriptions now say
-  only that `ts` is epoch seconds — a bare number per tool was both a second
-  copy and a shorter one, since the actionable half stayed in the instructions.
+  horizon stop at a coherent boundary and hand back. It is stated on the hosted
+  surface only — a bridge serving stdio or local HTTP alone has no conversation
+  turn to pace, so it is given none of that text. Tool descriptions say only
+  that `ts` is epoch seconds — a bare number per tool was both a second copy and
+  a shorter one, since the actionable half stayed in the instructions.
 - One command no longer runs longer than one turn horizon. `timeout_secs` is
   bounded above by 2100 s (35 min) instead of defaulting to an hour, so the
   deadline a call is given always matches the horizon the instructions ask it
