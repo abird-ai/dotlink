@@ -466,6 +466,34 @@ mod tests {
         assert!(trace.reports().is_empty(), "an exit is not a stop");
     }
 
+    /// Every delivered kill is attributable, including the two that name no
+    /// cause. Otherwise `stopped_by` is absent for a kill dotlink performed, and
+    /// `external_signal` reads that absence as a stranger's SIGKILL — which is
+    /// how the journal and the result once contradicted each other.
+    #[test]
+    fn every_delivered_kill_records_that_it_was_ours() {
+        for reason in [
+            KillReason::Timeout,
+            KillReason::Cancel,
+            KillReason::Shutdown,
+            KillReason::Failed,
+            KillReason::Cleanup,
+            KillReason::Dropped,
+        ] {
+            assert!(
+                reason.claim().is_some(),
+                "{} must record that dotlink signalled",
+                reason.as_str()
+            );
+        }
+        // The two that end a tree rather than a command name no cause, but they
+        // still say the signal was ours.
+        for reason in [KillReason::Cleanup, KillReason::Dropped] {
+            assert_eq!(reason.claim(), Some(StopCause::Teardown));
+            assert_eq!(reason.claim().map(StopCause::as_str), Some("teardown"));
+        }
+    }
+
     /// A group that is already empty is not a stop we performed: claiming one
     /// would read as "dotlink killed your command" when the command had ended.
     /// The contract a caller is told: descendants do not outlive the command.
