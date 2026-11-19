@@ -1587,16 +1587,19 @@ async fn prepare_runtime(
         tracing::warn!("shell mounts are inactive: {hint}");
     }
 
-    if transports.constraints().sync_hold.is_some()
-        && setup.config.max_shell_timeout_secs > crate::limits::TURN_HORIZON_SECS
+    // A value dotlink itself chose needs no announcement: the tool description
+    // already states the ceiling in force. A value the operator chose and this
+    // process then lowers is worth one line, or the cap would be silent.
+    if policy.allow_shell
+        && transports.constraints().sync_hold.is_some()
+        && setup.config.max_shell_timeout_secs > crate::limits::HOSTED_SHELL_TIMEOUT_SECS
+        && setup.config.max_shell_timeout_secs != setup::DEFAULT_MAX_SHELL_TIMEOUT_SECS
     {
-        // Accepted, so an upgrade never becomes a refusal to start, but never
-        // silently: a hosted caller is told the capped number, not the profile.
         tracing::warn!(
             "max_shell_timeout_secs={} exceeds the {} minute turn horizon; hosted commands are capped at {} s",
             setup.config.max_shell_timeout_secs,
             crate::limits::TURN_CHECKPOINT_MINUTES,
-            crate::limits::TURN_HORIZON_SECS
+            crate::limits::HOSTED_SHELL_TIMEOUT_SECS
         );
     }
 

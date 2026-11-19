@@ -8,69 +8,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- One lifetime contract for both modes: a command's descendants never outlive
-  it. The tree is ended when the command returns instead of being left to the
-  namespace teardown, so a successful command can no longer leave work running
-  that the reply implies is still alive. A sandboxed tree is already gone with
-  its namespace, so this finds nothing there and records nothing; unsandboxed
-  leftovers are ended and reported as `stopped_by: "teardown"`. It also removes a
-  latency trap: a backgrounded writer inheriting stdout used to hold the spool
-  reader open until the command's own deadline, turning a successful command into
-  a collection failure.
-- Tool descriptions now say it: processes left in the background die when the
-  command returns, and a long-lived one is kept by waiting for it inside a
-  durable call (`background: true`, e.g. `server & wait`), bounded by
-  `timeout_secs` and ended by `job_cancel`. `background: true` was never a way to
-  detach work — it only decides whether the caller waits before the handle is
-  returned — and the command itself is the right place to say how long its tree
-  lives: `wait` is ordinary shell, visible in the call, and needs no second
-  lifetime flag.
-- The turn horizon is stated once, in the server instructions, with the rule
-  that makes it actionable: anchor on the first `ts` of the turn, and at the
-  horizon stop at a coherent boundary and hand back. It is stated on the hosted
-  surface only — a bridge serving stdio or local HTTP alone has no conversation
-  turn to pace, so it is given none of that text. Tool descriptions say only
-  that `ts` is epoch seconds — a bare number per tool was both a second copy and
-  a shorter one, since the actionable half stayed in the instructions.
-- A hosted command no longer runs longer than one turn horizon: on the OpenAI
-  tunnel the `timeout_secs` ceiling is 2100 s (35 min), so the deadline a call
-  is given matches the horizon its instructions ask it to report by — a longer
-  one can only promise an execution no turn gets to see. A stdio or local HTTP
-  caller has no turn and keeps the profile's full 3600 s default. The schema
-  states whichever ceiling that surface will run, and a profile stored above
-  the horizon still loads: it is capped on the hosted surface and the cap is
-  reported at startup, so an upgrade is never a refusal to start.
-
+- One lifetime contract: a command's process group does not outlive it. The group
+  is swept when the command returns, and the reply carries the command's own
+  status. A sandboxed group is already gone with its namespace, so the sweep finds
+  nothing and records nothing. Unsandboxed, this ends the leftover writer that used
+  to hold the spool reader open until the execution deadline and turn a successful
+  command into a collection failure; output collection now has its own short
+  window rather than borrowing the execution deadline, so an hour-long
+  `timeout_secs` can no longer mean an hour-long collection. A `setsid` descendant
+  leaves the group and is out of reach — the contract is the group, and the
+  descriptions say so instead of implying full containment.
+- `stopped_by` answers one question: did dotlink end this command. It carries
+  `timeout`/`cancel`/`shutdown`/`failed`, and is absent when the command decided
+  its own fate — including after a sweep. Attribution moved to the journal, where
+  a sweep is its own `stop` line (`reason=leftovers`/`fail-safe`) instead of a
+  claim on the wire. The previous `stopped_by: "teardown"` described a tree while
+  the field's documented meaning was a command, and it was reachable only through
+  a scheduler race, so two identical commands could report different shapes. The
+  reply's sentence and the exit line now read one predicate, so a swept tree can
+  no longer hide a command's real ending behind a bare signal number.
 - Job lifecycle lines say what the signal did, not whether the command was
-  stopped. `outcome=delivered` read as the latter; the three values are now
-  `outcome=killed` (SIGKILL reached a live process in the group — a sweep of
-  leftovers is still a kill), `outcome=none` (nothing was left to signal) and
-  `outcome=refused` (the kernel would not take it, so the guard stays armed). The
-  two reasons that end a tree rather than a command are named for their target —
-  `reason=leftovers` and `reason=fail-safe` — so a line whose command had already
-  exited no longer reads as its death.
+  stopped: `outcome=killed` (SIGKILL reached a live process in the group — a sweep
+  of leftovers is still a kill), `outcome=refused` (the kernel would not take it,
+  so the guard stays armed), and no line at all when the group was empty. A `stop`
+  line therefore always means dotlink did something to a tree, and a job may carry
+  one `stop` and one `exit` line when dotlink swept a tree whose command somebody
+  else had killed. The two reasons that name a tree rather than a command are
+  `reason=leftovers` and `reason=fail-safe`.
+- Tool descriptions now say it: the command's process group is killed when it
+  returns (a `setsid` descendant can escape it), and a long-lived process is kept
+  by waiting for it inside a durable call (`background: true`, e.g. `server &
+  wait`), bounded by `timeout_secs` and ended by `job_cancel`. `background: true`
+  was never a way to detach work — it only decides whether the caller waits before
+  the handle is returned — and the command itself is the right place to say how
+  long its tree lives: `wait` is ordinary shell, visible in the call, and needs no
+  second lifetime flag.
+- The turn horizon is stated once, in the server instructions, with the rule that
+  makes it actionable: anchor on the first `ts` of the turn, and at the horizon stop
+  at a coherent boundary and hand back. It is stated only where a conversation turn
+  exists — a stdio or local HTTP client has none, so it is given none of that text.
+  Tool descriptions say only that `ts` is epoch seconds.
+- With a hosted transport active, a command no longer runs longer than one turn
+  horizon: the `timeout_secs` ceiling is 2100 s (35 min), while a stdio-only bridge
+  keeps the profile's 3600 s default. The bound is its own constant rather than the
+  advisory's, so re-tuning prompt text cannot move an execution limit or the
+  job-authority fingerprint, and a test keeps the two in step. One machine serves
+  every transport on the socket and advertises one schema, so the ceiling is the
+  tightest active transport — exactly as the response window already is. A stored
+  value above it still loads and is capped, and the cap is reported at startup only
+  when the value was the operator's own rather than the default.
 
 ### Fixed
 
-- Every delivered kill is now attributed. `KillReason::Cleanup` and
-  `KillReason::Dropped` used to claim no cause, so `stopped_by` stayed absent and
-  `external_signal` reported the kill as `signal=SIGKILL from=outside` — dotlink
-  telling a caller that a stranger signalled a tree it had killed itself. Tidy-up
-  and the fail-safe now claim `StopCause::Teardown`: they still name no cause,
-  because none applies, but they record that the signal was ours. Attribution is
-  now one property — `stopped_by` is present exactly when dotlink signalled the
-  tree — instead of two readings of one empty field.
+- A command that finished no longer reports a collection failure because a
+  backgrounded writer inherited stdout. The group is swept when the command
+  returns, so the writer dies with it and the drain finishes at once; reaching that
+  state previously took the execution deadline, so a command that returned in
+  milliseconds could fail seconds later, and its stop line arrived after the job
+  had already succeeded.
 - A failure that finds the process tree still live now stops it and owns that
   kill (`KillReason::Failed`). It previously left the tree armed and returned,
   which deferred the kill to the guard's fail-safe; the failure was recorded as
   an unattributed drop even though its cause was known at the call site.
-- A command killed from outside whose leftovers dotlink then cleaned up keeps its
-  explanation. `stopped_by: "teardown"` describes the tree, so it no longer takes
-  the sentence that names the command's signal — without it that reply carried a
-  bare signal number and nothing saying where it came from. The journal keeps its
-  own rule (one `stop` **or** one `exit` line per job), because the two ask
-  different questions: whether dotlink signalled anything, and whether it ended
-  this command.
+- The guard's stop line is a real record again: a signal that found an empty group
+  writes no line, so a sandboxed command's teardown no longer logs a sweep of
+  nothing, and a line means something happened to a tree.
 
 ## [0.17.5] - 2026-11-19
 

@@ -76,8 +76,11 @@ All paths and validation commands below are relative to the repository root.
   `stopped_by` (`timeout`/`cancel`/`shutdown`/`failed`/`teardown`) are the only
   termination facts a result carries, each omitted when it does not apply. `stopped_by` is
   set only by the site that signals the tree, and only when that signal was
-  delivered, so a completion built before anything was spawned claims nothing;
-  absent means no stop is provable, never that nothing was signalled. A
+  delivered while the command was still running, so a completion built before
+  anything was spawned claims nothing, and a sweep of leftovers behind a command
+  that had already exited claims nothing either — its fate was already decided by
+  its own status. `stopped_by` answers exactly one question: did dotlink end this
+  command. A
   cancellation records *who* asked before the token fires (`JobCancel` keeps the
   token and its origin together and exposes no cancel), because a caller
   cancelling their own job and the connector withdrawing it mean different
@@ -95,19 +98,20 @@ All paths and validation commands below are relative to the repository root.
   failure trims keys that say nothing, but its stop facts and `next` stay exactly
   what the ordinary result carries. Every signal dotlink sends is one `LOG job
   stop id=… reason=… outcome=…` line from the guard, at every verbosity including
-  the fail-safe `Drop`, so absence is evidence that nothing was signalled. The
-  same record names the other ending, because an unattributed signal is the one
-  an operator most needs attributed: a process that died on a signal dotlink did
-  not deliver gets one `LOG job exit id=… signal=SIGKILL from=outside` line, also
-  at every verbosity, emitted once at terminal publication. Exactly one of the two
-  lines is written per job: every delivered kill records a cause, and the tidy-up
-  and fail-safe kills that end a tree rather than a command record
-  `StopCause::Teardown`, so `stopped_by` is absent exactly when dotlink signalled
-  nothing. `from=outside` claims only that the signal was not ours, never who sent
-  it. Two questions follow from that and must not be merged: the exit line asks
-  "did we signal anything" (`external_signal`), the result sentence asks "did we
-  end this *command*" (`outside_command_signal`, which also fires for `teardown`)
-  — otherwise a tidied-up tree leaves a bare signal number in the reply.
+  the fail-safe `Drop`; a group with nothing left in it writes no line, so a
+  `stop` line always means dotlink did something to a tree. The same record names
+  the other ending, because an unattributed signal is the one an operator most
+  needs attributed: a command that died on a signal no cause claims gets one
+  `LOG job exit id=… signal=SIGKILL from=outside` line, also at every verbosity,
+  emitted once at terminal publication. A job therefore carries at most one `stop`
+  line and at most one `exit` line, and both may appear when dotlink swept a tree
+  whose command somebody else had killed: they answer different questions, and
+  merging them is what once made one field mean two things. Attribution lives in
+  the journal, not on the wire — a sweep claims no cause — so `external_signal` is
+  the single predicate (`stopped_by.is_none()` over a signal that no cause claims)
+  that both the exit line and the reply's sentence read, and a tidied-up tree can
+  no longer hide a command's real ending behind a bare signal number.
+  `from=outside` claims only that the signal was not ours, never who sent it.
 - Shell mounts are one layer in `src/mounts.rs`: `SandboxMount { source, target, writable, env, origin }`, keyed by sandbox target with last declaration winning over builtin caches, profile `mounts`, `DOTLINK_MOUNTS` and `--mount` (in that order, as an ordered layer slice). Targets stay below `/tmp/home`, must not nest, and are conflict-checked against fixed host integrations; mount `env` may not set the variables the sandbox owns and may not disagree with another mount. Layout is validated before environment wiring, and only on the set the binder will actually bind. Configuration mistakes are `CONFIG`; a declared source that is not usable yet is host state and retries the runtime, while a discovered cache that cannot be prepared is skipped with a warning. A declared mount is never skipped silently, and `-vv` lists the resolved set.
 - Linux native file IO must stay descriptor-rooted with openat2 and fail closed on unsupported resolution. Shared traversal errno comparisons use OS-native libc constants, never Linux numeric literals. Directory discovery reads child metadata under the same descriptor and mount-resolution authority as actual opens (Linux `openat2` O_PATH nofollow; macOS `fstatat` plus device check). Pathname metadata or unchecked mountpoint metadata must never be reintroduced after pinning. Linux/macOS native tools are concurrent by default; `-s/--serialize` opts into one-at-a-time MCP calls. Windows retains a conservative operation gate. Never reintroduce pathname IO following authorization for Linux tools.
 - Logging is quiet by default: `-v` = TOOL, `-vv` = TOOL + REQ. `LOG` lines are

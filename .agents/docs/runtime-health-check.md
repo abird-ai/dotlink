@@ -237,7 +237,7 @@ Check these explicitly. Each has a known-good value in the baseline.
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
 | `stop id=` lines | rare: `reason=timeout`/`cancel`/`failed` matches a completion that shows the stop, `reason=shutdown` is connector teardown (the revoked job publishes none), and `leftovers`/`fail-safe` are sweeps that ended no command | `outcome=refused`, or a `timeout`/`cancel`/`failed` claim that no completion shows |
-| `exit id=… signal=… from=outside` lines | rare: a process that died on a signal dotlink did not deliver, and never on a job that also wrote a `stop` line | two lines for one job; or a `signal` in a result whose job wrote neither line |
+| `exit id=… signal=… from=outside` lines | rare: the command died on a signal dotlink did not deliver; a job may also carry a `stop` line for the sweep, since the two answer different questions | an `exit` line for a job whose result claims `stopped_by`, or a `signal` in a result whose job wrote neither line |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
 
 A stop line written while the runtime restarts has no completion to match: the
@@ -250,15 +250,15 @@ The `id=` of a stop line is the durable job handle: when the call returned one
 — the line's timestamp and the result's `ts` are the same call — and compare the
 line's reason with the status the caller actually saw.
 
-**The record has two halves, and every job gets exactly one.** `stop` is a signal
-dotlink sent — every delivered kill records one, and the tidy-up and fail-safe
-kills that end a tree rather than a command record `reason=leftovers`/`fail-safe` with
-`stopped_by: teardown` in the reply. `exit … from=outside` is a signal it did not.
-So "who killed it?" is answered by which line is present, and a job with neither
-was never signalled at all. `outcome=killed` means SIGKILL reached a live process
-in the group (a sweep of leftovers is still a kill), `outcome=none` means there was
-nothing left to signal, and `outcome=refused` means the kernel would not take it and
-the guard stayed armed. `from=outside` names the absence of our signal only —
+**Two records, two questions.** `stop` says what dotlink did to a tree; `exit …
+from=outside` says the command's own ending was a signal it did not deliver. A job
+may carry one of each — a sweep of leftovers beside a command somebody else killed
+— because merging them is what once made one field answer both. A job with neither
+ended on its own. `outcome=killed` means SIGKILL reached a live process in the group
+(a sweep of leftovers is still a kill) and `outcome=refused` means the kernel would
+not take it, so the guard stayed armed; an empty group writes no line, or every
+sandboxed command would log a sweep of nothing. A sweep never appears in the reply:
+`stopped_by` is absent because the command's own status already said how it ended. `from=outside` names the absence of our signal only —
 a crash and a stranger's SIGKILL read the same, and the signal names distinguish
 them (`SIGSEGV` did not come from an operator's `kill -9`).
 

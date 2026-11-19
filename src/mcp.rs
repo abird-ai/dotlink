@@ -2709,11 +2709,9 @@ impl LocalMachine {
     }
 }
 
-#[tool_handler(
-    router = self.policy_tool_router(),
-    name = "dotlink",
-    instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
-)]
+// The instruction text lives in `server_instructions` only: `get_info` overrides
+// whatever the macro would advertise, so a copy here could drift unread.
+#[tool_handler(router = self.policy_tool_router(), name = "dotlink")]
 impl LocalMachine {
     /// The tool dispatch itself: everything `call_tool` does once the heartbeat
     /// sink is attached.

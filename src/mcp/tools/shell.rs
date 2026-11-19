@@ -93,6 +93,9 @@ pub(crate) struct ShellArgs {
 
 /// Salvage window for partial output after a killed child.
 const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+/// Drain window after a command that ended on its own. Its output is already in
+/// the spool, so this only bounds what an escaped writer can hold open.
+const COMPLETED_OUTPUT_GRACE: Duration = Duration::from_secs(2);
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
@@ -122,7 +125,7 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     // flag, and the script says how long that is.
     // The clause teaches the idiom; the bounds it used to repeat are already
     // stated above as `timeout_secs` and in the follow-up as `job_cancel`.
-    let lifetime = "Background processes die with the command; keep one with `wait` in a durable call (`server & wait`).";
+    let lifetime = "The command's process group is killed when it returns (a `setsid` descendant can escape it); keep one with `wait` inside a durable call (`server & wait`).";
     // `ts` is a fact of the result. The turn horizon is an advisory, and the
     // server instructions carry it once with the rule that goes with it, so no
     // tool description restates a bare number without that rule.
@@ -2354,8 +2357,8 @@ impl LocalMachine {
         if !command_exited {
             return cause.or_else(|| tree.terminate(KillReason::Failed));
         }
-        // Only the command's leftovers are left to tidy up. Tidy-up ends a tree,
-        // not a command, so it claims teardown rather than a cause.
+        // Only the command's leftovers are left to sweep. A sweep ends a tree,
+        // not a command, so it claims no cause: the record is its stop line.
         tree.terminate(KillReason::Cleanup);
         None
     }
@@ -2564,12 +2567,18 @@ impl LocalMachine {
         let mut terminal = JobStatus::Completed;
         let mut terminal_error = None;
         let mut stop: Option<StopCause> = None;
-        // Set when a status arrived after the execution deadline had passed, so
-        // the output-collection window is measured from now rather than from a
-        // deadline that has already fired.
-        let mut output_grace_refreshed = false;
         match outcome {
-            WaitOutcome::Child(Ok(status)) => exit_status = Some(status),
+            WaitOutcome::Child(Ok(status)) => {
+                exit_status = Some(status);
+                // The command returned; its group must not outlive it. A
+                // sandboxed group is already gone with the namespace, so this
+                // finds nothing there. An unsandboxed one can still hold
+                // inherited descriptors — stdout above all — and sweeping it
+                // here is what lets the collector finish now instead of at the
+                // deadline. The sweep claims no cause: the command's own status
+                // already said how it ended.
+                process_tree.terminate(KillReason::Cleanup);
+            }
             WaitOutcome::Child(Err(error)) => {
                 terminal = JobStatus::Failed;
                 terminal_error = Some(error.to_string());
@@ -2623,7 +2632,6 @@ impl LocalMachine {
                 };
                 if let Some(status) = finished {
                     exit_status = Some(status);
-                    output_grace_refreshed = true;
                     // The command ended; its tree does not get to outlive it. A
                     // sandboxed tree is already gone with the namespace, so this
                     // finds nothing and records nothing. An unsandboxed one can
@@ -2654,10 +2662,12 @@ impl LocalMachine {
             terminal,
         };
 
-        let collect_deadline = if terminal == JobStatus::Completed && !output_grace_refreshed {
-            deadline
-        } else {
-            Instant::now() + TIMEOUT_OUTPUT_GRACE
+        // A completed command's own output is already in the spool, so anything
+        // still holding the pipe is an escaped writer. Bound that drain instead of
+        // borrowing the execution deadline, which can be hours away.
+        let collect_deadline = match terminal {
+            JobStatus::Completed => Instant::now() + COMPLETED_OUTPUT_GRACE,
+            _ => Instant::now() + TIMEOUT_OUTPUT_GRACE,
         };
         let collected = timeout_at(collect_deadline, async {
             let stdout = (&mut stdout_task).await;
@@ -2736,9 +2746,9 @@ impl LocalMachine {
         match terminal {
             JobStatus::Completed => {
                 let status = exit_status.expect("completed job has an exit status");
-                // Nothing can still be running under this command: the tree was
-                // ended when the command returned. Disarm so the fail-safe has
-                // nothing to report.
+                // The group was swept when the command returned, so there is
+                // nothing left for the fail-safe to report. Disarm instead of
+                // leaving a second, silent kill authority behind.
                 process_tree.disarm();
                 JobCompletion::completed(status.code(), status.success(), stdout, stderr)
                     .with_signal(Self::exit_signal(&status))
@@ -4038,7 +4048,7 @@ mod tests {
     /// schema states whichever ceiling that surface will actually run.
     #[test]
     fn the_turn_horizon_bounds_the_hosted_surface_only() {
-        let horizon = crate::limits::TURN_HORIZON_SECS;
+        let horizon = crate::limits::HOSTED_SHELL_TIMEOUT_SECS;
         assert_eq!(horizon, crate::limits::TURN_CHECKPOINT_MINUTES * 60);
         assert_eq!(crate::limits::shell_timeout_ceiling(3_600, true), horizon);
         assert_eq!(crate::limits::shell_timeout_ceiling(3_600, false), 3_600);
@@ -4895,9 +4905,13 @@ mod tests {
         assert!(error.message.contains("unknown field"), "{error:?}");
     }
 
+    /// A command that returns is done: its leftover writer is swept at once, so
+    /// the job completes and the reply carries the command's own status. Waiting
+    /// for the writer's inherited pipe would report a failure for a command that
+    /// succeeded, which is what this test pins in the other direction.
     #[cfg(unix)]
     #[tokio::test]
-    async fn background_job_keeps_containment_until_inherited_pipes_finish() {
+    async fn a_finished_command_sweeps_its_leftovers_and_completes() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
@@ -4928,13 +4942,9 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_eq!(status["status"], "failed", "{status}");
-        assert!(
-            status["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("collecting command output timed out")),
-            "{status}"
-        );
+        assert_eq!(status["status"], "completed", "{status}");
+        assert_eq!(status["success"], true, "{status}");
+        assert!(status["error"].is_null(), "{status}");
         assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
         let partial = machine
             .jobs
@@ -4954,7 +4964,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(
             !marker.exists(),
-            "descendant holding inherited pipes must remain contained through output collection"
+            "the leftover writer must be swept with the command's group"
         );
         machine.jobs.shutdown().await.unwrap();
     }
@@ -6323,9 +6333,13 @@ mod tests {
         );
     }
 
+    /// Output collection has its own bounded window. It must never borrow the
+    /// execution deadline: a deadline an hour away would turn an escaped writer
+    /// into an hour-long collection, and a one-second one into a false failure for
+    /// a command that had already succeeded.
     #[cfg(unix)]
     #[tokio::test]
-    async fn shell_timeout_includes_output_collection_from_descendants() {
+    async fn output_collection_never_waits_for_the_execution_deadline() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
@@ -6378,9 +6392,6 @@ mod tests {
         let result = machine
             .run_shell(
                 ShellArgs {
-                    // The background process inherits the captured pipes after
-                    // Bash exits, so output collection must share the same
-                    // absolute deadline as the command itself.
                     command: "sleep 2 & printf done".to_owned(),
                     dir: ".".to_owned(),
                     stdin: None,
@@ -6395,11 +6406,16 @@ mod tests {
             .unwrap();
 
         assert!(started.elapsed() < Duration::from_millis(1800));
-        let serialized = serde_json::to_string(&result).unwrap();
-        assert!(
-            serialized.contains("collecting command output timed out after 1 seconds"),
-            "unexpected shell result: {serialized}"
-        );
+        let text = serde_json::to_value(&result).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // The command succeeded and its writer was swept, so the reply is the
+        // command's own result — not a collection failure.
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["success"], true, "{text}");
+        assert_eq!(payload["stdout"], "done", "{text}");
+        assert!(payload["error"].is_null(), "{text}");
     }
 
     #[cfg(unix)]

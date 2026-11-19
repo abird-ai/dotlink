@@ -1,10 +1,10 @@
 //! Kill the contained process group/job on timeout, error or cancellation.
 //! Unsandboxed Unix children can intentionally escape their process group
-//! (setsid); no process-group API can guarantee descendant containment.
-//! Descendants never outlive the command: the tree is ended when the command
-//! returns, and a sandboxed tree is already gone with its namespace. Work that
-//! must outlive the call belongs in a durable job (`background: true`), where the
-//! process is the job rather than a leftover of one.
+//! (setsid); no process-group API can guarantee descendant containment, so the
+//! contract is the group: it is swept when the command returns, and a sandboxed
+//! tree is already gone with its namespace. Work that must outlive the call
+//! belongs in a durable job (`background: true`), where the process is the job
+//! rather than a leftover of one.
 
 use std::io;
 use tokio::process::{Child, Command};
@@ -28,9 +28,11 @@ pub(crate) enum KillReason {
     Dropped,
 }
 
-/// What a result may claim: dotlink stopped the waited command. A separate type
+/// What a result may claim: dotlink ended the waited command. A separate type
 /// because "we signalled a tree" and "we ended your command" are different
-/// statements, and only the second belongs on the wire.
+/// statements, and only the second belongs on the wire. A sweep of leftovers
+/// ends a tree whose command had already decided its own fate, so it is a trace
+/// fact — one `stop` line — and never a claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StopCause {
     Timeout,
@@ -39,11 +41,6 @@ pub(crate) enum StopCause {
     /// `cancel` here would blame a user who did nothing.
     Shutdown,
     Failed,
-    /// dotlink ended the tree without ending the command: tidy-up after the
-    /// command had already exited, or the guard's fail-safe. It names no cause
-    /// because none applies, but it must still record that the signal was ours —
-    /// otherwise a kill we performed reads as a stranger's SIGKILL.
-    Teardown,
 }
 
 impl KillReason {
@@ -61,18 +58,18 @@ impl KillReason {
         }
     }
 
-    /// The cause this kill records. Every delivered kill records one, because
-    /// "dotlink signalled this tree" and "no cause applies" are different facts:
-    /// the first decides attribution, the second only decides wording. Tidy-up
-    /// and the fail-safe end a tree rather than the command, so they claim
-    /// [`StopCause::Teardown`] instead of a cause.
+    /// The cause this kill records on the result. Only a kill that ends the
+    /// command names one: a sweep of leftovers, and the fail-safe that may or may
+    /// not catch a live command, answer no question a result asks. They are still
+    /// on the record — the `stop` line names them — so attribution lives in the
+    /// journal rather than being smuggled into a field that means "we ended it".
     fn claim(self) -> Option<StopCause> {
         match self {
             Self::Timeout => Some(StopCause::Timeout),
             Self::Cancel => Some(StopCause::Cancel),
             Self::Shutdown => Some(StopCause::Shutdown),
             Self::Failed => Some(StopCause::Failed),
-            Self::Cleanup | Self::Dropped => Some(StopCause::Teardown),
+            Self::Cleanup | Self::Dropped => None,
         }
     }
 }
@@ -84,7 +81,6 @@ impl StopCause {
             Self::Cancel => "cancel",
             Self::Shutdown => "shutdown",
             Self::Failed => "failed",
-            Self::Teardown => "teardown",
         }
     }
 }
@@ -99,6 +95,12 @@ pub(crate) enum StopOutcome {
 }
 
 impl StopOutcome {
+    /// Did anything happen to the tree? A signal that found an empty group did
+    /// not, and a line saying so would be pure noise.
+    fn is_event(self) -> bool {
+        self != Self::AlreadyGone
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             // SIGKILL reached a live process in the group. The verb is the act,
@@ -163,14 +165,20 @@ impl StopTrace {
     }
 
     pub(crate) fn stopped(&self, reason: KillReason, outcome: StopOutcome) {
-        // A stop is rare and is the only proof of what the connector did, so it
-        // is a lifecycle line: visible whatever verbosity the operator chose,
-        // including quiet, because silence here would read as "not us".
         #[cfg(test)]
         self.reports
             .lock()
             .expect("report list")
             .push((reason, outcome));
+        // Only something that happened belongs on the record. A group with
+        // nothing left in it writes no line: otherwise every sandboxed command,
+        // whose tree the namespace already took, would log a sweep of nothing.
+        if !outcome.is_event() {
+            return;
+        }
+        // A stop is rare and is the only proof of what dotlink did to a tree, so
+        // it is a lifecycle line: visible whatever verbosity the operator chose,
+        // including quiet, because silence here would read as "not us".
         self.log
             .notice("job", stop_message(&self.label, reason, outcome));
     }
@@ -473,39 +481,46 @@ mod tests {
         assert!(trace.reports().is_empty(), "an exit is not a stop");
     }
 
-    /// Every delivered kill is attributable, including the two that name no
-    /// cause. Otherwise `stopped_by` is absent for a kill dotlink performed, and
-    /// `external_signal` reads that absence as a stranger's SIGKILL — which is
-    /// how the journal and the result once contradicted each other.
+    /// Two facts, two homes: a kill that ended the command claims a cause on the
+    /// result, a sweep of leftovers is on the journal record only. Neither may
+    /// borrow the other's meaning, which is how one field came to answer two
+    /// questions at once.
     #[test]
-    fn every_delivered_kill_records_that_it_was_ours() {
-        for reason in [
-            KillReason::Timeout,
-            KillReason::Cancel,
-            KillReason::Shutdown,
-            KillReason::Failed,
-            KillReason::Cleanup,
-            KillReason::Dropped,
+    fn only_a_command_ending_claims_a_cause() {
+        for (reason, cause) in [
+            (KillReason::Timeout, StopCause::Timeout),
+            (KillReason::Cancel, StopCause::Cancel),
+            (KillReason::Shutdown, StopCause::Shutdown),
+            (KillReason::Failed, StopCause::Failed),
         ] {
-            assert!(
-                reason.claim().is_some(),
-                "{} must record that dotlink signalled",
-                reason.as_str()
-            );
+            assert_eq!(reason.claim(), Some(cause), "{reason:?}");
         }
-        // The two that end a tree rather than a command name no cause, but they
-        // still say the signal was ours.
         for reason in [KillReason::Cleanup, KillReason::Dropped] {
-            assert_eq!(reason.claim(), Some(StopCause::Teardown));
-            assert_eq!(reason.claim().map(StopCause::as_str), Some("teardown"));
+            assert_eq!(
+                reason.claim(),
+                None,
+                "{reason:?} ends a tree, not a command"
+            );
+            // Still on the record, so the kill is never a stranger's.
+            assert!(!reason.as_str().is_empty());
         }
     }
 
-    /// A group that is already empty is not a stop we performed: claiming one
-    /// would read as "dotlink killed your command" when the command had ended.
-    /// The contract a caller is told: descendants do not outlive the command.
-    /// A shell that backgrounds work and returns leaves that work in this tree,
-    /// so ending the tree after the command returns must reach it — and say so.
+    /// A signal that found nothing is not an event: no line, or every sandboxed
+    /// command's sweep would write one saying nothing happened.
+    #[test]
+    fn an_empty_group_writes_no_line() {
+        assert!(!StopOutcome::AlreadyGone.is_event());
+        assert!(StopOutcome::Delivered.is_event());
+        assert!(StopOutcome::Failed.is_event());
+    }
+
+    /// The contract a caller is told: a command's process group does not outlive
+    /// it. A shell that backgrounds work and returns leaves that work in the
+    /// group, so sweeping the tree after the command returns must reach it — and
+    /// say so on the record, without claiming to have ended the command. A
+    /// `setsid` descendant leaves the group and is out of reach; the contract is
+    /// the group, not the machine.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_descendant_outliving_the_command_is_ended_and_recorded() {
@@ -533,9 +548,8 @@ mod tests {
         tree.disarm();
 
         assert_eq!(
-            claimed,
-            Some(StopCause::Teardown),
-            "ending live leftovers is a signal dotlink delivered"
+            claimed, None,
+            "a sweep ends a tree, not the command, so it claims no cause"
         );
         assert_eq!(trace.reports(), vec![KillReason::Cleanup]);
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
@@ -587,15 +601,13 @@ mod tests {
         assert!(trace.reports().is_empty(), "{:?}", trace.reports());
     }
 
-    /// Every delivered kill is dotlink's, so every delivered kill must be able to
-    /// say so — including the two that end a tree rather than a command. Reading
-    /// "no cause" as "not ours" is how dotlink's own teardown became a report of a
-    /// stranger's SIGKILL.
+    /// The two ends of a kill are separate facts, so they are asserted
+    /// separately: a command-ending kill claims its cause on the result, and a
+    /// sweep is a journal line only. Conflating them is what once let a sweep
+    /// claim `teardown` on the wire and, when a sweep was refused the claim, read
+    /// as a stranger's SIGKILL.
     #[test]
-    fn a_teardown_kill_records_itself_instead_of_looking_external() {
-        for reason in [KillReason::Cleanup, KillReason::Dropped] {
-            assert_eq!(reason.claim(), Some(StopCause::Teardown), "{reason:?}");
-        }
+    fn a_sweep_is_recorded_without_claiming_a_cause() {
         // The four that end the command keep their own claim.
         for (reason, cause) in [
             (KillReason::Timeout, StopCause::Timeout),
@@ -605,29 +617,6 @@ mod tests {
         ] {
             assert_eq!(reason.claim(), Some(cause), "{reason:?}");
         }
-    }
-
-    /// The fail-safe is the last authority: dropping an armed guard kills the
-    /// group and records it. A guard that killed nothing claims nothing.
-    #[tokio::test]
-    async fn an_armed_guard_that_is_dropped_records_a_signal() {
-        let mut command = Command::new("sh");
-        configure(&mut command);
-        command.arg("-c").arg("sleep 30");
-        let mut child = command.spawn().unwrap();
-        let trace = StopTrace::new(
-            crate::logging::LogConfig::new(0, false, crate::logging::ColorMode::Never),
-            "job-dropped",
-        );
-        let guard = Guard::attach(&child, trace.clone()).unwrap();
-        drop(guard);
-        assert_eq!(
-            trace.reports(),
-            vec![KillReason::Dropped],
-            "a dropped armed guard must record the kill it performed"
-        );
-        let _ = child.kill().await;
-        let _ = child.wait().await;
     }
 
     #[test]

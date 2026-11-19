@@ -28,10 +28,10 @@ Both trees must agree afterwards: `main`'s mapping in `src/jobs.rs`
 
 ### 2. Stop cause — `stopped_by`
 
-`release/0.17` adds `stopped_by` (`timeout` | `cancel` | `shutdown` | `failed` |
-`teardown`, where `shutdown` means the connector withdrew the work rather than the
-caller, and `teardown` means dotlink ended the tree behind a command that had
-already exited) alongside
+`release/0.17` adds `stopped_by` (`timeout` | `cancel` | `shutdown` | `failed`,
+where `shutdown` means the connector withdrew the work rather than the caller) and
+it is absent when the command decided its own fate, including after a sweep of its
+leftovers — a sweep is a journal line, not a claim — alongside
 `signal`. Combined with `ProcessExit`'s own `Cancelled` / `DeadlineExceeded`
 variants on `main`, this is one concept expressed twice; the port should keep a
 single representation, not both. `main`'s `Unknown` case maps onto "dotlink did

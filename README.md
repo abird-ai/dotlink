@@ -425,21 +425,23 @@ including `-q` — so `-q` is not silence:
 [01:07:12.884] LOG  job        exit id=<job id> signal=SIGKILL from=outside
 ~~~
 
-They cover startup, restart, verbosity changes, and both ways a shell job can
-end: a `stop` line is a signal dotlink sent, an `exit` line a signal it did not.
-For `stop`, `reason` is `timeout`, `cancel` (the caller cancelled), `shutdown`
-(the connector is being torn down), `failed`, `cleanup` (a tree tidied up behind
-a command that had already ended) or `dropped` (the fail-safe), and `outcome`
-says whether that signal was delivered, found the group already gone, or failed.
-`exit` reports `from=outside` because the signal was not ours; it names no
-culprit, and a crash and a stranger's `kill -9` read the same there, which is why
-the signal name is printed.
+They cover startup, restart, verbosity changes, and what became of a shell job's
+processes: a `stop` line records a signal dotlink sent to the tree, an `exit` line
+a signal it did not. For `stop`, `reason` is `timeout`, `cancel` (the caller
+cancelled), `shutdown` (the connector is being torn down), `failed`, `leftovers`
+(the command had already ended and its tree was swept) or `fail-safe` (a guard was
+dropped while still armed), and `outcome` says what the signal did: `killed`
+reached a live process in the group, `refused` the kernel would not take it, and a
+group with nothing left in it writes no line at all. `exit` reports `from=outside`
+because the signal was not ours; it names no culprit, and a crash and a stranger's
+`kill -9` read the same there, which is why the signal name is printed.
 
-Exactly one of the two lines is written per job, so *absence* is evidence: a job
-with neither was never signalled at all. The reply says the same in its own
-fields — `stopped_by` names what dotlink ended (`teardown` for a tree it cleaned
-up behind an already-finished command), and `signal` names what something else
-did.
+The two lines answer different questions, so one job may carry one of each: `stop`
+says what dotlink did to a tree, `exit` says the command's own ending was somebody
+else's signal. A job with neither ended on its own, and no signal is unaccounted
+for. The reply keeps the same split — `stopped_by` names what dotlink *ended*
+(`timeout`/`cancel`/`shutdown`/`failed`) and is absent when the command decided its
+own fate, including after a sweep, while `signal` names what something else did.
 
 TOOL logs include bounded command previews plus complete path labels, methods, status, and latency; file contents, binary payloads, Runtime keys, and raw request bodies are not intentionally logged. Interactive `V` removes the command-preview cap while TOOL logging is active, so use it only when command text is safe to retain.
 

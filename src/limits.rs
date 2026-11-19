@@ -46,16 +46,22 @@ pub(crate) const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(DEFAULT_JOB_WA
 /// it stamps `ts` and the caller keeps its own clock.
 pub(crate) const TURN_CHECKPOINT_MINUTES: u64 = 35;
 
-/// The longest command a hosted caller may run: one turn horizon.
-pub(crate) const TURN_HORIZON_SECS: u64 = TURN_CHECKPOINT_MINUTES * 60;
+/// The longest command a bridge with a hosted transport may run: one conversation
+/// turn. Its own constant on purpose — the checkpoint advisory above is
+/// model-facing text, and re-tuning prompt wording must never move an execution
+/// limit or the job-authority fingerprint. That the two agree is asserted, so a
+/// deliberate change to either is a visible decision rather than a side effect.
+pub(crate) const HOSTED_SHELL_TIMEOUT_SECS: u64 = 35 * 60;
 
-/// The deadline this profile actually offers, on this surface. A hosted caller
-/// has a turn to report in, so a deadline past the horizon would promise an
-/// execution no turn can show; a stdio or local HTTP caller has no turn, so its
-/// deadline is the profile's alone.
+/// The deadline this runtime offers. A hosted caller has a turn to report in, so a
+/// deadline past one turn would promise an execution no turn can show. One machine
+/// serves every transport on the socket, and a tool schema is advertised once, so
+/// "hosted" is the tightest active transport: a stdio caller sharing a tunneled
+/// bridge sees the same ceiling, exactly as it already sees that bridge's response
+/// window. With no hosted transport the profile's ceiling stands alone.
 pub(crate) fn shell_timeout_ceiling(profile: u64, hosted: bool) -> u64 {
     if hosted {
-        profile.min(TURN_HORIZON_SECS)
+        profile.min(HOSTED_SHELL_TIMEOUT_SECS)
     } else {
         profile
     }
@@ -123,3 +129,26 @@ pub(crate) const MAX_JOB_TAIL_LINES: usize = 16;
 pub(crate) const DEFAULT_JOB_SPOOL_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MIN_JOB_SPOOL_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_JOB_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two numbers that must move together, and a test that says so out loud: a
+    /// deadline longer than the advertised turn horizon promises work no turn can
+    /// report, and a shorter one caps execution for no stated reason.
+    #[test]
+    fn the_hosted_deadline_is_one_advertised_turn_horizon() {
+        assert_eq!(HOSTED_SHELL_TIMEOUT_SECS, TURN_CHECKPOINT_MINUTES * 60);
+    }
+
+    #[test]
+    fn the_ceiling_bounds_only_a_hosted_runtime() {
+        assert_eq!(
+            shell_timeout_ceiling(3_600, true),
+            HOSTED_SHELL_TIMEOUT_SECS
+        );
+        assert_eq!(shell_timeout_ceiling(3_600, false), 3_600);
+        assert_eq!(shell_timeout_ceiling(600, true), 600);
+    }
+}
