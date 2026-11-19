@@ -120,7 +120,9 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     // Said once, on every surface: the command owns its tree's lifetime, not the
     // flag, and the script says how long that is.
-    let lifetime = "Background processes die with the command; keep one with `wait` inside a durable call (`server & wait`) — it runs until that exits, `timeout_secs`, or job_cancel.";
+    // The clause teaches the idiom; the bounds it used to repeat are already
+    // stated above as `timeout_secs` and in the follow-up as `job_cancel`.
+    let lifetime = "Background processes die with the command; keep one with `wait` in a durable call (`server & wait`).";
     // `ts` is a fact on every surface; the turn clock is not. A hosted caller
     // has a user turn to pace against, a local one has no such horizon, so
     // advertising one there would be a claim about a clock it never had.
