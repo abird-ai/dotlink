@@ -86,7 +86,7 @@ pub(crate) struct ShellArgs {
     #[serde(default)]
     pub(crate) max_output_bytes: Option<usize>,
 
-    /// Return the durable job handle instead of waiting. The execution is the same either way; this only chooses not to hold the request, which is what a build that outlives a response window wants.
+    /// Return the job handle at once instead of waiting; the execution is the same either way.
     #[serde(default)]
     pub(crate) background: bool,
 }
@@ -96,13 +96,13 @@ const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
-        "Hard execution deadline in seconds: on expiry the command tree is killed and the result reports stopped_by: \"timeout\". Defaults to {max_secs} (the ceiling). Not how long the caller waits — `background: true` returns at once and the command keeps running."
+        "Hard execution deadline in seconds: on expiry the command tree is killed and the result reports stopped_by: \"timeout\". Defaults to {max_secs} (the ceiling), never how long the caller waits."
     )
 }
 
 fn shell_output_description(max_bytes: usize) -> String {
     format!(
-        "Per-stream byte limit for the inline result. Defaults to the short page ({default}) and is capped at {max_bytes}; it never limits what the spool retains, so ask for more only when the result itself is needed.",
+        "Per-stream inline result limit. Defaults to {default}, capped at {max_bytes}; the spool retains more regardless, so raise it only when the result itself is needed.",
         default =
             super::human_bytes((crate::limits::DEFAULT_OUTPUT_PAGE_BYTES.min(max_bytes)) as u64),
         max_bytes = super::human_bytes(max_bytes as u64),
@@ -118,15 +118,20 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
         crate::jobs::shell_job_follow_up(None),
         crate::jobs::SHELL_JOB_DO_NOT_REPEAT
     );
+    // Said once, on every surface: the command owns its tree's lifetime, not the
+    // flag, and the script says how long that is.
+    let lifetime = "Background processes die with the command; keep one with `wait` inside a durable call (`server & wait`) — it runs until that exits, `timeout_secs`, or job_cancel.";
+    let tail = format!(
+        "{lifetime} `ts` = epoch seconds, {}-minute turn clock.",
+        crate::limits::TURN_CHECKPOINT_MINUTES
+    );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; reaching `timeout_secs` kills it; {follow_up}. Processes left in the background die when the command returns; to keep one running, `wait` for it inside a durable call (`background: true`, e.g. `server & wait`), which stays alive until it exits, `timeout_secs` expires, or you cancel the job. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
-            hold.as_secs(),
-            crate::limits::TURN_CHECKPOINT_MINUTES
+            "Run a {shell} command. Waits, then after at most {}s of response window returns a job handle and keeps running; `background: true` returns that handle at once; `timeout_secs` kills it; {follow_up}. {tail}",
+            hold.as_secs()
         ),
         None => format!(
-            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Processes left in the background die when the command returns; to keep one running, `wait` for it inside a durable call (`background: true`, e.g. `server & wait`), which stays alive until it exits, `timeout_secs` expires, or you cancel the job. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
-            crate::limits::TURN_CHECKPOINT_MINUTES
+            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` returns that execution's handle at once: {follow_up}. {tail}"
         ),
     }
 }
