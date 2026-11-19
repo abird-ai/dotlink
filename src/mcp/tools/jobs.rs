@@ -12,7 +12,11 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
+use aw_tools::{
+    budget::SerializedResultBytes,
+    execution_ref::JobRef,
+    receipt::{AckMode, Receipt, render_plain},
+};
 
 use super::{LocalMachine, graph, ok_text, tool_error};
 use crate::jobs::{
@@ -58,188 +62,125 @@ fn bounded_job_status(status: String, budget: Option<usize>) -> CallToolResult {
     )
 }
 
+fn result_fits(result: &CallToolResult, budget: Option<usize>) -> bool {
+    budget.is_none_or(|limit| {
+        crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
+    })
+}
+
 /// A launched Job must retain a complete model-visible continuation ref, even
-/// when its full status cannot fit the authenticated transport envelope.
-fn bounded_job_handoff(id: &str, status: String, budget: Option<usize>) -> CallToolResult {
-    let result = ok_text(status);
-    if budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(&result).is_some_and(|size| size <= limit)
-    }) {
-        return result;
+/// when its rich status cannot fit the authenticated transport envelope.
+fn bounded_job_handoff(
+    machine: &LocalMachine,
+    reference: &JobRef,
+    budget: Option<usize>,
+) -> CallToolResult {
+    let (id, node) = match job_ref_parts(reference) {
+        Ok(parts) => parts,
+        Err(error) => return tool_error(error),
+    };
+    if node.is_some() {
+        return tool_error("Job handoff requires a root Job ref");
     }
-    let concise = ok_text(format!("j:{id} next=jobs_get no-rerun"));
-    if budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(&concise).is_some_and(|size| size <= limit)
-    }) {
-        concise
-    } else {
-        tool_error(
-            "Job is already admitted, but its handoff exceeds the response budget; list Jobs to recover it without rerunning",
-        )
-    }
+    machine
+        .jobs
+        .standalone_handoff_fitted(id, |text| result_fits(&ok_text(text.to_owned()), budget))
+        .map(ok_text)
+        .unwrap_or_else(tool_error)
 }
 
 /// The replay ledger retains the original receipt. A narrower authenticated
 /// response may project the same Job ref compactly; it may never rerun work or
 /// silently clip away the continuation.
-fn bounded_replayed_job_handoff(cached: CallToolResult, budget: Option<usize>) -> CallToolResult {
-    if cached.is_error.unwrap_or(false)
-        || budget.is_none_or(|limit| {
-            crate::mcp::serialized_json_len(&cached).is_some_and(|size| size <= limit)
-        })
-    {
+fn bounded_replayed_job_handoff(
+    machine: &LocalMachine,
+    reference: &JobRef,
+    cached: CallToolResult,
+    budget: Option<usize>,
+) -> CallToolResult {
+    if cached.is_error.unwrap_or(false) || result_fits(&cached, budget) {
         return cached;
     }
-    let Some(status) = cached
-        .content
-        .iter()
-        .find_map(|block| block.as_text().map(|text| text.text.as_str()))
-    else {
-        return tool_error("Cached Job receipt has no continuation; list Jobs, do not rerun");
-    };
-    let Some(reference) = status.split_whitespace().next() else {
-        return tool_error("Cached Job receipt has no continuation; list Jobs, do not rerun");
-    };
     let meta = cached.meta.clone();
-    let fits = |result: &CallToolResult| {
-        budget.is_none_or(|limit| {
-            crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
-        })
-    };
-    match parse_ref(reference) {
-        Ok(StandaloneRef { id, node: None }) => {
-            let mut full = ok_text(status.to_owned());
-            full.meta = meta.clone();
-            if fits(&full) {
-                return full;
-            }
-            let mut concise = ok_text(format!("j:{id} next=jobs_get no-rerun"));
-            concise.meta = meta.clone();
-            if fits(&concise) {
-                concise
-            } else {
-                let mut error = tool_error(
-                    "Job is already admitted, but its replay handoff exceeds the response budget; list Jobs to recover it without rerunning",
-                );
-                error.meta = meta;
-                error
-            }
+    let (id, node) = match job_ref_parts(reference) {
+        Ok(parts) => parts,
+        Err(error) => {
+            let mut error = tool_error(error);
+            error.meta = meta;
+            return error;
         }
-        _ => {
-            let mut error = tool_error("Cached Job reference is invalid; list Jobs, do not rerun");
+    };
+    if node.is_some() {
+        let mut error = tool_error("Cached Job handoff is not a root Job; list Jobs, do not rerun");
+        error.meta = meta;
+        return error;
+    }
+    match machine.jobs.standalone_handoff_fitted(id, |text| {
+        let mut projected = ok_text(text.to_owned());
+        projected.meta = meta.clone();
+        result_fits(&projected, budget)
+    }) {
+        Ok(text) => {
+            let mut projected = ok_text(text);
+            projected.meta = meta;
+            projected
+        }
+        Err(_) => {
+            let mut error = tool_error(
+                "Job is already admitted, but its replay handoff exceeds the response budget; list Jobs to recover it without rerunning",
+            );
             error.meta = meta;
             error
         }
     }
 }
 
-#[derive(Clone, Copy)]
-enum ControlReceipt {
-    AckThrough(u64),
-    Finish,
-    Cancel,
-}
-
 fn bounded_control_success(
-    reference: &StandaloneRef,
-    status: String,
-    effect: ControlReceipt,
+    reference: &JobRef,
+    receipt: String,
     budget: Option<usize>,
 ) -> CallToolResult {
-    let result = ok_text(status);
-    let fits = |result: &CallToolResult| {
-        budget.is_none_or(|limit| {
-            crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
-        })
-    };
-    if fits(&result) {
+    let result = ok_text(receipt);
+    if result_fits(&result, budget) {
         return result;
     }
-    let reference = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
-    let receipt = match effect {
-        ControlReceipt::AckThrough(through) => {
-            format!("{reference} ack=through:{through} next=jobs_get no-rerun")
-        }
-        ControlReceipt::Finish => format!("{reference} ack=finish next=jobs_get no-rerun"),
-        ControlReceipt::Cancel => format!("{reference} cancel=accepted next=jobs_get no-rerun"),
-    };
-    let compact = ok_text(receipt);
-    if fits(&compact) {
-        compact
-    } else {
-        tool_error(format!(
-            "{reference} Job Control effect already applied, but its receipt exceeds the response budget; inspect with jobs_get before retrying"
-        ))
-    }
+    tool_error(format!(
+        "{reference} Job Control effect already applied, but its receipt exceeds the response budget; inspect with jobs_get before retrying"
+    ))
 }
 
 /// Reproject the original completed effect; never mutate its replay receipt
 /// or convert an error into a successful Control acknowledgement.
 fn bounded_control_replay(
     cached: CallToolResult,
-    reference: &StandaloneRef,
-    effect: ControlReceipt,
+    reference: &JobRef,
     budget: Option<usize>,
 ) -> CallToolResult {
     if cached.is_error.unwrap_or(false) {
         return cached;
     }
-    let expected = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
-    let Some(status) = cached
-        .content
-        .iter()
-        .find_map(|block| block.as_text().map(|text| text.text.as_str()))
-    else {
-        return tool_error("Cached Control outcome is unverified; inspect the Job before retrying");
-    };
-    if status.split_whitespace().next() != Some(expected.as_str()) {
-        return tool_error("Cached Control Job identity differs; inspect the Job before retrying");
-    }
-    if budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(&cached).is_some_and(|size| size <= limit)
-    }) {
+    if result_fits(&cached, budget) {
         return cached;
     }
-    let receipt = match effect {
-        ControlReceipt::AckThrough(through) => {
-            format!("{expected} ack=through:{through} next=jobs_get no-rerun")
-        }
-        ControlReceipt::Finish => format!("{expected} ack=finish next=jobs_get no-rerun"),
-        ControlReceipt::Cancel => format!("{expected} cancel=accepted next=jobs_get no-rerun"),
-    };
-    let mut compact = ok_text(receipt);
-    compact.meta = cached.meta.clone();
-    if budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(&compact).is_some_and(|size| size <= limit)
-    }) {
-        compact
-    } else {
-        let mut error = tool_error(format!(
-            "{expected} Job Control effect already applied, but its replay receipt exceeds the response budget; inspect with jobs_get before retrying"
-        ));
-        error.meta = cached.meta;
-        error
-    }
+    let mut error = tool_error(format!(
+        "{reference} Job Control effect already applied, but its replay receipt exceeds the response budget; inspect with jobs_get before retrying"
+    ));
+    error.meta = cached.meta;
+    error
 }
 
 /// A completed stdin write must never become an ambiguously truncated
 /// success. The minimal receipt deliberately avoids claiming a new revision.
 fn bounded_send_result(
-    reference: &StandaloneRef,
+    reference: &JobRef,
     original: CallToolResult,
     budget: Option<usize>,
 ) -> CallToolResult {
-    let fits = |result: &CallToolResult| {
-        budget.is_none_or(|limit| {
-            crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
-        })
-    };
-    if fits(&original) {
+    if result_fits(&original, budget) {
         return original;
     }
-    let reference = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
     let compact = ok_text(format!("{reference} sent"));
-    if fits(&compact) {
+    if result_fits(&compact, budget) {
         compact
     } else {
         tool_error(format!(
@@ -249,55 +190,23 @@ fn bounded_send_result(
 }
 
 fn bounded_send_replay(
-    reference: &StandaloneRef,
+    reference: &JobRef,
     cached: CallToolResult,
     budget: Option<usize>,
 ) -> CallToolResult {
     if cached.is_error.unwrap_or(false) {
         return cached;
     }
-    let expected = crate::jobs::JobManager::standalone_ref(&reference.id, reference.node);
-    let Some(text) = cached
-        .content
-        .iter()
-        .find_map(|block| block.as_text().map(|text| text.text.as_str()))
-    else {
-        return tool_error("Cached stdin receipt is unverified; inspect Job, do not resend");
-    };
-    let mut tokens = text.split_whitespace();
-    if tokens.next() != Some(expected.as_str()) {
-        return tool_error("Cached stdin Job identity differs; inspect Job, do not resend");
-    }
-    let next = tokens.next();
-    let valid = match next {
-        Some("sent") => tokens.next().is_none(),
-        Some(revision) => {
-            revision
-                .strip_prefix("rev=")
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some()
-                && tokens.next() == Some("ok")
-                && tokens.next().is_none()
-        }
-        None => false,
-    };
-    if !valid {
-        return tool_error("Cached stdin outcome is unverified; inspect Job, do not resend");
-    }
-    if budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(&cached).is_some_and(|size| size <= limit)
-    }) {
+    if result_fits(&cached, budget) {
         return cached;
     }
-    let mut compact = ok_text(format!("{expected} sent"));
+    let mut compact = ok_text(format!("{reference} sent"));
     compact.meta = cached.meta.clone();
-    if budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(&compact).is_some_and(|size| size <= limit)
-    }) {
+    if result_fits(&compact, budget) {
         compact
     } else {
         let mut error = tool_error(format!(
-            "{expected} stdin was already accepted, but its replay receipt exceeds the response budget; inspect with jobs_get, do not resend"
+            "{reference} stdin was already accepted, but its replay receipt exceeds the response budget; inspect with jobs_get, do not resend"
         ));
         error.meta = cached.meta;
         error
@@ -308,6 +217,7 @@ fn complete_remote_start_result(
     machine: &LocalMachine,
     operation: aw_tools::OperationId,
     guard: Option<RemoteStartGuard>,
+    reference: &JobRef,
     mut result: CallToolResult,
 ) -> CallToolResult {
     let Some(guard) = guard else {
@@ -317,12 +227,18 @@ fn complete_remote_start_result(
         let fallback = tool_error(format!(
             "remote Start effect completed but its timestamp receipt could not be finalized: {error}; inspect the Job before retrying"
         ));
-        return match guard.mark_ready(RemoteStartReceipt::Mcp(fallback.clone())) {
+        return match guard.mark_ready(RemoteStartReceipt::JobMcp {
+            reference: reference.clone(),
+            result: fallback.clone(),
+        }) {
             Ok(()) => fallback,
             Err(cache_error) => tool_error(cache_error),
         };
     }
-    match guard.mark_ready(RemoteStartReceipt::Mcp(result.clone())) {
+    match guard.mark_ready(RemoteStartReceipt::JobMcp {
+        reference: reference.clone(),
+        result: result.clone(),
+    }) {
         Ok(()) => result,
         Err(error) => tool_error(error),
     }
@@ -349,6 +265,7 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
     if name != "jobs_read" {
         return;
     }
+    let profile = crate::jobs::dotlink_job_profile(max_output_bytes);
     let mut schema = (*tool.input_schema).clone();
     let Some(properties) = schema
         .get_mut("properties")
@@ -364,43 +281,36 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Maximum retained raw bytes for this page. Defaults to the profile output ceiling, may be as small as 1 byte and is capped at {max_output_bytes}."
+                "Maximum retained raw bytes for this page. Defaults to {} bytes, may be as small as 1 byte and is capped at {}.",
+                profile.read_page_default_bytes,
+                profile.read_page_max_bytes
             )),
         );
         property.insert("minimum".to_owned(), serde_json::Value::from(1));
         property.insert(
             "maximum".to_owned(),
-            serde_json::Value::from(max_output_bytes),
+            serde_json::Value::from(profile.read_page_max_bytes),
+        );
+        property.insert(
+            "default".to_owned(),
+            serde_json::Value::from(profile.read_page_default_bytes),
         );
     }
     tool.input_schema = std::sync::Arc::new(schema);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StandaloneRef {
-    id: String,
-    node: Option<usize>,
+fn parse_ref(reference: &str) -> Result<JobRef, String> {
+    JobRef::parse(reference).map_err(|_| "invalid finite Job ref".into())
 }
 
-fn parse_ref(reference: &str) -> Result<StandaloneRef, String> {
-    if !reference.starts_with("j:") {
-        return Err("standalone Job ref must start with j:".into());
-    }
-    let resolved = ExecutionRef::parse(reference)
-        .map_err(|_| "invalid standalone Job ref".to_owned())?
-        .resolve(None, None)
-        .map_err(|_| "invalid standalone Job ref".to_owned())?;
-    match resolved.suffix() {
-        [ExecutionSegment::Job(job)] => Ok(StandaloneRef {
-            id: job.as_str().to_owned(),
-            node: None,
-        }),
-        [ExecutionSegment::Job(job), ExecutionSegment::Node(node)] => Ok(StandaloneRef {
-            id: job.as_str().to_owned(),
-            node: Some(node.get() as usize),
-        }),
-        _ => Err("standalone Job ref supports only j:<handle>[/n:<coordinate>]".into()),
-    }
+fn job_ref_parts(reference: &JobRef) -> Result<(&str, Option<usize>), String> {
+    let node = reference
+        .node()
+        .map(|node| {
+            usize::try_from(node.get()).map_err(|_| "Job node coordinate is unsupported".to_owned())
+        })
+        .transpose()?;
+    Ok((reference.job().as_str(), node))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -539,12 +449,13 @@ impl LocalMachine {
         deadline: Option<tokio::time::Instant>,
         result_budget: Option<usize>,
     ) -> CallToolResult {
+        let reference = match crate::jobs::JobManager::standalone_ref(id, None) {
+            Ok(reference) => reference,
+            Err(error) => return tool_error(error),
+        };
         match self.jobs.wait_until(id, deadline).await {
             Ok(JobWait::Pending) => match self.jobs.expose_compatibility(id) {
-                Ok(_) => match self.jobs.standalone_status(id, None) {
-                    Ok((_, status)) => bounded_job_handoff(id, status, result_budget),
-                    Err(error) => tool_error(error),
-                },
+                Ok(_) => bounded_job_handoff(self, &reference, result_budget),
                 Err(error) => tool_error(error),
             },
             Err(error) => tool_error(error),
@@ -560,10 +471,7 @@ impl LocalMachine {
                             crate::mcp::serialized_json_len(&result).is_none_or(|size| size > limit)
                         }) {
                             let _ = self.jobs.expose_compatibility(id);
-                            return match self.jobs.standalone_status(id, None) {
-                                Ok((_, status)) => bounded_job_handoff(id, status, result_budget),
-                                Err(error) => tool_error(error),
-                            };
+                            return bounded_job_handoff(self, &reference, result_budget);
                         }
                         match self.jobs.mark_synchronous_result(id) {
                             Ok(_) => result,
@@ -572,10 +480,7 @@ impl LocalMachine {
                     }
                     Ok(None) => {
                         let _ = self.jobs.expose_compatibility(id);
-                        match self.jobs.standalone_status(id, None) {
-                            Ok((_, status)) => bounded_job_handoff(id, status, result_budget),
-                            Err(error) => tool_error(error),
-                        }
+                        bounded_job_handoff(self, &reference, result_budget)
                     }
                     Err(error) => tool_error(error),
                 }
@@ -592,9 +497,8 @@ impl LocalMachine {
             Ok(None) => None,
             Err(error) => Some(tool_error(error)),
             Ok(Some(JobHandoff::Compatibility(_))) => Some(
-                self.jobs
-                    .standalone_status(id, None)
-                    .map(|(_, status)| bounded_job_handoff(id, status, result_budget))
+                crate::jobs::JobManager::standalone_ref(id, None)
+                    .map(|reference| bounded_job_handoff(self, &reference, result_budget))
                     .unwrap_or_else(tool_error),
             ),
             Ok(Some(JobHandoff::Synchronous)) => {
@@ -653,8 +557,14 @@ impl LocalMachine {
             // topology/policy revalidation. A duplicate successful Start must
             // return its original receipt even if the workspace has changed.
             let guard = match self.jobs.claim_remote_start(&start) {
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp {
+                    reference,
+                    result,
+                })) => {
+                    return bounded_replayed_job_handoff(self, &reference, result, result_budget);
+                }
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return bounded_replayed_job_handoff(result, result_budget);
+                    return result;
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -678,18 +588,19 @@ impl LocalMachine {
                     return tool_error(error);
                 }
             };
-            let status = match self.jobs.standalone_status(&started.id, None) {
-                Ok((_, status)) => status,
+            let reference = match crate::jobs::JobManager::standalone_ref(&started.id, None) {
+                Ok(reference) => reference,
                 Err(error) => {
                     guard.mark_unknown();
                     return tool_error(error);
                 }
             };
-            let result = bounded_job_handoff(&started.id, status, result_budget);
+            let result = bounded_job_handoff(self, &reference, result_budget);
             return complete_remote_start_result(
                 self,
                 aw_tools::OperationId::Batch,
                 Some(guard),
+                &reference,
                 result,
             );
         }
@@ -708,8 +619,8 @@ impl LocalMachine {
             return response;
         }
         if background {
-            return match self.jobs.standalone_status(&started.id, None) {
-                Ok((_, status)) => bounded_job_handoff(&started.id, status, result_budget),
+            return match crate::jobs::JobManager::standalone_ref(&started.id, None) {
+                Ok(reference) => bounded_job_handoff(self, &reference, result_budget),
                 Err(error) => tool_error(error),
             };
         }
@@ -778,6 +689,10 @@ impl LocalMachine {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
+        let (id, node) = match job_ref_parts(&reference) {
+            Ok(parts) => parts,
+            Err(error) => return tool_error(error),
+        };
         let wait_ms = args.wait_ms.unwrap_or(0);
         if wait_ms > DOTLINK_JOB_PROFILE.get_wait_max_ms {
             return tool_error(format!(
@@ -799,21 +714,16 @@ impl LocalMachine {
             .request_result_budget(&context)
             .unwrap_or(self.config.max_output_bytes)
             .min(self.config.max_output_bytes);
-        match self
-            .jobs
-            .standalone_get(&reference.id, reference.node, args.rev, wait_ms)
-            .await
-        {
-            Ok(status) => match self.jobs.standalone_process_tail(
-                &reference.id,
-                reference.node,
-                args.tail,
-                status,
-                result_budget,
-            ) {
-                Ok(status) => bounded_job_status(status, Some(result_budget)),
-                Err(error) => tool_error(error),
-            },
+        match self.jobs.standalone_get(id, node, args.rev, wait_ms).await {
+            Ok(status) => {
+                match self
+                    .jobs
+                    .standalone_process_tail(id, node, args.tail, status, result_budget)
+                {
+                    Ok(status) => bounded_job_status(status, Some(result_budget)),
+                    Err(error) => tool_error(error),
+                }
+            }
             Err(error) => tool_error(error),
         }
     }
@@ -843,37 +753,43 @@ impl LocalMachine {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
+        let (id, node) = match job_ref_parts(&reference) {
+            Ok(parts) => parts,
+            Err(error) => return tool_error(error),
+        };
         let profile = crate::jobs::dotlink_job_profile(self.config.max_output_bytes);
-        let ceiling = match args.limit {
-            Some(0) => return tool_error("jobs_read limit must be at least 1"),
-            Some(limit) if limit > profile.read_page_max_bytes => {
+        let raw_page = match profile.resolve_read_page(args.limit) {
+            Ok(raw_page) => raw_page,
+            Err(_) => {
                 return tool_error(format!(
-                    "jobs_read limit exceeds {}",
+                    "jobs_read limit must be within 1..={}",
                     profile.read_page_max_bytes
                 ));
             }
-            Some(limit) => limit,
-            None => profile.read_page_default_bytes,
         };
         // Raw page bytes and serialized response bytes are independent
         // budgets. In particular, a one-byte raw page still needs room for its
         // JSON/MCP envelope. Trusted transports may narrow the serialized
         // result; local/stdio callers fall back to the same profile-derived
         // response capacity used by the transport configuration.
-        let response_ceiling = self
-            .request_result_budget(&context)
-            .unwrap_or_else(|| self.max_response_body_bytes());
+        let response_ceiling = match SerializedResultBytes::new(
+            self.request_result_budget(&context)
+                .unwrap_or_else(|| self.max_response_body_bytes()),
+        ) {
+            Some(response_ceiling) => response_ceiling,
+            None => return tool_error("jobs_read response budget must be at least 1 byte"),
+        };
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
         let wait_ms = bounded_wait_ms(
             args.wait_ms.unwrap_or(0),
             self.request_sync_budget_millis(&context),
         );
-        let is_graph = match self.jobs.standalone_is_graph(&reference.id) {
+        let is_graph = match self.jobs.standalone_is_graph(id) {
             Ok(value) => value,
             Err(error) => return tool_error(error),
         };
-        if is_graph && reference.node.is_none() {
+        if is_graph && node.is_none() {
             if args
                 .view
                 .is_some_and(|view| !matches!(view, ReadView::Result))
@@ -885,9 +801,9 @@ impl LocalMachine {
             return match self
                 .jobs
                 .standalone_graph_result_page_wait(
-                    &reference.id,
+                    id,
                     offset,
-                    ceiling,
+                    raw_page,
                     response_ceiling,
                     base64,
                     wait_ms,
@@ -901,12 +817,12 @@ impl LocalMachine {
         match self
             .jobs
             .output_node_page_wait(
-                &reference.id,
+                id,
                 crate::jobs::OutputPageRequest {
-                    node: reference.node,
+                    node,
                     stream: args.view.map(Into::into),
                     offset,
-                    requested_bytes: ceiling,
+                    requested_bytes: raw_page,
                     response_ceiling,
                     base64,
                 },
@@ -943,18 +859,32 @@ impl LocalMachine {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
-        let effect = args
-            .offset
-            .map(ControlReceipt::AckThrough)
-            .unwrap_or(ControlReceipt::Finish);
+        let (id, node) = match job_ref_parts(&reference) {
+            Ok(parts) => parts,
+            Err(error) => return tool_error(error),
+        };
+        let mode = args.offset.map(AckMode::Through).unwrap_or(AckMode::Finish);
         let remote_start = context
             .extensions
             .get::<crate::remote_start::ValidatedRemoteStart>()
             .cloned();
         let guard = if let Some(start) = remote_start.as_ref() {
             match self.jobs.claim_remote_start(start) {
-                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return bounded_control_replay(result, &reference, effect, result_budget);
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp {
+                    reference: cached_reference,
+                    result,
+                })) => {
+                    if cached_reference != reference {
+                        return tool_error(
+                            "Cached Job Control identity differs; inspect the Job before retrying",
+                        );
+                    }
+                    return bounded_control_replay(result, &reference, result_budget);
+                }
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(_))) => {
+                    return tool_error(
+                        "Cached Job Control outcome lacks typed identity; inspect the Job before retrying",
+                    );
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -968,34 +898,56 @@ impl LocalMachine {
             None
         };
         let applied = match args.offset {
-            Some(offset) => self.jobs.acknowledge_node_output(
-                &reference.id,
-                reference.node,
-                args.view.map(Into::into),
-                offset,
-            ),
-            None => self.jobs.finish_node_output(
-                &reference.id,
-                reference.node,
-                args.view.map(Into::into),
-            ),
-        };
-        let outcome = match applied {
-            Ok(_) => self
-                .jobs
-                .standalone_status(&reference.id, reference.node)
-                .map(|(_, status)| status)
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
-        };
-        match outcome {
-            Ok(text) => {
-                let result = bounded_control_success(&reference, text, effect, result_budget);
-                complete_remote_start_result(self, aw_tools::OperationId::JobsAck, guard, result)
+            Some(offset) => {
+                self.jobs
+                    .acknowledge_node_output(id, node, args.view.map(Into::into), offset)
             }
-            Err(text) => {
-                let result = tool_error(text);
-                complete_remote_start_result(self, aw_tools::OperationId::JobsAck, guard, result)
+            None => self
+                .jobs
+                .finish_node_output(id, node, args.view.map(Into::into)),
+        };
+        match applied {
+            Ok(ack) => {
+                let receipt = match render_plain(
+                    Receipt::Ack {
+                        reference: &reference,
+                        mode,
+                        changed: ack.changed,
+                        released: ack.released,
+                    },
+                    aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let result =
+                            tool_error(format!("cannot render typed Job ACK receipt: {error:?}"));
+                        return complete_remote_start_result(
+                            self,
+                            aw_tools::OperationId::JobsAck,
+                            guard,
+                            &reference,
+                            result,
+                        );
+                    }
+                };
+                let result = bounded_control_success(&reference, receipt, result_budget);
+                complete_remote_start_result(
+                    self,
+                    aw_tools::OperationId::JobsAck,
+                    guard,
+                    &reference,
+                    result,
+                )
+            }
+            Err(error) => {
+                let result = tool_error(error);
+                complete_remote_start_result(
+                    self,
+                    aw_tools::OperationId::JobsAck,
+                    guard,
+                    &reference,
+                    result,
+                )
             }
         }
     }
@@ -1044,14 +996,31 @@ impl LocalMachine {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
+        let (id, node) = match job_ref_parts(&reference) {
+            Ok(parts) => parts,
+            Err(error) => return tool_error(error),
+        };
         let input = match args.input.into_process() {
             Ok(input) => input,
             Err(error) => return tool_error(error),
         };
         let guard = if let Some(start) = remote_start.as_ref() {
             match self.jobs.claim_remote_start(start) {
-                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp {
+                    reference: cached_reference,
+                    result,
+                })) => {
+                    if cached_reference != reference {
+                        return tool_error(
+                            "Cached stdin Job identity differs; inspect Job, do not resend",
+                        );
+                    }
                     return bounded_send_replay(&reference, result, result_budget);
+                }
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(_))) => {
+                    return tool_error(
+                        "Cached stdin outcome lacks typed identity; inspect Job, do not resend",
+                    );
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -1066,10 +1035,7 @@ impl LocalMachine {
         };
         // Do not send irreversible stdin unless a complete confirmation can
         // fit. An existing replay was inspected above, before this preflight.
-        let minimal = ok_text(format!(
-            "{} sent",
-            crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
-        ));
+        let minimal = ok_text(format!("{reference} sent"));
         if result_budget.is_some_and(|limit| {
             crate::mcp::serialized_json_len(&minimal).is_none_or(|size| size > limit)
         }) {
@@ -1081,21 +1047,29 @@ impl LocalMachine {
             );
         }
         match self
-            .send_process_input_checked(&reference.id, reference.node, args.rev, input)
+            .send_process_input_checked(id, node, args.rev, input)
             .await
         {
             Ok(revision) => {
-                let full = ok_text(format!(
-                    "{} rev={revision} ok",
-                    crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
-                ));
+                let full = ok_text(format!("{reference} rev={revision} ok"));
                 let result = bounded_send_result(&reference, full, result_budget);
-                complete_remote_start_result(self, aw_tools::OperationId::JobsSend, guard, result)
+                complete_remote_start_result(
+                    self,
+                    aw_tools::OperationId::JobsSend,
+                    guard,
+                    &reference,
+                    result,
+                )
             }
             Err(error) => {
-                let text = error.to_string();
-                let result = tool_error(text);
-                complete_remote_start_result(self, aw_tools::OperationId::JobsSend, guard, result)
+                let result = tool_error(error);
+                complete_remote_start_result(
+                    self,
+                    aw_tools::OperationId::JobsSend,
+                    guard,
+                    &reference,
+                    result,
+                )
             }
         }
     }
@@ -1110,17 +1084,29 @@ impl LocalMachine {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
-        if reference.node.is_some() {
+        let (id, node) = match job_ref_parts(&reference) {
+            Ok(parts) => parts,
+            Err(error) => return tool_error(error),
+        };
+        if node.is_some() {
             return tool_error("standalone jobs_cancel targets a Job root, not a Graph node");
         }
         let guard = if let Some(start) = remote_start.as_ref() {
             match self.jobs.claim_remote_start(start) {
-                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
-                    return bounded_control_replay(
-                        result,
-                        &reference,
-                        ControlReceipt::Cancel,
-                        result_budget,
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp {
+                    reference: cached_reference,
+                    result,
+                })) => {
+                    if cached_reference != reference {
+                        return tool_error(
+                            "Cached cancellation Job identity differs; inspect the Job before retrying",
+                        );
+                    }
+                    return bounded_control_replay(result, &reference, result_budget);
+                }
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(_))) => {
+                    return tool_error(
+                        "Cached cancellation outcome lacks typed identity; inspect the Job before retrying",
                     );
                 }
                 Ok(RemoteStartDecision::Unknown) => {
@@ -1138,52 +1124,48 @@ impl LocalMachine {
         // first cancellation may itself advance the Job revision, so an exact
         // duplicate remote Start must return the original receipt rather than
         // being reinterpreted as a fresh stale-revision request.
-        if let Some(expected) = args.rev {
-            let (current, _) = match self.jobs.standalone_status(&reference.id, None) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    let result = tool_error(error);
-                    return complete_remote_start_result(
-                        self,
-                        aw_tools::OperationId::JobsCancel,
-                        guard,
-                        result,
-                    );
-                }
-            };
-            if expected != current {
-                let result = tool_error(format!(
-                    "stale Job revision: expected {expected}, current {current}"
-                ));
-                return complete_remote_start_result(
+        match self.jobs.standalone_cancel_checked(id, args.rev) {
+            Ok((changed, revision)) => {
+                let receipt = match render_plain(
+                    Receipt::Cancel {
+                        reference: &reference,
+                        revision,
+                        changed,
+                    },
+                    aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let result = tool_error(format!(
+                            "cannot render typed Job cancellation receipt: {error:?}"
+                        ));
+                        return complete_remote_start_result(
+                            self,
+                            aw_tools::OperationId::JobsCancel,
+                            guard,
+                            &reference,
+                            result,
+                        );
+                    }
+                };
+                let result = bounded_control_success(&reference, receipt, result_budget);
+                complete_remote_start_result(
                     self,
                     aw_tools::OperationId::JobsCancel,
                     guard,
-                    result,
-                );
-            }
-        }
-        let outcome = match self.jobs.cancel(&reference.id) {
-            Ok(_) => self
-                .jobs
-                .standalone_status(&reference.id, None)
-                .map(|(_, status)| status)
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
-        };
-        match outcome {
-            Ok(text) => {
-                let result = bounded_control_success(
                     &reference,
-                    text,
-                    ControlReceipt::Cancel,
-                    result_budget,
-                );
-                complete_remote_start_result(self, aw_tools::OperationId::JobsCancel, guard, result)
+                    result,
+                )
             }
-            Err(text) => {
-                let result = tool_error(text);
-                complete_remote_start_result(self, aw_tools::OperationId::JobsCancel, guard, result)
+            Err(error) => {
+                let result = tool_error(error);
+                complete_remote_start_result(
+                    self,
+                    aw_tools::OperationId::JobsCancel,
+                    guard,
+                    &reference,
+                    result,
+                )
             }
         }
     }
@@ -1221,6 +1203,14 @@ impl LocalMachine {
 mod tests {
     use super::*;
 
+    fn raw(bytes: usize) -> aw_tools::budget::RawPageBytes {
+        aw_tools::budget::RawPageBytes::new(bytes).expect("test raw page budget")
+    }
+
+    fn serialized(bytes: usize) -> SerializedResultBytes {
+        SerializedResultBytes::new(bytes).expect("test serialized result budget")
+    }
+
     fn test_toolset(max_output_bytes: usize) -> aw_tools::toolset::Toolset {
         crate::mcp::tools::shared_native::toolset(
             aw_tools::filesystem::schema::SchemaCaps::default(),
@@ -1238,24 +1228,31 @@ mod tests {
     }
 
     #[test]
-    fn standalone_refs_are_explicit_and_node_coordinates_are_canonical() {
+    fn standalone_refs_use_the_shared_finite_job_ref_grammar() {
+        let root = parse_ref("j:abc-123").unwrap();
+        assert_eq!(root.job().as_str(), "abc-123");
+        assert_eq!(root.node(), None);
+        assert_eq!(root.to_string(), "j:abc-123");
+
+        let node = parse_ref("j:abc-123/n:4").unwrap();
+        assert_eq!(node.job().as_str(), "abc-123");
+        assert_eq!(node.node().map(|node| node.get()), Some(4));
+        assert_eq!(node.to_string(), "j:abc-123/n:4");
         assert_eq!(
-            parse_ref("j:abc-123").unwrap(),
-            StandaloneRef {
-                id: "abc-123".into(),
-                node: None
-            }
+            crate::jobs::JobManager::standalone_ref("abc-123", Some(4))
+                .unwrap()
+                .to_string(),
+            node.to_string(),
+            "trusted internal construction and model parsing must share one grammar"
         );
-        assert_eq!(
-            parse_ref("j:abc-123/n:4").unwrap(),
-            StandaloneRef {
-                id: "abc-123".into(),
-                node: Some(4)
-            }
-        );
+
         for invalid in ["", ".", "^", "abc", "j:", "j:x/n:0", "j:x/n:01", "j:x/x:1"] {
             assert!(parse_ref(invalid).is_err(), "{invalid}");
         }
+        let hostile = format!("j:{}", "x".repeat(32 * 1024));
+        let error = parse_ref(&hostile).unwrap_err();
+        assert_eq!(error, "invalid finite Job ref");
+        assert!(!error.contains(&hostile));
     }
 
     #[test]
@@ -1464,8 +1461,8 @@ mod tests {
                     node: Some(2),
                     stream: Some(crate::jobs::JobOutputStream::Result),
                     offset: 0,
-                    requested_bytes: 64,
-                    response_ceiling: 4096,
+                    requested_bytes: raw(64),
+                    response_ceiling: serialized(4096),
                     base64: false,
                 },
                 1200,
@@ -1519,8 +1516,8 @@ mod tests {
             node: None,
             stream: Some(crate::jobs::JobOutputStream::Stdout),
             offset,
-            requested_bytes: 128,
-            response_ceiling: 4096,
+            requested_bytes: raw(128),
+            response_ceiling: serialized(4096),
             base64: false,
         };
         let page = machine
@@ -1576,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn status_budget_never_returns_truncated_success_and_handoff_keeps_ref() {
+    fn status_budget_never_returns_truncated_success() {
         let full = "j:example node settled rev=12 ".to_owned() + &"status-output".repeat(800);
         let success = ok_text(full.clone());
         let exact = crate::mcp::serialized_json_len(&success).unwrap();
@@ -1584,28 +1581,15 @@ mod tests {
         assert!(!accepted.is_error.unwrap_or(false));
         assert_eq!(accepted.content[0].as_text().unwrap().text, full);
 
-        let oversized = bounded_job_status(full.clone(), Some(512));
+        let oversized = bounded_job_status(full, Some(512));
         assert!(oversized.is_error.unwrap_or(false));
         let message = &oversized.content[0].as_text().unwrap().text;
         assert!(message.contains("exceeds the response budget"));
         assert!(!message.contains("status-output"));
-
-        let id = "20261116-abc";
-        let concise = format!("j:{id} next=jobs_get no-rerun");
-        let concise_size = crate::mcp::serialized_json_len(&ok_text(concise.clone())).unwrap();
-        let admitted = bounded_job_handoff(id, full.clone(), Some(concise_size));
-        assert!(!admitted.is_error.unwrap_or(false));
-        assert_eq!(admitted.content[0].as_text().unwrap().text, concise);
-        assert!(crate::mcp::serialized_json_len(&admitted).unwrap() <= concise_size);
-        let impossible = bounded_job_handoff(id, full, Some(concise_size - 1));
-        assert!(
-            impossible.is_error.unwrap_or(false),
-            "cannot fake a partial handoff"
-        );
     }
 
     #[tokio::test]
-    async fn large_graph_result_handoff_keeps_exact_ref_under_small_budget() {
+    async fn large_graph_result_handoff_keeps_typed_ref_under_small_budget() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("large.txt"), "long-line ".repeat(2048)).unwrap();
@@ -1618,20 +1602,33 @@ mod tests {
             .await
             .unwrap();
         machine.jobs.wait_until(&started.id, None).await.unwrap();
-        let concise = format!("j:{} next=jobs_get no-rerun", started.id);
-        let budget = crate::mcp::serialized_json_len(&ok_text(concise.clone())).unwrap() + 1;
+        let (revision, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        let concise = format!("j:{} rev={revision} next=jobs_get no-rerun", started.id);
+        let budget = crate::mcp::serialized_json_len(&ok_text(concise)).unwrap() + 128;
         let result = machine
             .finish_graph_call(&started.id, None, Some(budget))
             .await;
         assert!(!result.is_error.unwrap_or(false), "{result:?}");
-        assert_eq!(result.content[0].as_text().unwrap().text, concise);
+        let result_text = &result.content[0].as_text().unwrap().text;
+        assert_eq!(
+            result_text.split_whitespace().next(),
+            Some(format!("j:{}", started.id).as_str())
+        );
+        assert!(result_text.contains("rev="), "{result_text}");
+        assert!(!result_text.contains("long-line"), "{result_text}");
         assert!(crate::mcp::serialized_json_len(&result).unwrap() <= budget);
         let repeated = machine
             .replay_graph_response(&started.id, Some(budget))
             .await
             .unwrap();
-        assert!(!repeated.is_error.unwrap_or(false));
-        assert_eq!(repeated.content[0].as_text().unwrap().text, concise);
+        assert!(!repeated.is_error.unwrap_or(false), "{repeated:?}");
+        let repeated_text = &repeated.content[0].as_text().unwrap().text;
+        assert_eq!(
+            repeated_text.split_whitespace().next(),
+            Some(format!("j:{}", started.id).as_str())
+        );
+        assert!(repeated_text.contains("rev="), "{repeated_text}");
+        assert!(!repeated_text.contains("long-line"), "{repeated_text}");
         assert_eq!(
             machine
                 .jobs
@@ -1646,90 +1643,71 @@ mod tests {
     }
 
     #[test]
-    fn control_receipts_keep_action_and_exact_ref_under_tight_budgets() {
+    fn shared_control_receipts_keep_typed_identity_and_factual_grammar() {
         let root = parse_ref("j:control-123").unwrap();
         let node = parse_ref("j:control-123/n:2").unwrap();
-        let large = format!(
-            "j:control-123 process settled rev=42 {}",
-            "detail ".repeat(800)
-        );
-        let full = ok_text(large.clone());
-        let exact = crate::mcp::serialized_json_len(&full).unwrap();
 
-        let accepted =
-            bounded_control_success(&root, large.clone(), ControlReceipt::Cancel, Some(exact));
+        let ack = render_plain(
+            Receipt::Ack {
+                reference: &node,
+                mode: AckMode::Through(47),
+                changed: true,
+                released: false,
+            },
+            128,
+        )
+        .unwrap();
+        assert_eq!(ack, "j:control-123/n:2 ok ack=47 released=false");
+
+        let finish = render_plain(
+            Receipt::Ack {
+                reference: &node,
+                mode: AckMode::Finish,
+                changed: false,
+                released: true,
+            },
+            128,
+        )
+        .unwrap();
+        assert_eq!(finish, "j:control-123/n:2 unchanged ack=all released=true");
+
+        let cancel = render_plain(
+            Receipt::Cancel {
+                reference: &root,
+                revision: 42,
+                changed: true,
+            },
+            128,
+        )
+        .unwrap();
+        assert_eq!(cancel, "j:control-123 rev=42 cancel=accepted");
+
+        let exact = crate::mcp::serialized_json_len(&ok_text(cancel.clone())).unwrap();
         assert_eq!(
-            accepted, full,
-            "an already-fitting status must not be modified"
+            bounded_control_success(&root, cancel.clone(), Some(exact)),
+            ok_text(cancel.clone())
         );
-
-        let ack_compact = "j:control-123/n:2 ack=through:47 next=jobs_get no-rerun";
-        let ack_size = crate::mcp::serialized_json_len(&ok_text(ack_compact)).unwrap();
-        let acknowledged = bounded_control_success(
-            &node,
-            large.clone(),
-            ControlReceipt::AckThrough(47),
-            Some(ack_size),
-        );
-        assert!(!acknowledged.is_error.unwrap_or(false));
-        assert_eq!(acknowledged.content[0].as_text().unwrap().text, ack_compact);
-        assert!(crate::mcp::serialized_json_len(&acknowledged).unwrap() <= ack_size);
-        let finish_compact = "j:control-123/n:2 ack=finish next=jobs_get no-rerun";
-        let finish_size = crate::mcp::serialized_json_len(&ok_text(finish_compact)).unwrap();
-        let finished = bounded_control_success(
-            &node,
-            large.clone(),
-            ControlReceipt::Finish,
-            Some(finish_size),
-        );
-        assert!(!finished.is_error.unwrap_or(false));
-        assert_eq!(finished.content[0].as_text().unwrap().text, finish_compact);
-        let too_small = bounded_control_success(
-            &node,
-            large.clone(),
-            ControlReceipt::AckThrough(47),
-            Some(ack_size - 1),
-        );
+        let too_small = bounded_control_success(&root, cancel.clone(), Some(exact - 1));
         assert!(too_small.is_error.unwrap_or(false));
-        let detail = &too_small.content[0].as_text().unwrap().text;
-        assert!(detail.contains("effect already applied") && detail.contains("before retrying"));
-
-        let cancel_compact = "j:control-123 cancel=accepted next=jobs_get no-rerun";
-        let cancel_size = crate::mcp::serialized_json_len(&ok_text(cancel_compact)).unwrap();
-        let cancelled = bounded_control_success(
-            &root,
-            large.clone(),
-            ControlReceipt::Cancel,
-            Some(cancel_size),
+        assert!(
+            too_small.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("effect already applied")
         );
-        assert_eq!(cancelled.content[0].as_text().unwrap().text, cancel_compact);
-        assert!(!cancelled.is_error.unwrap_or(false));
 
-        let replayed = bounded_control_replay(
-            full.clone(),
-            &root,
-            ControlReceipt::Cancel,
-            Some(cancel_size),
-        );
-        assert_eq!(replayed, cancelled);
+        let cached = ok_text(cancel);
         assert_eq!(
-            full.content[0].as_text().unwrap().text,
-            large,
-            "cached receipt is immutable"
+            bounded_control_replay(cached.clone(), &root, Some(exact)),
+            cached,
+            "typed identity is validated by the replay ledger before projection"
         );
-
         let failed = tool_error("stale Job revision");
         assert_eq!(
-            bounded_control_replay(failed.clone(), &root, ControlReceipt::Cancel, Some(1)),
+            bounded_control_replay(failed.clone(), &root, Some(1)),
             failed,
             "a failed effect replay cannot be turned into Control success"
-        );
-        let mismatch = ok_text("j:other-456 process settled rev=42");
-        assert!(
-            bounded_control_replay(mismatch, &root, ControlReceipt::Cancel, Some(cancel_size))
-                .is_error
-                .unwrap_or(false),
-            "wrong cached Job identity must fail closed"
         );
     }
 
@@ -1775,21 +1753,19 @@ mod tests {
             denied,
             "cached error can never become a success"
         );
-        for invalid in [
-            "j:different/n:2 rev=1 ok",
-            "j:send-123/n:2 rev=1 maybe",
-            "j:send-123/n:2 rev=bad ok",
-            "j:send-123/n:2 rev=1 ok extra",
-            "j:send-123/n:2 ack=all",
-            "j:send-123/n:2 sent extra",
-        ] {
-            assert!(
-                bounded_send_replay(&reference, ok_text(invalid), Some(compact_size))
-                    .is_error
-                    .unwrap_or(false),
-                "malformed or unrelated cached receipt must be denied: {invalid}"
-            );
-        }
+        let opaque = ok_text("cached-rendering-is-not-semantic-state");
+        let opaque_size = crate::mcp::serialized_json_len(&opaque).unwrap();
+        assert_eq!(
+            bounded_send_replay(&reference, opaque.clone(), Some(opaque_size)),
+            opaque,
+            "trusted replay identity is external to rendered prose"
+        );
+        let opaque_large = ok_text("cached-rendering-is-not-semantic-state ".repeat(64));
+        assert_eq!(
+            bounded_send_replay(&reference, opaque_large, Some(compact_size)),
+            compact,
+            "a narrow replay projects the already-known typed Job ref without parsing cached text"
+        );
     }
 
     #[cfg(unix)]
@@ -1949,11 +1925,13 @@ mod tests {
         let started = graph::start(&machine, prepared, None, Some(start.replay_key()), true)
             .await
             .unwrap();
+        let reference = crate::jobs::JobManager::standalone_ref(&started.id, None).unwrap();
         let (_, status) = machine.jobs.standalone_status(&started.id, None).unwrap();
         let first = complete_remote_start_result(
             &machine,
             aw_tools::OperationId::Batch,
             Some(guard),
+            &reference,
             ok_text(status),
         );
         let first_ts =
@@ -1963,44 +1941,70 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
 
         let replay = match machine.jobs.claim_remote_start(&start).unwrap() {
-            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => result,
-            _ => panic!("duplicate Graph Start must replay the first receipt"),
+            RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp {
+                reference: cached_reference,
+                result,
+            }) => {
+                assert_eq!(cached_reference, reference);
+                result
+            }
+            _ => panic!("duplicate Graph Start must replay the first typed receipt"),
         };
         assert_eq!(replay, first);
         assert_eq!(crate::mcp::stored_receipt_ts(&replay), Some(first_ts));
         // A replay under a smaller envelope keeps the original ledger result
         // and returns a complete ref instead of a clipped success receipt.
-        let concise = format!("j:{} next=jobs_get no-rerun", started.id);
+        let (current_revision, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        let concise = format!(
+            "j:{} rev={current_revision} next=jobs_get no-rerun",
+            started.id
+        );
         let mut concise_result = ok_text(concise.clone());
         concise_result.meta = replay.meta.clone();
-        let small_budget = crate::mcp::serialized_json_len(&concise_result).unwrap();
-        // This particular one-node receipt may already fit that smaller
-        // budget; verify its exact replay before exercising the forced-large
-        // projection case.
-        let projected = bounded_replayed_job_handoff(replay.clone(), Some(small_budget));
+        // Leave a little serialized-envelope headroom so a concurrently
+        // advancing shared revision cannot turn a factual replay into a
+        // byte-exact test artifact. The cached synthetic receipt below remains
+        // much larger and therefore still forces projection.
+        let small_budget = crate::mcp::serialized_json_len(&concise_result).unwrap() + 128;
+        let projected =
+            bounded_replayed_job_handoff(&machine, &reference, replay.clone(), Some(small_budget));
         let fits = crate::mcp::serialized_json_len(&replay).unwrap() <= small_budget;
-        assert_eq!(
-            projected,
-            if fits {
-                replay.clone()
-            } else {
-                concise_result.clone()
-            }
-        );
+        if fits {
+            assert_eq!(projected, replay);
+        } else {
+            assert!(!projected.is_error.unwrap_or(false), "{projected:?}");
+            let text = &projected.content[0].as_text().unwrap().text;
+            assert!(text.starts_with(&format!("j:{} ", started.id)), "{text}");
+            assert!(text.contains("rev="), "{text}");
+            assert_eq!(crate::mcp::stored_receipt_ts(&projected), Some(first_ts));
+            assert!(crate::mcp::serialized_json_len(&projected).unwrap() <= small_budget);
+        }
         let mut long_cached = ok_text(format!(
             "j:{} graph waiting rev=1 {}",
             started.id,
             "node waiting ".repeat(100)
         ));
         long_cached.meta = replay.meta.clone();
-        let projected = bounded_replayed_job_handoff(long_cached, Some(small_budget));
-        assert!(!projected.is_error.unwrap_or(false));
-        assert_eq!(projected.content[0].as_text().unwrap().text, concise);
+        let projected =
+            bounded_replayed_job_handoff(&machine, &reference, long_cached, Some(small_budget));
+        assert!(!projected.is_error.unwrap_or(false), "{projected:?}");
+        let projected_text = &projected.content[0].as_text().unwrap().text;
+        assert!(
+            projected_text.starts_with(&format!("j:{} ", started.id)),
+            "{projected_text}"
+        );
+        assert!(projected_text.contains("rev="), "{projected_text}");
         assert_eq!(crate::mcp::stored_receipt_ts(&projected), Some(first_ts));
         assert!(crate::mcp::serialized_json_len(&projected).unwrap() <= small_budget);
         let original = match machine.jobs.claim_remote_start(&start).unwrap() {
-            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => result,
-            _ => panic!("duplicate Start must preserve the cached original receipt"),
+            RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp {
+                reference: cached_reference,
+                result,
+            }) => {
+                assert_eq!(cached_reference, reference);
+                result
+            }
+            _ => panic!("duplicate Start must preserve the cached typed receipt"),
         };
         assert_eq!(original, first);
         assert!(!root.join("a.txt").exists());
@@ -2193,21 +2197,43 @@ mod tests {
     }
 
     #[test]
-    fn jobs_read_schema_uses_profile_result_ceiling_and_has_no_filter() {
-        let read = project_job_tool(
-            LocalMachine::all_tools().get("jobs_read").cloned().unwrap(),
-            8 * 1024 * 1024,
-        );
-        let output_limit = &read.input_schema["properties"]["limit"];
-        assert_eq!(output_limit["minimum"], 1);
-        assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
-        assert_eq!(output_limit["default"], 256 * 1024);
-        assert!(
-            !read.input_schema["properties"]
-                .as_object()
-                .unwrap()
-                .contains_key("filter")
-        );
+    fn jobs_read_schema_and_runtime_share_the_effective_raw_page_profile() {
+        for (max_output_bytes, expected_default) in
+            [(8 * 1024 * 1024, 256 * 1024), (128 * 1024, 128 * 1024)]
+        {
+            let read = project_job_tool(
+                LocalMachine::all_tools().get("jobs_read").cloned().unwrap(),
+                max_output_bytes,
+            );
+            let profile = crate::jobs::dotlink_job_profile(max_output_bytes);
+            let output_limit = &read.input_schema["properties"]["limit"];
+            assert_eq!(output_limit["minimum"], 1);
+            assert_eq!(output_limit["maximum"], profile.read_page_max_bytes);
+            assert_eq!(output_limit["default"], expected_default);
+            assert_eq!(
+                profile.resolve_read_page(None).unwrap().get(),
+                expected_default
+            );
+            assert_eq!(
+                profile
+                    .resolve_read_page(Some(profile.read_page_max_bytes))
+                    .unwrap()
+                    .get(),
+                profile.read_page_max_bytes
+            );
+            assert!(profile.resolve_read_page(Some(0)).is_err());
+            assert!(
+                profile
+                    .resolve_read_page(Some(profile.read_page_max_bytes + 1))
+                    .is_err()
+            );
+            assert!(
+                !read.input_schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("filter")
+            );
+        }
     }
 
     #[test]

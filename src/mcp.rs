@@ -22,6 +22,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+pub(crate) use aw_mcp_protocol::has_visible_receipt_timestamp as has_visible_receipt_ts;
+pub(crate) use aw_mcp_protocol::stored_receipt_timestamp as stored_receipt_ts;
+use aw_mcp_protocol::{
+    decorate_and_fit_complete_result, fit_complete_result,
+    set_stored_receipt_timestamp as set_stored_receipt_ts, validate_complete_result,
+};
+use aw_tools::budget::SerializedResultBytes;
 use rmcp::{
     ErrorData as McpError,
     handler::server::router::tool::ToolRouter,
@@ -307,119 +315,6 @@ pub(crate) fn serialized_text_tool_result_len(text: &str) -> usize {
     serialized_text_tool_result_fixed_len().saturating_add(serialized_text_content_len(text))
 }
 
-fn text_prefix_at_boundary(text: &str, bytes: usize) -> &str {
-    let mut end = bytes.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-fn fitted_text_blocks(
-    original: &CallToolResult,
-    retained_bytes: usize,
-    suffix: &str,
-) -> CallToolResult {
-    let mut fitted = original.clone();
-    let mut remaining = retained_bytes;
-    let mut truncated = false;
-
-    for block in &mut fitted.content {
-        let ContentBlock::Text(text) = block else {
-            continue;
-        };
-        if truncated {
-            text.text.clear();
-            continue;
-        }
-        if remaining >= text.text.len() {
-            remaining -= text.text.len();
-            continue;
-        }
-
-        let prefix = text_prefix_at_boundary(&text.text, remaining).to_owned();
-        text.text.clear();
-        text.text.push_str(&prefix);
-        text.text.push_str(suffix);
-        remaining = 0;
-        truncated = true;
-    }
-
-    fitted
-}
-
-fn fit_call_tool_response_to_budget(
-    tool: &str,
-    response: CallToolResponse,
-    budget: Option<usize>,
-) -> Result<CallToolResponse, McpError> {
-    let Some(budget) = budget else {
-        return Ok(response);
-    };
-    let CallToolResponse::Complete(result) = response else {
-        return Ok(response);
-    };
-    if serialized_json_len(&result).is_some_and(|size| size <= budget) {
-        return Ok(CallToolResponse::Complete(result));
-    }
-
-    let is_error = result.is_error.unwrap_or(false);
-    let suffix = if is_error {
-        "\n… error details truncated to fit the transport response budget"
-    } else {
-        "\n… detailed result omitted because it exceeded the transport response budget"
-    };
-    let total_text_bytes = result
-        .content
-        .iter()
-        .filter_map(ContentBlock::as_text)
-        .map(|text| text.text.len())
-        .sum::<usize>();
-
-    // Text is the only mutable projection. Preserve structured content, typed
-    // media/resources, block order, annotations, per-block metadata, result
-    // metadata and error status exactly. Truncation must stay explicit: if the
-    // immutable facts plus the generic marker cannot fit, fail instead of
-    // returning shortened text that looks complete.
-    let minimal = fitted_text_blocks(&result, 0, suffix);
-    if serialized_json_len(&minimal).is_none_or(|size| size > budget) {
-        tracing::error!(
-            tool,
-            budget,
-            "minimal factual tool result exceeded the transport response budget"
-        );
-        return Err(McpError::internal_error(
-            "tool result cannot fit the transport response budget with an explicit truncation marker",
-            None,
-        ));
-    }
-
-    let mut low = 0_usize;
-    let mut high = total_text_bytes;
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        let candidate = fitted_text_blocks(&result, mid, suffix);
-        if serialized_json_len(&candidate).is_some_and(|size| size <= budget) {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-
-    let fitted = fitted_text_blocks(&result, low, suffix);
-    if !is_error {
-        tracing::error!(
-            tool,
-            budget,
-            "tool success result exceeded its transport response budget"
-        );
-    }
-    Ok(CallToolResponse::Complete(fitted))
-}
-
-const RECEIPT_META_KEY: &str = "io.abird/receipt";
-const MAX_MCP_RESULT_META_BYTES: usize = 16 * 1024;
-
 fn unix_ts_now() -> Result<u64, McpError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -427,67 +322,29 @@ fn unix_ts_now() -> Result<u64, McpError> {
         .map_err(|_| McpError::internal_error("system clock is before Unix epoch", None))
 }
 
-fn stored_receipt_ts(result: &CallToolResult) -> Option<u64> {
-    result
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.0.get(RECEIPT_META_KEY))
-        .and_then(|receipt| receipt.get("ts"))
-        .and_then(Value::as_u64)
+fn protocol_result_error(error: aw_mcp_protocol::Error) -> McpError {
+    McpError::internal_error(error.to_string(), None)
 }
 
-fn has_visible_receipt_ts(result: &CallToolResult, ts: u64) -> bool {
-    let marker = format!("ts={ts}");
-    result.content.iter().any(|block| {
-        block
-            .as_text()
-            .is_some_and(|text| text.text.lines().any(|line| line.trim() == marker.as_str()))
+fn serialized_result_ceiling(bytes: usize) -> Result<SerializedResultBytes, McpError> {
+    SerializedResultBytes::new(bytes).ok_or_else(|| {
+        McpError::internal_error("serialized MCP result budget must be non-zero", None)
     })
 }
 
-pub(crate) fn set_stored_receipt_ts(
-    result: &mut CallToolResult,
-    ts: u64,
-) -> Result<(), &'static str> {
-    let mut meta = result.meta.clone().unwrap_or_default();
-    let receipt = meta
-        .0
-        .entry(RECEIPT_META_KEY.to_owned())
-        .or_insert_with(|| serde_json::json!({}));
-    let object = receipt
-        .as_object_mut()
-        .ok_or("reserved receipt metadata must be an object")?;
-    object.insert("ts".to_owned(), Value::from(ts));
-    if serialized_json_len(&meta).is_none_or(|size| size > MAX_MCP_RESULT_META_BYTES) {
-        return Err("tool result metadata exceeds the 16 KiB MCP result metadata limit");
-    }
-    result.meta = Some(meta);
-    Ok(())
-}
-
-pub(crate) fn ensure_visible_receipt_ts(result: &mut CallToolResult, ts: u64) {
-    if !has_visible_receipt_ts(result, ts) {
-        result.content.push(ContentBlock::text(format!("ts={ts}")));
-    }
-}
-
-fn stamp_receipt_metadata(
-    toolset: &aw_tools::toolset::Toolset,
+pub(crate) fn decorate_native_task_result(
     operation: aw_tools::OperationId,
-    result: &mut CallToolResult,
-) -> Result<Option<u64>, McpError> {
-    let profile = toolset.receipt_profile();
-    if !profile.unix_ts || !profile.scope.contains(operation) {
-        return Ok(None);
-    }
-    let ts = stored_receipt_ts(result).unwrap_or(unix_ts_now()?);
-    let metadata = toolset
-        .receipt_metadata(operation, Some(ts))
-        .map_err(|error| McpError::internal_error(error.to_string(), None))?
-        .ok_or_else(|| McpError::internal_error("receipt profile lost selected operation", None))?;
-    set_stored_receipt_ts(result, metadata.ts)
-        .map_err(|error| McpError::internal_error(error, None))?;
-    Ok(Some(metadata.ts))
+    result: CallToolResult,
+    ts: u64,
+) -> Result<CallToolResult, McpError> {
+    decorate_and_fit_complete_result(
+        tools::shared_native::receipt_profile(),
+        operation,
+        result,
+        Some(ts),
+        SerializedResultBytes::new(usize::MAX).expect("usize::MAX is non-zero"),
+    )
+    .map_err(protocol_result_error)
 }
 
 fn fit_mcp_error_to_budget(error: McpError, budget: Option<usize>) -> McpError {
@@ -2277,9 +2134,16 @@ impl LocalMachine {
         operation: aw_tools::OperationId,
         result: &mut CallToolResult,
     ) -> Result<(), McpError> {
-        let toolset = self.shared_toolset();
-        let _ = stamp_receipt_metadata(&toolset, operation, result)?;
-        Ok(())
+        let profile = self.shared_toolset().receipt_profile();
+        if !profile.timestamps(operation) {
+            return Ok(());
+        }
+        validate_complete_result(result).map_err(protocol_result_error)?;
+        let ts = match stored_receipt_ts(result) {
+            Some(ts) => ts,
+            None => unix_ts_now()?,
+        };
+        set_stored_receipt_ts(result, ts).map_err(protocol_result_error)
     }
 
     fn decorate_and_fit_tool_response(
@@ -2288,75 +2152,26 @@ impl LocalMachine {
         response: CallToolResponse,
         budget: Option<usize>,
     ) -> Result<CallToolResponse, McpError> {
-        let Some(operation) = aw_tools::OperationId::from_model_name(name) else {
-            return fit_call_tool_response_to_budget(name, response, budget);
-        };
-        let CallToolResponse::Complete(mut result) = response else {
+        let CallToolResponse::Complete(result) = response else {
             return Ok(response);
         };
-        let toolset = self.shared_toolset();
-        let Some(ts) = stamp_receipt_metadata(&toolset, operation, &mut result)? else {
-            return fit_call_tool_response_to_budget(
-                name,
-                CallToolResponse::Complete(result),
-                budget,
-            );
+        let ceiling =
+            serialized_result_ceiling(budget.unwrap_or_else(|| self.max_response_body_bytes()))?;
+        let Some(operation) = aw_tools::OperationId::from_model_name(name) else {
+            return fit_complete_result(result, ceiling)
+                .map(CallToolResponse::Complete)
+                .map_err(protocol_result_error);
         };
-        let marker = format!("ts={ts}");
-        let Some(budget) = budget else {
-            ensure_visible_receipt_ts(&mut result, ts);
-            return Ok(CallToolResponse::Complete(result));
-        };
-
-        // First fit against the full envelope. If an existing visible receipt
-        // marker survives, do not reserve space for a duplicate sidecar.
-        let fitted = fit_call_tool_response_to_budget(
-            name,
-            CallToolResponse::Complete(result.clone()),
-            Some(budget),
-        )?;
-        let CallToolResponse::Complete(fitted) = fitted else {
-            return Ok(fitted);
-        };
-        if has_visible_receipt_ts(&fitted, ts) {
-            return Ok(CallToolResponse::Complete(fitted));
-        }
-
-        let mut candidate = fitted.clone();
-        candidate.content.push(ContentBlock::text(marker.clone()));
-        let fitted_size = serialized_json_len(&fitted).unwrap_or(usize::MAX);
-        let candidate_size = serialized_json_len(&candidate).unwrap_or(usize::MAX);
-        if candidate_size <= budget {
-            return Ok(CallToolResponse::Complete(candidate));
-        }
-
-        let receipt_reserve = candidate_size.saturating_sub(fitted_size);
-        let body_budget = budget.checked_sub(receipt_reserve).ok_or_else(|| {
-            McpError::internal_error(
-                "tool receipt timestamp cannot fit the transport response budget",
-                None,
-            )
-        })?;
-        let fitted = fit_call_tool_response_to_budget(
-            name,
-            CallToolResponse::Complete(result),
-            Some(body_budget),
-        )?;
-        let CallToolResponse::Complete(mut fitted) = fitted else {
-            return Ok(fitted);
-        };
-        if has_visible_receipt_ts(&fitted, ts) {
-            return Ok(CallToolResponse::Complete(fitted));
-        }
-        fitted.content.push(ContentBlock::text(marker));
-        if serialized_json_len(&fitted).is_some_and(|size| size <= budget) {
-            Ok(CallToolResponse::Complete(fitted))
-        } else {
-            Err(McpError::internal_error(
-                "tool receipt timestamp cannot fit the transport response budget",
-                None,
-            ))
-        }
+        let profile = self.shared_toolset().receipt_profile();
+        let host_timestamp =
+            if profile.timestamps(operation) && stored_receipt_ts(&result).is_none() {
+                Some(unix_ts_now()?)
+            } else {
+                None
+            };
+        decorate_and_fit_complete_result(profile, operation, result, host_timestamp, ceiling)
+            .map(CallToolResponse::Complete)
+            .map_err(protocol_result_error)
     }
 
     /// Product-owned non-filesystem routes. The canonical filesystem surface is
@@ -2810,14 +2625,14 @@ impl rmcp::ServerHandler for LocalMachine {
         // wait has its own deadline-aware sink. No handler can forget a heartbeat.
         let heartbeat = (!is_shell_tool(&request.name))
             .then(|| {
-                tools::ProgressHeartbeat::for_request(
+                tools::RequestProgress::for_request(
                     &context,
                     self.config.log.clone(),
                     request.name.to_string(),
                 )
             })
             .flatten();
-        tools::await_with_heartbeat(heartbeat, None, async {
+        tools::await_with_request_progress(heartbeat, None, async {
             let name = request.name.to_string();
             if crate::remote_start::has_metadata(&context.meta) {
                 let operation = aw_tools::OperationId::from_model_name(&name).ok_or_else(|| {
@@ -2930,6 +2745,7 @@ impl rmcp::ServerHandler for LocalMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aw_mcp_protocol::{MAX_MCP_RESULT_META_BYTES, RECEIPT_META_KEY};
 
     use crate::mcp::tools::test_support::access;
 
@@ -4094,7 +3910,7 @@ mod tests {
         oversized.meta = Some(oversized_meta);
         let before = oversized.meta.clone();
         let error = set_stored_receipt_ts(&mut oversized, 9).expect_err("oversized meta must fail");
-        assert!(error.contains("16 KiB"));
+        assert!(error.to_string().contains("16 KiB"));
         assert_eq!(
             oversized.meta, before,
             "failed receipt stamping must not partially rewrite result metadata"
@@ -4109,7 +3925,7 @@ mod tests {
         let before = invalid.meta.clone();
         let error = set_stored_receipt_ts(&mut invalid, 9)
             .expect_err("reserved receipt metadata must remain an object");
-        assert!(error.contains("reserved receipt metadata"));
+        assert!(error.to_string().contains("reserved receipt metadata"));
         assert_eq!(invalid.meta, before);
 
         let error = machine
@@ -4122,15 +3938,8 @@ mod tests {
             ContentBlock::text("x".repeat(4096)),
         ]);
         set_stored_receipt_ts(&mut visible, replay_ts).unwrap();
-        let expected = fit_call_tool_response_to_budget(
-            "jobs_get",
-            CallToolResponse::Complete(visible.clone()),
-            Some(512),
-        )
-        .unwrap();
-        let CallToolResponse::Complete(expected) = expected else {
-            panic!("fitted visible receipt must stay complete")
-        };
+        let expected =
+            fit_complete_result(visible.clone(), serialized_result_ceiling(512).unwrap()).unwrap();
         assert!(has_visible_receipt_ts(&expected, replay_ts));
         let decorated = machine
             .decorate_and_fit_tool_response(
@@ -4223,29 +4032,23 @@ mod tests {
     fn transport_postcondition_bounds_error_and_unexpected_success_results() {
         let budget = 512;
         let bulk = format!("{}{}", "\"\\\n".repeat(512), "tail");
-        for (is_error, response) in [
+        for (is_error, result) in [
             (
                 true,
-                CallToolResponse::Complete(CallToolResult::error(vec![ContentBlock::text(
-                    bulk.clone(),
-                )])),
+                CallToolResult::error(vec![ContentBlock::text(bulk.clone())]),
             ),
             (
                 false,
-                CallToolResponse::Complete(CallToolResult::success(vec![ContentBlock::text(
-                    bulk.clone(),
-                )])),
+                CallToolResult::success(vec![ContentBlock::text(bulk.clone())]),
             ),
         ] {
-            let fitted = fit_call_tool_response_to_budget("test", response, Some(budget)).unwrap();
-            let CallToolResponse::Complete(result) = fitted else {
-                panic!("complete result changed response kind")
-            };
+            let result =
+                fit_complete_result(result, serialized_result_ceiling(budget).unwrap()).unwrap();
             assert_eq!(result.is_error.unwrap_or(false), is_error);
             assert!(serialized_json_len(&result).unwrap() <= budget);
             let text = result.content[0].as_text().unwrap().text.as_str();
             assert!(
-                text.contains("transport response budget") || text.is_empty(),
+                text.contains("truncated to fit the serialized MCP result budget"),
                 "{text:?}"
             );
         }
@@ -4274,15 +4077,8 @@ mod tests {
         let minimum = serialized_json_len(&empty_text).unwrap();
         let budget = minimum + 256;
 
-        let fitted = fit_call_tool_response_to_budget(
-            "test",
-            CallToolResponse::Complete(result),
-            Some(budget),
-        )
-        .unwrap();
-        let CallToolResponse::Complete(fitted) = fitted else {
-            panic!("complete result changed response kind")
-        };
+        let fitted =
+            fit_complete_result(result, serialized_result_ceiling(budget).unwrap()).unwrap();
 
         assert!(serialized_json_len(&fitted).unwrap() <= budget);
         assert_eq!(fitted.structured_content, structured);
@@ -4309,11 +4105,10 @@ mod tests {
             "payload": "b".repeat(4096)
         }));
 
-        let error =
-            fit_call_tool_response_to_budget("test", CallToolResponse::Complete(result), Some(512))
-                .expect_err("immutable typed/structured facts must not collapse to text");
+        let error = fit_complete_result(result, serialized_result_ceiling(512).unwrap())
+            .expect_err("immutable typed/structured facts must not collapse to text");
         assert!(
-            error.message.contains("transport response budget"),
+            error.to_string().contains("immutable MCP result"),
             "immutable result must fail explicitly at the bounded response surface: {error:?}"
         );
     }
@@ -4321,20 +4116,14 @@ mod tests {
     #[test]
     fn transport_postcondition_never_silently_truncates_without_marker() {
         let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(4096))]);
-        let empty = fitted_text_blocks(&result, 0, "");
-        let marker =
-            "\n… detailed result omitted because it exceeded the transport response budget";
-        let marked = fitted_text_blocks(&result, 0, marker);
+        let empty = CallToolResult::success(vec![ContentBlock::text("")]);
         let empty_size = serialized_json_len(&empty).unwrap();
-        let marked_size = serialized_json_len(&marked).unwrap();
-        assert!(empty_size < marked_size);
-        let error = fit_call_tool_response_to_budget(
-            "test",
-            CallToolResponse::Complete(result),
-            Some(empty_size),
-        )
-        .expect_err("shortened text without a truncation marker must fail explicitly");
-        assert!(error.message.contains("truncation marker"), "{error:?}");
+        let error = fit_complete_result(result, serialized_result_ceiling(empty_size).unwrap())
+            .expect_err("shortened text without a truncation marker must fail explicitly");
+        assert!(
+            error.to_string().contains("minimal factual MCP result"),
+            "{error:?}"
+        );
     }
 
     #[test]

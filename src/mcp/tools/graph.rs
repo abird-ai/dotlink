@@ -1155,6 +1155,14 @@ mod tests {
     };
     use std::{fs, path::PathBuf};
 
+    fn raw(bytes: usize) -> aw_tools::budget::RawPageBytes {
+        aw_tools::budget::RawPageBytes::new(bytes).expect("test raw page budget")
+    }
+
+    fn serialized(bytes: usize) -> aw_tools::budget::SerializedResultBytes {
+        aw_tools::budget::SerializedResultBytes::new(bytes).expect("test serialized result budget")
+    }
+
     #[test]
     fn preattached_shell_failure_seals_result_and_allows_terminal_cleanup() {
         use aw_tools::filesystem::{
@@ -1479,7 +1487,13 @@ mod tests {
         let aggregate: serde_json::Value = serde_json::from_str(
             &machine
                 .jobs
-                .standalone_graph_result_page(&started.id, 0, 64 * 1024, 64 * 1024, false)
+                .standalone_graph_result_page(
+                    &started.id,
+                    0,
+                    raw(64 * 1024),
+                    serialized(64 * 1024),
+                    false,
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -1526,8 +1540,8 @@ mod tests {
                         node: Some(2),
                         stream: Some(crate::jobs::JobOutputStream::Result),
                         offset: 0,
-                        requested_bytes: 1,
-                        response_ceiling: 64 * 1024,
+                        requested_bytes: raw(1),
+                        response_ceiling: serialized(64 * 1024),
                         base64: false,
                     },
                 )

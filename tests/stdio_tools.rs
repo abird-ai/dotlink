@@ -511,7 +511,7 @@ fn stdio_jobs_read_one_byte_page_has_independent_response_envelope() {
         json!({"ref":node_ref,"view":"result","offset":0,"limit":0}),
     ));
     assert_eq!(zero["result"]["isError"], true, "{zero}");
-    assert!(text_of(&zero).contains("at least 1"), "{zero}");
+    assert!(text_of(&zero).contains("within 1..="), "{zero}");
 
     let page = probe.request(&call_request(
         4,

@@ -8763,7 +8763,7 @@ name"
             .expect("durable shell receipt text");
         assert!(
             receipt_text.starts_with("j:")
-                && receipt_text.contains(" process ")
+                && receipt_text.contains(" bash ")
                 && (receipt_text.contains(" running ") || receipt_text.contains(" waiting ")),
             "{receipt_text}"
         );

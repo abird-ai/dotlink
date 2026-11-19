@@ -15,163 +15,107 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::LocalMachine;
 
-use std::{
-    future::Future,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
-
-use rmcp::{
-    model::{ProgressNotificationParam, ProgressToken},
-    service::{Peer, RequestContext, RoleServer},
-};
-use tokio::time::{Instant, sleep_until};
-
-/// Interval between advisory progress ticks for one `tools/call`. A caller
-/// cannot know how much of an arbitrary command or build is done, so a tick is
-/// bare: a monotonic counter, no total, no message.
-#[cfg(not(test))]
-pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
-pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+use std::time::Duration;
+use std::{future::Future, sync::Arc};
 
-/// Progress is advisory; a stalled transport must never delay the operation it
-/// reports on. Delivery is bounded per tick, with no detached task or queue.
-const PROGRESS_SEND_BUDGET: Duration = Duration::from_millis(100);
+use aw_mcp_protocol::{
+    ProgressHeartbeat, ProgressHeartbeatConfig, ProgressHeartbeatObserver,
+    ProgressHeartbeatSummary, await_with_progress_heartbeat,
+};
+use rmcp::service::{Peer, RequestContext, RoleServer};
+use tokio::time::Instant;
 
-/// Reports are advisory: a stalled peer must never delay the operation. The
-/// outcome is returned so a tick can say whether it landed or was cut off.
-async fn deliver_heartbeat_bounded<F: Future>(
-    deadline: Option<Instant>,
-    delivery: F,
-) -> Option<F::Output> {
-    let bound = Instant::now() + PROGRESS_SEND_BUDGET;
-    let send_deadline = deadline.map_or(bound, |deadline| deadline.min(bound));
-    tokio::select! {
-        biased;
-        () = sleep_until(send_deadline) => None,
-        output = delivery => Some(output),
-    }
-}
-
-/// Heartbeat sink for one `tools/call` that carried a progress token. A wait
-/// that emits nothing is indistinguishable from a stalled turn, so anything
-/// that blocks for a transport window reports while it blocks.
-pub(crate) struct ProgressHeartbeat {
-    peer: Peer<RoleServer>,
-    token: ProgressToken,
-    ticks: AtomicU64,
-    delivered: AtomicU64,
+/// Dotlink-owned product observer. Shared progress owns scheduling/counting;
+/// the product keeps only its existing log surface.
+struct ProgressLogObserver {
     log: crate::logging::LogConfig,
     tool: String,
 }
 
-impl ProgressHeartbeat {
-    /// One sink per call that carried a progress token; the caller's tool name
-    /// and log are captured here so ticks and the summary report themselves.
+impl ProgressHeartbeatObserver for ProgressLogObserver {
+    fn completed(&self, summary: ProgressHeartbeatSummary) {
+        if summary.attempted == 0 {
+            return;
+        }
+        self.log
+            .progress_done(&self.tool, summary.attempted, summary.delivered);
+    }
+}
+
+/// Request-scoped rmcp delivery context around the shared heartbeat primitive.
+/// It owns no timer/counter/scheduler state.
+pub(crate) struct RequestProgress {
+    heartbeat: ProgressHeartbeat,
+    peer: Peer<RoleServer>,
+    log: crate::logging::LogConfig,
+}
+
+fn progress_heartbeat_config() -> ProgressHeartbeatConfig {
+    #[cfg(not(test))]
+    {
+        ProgressHeartbeatConfig::default()
+    }
+    #[cfg(test)]
+    {
+        ProgressHeartbeatConfig::new(
+            Duration::from_millis(100),
+            aw_mcp_protocol::DEFAULT_PROGRESS_SEND_BUDGET,
+        )
+        .expect("test heartbeat timing is valid")
+    }
+}
+
+impl RequestProgress {
     pub(crate) fn for_request(
         context: &RequestContext<RoleServer>,
         log: crate::logging::LogConfig,
         tool: impl Into<String>,
     ) -> Option<Self> {
         let token = context.meta.get_progress_token()?;
-        Some(Self {
-            peer: context.peer.clone(),
-            token,
-            ticks: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
-            log,
+        let observer: Arc<dyn ProgressHeartbeatObserver> = Arc::new(ProgressLogObserver {
+            log: log.clone(),
             tool: tool.into(),
+        });
+        let heartbeat = ProgressHeartbeat::from_token(
+            Some(token),
+            progress_heartbeat_config(),
+            Some(observer),
+        )?;
+        Some(Self {
+            heartbeat,
+            peer: context.peer.clone(),
+            log,
         })
     }
-
-    /// Monotonic progress counter with no total and no message.
-    pub(crate) async fn report(&self, deadline: Option<Instant>) {
-        let tick = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        let param = ProgressNotificationParam::new(self.token.clone(), tick as f64);
-        let delivered = deliver_heartbeat_bounded(deadline, async {
-            self.peer.notify_progress(param).await.is_ok()
-        })
-        .await
-        .unwrap_or(false);
-        if delivered {
-            self.delivered.fetch_add(1, Ordering::Relaxed);
-        }
-        self.log.progress_mark(delivered);
-    }
 }
 
-/// The call is over: report how many ticks it needed and how many landed. This
-/// is the only line a silent wait cannot produce, so a deployment can tell "no
-/// progress token" (no line at all) from "ticks delivered" (`hb=n/n`).
-impl Drop for ProgressHeartbeat {
-    fn drop(&mut self) {
-        let attempted = self.ticks.load(Ordering::Relaxed);
-        if attempted == 0 {
-            return;
-        }
-        self.log.progress_done(
-            &self.tool,
-            attempted,
-            self.delivered.load(Ordering::Relaxed),
-        );
-    }
-}
-
-pub(crate) async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
-    match heartbeat {
-        Some(_) => tokio::time::sleep(PROGRESS_HEARTBEAT_INTERVAL).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Poll the operation while one advisory notification is in flight. Completion
-/// owns the call: if the wait becomes ready while progress delivery is blocked,
-/// drop the delivery future and return immediately rather than charging the
-/// operation up to one send-budget interval.
-async fn await_wait_or_delivery<F, D>(
-    wait: std::pin::Pin<&mut F>,
-    delivery: D,
-) -> Result<F::Output, ()>
-where
-    F: Future,
-    D: Future<Output = ()>,
-{
-    tokio::pin!(delivery);
-    tokio::select! {
-        biased;
-        output = wait => Ok(output),
-        () = &mut delivery => Err(()),
-    }
-}
-
-/// Awaits a window-bounded wait while reporting progress. Without a progress
-/// token this is exactly `wait`; with one, the caller keeps receiving ticks for
-/// as long as the wait blocks. Progress delivery never suspends polling the
-/// operation itself.
-pub(crate) async fn await_with_heartbeat<F: Future>(
-    heartbeat: Option<ProgressHeartbeat>,
+/// Thin rmcp transport adapter around the shared heartbeat scheduler. The send
+/// closure preserves dotlink's per-tick mark while the shared observer owns the
+/// final attempted/delivered summary, including cancellation/drop paths.
+pub(crate) async fn await_with_request_progress<F: Future>(
+    progress: Option<RequestProgress>,
     deadline: Option<Instant>,
     wait: F,
 ) -> F::Output {
-    let heartbeat = match heartbeat {
-        Some(heartbeat) => heartbeat,
-        None => return wait.await,
+    let Some(RequestProgress {
+        heartbeat,
+        peer,
+        log,
+    }) = progress
+    else {
+        return wait.await;
     };
-    tokio::pin!(wait);
-    loop {
-        tokio::select! {
-            biased;
-            output = &mut wait => return output,
-            () = heartbeat_tick(Some(&heartbeat)) => {
-                if let Ok(output) =
-                    await_wait_or_delivery(wait.as_mut(), heartbeat.report(deadline)).await
-                {
-                    return output;
-                }
-            }
+    await_with_progress_heartbeat(Some(heartbeat), deadline, wait, move |param| {
+        let peer = peer.clone();
+        let log = log.clone();
+        async move {
+            let delivered = peer.notify_progress(param).await.is_ok();
+            log.progress_mark(delivered);
+            delivered
         }
-    }
+    })
+    .await
 }
 
 fn dot() -> String {
@@ -197,7 +141,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{await_wait_or_delivery, resolve_capped};
+    use super::resolve_capped;
 
     #[tokio::test]
     async fn pending_progress_delivery_never_delays_or_outlives_ready_operation() {
@@ -211,23 +155,43 @@ mod tests {
             }
         }
 
+        let token =
+            rmcp::model::ProgressToken(rmcp::model::NumberOrString::String("progress-test".into()));
+        let heartbeat = aw_mcp_protocol::ProgressHeartbeat::new(
+            token,
+            aw_mcp_protocol::ProgressHeartbeatConfig::new(
+                std::time::Duration::from_millis(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+            None,
+        );
         let (delivery_started, wait_for_delivery) = tokio::sync::oneshot::channel();
         let (delivery_dropped, dropped) = tokio::sync::oneshot::channel();
         let wait = async {
             wait_for_delivery.await.expect("delivery started");
             42_u8
         };
-        tokio::pin!(wait);
-
-        let delivery = async move {
-            let _drop_signal = DropSignal(Some(delivery_dropped));
-            let _ = delivery_started.send(());
-            std::future::pending::<()>().await;
-        };
-        assert_eq!(
-            await_wait_or_delivery(wait.as_mut(), delivery).await,
-            Ok(42)
-        );
+        let mut delivery_started = Some(delivery_started);
+        let mut delivery_dropped = Some(delivery_dropped);
+        let result = aw_mcp_protocol::await_with_progress_heartbeat(
+            Some(heartbeat),
+            None,
+            wait,
+            move |_param| {
+                let started = delivery_started.take();
+                let dropped = delivery_dropped.take();
+                async move {
+                    let _drop_signal = DropSignal(dropped);
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    std::future::pending::<bool>().await
+                }
+            },
+        )
+        .await;
+        assert_eq!(result, 42);
         dropped
             .await
             .expect("pending progress delivery must be dropped with the call");

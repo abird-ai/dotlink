@@ -82,18 +82,22 @@ pub(crate) fn caps(max_read: usize, max_write: usize) -> Result<SchemaCaps, &'st
 /// Dotlink-selected shared catalog profile. Receipt timestamps/checkpoint
 /// guidance stay disabled until dotlink has a typed shared receipt projection;
 /// never decorate existing free-form MCP results by parsing text.
+pub(crate) fn receipt_profile() -> ReceiptProfile {
+    ReceiptProfile {
+        unix_ts: true,
+        checkpoint_minutes: Some(30),
+        scope: ReceiptScope::none()
+            .with_category(ReceiptCategory::Process)
+            .with_category(ReceiptCategory::Batch)
+            .with_category(ReceiptCategory::Jobs),
+    }
+}
+
 pub(crate) fn toolset(caps: SchemaCaps, max_output_bytes: usize) -> Toolset {
     Toolset::builder()
         .filesystem(caps)
         .jobs(crate::jobs::dotlink_job_profile(max_output_bytes))
-        .receipts(ReceiptProfile {
-            unix_ts: true,
-            checkpoint_minutes: Some(30),
-            scope: ReceiptScope::none()
-                .with_category(ReceiptCategory::Process)
-                .with_category(ReceiptCategory::Batch)
-                .with_category(ReceiptCategory::Jobs),
-        })
+        .receipts(receipt_profile())
         .build()
         .expect("dotlink shared Toolset profile is valid")
 }
@@ -659,7 +663,11 @@ fn execute_with_remote_start(
     {
         crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::Mcp(
             result,
-        )) => return Ok(result),
+        ))
+        | crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::JobMcp {
+            result,
+            ..
+        }) => return Ok(result),
         crate::jobs::RemoteStartDecision::Unknown => {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "remote Start outcome is unknown; inspect the original filesystem attempt before any new invocation",

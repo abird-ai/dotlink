@@ -37,7 +37,8 @@ use tokio::{
 use tokio_util::{sync::CancellationToken as DrainStop, task::AbortOnDropHandle};
 
 use super::{
-    LocalMachine, ProgressHeartbeat, await_with_heartbeat, dot, ok_text, resolve_capped, tool_error,
+    LocalMachine, RequestProgress, await_with_request_progress, dot, ok_text, resolve_capped,
+    tool_error,
 };
 #[cfg(target_os = "linux")]
 use crate::mcp::{
@@ -2027,13 +2028,13 @@ impl LocalMachine {
         &self,
         args: ShellArgs,
         shell_tool: aw_tools::filesystem::batch::NodeTool,
-        heartbeat: Option<ProgressHeartbeat>,
+        heartbeat: Option<RequestProgress>,
     ) -> Result<CallToolResult, McpError> {
         let started = match self.start_shell_job(args, shell_tool, None, false) {
             Ok(started) => started,
             Err(error) => return Ok(tool_error(error)),
         };
-        await_with_heartbeat(heartbeat, None, self.jobs.wait_until(&started.id, None))
+        await_with_request_progress(heartbeat, None, self.jobs.wait_until(&started.id, None))
             .await
             .map_err(crate::jobs::JobError::into_mcp)?;
         let result = self
@@ -2054,7 +2055,7 @@ impl LocalMachine {
         &self,
         args: ShellArgs,
         powershell: bool,
-        heartbeat: Option<ProgressHeartbeat>,
+        heartbeat: Option<RequestProgress>,
     ) -> Result<CallToolResult, McpError> {
         let shell_tool = if powershell {
             aw_tools::filesystem::batch::NodeTool::Powershell
@@ -2250,7 +2251,7 @@ impl LocalMachine {
                 .is_some_and(|capabilities| capabilities.supports_tasks()),
             self.request_job_key(context),
             self.request_result_budget(context),
-            ProgressHeartbeat::for_request(
+            RequestProgress::for_request(
                 context,
                 self.config.log.clone(),
                 request.name.to_string(),
@@ -2281,7 +2282,8 @@ impl LocalMachine {
             .claim_remote_start(&start)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?
         {
-            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => {
+            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))
+            | RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp { result, .. }) => {
                 return Ok(CallToolResponse::Complete(result));
             }
             RemoteStartDecision::Unknown => {
@@ -2348,7 +2350,7 @@ impl LocalMachine {
         native_tasks: bool,
         request_key: Option<String>,
         result_budget: Option<usize>,
-        heartbeat: Option<ProgressHeartbeat>,
+        heartbeat: Option<RequestProgress>,
     ) -> Result<Option<CallToolResponse>, McpError> {
         let name = request.name.as_ref();
         if !crate::mcp::is_shell_tool(name) {
@@ -2400,7 +2402,7 @@ impl LocalMachine {
 
         let deadline = sync_budget_millis
             .and_then(|millis| Instant::now().checked_add(Duration::from_millis(millis)));
-        let outcome = await_with_heartbeat(
+        let outcome = await_with_request_progress(
             heartbeat,
             deadline,
             self.jobs.wait_until(&started.id, deadline),
@@ -3327,7 +3329,7 @@ impl LocalMachine {
         self.run_shell_to_completion(
             args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Bash,
-            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "bash"),
+            RequestProgress::for_request(&context, self.config.log.clone(), "bash"),
         )
         .await
     }
@@ -3350,7 +3352,7 @@ impl LocalMachine {
         self.run_shell_to_completion(
             args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Pwsh,
-            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "pwsh"),
+            RequestProgress::for_request(&context, self.config.log.clone(), "pwsh"),
         )
         .await
     }
@@ -3373,7 +3375,7 @@ impl LocalMachine {
         self.run_shell_to_completion(
             args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Powershell,
-            ProgressHeartbeat::for_request(&context, self.config.log.clone(), "powershell"),
+            RequestProgress::for_request(&context, self.config.log.clone(), "powershell"),
         )
         .await
     }
@@ -3407,6 +3409,14 @@ mod tests {
         AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, PreparedLaunchers,
         RuntimeConfig, SandboxCacheMount, TransportContextToken,
     };
+
+    fn raw(bytes: usize) -> aw_tools::budget::RawPageBytes {
+        aw_tools::budget::RawPageBytes::new(bytes).expect("test raw page budget")
+    }
+
+    fn serialized(bytes: usize) -> aw_tools::budget::SerializedResultBytes {
+        aw_tools::budget::SerializedResultBytes::new(bytes).expect("test serialized result budget")
+    }
 
     fn compact_job_id(receipt: &str) -> &str {
         receipt
@@ -4043,7 +4053,14 @@ mod tests {
         }
         let output = second
             .jobs
-            .output_page(&id, crate::jobs::JobStream::Stdout, 0, 4096, 4096, false)
+            .output_page(
+                &id,
+                crate::jobs::JobStream::Stdout,
+                0,
+                raw(4096),
+                serialized(4096),
+                false,
+            )
             .unwrap();
         assert!(output.contains("survived"), "{output}");
         drop(second);
@@ -4279,19 +4296,36 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_delivery_never_crosses_the_command_deadline() {
         use std::sync::atomic::Ordering;
+        let token =
+            rmcp::model::ProgressToken(rmcp::model::NumberOrString::String("deadline-test".into()));
+        let heartbeat = aw_mcp_protocol::ProgressHeartbeat::new(
+            token,
+            aw_mcp_protocol::ProgressHeartbeatConfig::new(
+                Duration::from_millis(1),
+                Duration::from_millis(100),
+            )
+            .unwrap(),
+            None,
+        );
         let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delivery_polled = polled.clone();
-        let delivery = async move {
-            delivery_polled.store(true, Ordering::Relaxed);
-            std::future::pending::<()>().await;
-        };
-
-        let delivered = super::super::deliver_heartbeat_bounded(
+        let result = aw_mcp_protocol::await_with_progress_heartbeat(
+            Some(heartbeat),
             Some(Instant::now() - Duration::from_secs(1)),
-            delivery,
+            async {
+                tokio::time::sleep(Duration::from_millis(4)).await;
+                7_u8
+            },
+            move |_param| {
+                let delivery_polled = delivery_polled.clone();
+                async move {
+                    delivery_polled.store(true, Ordering::Relaxed);
+                    false
+                }
+            },
         )
         .await;
-        assert!(delivered.is_none());
+        assert_eq!(result, 7);
         assert!(
             !polled.load(Ordering::Relaxed),
             "an expired command deadline must win before delivery is polled"
@@ -4478,8 +4512,8 @@ mod tests {
                     &compat_id,
                     crate::jobs::JobStream::Stdout,
                     0,
-                    4096,
-                    4096,
+                    raw(4096),
+                    serialized(4096),
                     false,
                 )
                 .unwrap()
@@ -4492,8 +4526,8 @@ mod tests {
                     &native_id,
                     crate::jobs::JobStream::Stdout,
                     0,
-                    4096,
-                    4096,
+                    raw(4096),
+                    serialized(4096),
                     false,
                 )
                 .unwrap()
@@ -4879,13 +4913,20 @@ mod tests {
             panic!("compatibility client should receive a compact job receipt")
         };
         let receipt_text = receipt.content[0].as_text().unwrap().text.as_str();
-        assert!(receipt_text.contains(" process settled "), "{receipt_text}");
+        assert!(receipt_text.contains(" bash settled "), "{receipt_text}");
         assert!(receipt_text.contains(" outcome=ok"), "{receipt_text}");
         let job_id = compact_job_id(receipt_text);
         let page: Value = serde_json::from_str(
             &machine
                 .jobs
-                .output_page(job_id, crate::jobs::JobStream::Stdout, 0, 8192, 8192, false)
+                .output_page(
+                    job_id,
+                    crate::jobs::JobStream::Stdout,
+                    0,
+                    raw(8192),
+                    serialized(8192),
+                    false,
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -4928,7 +4969,7 @@ mod tests {
         let value = serde_json::to_value(receipt).unwrap();
         assert_ne!(value["isError"], true);
         let text = value["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains(" process settled "), "{text}");
+        assert!(text.contains(" bash settled "), "{text}");
         let job_id = compact_job_id(text);
         let status: Value = serde_json::from_str(&machine.jobs.status(job_id).unwrap()).unwrap();
         assert_eq!(status["status"], "completed");
@@ -4939,8 +4980,8 @@ mod tests {
                     job_id,
                     crate::jobs::JobStream::Stdout,
                     0,
-                    16_384,
-                    16_384,
+                    raw(16_384),
+                    serialized(16_384),
                     false,
                 )
                 .unwrap(),
@@ -5032,8 +5073,8 @@ mod tests {
                     &task_id,
                     crate::jobs::JobStream::Stdout,
                     0,
-                    4096,
-                    4096,
+                    raw(4096),
+                    serialized(4096),
                     false,
                 )
                 .unwrap(),
@@ -5285,8 +5326,8 @@ mod tests {
                         node: None,
                         stream: Some(crate::jobs::JobOutputStream::Stdout),
                         offset: 0,
-                        requested_bytes: 4096,
-                        response_ceiling: 16 * 1024,
+                        requested_bytes: raw(4096),
+                        response_ceiling: serialized(16 * 1024),
                         base64: false,
                     },
                 )
@@ -5334,8 +5375,8 @@ mod tests {
                         node: None,
                         stream: Some(crate::jobs::JobOutputStream::Stdout),
                         offset: 0,
-                        requested_bytes: 4096,
-                        response_ceiling: 16 * 1024,
+                        requested_bytes: raw(4096),
+                        response_ceiling: serialized(16 * 1024),
                         base64: false,
                     },
                     1_000,
@@ -5392,7 +5433,14 @@ mod tests {
         assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
         let partial = machine
             .jobs
-            .output_page(&id, crate::jobs::JobStream::Stdout, 0, 4096, 4096, false)
+            .output_page(
+                &id,
+                crate::jobs::JobStream::Stdout,
+                0,
+                raw(4096),
+                serialized(4096),
+                false,
+            )
             .unwrap();
         assert!(partial.contains("done"), "{partial}");
         tokio::time::sleep(Duration::from_millis(1300)).await;
