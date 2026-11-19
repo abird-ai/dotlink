@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.5] - 2026-11-19
+
+### Added
+
+- A shell job whose process died on a signal dotlink did not deliver now records
+  it: `LOG job exit id=<id> signal=<name> from=outside`. The stop line already
+  proved what dotlink signalled; nothing proved what it did not, so an
+  unattributed `SIGKILL` in a result had to be investigated by reading the code.
+  Exactly one of the two lines is written per job — `stop` is a signal dotlink
+  sent, `exit` is a signal it did not — and both are lifecycle lines, so their
+  absence stays evidence. `from=outside` claims only that the signal was not
+  ours, never who sent it: a crash reads the same, and the signal name
+  (`SIGSEGV` versus `SIGKILL`) is what separates them. The line is emitted once,
+  at terminal publication, from the same predicate as the result's prose, so the
+  journal and the reply cannot tell different stories.
+
+### Changed
+
+- The `timeout_secs` description says what the deadline does: the command tree
+  is **killed** and the result reports `stopped_by: "timeout"`. It also says it
+  is not the caller's wait, and that `background: true` returns at once and
+  leaves the command running. The shell tool description now mentions the same
+  fact. A caller that read "timeout" as "stop waiting" used to lose a long build
+  to a deadline nobody meant to set; both descriptions cost about the same
+  tokens as before (+12 B on the whole `tools/list` payload).
+
 ## [0.17.4] - 2026-11-18
 
 ### Added
@@ -787,6 +813,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.4...HEAD
+[0.17.5]: https://github.com/abird-ai/dotlink/compare/v0.17.4...v0.17.5
 [0.17.4]: https://github.com/abird-ai/dotlink/compare/v0.17.3...v0.17.4
 [0.17.3]: https://github.com/abird-ai/dotlink/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/abird-ai/dotlink/compare/v0.17.1...v0.17.2
