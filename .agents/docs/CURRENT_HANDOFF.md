@@ -1,6 +1,6 @@
 # CURRENT HANDOFF — dotlink unified Jobs + Agent runtime
 
-Prepared: 2026-11-14
+Prepared: 2026-11-18
 Owner: @pvl
 Machine: **L5 implementation/source authority**
 Repo: `/home/pvl/spaces/abird/src/dotlink`
@@ -12,6 +12,177 @@ Repo: `/home/pvl/spaces/abird/src/dotlink`
 > Later operational convergence with the 0.17.1 release branch is tracked in
 > [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
 > It preserves this unified-runtime implementation and is not a release/tag.
+
+## LIVE 0.17 shared-consumer update — P9 started
+
+This section supersedes older dependency/state details below when they conflict.
+
+- dotlink HEAD remains
+  `6598de605a006a75473a2043de3f60db384b0d02`;
+  `origin/main` remains
+  `5381729cd469eda54691e540deb3fee13e9f3e3e`.
+- AW P1-P8 is implemented and host-qualified in the AW working tree, but that
+  implementation is intentionally uncommitted/unpublished pending explicit user
+  authorization.
+- dotlink still pins published AW
+  `792f0b38d104659264b70c31736655df1a46b60f` in its three existing direct
+  dependencies: `aw-tools`, `aw-tools-fs-unix`, `aw-tools-fs-win`.
+- The authority-gated cutover is now fully preflighted in AW
+  `017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`.
+  D1/D6-D7 add direct `aw-platform` and `aw-mcp`, so the eventual repin must
+  place all **five** direct AW dependencies—and every transitive AW Git lock
+  package—on one exact signed/published **implementation** SHA. A later AW
+  docs-only commit is not the dependency pin.
+- The companion plan forbids temporary sibling/path AW dependencies, so P9
+  D1-D7 cannot honestly consume the new shared APIs until an authorized AW
+  commit is signed, published and atomically repinned.
+- D1-D3 is now source-mapped in
+  `.agents/plans/017-main-shared-consumer-backport-2026-11-18/D1-D3-SOURCE-CUTOVER-MAP.md`.
+  It identifies the exact `shell_process`/`run_shell_job`/`JobCompletion`/
+  `shared_process_terminal`/Task sites to replace. Its one discovered AW API
+  gap is now resolved in the AW working tree: platform-owned
+  `exit_signal(&ExitStatus)` supplies Unix physical signal extraction and AW's
+  process adapter consumes it. Dotlink must consume the same helper after repin.
+- No compatibility copies of the new AW stop/ref/receipt/budget/MCP semantics
+  were introduced while waiting.
+
+Unblocked P9 D8 is complete in the working tree:
+
+- Nix module rejects all module-owned environment keys through one generic
+  assertion:
+  `DOTLINK_PROFILE`, `DOTLINK_CONFIG_FILE`, `DOTLINK_API_KEY_FILE`,
+  `NGROK_AUTHTOKEN_FILE`, `DOTLINK_STDIO`, `DOTLINK_COLOR`,
+  `DOTLINK_SUPERVISOR`, `DOTLINK_SSH_AGENT_SOCKET`;
+- regression loops over every reserved key;
+- `DOTLINK_VERBOSITY`, `RUST_LOG`, `XDG_CONFIG_HOME` and
+  `XDG_STATE_HOME` remain accepted;
+- Nix service docs record the ownership/source-of-truth rule;
+- NixOS module derivation evaluates/builds green using the existing
+  command-local immutable NSS CA bundle;
+- Alejandra and `git diff --check` are green.
+
+No Rust/Cargo source was changed for this D8 checkpoint. Nothing is staged,
+committed or pushed.
+
+D9 operational/equivalence work is also checkpointed:
+
+- `.agents/docs/runtime-health-check.md` now targets the live `jobs_*`
+  surface, current 30-second Job observation waits, forward `jobs_read` paging,
+  explicit ACK/Finish, current receipt timestamps and progress logging;
+- its embedded stdlib Python reporter is syntax-checked and smoke-tested against
+  a synthetic `jobs_get/jobs_read/jobs_ack` log;
+- stop-line/`stopped_by` health semantics are explicitly labeled post-D1-D3,
+  so the pre-repin binary is not falsely judged against unavailable fields;
+- `V0174-EQUIVALENCE.md` classifies every v0.17.x item as Done, Superseded,
+  Product-only, Blocked or Deferred and records the remaining blockers;
+- current pre-repin qualification is **697/0/1** main unit tests plus
+  **40/40 integrations**, strict all-target/all-feature check+Clippy, rustfmt,
+  diff check, repo-wide Markdown lint, Alejandra and NixOS module build.
+
+One additional product-owned D2 prerequisite is complete without depending on
+unpublished AW APIs:
+
+- `src/logging.rs` no longer uses panic-on-I/O `eprintln!` for structured
+  LOG/TOOL/REQ lines or progress continuations;
+- all structured writes lock stderr and ignore write failure as best-effort
+  telemetry;
+- a BrokenPipe regression verifies the writer returns an error without panic;
+- a second regression invokes the lifecycle write helper from `Drop` while an
+  outer panic is already unwinding, proving there is no double-panic abort path;
+- full qualification after this change is **697/0/1** main unit tests plus
+  **40/40 integrations**, strict all-target/all-feature Clippy/check, rustfmt
+  and diff check.
+
+The logger now also has an explicit always-visible
+`LogConfig::lifecycle` channel. Existing production `notice()` calls delegate
+to it, and focused coverage proves the same LOG record is emitted regardless of
+quiet/TOOL/REQ verbosity. This gives the future stop observer a legitimate
+production-used channel without prewiring a dead stop-specific API.
+
+The actual stop-event sink, fixed `LOG job stop ...` rendering and stop-line
+real-binary tests remain blocked on the AW lifecycle-event publish/repin. No
+parallel stop semantic type was introduced.
+
+D6 compatibility-preservation is now locked before the helper swap:
+
+- real stdio and embedded-hosted `bread(format="mcp")` tests exercise every
+  production typed block class: Image/PNG, Audio/WAV and Resource/PDF;
+- both paths assert exact MCP type, MIME and base64/blob bytes, so typed content
+  cannot silently collapse to prose;
+- the existing decorator regression preserves synthetic `structured_content`,
+  typed blocks, stored receipt metadata and replay timestamp identity;
+- existing stdio/hosted Jobs tests preserve
+  `_meta["io.abird/receipt"].ts` plus the visible `ts=` marker;
+- no live tool currently emits `structuredContent`, so that invariant is
+  intentionally tested at the decorator boundary rather than through a fake
+  transport-only route.
+
+The D6 shared aw-mcp helper replacement itself remains blocked on AW repin.
+
+D4/D5 compatibility prerequisites are now locked as well:
+
+- 32 KiB hostile Job refs are rejected over real stdio and local HTTP with a
+  compact response that does not reflect the caller-controlled identifier;
+- existing narrow-replay tests prove compact handoff/cancel projection preserves
+  the same Job/effect and stored receipt metadata without replacing the cached
+  original;
+- `jobs_read.limit` now advertises and accepts a **1-byte** raw page;
+- when no trusted transport budget exists, `jobs_read` uses the profile-derived
+  serialized response capacity instead of incorrectly treating the raw page
+  limit as the response-envelope ceiling;
+- real stdio proves `limit=1` returns one byte, creates delivery proof, permits
+  ACK through byte 1, then continues truthfully at absolute offset 1.
+
+This is the local behavioral correction only. The final D4/D5 type/owner
+cutover to shared `JobRef`, `bounded_diagnostic`, shared receipts,
+`RawPageBytes` and `SerializedResultBytes` still waits for AW repin.
+
+D7 pre-repin scheduling now matches the stronger shared contract as well:
+
+- production defaults remain 10 s heartbeat interval / 100 ms send budget;
+- real hosted shell coverage proves monotonic token-gated heartbeat counters with
+  no fabricated total or message;
+- after a tick fires, notification delivery is raced against the same pinned
+  operation future rather than awaited serially;
+- deterministic coverage holds delivery pending forever, lets the operation
+  become ready, and proves the result wins immediately and the pending send is
+  dropped instead of detached;
+- the existing expired-deadline regression still proves an already-expired
+  operation deadline prevents the notification send from being polled.
+
+The D7 shared `ProgressHeartbeat`, observer and semantic-progress projection
+cutover still waits for AW repin; dotlink's current Drop summary remains the
+product logging implementation until that replacement.
+
+D6 local result fitting now matches the intended shared semantics too:
+
+- only text content may shrink under a serialized-result budget;
+- block order, annotations, per-block metadata, result metadata, error status,
+  typed Image/Audio/Resource blocks and `structured_content` are preserved;
+- text retention is chosen against the **actual serialized result size**, across
+  all text blocks rather than collapsing the result to one prose block;
+- if immutable facts still exceed the envelope after all text is emptied, the
+  call returns an explicit MCP budget error instead of a fabricated text
+  success.
+
+The local receipt path now also matches the shared metadata contract:
+
+- stored receipt timestamps win on replay; fresh selected results receive a host
+  UTC Unix timestamp only when no stored receipt timestamp exists;
+- result `_meta` is transactionally capped at **16 KiB serialized** before the
+  receipt key is committed;
+- unrelated result metadata survives receipt stamping;
+- an existing exact visible `ts=<same value>` line is not duplicated;
+- oversized existing metadata fails explicitly and leaves the original map
+  untouched.
+
+The shared `fit_complete_result` and receipt-helper replacement still waits for
+AW repin. Qualification for these D6 checkpoints used `CARGO_BUILD_JOBS=1` after
+parallel compile attempts were externally SIGKILLed; host memory remained
+healthy (~23 GiB available) with no kernel OOM/kill evidence.
+
+Next shared-consumer semantic hookup remains D1-D7 after the AW publish/repin
+gate. All final equivalence gates must be rerun after that cutover.
 
 ## Final implementation state
 
