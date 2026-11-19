@@ -50,11 +50,13 @@ fn wait_budget_only_narrows_by_authenticated_transport_remaining() {
 
 /// Read-only status must be complete; outer response truncation would
 /// destroy its outcome/revision semantics while still reporting success.
-fn bounded_job_status(status: String, budget: Option<usize>) -> CallToolResult {
+fn bounded_job_status(
+    machine: &LocalMachine,
+    status: String,
+    budget: Option<usize>,
+) -> CallToolResult {
     let result = ok_text(status);
-    if budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(&result).is_some_and(|size| size <= limit)
-    }) {
+    if result_fits(machine, aw_tools::OperationId::JobsGet, &result, budget) {
         return result;
     }
     tool_error(
@@ -62,9 +64,16 @@ fn bounded_job_status(status: String, budget: Option<usize>) -> CallToolResult {
     )
 }
 
-fn result_fits(result: &CallToolResult, budget: Option<usize>) -> bool {
+fn result_fits(
+    machine: &LocalMachine,
+    operation: aw_tools::OperationId,
+    result: &CallToolResult,
+    budget: Option<usize>,
+) -> bool {
     budget.is_none_or(|limit| {
-        crate::mcp::serialized_json_len(result).is_some_and(|size| size <= limit)
+        machine
+            .exact_decorated_result_len(operation, result.clone())
+            .is_ok_and(|size| size <= limit)
     })
 }
 
@@ -84,7 +93,14 @@ fn bounded_job_handoff(
     }
     machine
         .jobs
-        .standalone_handoff_fitted(id, |text| result_fits(&ok_text(text.to_owned()), budget))
+        .standalone_handoff_fitted(id, |text| {
+            result_fits(
+                machine,
+                aw_tools::OperationId::Batch,
+                &ok_text(text.to_owned()),
+                budget,
+            )
+        })
         .map(ok_text)
         .unwrap_or_else(tool_error)
 }
@@ -92,13 +108,15 @@ fn bounded_job_handoff(
 /// The replay ledger retains the original receipt. A narrower authenticated
 /// response may project the same Job ref compactly; it may never rerun work or
 /// silently clip away the continuation.
-fn bounded_replayed_job_handoff(
+fn bounded_cached_job_handoff(
     machine: &LocalMachine,
     reference: &JobRef,
     cached: CallToolResult,
     budget: Option<usize>,
 ) -> CallToolResult {
-    if cached.is_error.unwrap_or(false) || result_fits(&cached, budget) {
+    if cached.is_error.unwrap_or(false)
+        || result_fits(machine, aw_tools::OperationId::Batch, &cached, budget)
+    {
         return cached;
     }
     let meta = cached.meta.clone();
@@ -118,7 +136,7 @@ fn bounded_replayed_job_handoff(
     match machine.jobs.standalone_handoff_fitted(id, |text| {
         let mut projected = ok_text(text.to_owned());
         projected.meta = meta.clone();
-        result_fits(&projected, budget)
+        result_fits(machine, aw_tools::OperationId::Batch, &projected, budget)
     }) {
         Ok(text) => {
             let mut projected = ok_text(text);
@@ -127,7 +145,7 @@ fn bounded_replayed_job_handoff(
         }
         Err(_) => {
             let mut error = tool_error(
-                "Job is already admitted, but its replay handoff exceeds the response budget; list Jobs to recover it without rerunning",
+                "Job is already admitted, but its handoff exceeds the response budget; list Jobs to recover it without rerunning",
             );
             error.meta = meta;
             error
@@ -136,22 +154,28 @@ fn bounded_replayed_job_handoff(
 }
 
 fn bounded_control_success(
+    machine: &LocalMachine,
+    operation: aw_tools::OperationId,
     reference: &JobRef,
-    receipt: String,
+    result: CallToolResult,
     budget: Option<usize>,
 ) -> CallToolResult {
-    let result = ok_text(receipt);
-    if result_fits(&result, budget) {
+    if result_fits(machine, operation, &result, budget) {
         return result;
     }
-    tool_error(format!(
+    let meta = result.meta;
+    let mut error = tool_error(format!(
         "{reference} Job Control effect already applied, but its receipt exceeds the response budget; inspect with jobs_get before retrying"
-    ))
+    ));
+    error.meta = meta;
+    error
 }
 
 /// Reproject the original completed effect; never mutate its replay receipt
 /// or convert an error into a successful Control acknowledgement.
 fn bounded_control_replay(
+    machine: &LocalMachine,
+    operation: aw_tools::OperationId,
     cached: CallToolResult,
     reference: &JobRef,
     budget: Option<usize>,
@@ -159,7 +183,7 @@ fn bounded_control_replay(
     if cached.is_error.unwrap_or(false) {
         return cached;
     }
-    if result_fits(&cached, budget) {
+    if result_fits(machine, operation, &cached, budget) {
         return cached;
     }
     let mut error = tool_error(format!(
@@ -172,24 +196,30 @@ fn bounded_control_replay(
 /// A completed stdin write must never become an ambiguously truncated
 /// success. The minimal receipt deliberately avoids claiming a new revision.
 fn bounded_send_result(
+    machine: &LocalMachine,
     reference: &JobRef,
     original: CallToolResult,
     budget: Option<usize>,
 ) -> CallToolResult {
-    if result_fits(&original, budget) {
+    if result_fits(machine, aw_tools::OperationId::JobsSend, &original, budget) {
         return original;
     }
-    let compact = ok_text(format!("{reference} sent"));
-    if result_fits(&compact, budget) {
+    let meta = original.meta;
+    let mut compact = ok_text(format!("{reference} sent"));
+    compact.meta = meta.clone();
+    if result_fits(machine, aw_tools::OperationId::JobsSend, &compact, budget) {
         compact
     } else {
-        tool_error(format!(
+        let mut error = tool_error(format!(
             "{reference} stdin was already accepted, but its receipt exceeds the response budget; inspect with jobs_get, do not resend"
-        ))
+        ));
+        error.meta = meta;
+        error
     }
 }
 
 fn bounded_send_replay(
+    machine: &LocalMachine,
     reference: &JobRef,
     cached: CallToolResult,
     budget: Option<usize>,
@@ -197,12 +227,12 @@ fn bounded_send_replay(
     if cached.is_error.unwrap_or(false) {
         return cached;
     }
-    if result_fits(&cached, budget) {
+    if result_fits(machine, aw_tools::OperationId::JobsSend, &cached, budget) {
         return cached;
     }
     let mut compact = ok_text(format!("{reference} sent"));
     compact.meta = cached.meta.clone();
-    if result_fits(&compact, budget) {
+    if result_fits(machine, aw_tools::OperationId::JobsSend, &compact, budget) {
         compact
     } else {
         let mut error = tool_error(format!(
@@ -218,12 +248,13 @@ fn complete_remote_start_result(
     operation: aw_tools::OperationId,
     guard: Option<RemoteStartGuard>,
     reference: &JobRef,
-    mut result: CallToolResult,
+    mut canonical: CallToolResult,
+    project: impl FnOnce(CallToolResult) -> CallToolResult,
 ) -> CallToolResult {
     let Some(guard) = guard else {
-        return result;
+        return project(canonical);
     };
-    if let Err(error) = machine.stamp_cached_mcp_receipt(operation, &mut result) {
+    if let Err(error) = machine.stamp_cached_mcp_receipt(operation, &mut canonical) {
         let fallback = tool_error(format!(
             "remote Start effect completed but its timestamp receipt could not be finalized: {error}; inspect the Job before retrying"
         ));
@@ -237,9 +268,9 @@ fn complete_remote_start_result(
     }
     match guard.mark_ready(RemoteStartReceipt::JobMcp {
         reference: reference.clone(),
-        result: result.clone(),
+        result: canonical.clone(),
     }) {
-        Ok(()) => result,
+        Ok(()) => project(canonical),
         Err(error) => tool_error(error),
     }
 }
@@ -467,9 +498,8 @@ impl LocalMachine {
                 match self.jobs.render_graph_result(id, render_budget) {
                     Ok(Some(text)) => {
                         let result = ok_text(text);
-                        if result_budget.is_some_and(|limit| {
-                            crate::mcp::serialized_json_len(&result).is_none_or(|size| size > limit)
-                        }) {
+                        if !result_fits(self, aw_tools::OperationId::Batch, &result, result_budget)
+                        {
                             let _ = self.jobs.expose_compatibility(id);
                             return bounded_job_handoff(self, &reference, result_budget);
                         }
@@ -507,7 +537,16 @@ impl LocalMachine {
                     .min(self.config.max_output_bytes)
                     .max(1);
                 Some(match self.jobs.render_graph_result(id, render_budget) {
-                    Ok(Some(text)) => ok_text(text),
+                    Ok(Some(text)) => {
+                        let result = ok_text(text);
+                        if result_fits(self, aw_tools::OperationId::Batch, &result, result_budget) {
+                            result
+                        } else {
+                            tool_error(
+                                "committed synchronous Graph result no longer fits the request budget",
+                            )
+                        }
+                    }
                     Ok(None) => tool_error(
                         "committed synchronous Graph result no longer fits its response budget",
                     ),
@@ -561,7 +600,7 @@ impl LocalMachine {
                     reference,
                     result,
                 })) => {
-                    return bounded_replayed_job_handoff(self, &reference, result, result_budget);
+                    return bounded_cached_job_handoff(self, &reference, result, result_budget);
                 }
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
                     return result;
@@ -595,13 +634,18 @@ impl LocalMachine {
                     return tool_error(error);
                 }
             };
-            let result = bounded_job_handoff(self, &reference, result_budget);
+            let canonical = self
+                .jobs
+                .standalone_handoff_fitted(&started.id, |_| true)
+                .map(ok_text)
+                .unwrap_or_else(tool_error);
             return complete_remote_start_result(
                 self,
                 aw_tools::OperationId::Batch,
                 Some(guard),
                 &reference,
-                result,
+                canonical,
+                |cached| bounded_cached_job_handoff(self, &reference, cached, result_budget),
             );
         }
 
@@ -662,8 +706,12 @@ impl LocalMachine {
         match self
             .jobs
             .standalone_list_fitted(args.cursor.as_deref(), limit, |page| {
-                let result = ok_text(page.to_owned());
-                crate::mcp::serialized_json_len(&result).is_some_and(|size| size <= ceiling)
+                result_fits(
+                    self,
+                    aw_tools::OperationId::JobsList,
+                    &ok_text(page.to_owned()),
+                    Some(ceiling),
+                )
             }) {
             Ok(page) => ok_text(page),
             Err(error) => tool_error(error),
@@ -720,7 +768,7 @@ impl LocalMachine {
                     .jobs
                     .standalone_process_tail(id, node, args.tail, status, result_budget)
                 {
-                    Ok(status) => bounded_job_status(status, Some(result_budget)),
+                    Ok(status) => bounded_job_status(self, status, Some(result_budget)),
                     Err(error) => tool_error(error),
                 }
             }
@@ -879,7 +927,13 @@ impl LocalMachine {
                             "Cached Job Control identity differs; inspect the Job before retrying",
                         );
                     }
-                    return bounded_control_replay(result, &reference, result_budget);
+                    return bounded_control_replay(
+                        self,
+                        aw_tools::OperationId::JobsAck,
+                        result,
+                        &reference,
+                        result_budget,
+                    );
                 }
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(_))) => {
                     return tool_error(
@@ -927,16 +981,25 @@ impl LocalMachine {
                             guard,
                             &reference,
                             result,
+                            |result| result,
                         );
                     }
                 };
-                let result = bounded_control_success(&reference, receipt, result_budget);
                 complete_remote_start_result(
                     self,
                     aw_tools::OperationId::JobsAck,
                     guard,
                     &reference,
-                    result,
+                    ok_text(receipt),
+                    |canonical| {
+                        bounded_control_success(
+                            self,
+                            aw_tools::OperationId::JobsAck,
+                            &reference,
+                            canonical,
+                            result_budget,
+                        )
+                    },
                 )
             }
             Err(error) => {
@@ -947,6 +1010,7 @@ impl LocalMachine {
                     guard,
                     &reference,
                     result,
+                    |result| result,
                 )
             }
         }
@@ -1015,7 +1079,7 @@ impl LocalMachine {
                             "Cached stdin Job identity differs; inspect Job, do not resend",
                         );
                     }
-                    return bounded_send_replay(&reference, result, result_budget);
+                    return bounded_send_replay(self, &reference, result, result_budget);
                 }
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(_))) => {
                     return tool_error(
@@ -1036,9 +1100,19 @@ impl LocalMachine {
         // Do not send irreversible stdin unless a complete confirmation can
         // fit. An existing replay was inspected above, before this preflight.
         let minimal = ok_text(format!("{reference} sent"));
-        if result_budget.is_some_and(|limit| {
-            crate::mcp::serialized_json_len(&minimal).is_none_or(|size| size > limit)
-        }) {
+        let minimal_size =
+            match self.exact_decorated_result_len(aw_tools::OperationId::JobsSend, minimal) {
+                Ok(size) => size,
+                Err(error) => {
+                    if let Some(guard) = guard {
+                        guard.release_before_effect();
+                    }
+                    return tool_error(format!(
+                        "jobs_send receipt preflight failed before stdin delivery: {error}"
+                    ));
+                }
+            };
+        if result_budget.is_some_and(|limit| minimal_size > limit) {
             if let Some(guard) = guard {
                 guard.release_before_effect();
             }
@@ -1051,14 +1125,14 @@ impl LocalMachine {
             .await
         {
             Ok(revision) => {
-                let full = ok_text(format!("{reference} rev={revision} ok"));
-                let result = bounded_send_result(&reference, full, result_budget);
+                let canonical = ok_text(format!("{reference} rev={revision} ok"));
                 complete_remote_start_result(
                     self,
                     aw_tools::OperationId::JobsSend,
                     guard,
                     &reference,
-                    result,
+                    canonical,
+                    |canonical| bounded_send_result(self, &reference, canonical, result_budget),
                 )
             }
             Err(error) => {
@@ -1069,6 +1143,7 @@ impl LocalMachine {
                     guard,
                     &reference,
                     result,
+                    |result| result,
                 )
             }
         }
@@ -1102,7 +1177,13 @@ impl LocalMachine {
                             "Cached cancellation Job identity differs; inspect the Job before retrying",
                         );
                     }
-                    return bounded_control_replay(result, &reference, result_budget);
+                    return bounded_control_replay(
+                        self,
+                        aw_tools::OperationId::JobsCancel,
+                        result,
+                        &reference,
+                        result_budget,
+                    );
                 }
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(_))) => {
                     return tool_error(
@@ -1145,16 +1226,25 @@ impl LocalMachine {
                             guard,
                             &reference,
                             result,
+                            |result| result,
                         );
                     }
                 };
-                let result = bounded_control_success(&reference, receipt, result_budget);
                 complete_remote_start_result(
                     self,
                     aw_tools::OperationId::JobsCancel,
                     guard,
                     &reference,
-                    result,
+                    ok_text(receipt),
+                    |canonical| {
+                        bounded_control_success(
+                            self,
+                            aw_tools::OperationId::JobsCancel,
+                            &reference,
+                            canonical,
+                            result_budget,
+                        )
+                    },
                 )
             }
             Err(error) => {
@@ -1165,6 +1255,7 @@ impl LocalMachine {
                     guard,
                     &reference,
                     result,
+                    |result| result,
                 )
             }
         }
@@ -1574,14 +1665,19 @@ mod tests {
 
     #[test]
     fn status_budget_never_returns_truncated_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine =
+            crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
         let full = "j:example node settled rev=12 ".to_owned() + &"status-output".repeat(800);
         let success = ok_text(full.clone());
-        let exact = crate::mcp::serialized_json_len(&success).unwrap();
-        let accepted = bounded_job_status(full.clone(), Some(exact));
+        let exact = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsGet, success)
+            .unwrap();
+        let accepted = bounded_job_status(&machine, full.clone(), Some(exact));
         assert!(!accepted.is_error.unwrap_or(false));
         assert_eq!(accepted.content[0].as_text().unwrap().text, full);
 
-        let oversized = bounded_job_status(full, Some(512));
+        let oversized = bounded_job_status(&machine, full, Some(512));
         assert!(oversized.is_error.unwrap_or(false));
         let message = &oversized.content[0].as_text().unwrap().text;
         assert!(message.contains("exceeds the response budget"));
@@ -1603,8 +1699,18 @@ mod tests {
             .unwrap();
         machine.jobs.wait_until(&started.id, None).await.unwrap();
         let (revision, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
-        let concise = format!("j:{} rev={revision} next=jobs_get no-rerun", started.id);
-        let budget = crate::mcp::serialized_json_len(&ok_text(concise)).unwrap() + 128;
+        let reference = crate::jobs::JobManager::standalone_ref(&started.id, None).unwrap();
+        let concise = render_plain(
+            Receipt::Handoff {
+                reference: &reference,
+                revision,
+            },
+            aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+        )
+        .unwrap();
+        let budget = machine
+            .exact_decorated_result_len(aw_tools::OperationId::Batch, ok_text(concise))
+            .unwrap();
         let result = machine
             .finish_graph_call(&started.id, None, Some(budget))
             .await;
@@ -1644,6 +1750,9 @@ mod tests {
 
     #[test]
     fn shared_control_receipts_keep_typed_identity_and_factual_grammar() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine =
+            crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
         let root = parse_ref("j:control-123").unwrap();
         let node = parse_ref("j:control-123/n:2").unwrap();
 
@@ -1682,13 +1791,30 @@ mod tests {
         .unwrap();
         assert_eq!(cancel, "j:control-123 rev=42 cancel=accepted");
 
-        let exact = crate::mcp::serialized_json_len(&ok_text(cancel.clone())).unwrap();
+        let mut canonical = ok_text(cancel.clone());
+        crate::mcp::set_stored_receipt_ts(&mut canonical, 77).unwrap();
+        let exact = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsCancel, canonical.clone())
+            .unwrap();
         assert_eq!(
-            bounded_control_success(&root, cancel.clone(), Some(exact)),
-            ok_text(cancel.clone())
+            bounded_control_success(
+                &machine,
+                aw_tools::OperationId::JobsCancel,
+                &root,
+                canonical.clone(),
+                Some(exact),
+            ),
+            canonical
         );
-        let too_small = bounded_control_success(&root, cancel.clone(), Some(exact - 1));
+        let too_small = bounded_control_success(
+            &machine,
+            aw_tools::OperationId::JobsCancel,
+            &root,
+            canonical.clone(),
+            Some(exact - 1),
+        );
         assert!(too_small.is_error.unwrap_or(false));
+        assert_eq!(crate::mcp::stored_receipt_ts(&too_small), Some(77));
         assert!(
             too_small.content[0]
                 .as_text()
@@ -1697,15 +1823,27 @@ mod tests {
                 .contains("effect already applied")
         );
 
-        let cached = ok_text(cancel);
+        let cached = canonical;
         assert_eq!(
-            bounded_control_replay(cached.clone(), &root, Some(exact)),
+            bounded_control_replay(
+                &machine,
+                aw_tools::OperationId::JobsCancel,
+                cached.clone(),
+                &root,
+                Some(exact),
+            ),
             cached,
             "typed identity is validated by the replay ledger before projection"
         );
         let failed = tool_error("stale Job revision");
         assert_eq!(
-            bounded_control_replay(failed.clone(), &root, Some(1)),
+            bounded_control_replay(
+                &machine,
+                aw_tools::OperationId::JobsCancel,
+                failed.clone(),
+                &root,
+                Some(1),
+            ),
             failed,
             "a failed effect replay cannot be turned into Control success"
         );
@@ -1713,33 +1851,45 @@ mod tests {
 
     #[test]
     fn send_receipts_are_exact_bounded_and_replay_preserves_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine =
+            crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
         let reference = parse_ref("j:send-123/n:2").unwrap();
         let name = "j:send-123/n:2";
-        let full = ok_text(format!("{name} rev={} ok", u64::MAX));
-        let full_size = crate::mcp::serialized_json_len(&full).unwrap();
-        let compact = ok_text(format!("{name} sent"));
-        let compact_size = crate::mcp::serialized_json_len(&compact).unwrap();
+        let mut full = ok_text(format!("{name} rev={} ok", u64::MAX));
+        crate::mcp::set_stored_receipt_ts(&mut full, 88).unwrap();
+        let full_size = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsSend, full.clone())
+            .unwrap();
+        let bare_compact = ok_text(format!("{name} sent"));
+        let mut compact = bare_compact.clone();
+        compact.meta = full.meta.clone();
+        let compact_size = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsSend, compact.clone())
+            .unwrap();
         assert!(compact_size < full_size);
 
         assert_eq!(
-            bounded_send_result(&reference, full.clone(), Some(full_size)),
+            bounded_send_result(&machine, &reference, full.clone(), Some(full_size)),
             full
         );
-        let narrowed = bounded_send_result(&reference, full.clone(), Some(compact_size));
+        let narrowed = bounded_send_result(&machine, &reference, full.clone(), Some(compact_size));
         assert_eq!(narrowed, compact);
         assert!(crate::mcp::serialized_json_len(&narrowed).unwrap() <= compact_size);
-        let too_small = bounded_send_result(&reference, full.clone(), Some(compact_size - 1));
+        let too_small =
+            bounded_send_result(&machine, &reference, full.clone(), Some(compact_size - 1));
         assert!(too_small.is_error.unwrap_or(false));
+        assert_eq!(crate::mcp::stored_receipt_ts(&too_small), Some(88));
         let detail = &too_small.content[0].as_text().unwrap().text;
         assert!(detail.contains("already accepted") && detail.contains("do not resend"));
 
         assert_eq!(
-            bounded_send_replay(&reference, full.clone(), Some(compact_size)),
+            bounded_send_replay(&machine, &reference, full.clone(), Some(compact_size)),
             compact,
             "narrow replay may drop a revision but must preserve the exact send identity"
         );
         assert_eq!(
-            bounded_send_replay(&reference, compact.clone(), Some(full_size)),
+            bounded_send_replay(&machine, &reference, compact.clone(), Some(full_size)),
             compact,
             "a replay cannot invent a revision omitted from the cached receipt"
         );
@@ -1749,21 +1899,26 @@ mod tests {
         );
         let denied = tool_error("Process authority revoked; stdin outcome unknown");
         assert_eq!(
-            bounded_send_replay(&reference, denied.clone(), Some(1)),
+            bounded_send_replay(&machine, &reference, denied.clone(), Some(1)),
             denied,
             "cached error can never become a success"
         );
         let opaque = ok_text("cached-rendering-is-not-semantic-state");
-        let opaque_size = crate::mcp::serialized_json_len(&opaque).unwrap();
+        let opaque_size = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsSend, opaque.clone())
+            .unwrap();
         assert_eq!(
-            bounded_send_replay(&reference, opaque.clone(), Some(opaque_size)),
+            bounded_send_replay(&machine, &reference, opaque.clone(), Some(opaque_size)),
             opaque,
             "trusted replay identity is external to rendered prose"
         );
         let opaque_large = ok_text("cached-rendering-is-not-semantic-state ".repeat(64));
+        let bare_compact_size = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsSend, bare_compact.clone())
+            .unwrap();
         assert_eq!(
-            bounded_send_replay(&reference, opaque_large, Some(compact_size)),
-            compact,
+            bounded_send_replay(&machine, &reference, opaque_large, Some(bare_compact_size)),
+            bare_compact,
             "a narrow replay projects the already-known typed Job ref without parsing cached text"
         );
     }
@@ -1803,7 +1958,14 @@ mod tests {
         }
         let reference = format!("j:{}", started.id);
         let minimal = ok_text(format!("{reference} sent"));
-        let minimal_size = crate::mcp::serialized_json_len(&minimal).unwrap();
+        let bare_minimal_size = crate::mcp::serialized_json_len(&minimal).unwrap();
+        let minimal_size = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsSend, minimal.clone())
+            .unwrap();
+        assert!(
+            bare_minimal_size < minimal_size,
+            "receipt metadata + visible timestamp must consume response envelope space"
+        );
         let args = || {
             serde_json::from_value::<JobsSendArgs>(serde_json::json!({
                 "ref":reference, "input":{"text":"hello\n"}
@@ -1812,7 +1974,7 @@ mod tests {
         };
 
         let denied = machine
-            .jobs_send_impl(args(), None, Some(minimal_size - 1))
+            .jobs_send_impl(args(), None, Some(bare_minimal_size))
             .await;
         assert!(denied.is_error.unwrap_or(false));
         assert!(
@@ -1927,15 +2089,20 @@ mod tests {
             .unwrap();
         let reference = crate::jobs::JobManager::standalone_ref(&started.id, None).unwrap();
         let (_, status) = machine.jobs.standalone_status(&started.id, None).unwrap();
-        let first = complete_remote_start_result(
+        let narrow_first = complete_remote_start_result(
             &machine,
             aw_tools::OperationId::Batch,
             Some(guard),
             &reference,
-            ok_text(status),
+            ok_text(status.clone()),
+            |cached| bounded_cached_job_handoff(&machine, &reference, cached, Some(1)),
         );
-        let first_ts =
-            crate::mcp::stored_receipt_ts(&first).expect("cached Batch receipt timestamp");
+        assert!(
+            narrow_first.is_error.unwrap_or(false),
+            "an impossible first response budget must project an error after the canonical receipt is cached"
+        );
+        let first_ts = crate::mcp::stored_receipt_ts(&narrow_first)
+            .expect("narrow first response preserves cached Batch timestamp");
         machine.jobs.wait_until(&started.id, None).await.unwrap();
         assert!(!root.join("a.txt").exists());
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
@@ -1950,25 +2117,40 @@ mod tests {
             }
             _ => panic!("duplicate Graph Start must replay the first typed receipt"),
         };
-        assert_eq!(replay, first);
+        assert!(
+            !replay.is_error.unwrap_or(false),
+            "a wider replay must recover the canonical successful receipt, not the first narrow projection"
+        );
+        assert_eq!(replay.content[0].as_text().unwrap().text, status);
         assert_eq!(crate::mcp::stored_receipt_ts(&replay), Some(first_ts));
+        assert_ne!(
+            replay, narrow_first,
+            "the replay ledger must not cache a request-specific narrow projection"
+        );
         // A replay under a smaller envelope keeps the original ledger result
         // and returns a complete ref instead of a clipped success receipt.
         let (current_revision, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
-        let concise = format!(
-            "j:{} rev={current_revision} next=jobs_get no-rerun",
-            started.id
-        );
-        let mut concise_result = ok_text(concise.clone());
+        let concise = render_plain(
+            Receipt::Handoff {
+                reference: &reference,
+                revision: current_revision,
+            },
+            aw_tools::filesystem::job_manager::MAX_COMPACT_JOB_STATUS_BYTES,
+        )
+        .unwrap();
+        let mut concise_result = ok_text(concise);
         concise_result.meta = replay.meta.clone();
-        // Leave a little serialized-envelope headroom so a concurrently
-        // advancing shared revision cannot turn a factual replay into a
-        // byte-exact test artifact. The cached synthetic receipt below remains
-        // much larger and therefore still forces projection.
-        let small_budget = crate::mcp::serialized_json_len(&concise_result).unwrap() + 128;
+        let small_budget = machine
+            .exact_decorated_result_len(aw_tools::OperationId::Batch, concise_result)
+            .unwrap();
         let projected =
-            bounded_replayed_job_handoff(&machine, &reference, replay.clone(), Some(small_budget));
-        let fits = crate::mcp::serialized_json_len(&replay).unwrap() <= small_budget;
+            bounded_cached_job_handoff(&machine, &reference, replay.clone(), Some(small_budget));
+        let fits = result_fits(
+            &machine,
+            aw_tools::OperationId::Batch,
+            &replay,
+            Some(small_budget),
+        );
         if fits {
             assert_eq!(projected, replay);
         } else {
@@ -1977,7 +2159,12 @@ mod tests {
             assert!(text.starts_with(&format!("j:{} ", started.id)), "{text}");
             assert!(text.contains("rev="), "{text}");
             assert_eq!(crate::mcp::stored_receipt_ts(&projected), Some(first_ts));
-            assert!(crate::mcp::serialized_json_len(&projected).unwrap() <= small_budget);
+            assert!(result_fits(
+                &machine,
+                aw_tools::OperationId::Batch,
+                &projected,
+                Some(small_budget),
+            ));
         }
         let mut long_cached = ok_text(format!(
             "j:{} graph waiting rev=1 {}",
@@ -1986,7 +2173,7 @@ mod tests {
         ));
         long_cached.meta = replay.meta.clone();
         let projected =
-            bounded_replayed_job_handoff(&machine, &reference, long_cached, Some(small_budget));
+            bounded_cached_job_handoff(&machine, &reference, long_cached, Some(small_budget));
         assert!(!projected.is_error.unwrap_or(false), "{projected:?}");
         let projected_text = &projected.content[0].as_text().unwrap().text;
         assert!(
@@ -2006,7 +2193,10 @@ mod tests {
             }
             _ => panic!("duplicate Start must preserve the cached typed receipt"),
         };
-        assert_eq!(original, first);
+        assert_eq!(
+            original, replay,
+            "narrow projections must never replace the canonical cached Graph receipt"
+        );
         assert!(!root.join("a.txt").exists());
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
     }
@@ -2106,17 +2296,22 @@ mod tests {
         )
         .unwrap();
 
-        let first = machine
+        let narrow_first = machine
             .jobs_cancel_impl(
                 JobsCancelArgs {
                     reference: reference.clone(),
                     rev: Some(initial_rev),
                 },
                 Some(start.clone()),
-                None,
+                Some(1),
             )
             .await;
-        assert_ne!(first.is_error, Some(true));
+        assert!(
+            narrow_first.is_error.unwrap_or(false),
+            "the first narrow response may fail projection after cancellation, but must still cache canonical success"
+        );
+        let first_ts = crate::mcp::stored_receipt_ts(&narrow_first)
+            .expect("narrow first cancel response preserves cached receipt timestamp");
         let (after_rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
         assert_ne!(
             after_rev, initial_rev,
@@ -2133,21 +2328,18 @@ mod tests {
                 None,
             )
             .await;
-        assert_eq!(
-            replay, first,
-            "duplicate remote Start must replay the original cancel receipt"
+        assert!(
+            !replay.is_error.unwrap_or(false),
+            "wide duplicate must recover canonical cancel success rather than the first narrow projection"
         );
-        let first_ts =
-            crate::mcp::stored_receipt_ts(&first).expect("cached cancel receipt timestamp");
-        let mut minimal = ok_text(format!(
-            "j:{} cancel=accepted next=jobs_get no-rerun",
-            started.id
-        ));
-        minimal.meta = first.meta.clone();
-        minimal
-            .content
-            .push(rmcp::model::ContentBlock::text(format!("ts={first_ts}")));
-        let budget = crate::mcp::serialized_json_len(&minimal).unwrap();
+        assert_eq!(crate::mcp::stored_receipt_ts(&replay), Some(first_ts));
+        assert_ne!(
+            replay, narrow_first,
+            "request-specific narrow projection must not replace the cached cancel receipt"
+        );
+        let exact = machine
+            .exact_decorated_result_len(aw_tools::OperationId::JobsCancel, replay.clone())
+            .unwrap();
         let narrow = machine
             .jobs_cancel_impl(
                 JobsCancelArgs {
@@ -2155,11 +2347,14 @@ mod tests {
                     rev: Some(initial_rev),
                 },
                 Some(start.clone()),
-                Some(budget),
+                Some(exact - 1),
             )
             .await;
-        assert!(!narrow.is_error.unwrap_or(false), "{narrow:?}");
-        assert!(crate::mcp::serialized_json_len(&narrow).unwrap() <= budget);
+        assert!(
+            narrow.is_error.unwrap_or(false),
+            "a replay budget below the exact decorated receipt must fail projection without replacing cache"
+        );
+        assert_eq!(crate::mcp::stored_receipt_ts(&narrow), Some(first_ts));
         let still_original = machine
             .jobs_cancel_impl(
                 JobsCancelArgs {
@@ -2171,8 +2366,8 @@ mod tests {
             )
             .await;
         assert_eq!(
-            still_original, first,
-            "narrow replay must not replace the cached Control result"
+            still_original, replay,
+            "narrow replay must not replace the canonical cached Control result"
         );
         machine.jobs.wait_until(&started.id, None).await.unwrap();
     }

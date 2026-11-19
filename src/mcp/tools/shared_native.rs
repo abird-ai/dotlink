@@ -79,9 +79,9 @@ pub(crate) fn caps(max_read: usize, max_write: usize) -> Result<SchemaCaps, &'st
     .validate()
 }
 
-/// Dotlink-selected shared catalog profile. Receipt timestamps/checkpoint
-/// guidance stay disabled until dotlink has a typed shared receipt projection;
-/// never decorate existing free-form MCP results by parsing text.
+/// Dotlink-selected shared catalog profile. D6 enables receipt timestamps and
+/// checkpoint guidance only for typed Process/Batch/Jobs projections; no
+/// free-form MCP result text is parsed to recover receipt state.
 pub(crate) fn receipt_profile() -> ReceiptProfile {
     ReceiptProfile {
         unix_ts: true,

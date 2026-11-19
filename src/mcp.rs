@@ -8,6 +8,8 @@ mod shared_fs;
 mod tools;
 pub(crate) use aw_tools::mutation::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 #[cfg(test)]
+pub(crate) use tools::shared_native::receipt_profile as shared_receipt_profile;
+#[cfg(test)]
 pub(crate) use tools::shell::ShellArgs;
 #[cfg(test)]
 pub(crate) use tools::test_support::test_machine;
@@ -2129,12 +2131,36 @@ impl LocalMachine {
         tools::shared_native::toolset(self.config.shared_caps, self.config.max_output_bytes)
     }
 
+    pub(crate) fn exact_decorated_result_len(
+        &self,
+        operation: aw_tools::OperationId,
+        result: CallToolResult,
+    ) -> Result<usize, McpError> {
+        let profile = tools::shared_native::receipt_profile();
+        let host_timestamp =
+            if profile.timestamps(operation) && stored_receipt_ts(&result).is_none() {
+                Some(unix_ts_now()?)
+            } else {
+                None
+            };
+        let decorated = decorate_and_fit_complete_result(
+            profile,
+            operation,
+            result,
+            host_timestamp,
+            SerializedResultBytes::new(usize::MAX).expect("usize::MAX is non-zero"),
+        )
+        .map_err(protocol_result_error)?;
+        serialized_json_len(&decorated)
+            .ok_or_else(|| McpError::internal_error("invalid decorated MCP tool result", None))
+    }
+
     pub(crate) fn stamp_cached_mcp_receipt(
         &self,
         operation: aw_tools::OperationId,
         result: &mut CallToolResult,
     ) -> Result<(), McpError> {
-        let profile = self.shared_toolset().receipt_profile();
+        let profile = tools::shared_native::receipt_profile();
         if !profile.timestamps(operation) {
             return Ok(());
         }
@@ -2162,7 +2188,7 @@ impl LocalMachine {
                 .map(CallToolResponse::Complete)
                 .map_err(protocol_result_error);
         };
-        let profile = self.shared_toolset().receipt_profile();
+        let profile = tools::shared_native::receipt_profile();
         let host_timestamp =
             if profile.timestamps(operation) && stored_receipt_ts(&result).is_none() {
                 Some(unix_ts_now()?)

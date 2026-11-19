@@ -11166,7 +11166,25 @@ mod tests {
             .output_node_page(&job.id, request(0, 1024, false))
             .unwrap();
         assert!(serialized_tool_result_len(&rendered).unwrap() <= 1024);
-        let page: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let decorated = aw_mcp_protocol::decorate_and_fit_complete_result(
+            crate::mcp::shared_receipt_profile(),
+            OperationId::JobsRead,
+            CallToolResult::success(vec![ContentBlock::text(rendered.clone())]),
+            Some(1_794_737_000),
+            serialized(1024),
+        )
+        .unwrap();
+        assert!(
+            aw_mcp_protocol::serialized_result_len(&decorated).unwrap() <= 1024,
+            "D5 response reserve must leave room for the D6 receipt envelope"
+        );
+        assert_eq!(
+            decorated.content[0].as_text().unwrap().text,
+            rendered,
+            "D6 decoration must not truncate a jobs_read page after delivery credit is recorded"
+        );
+        let page: serde_json::Value =
+            serde_json::from_str(&decorated.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(page["offset"], 0);
         let through = page["next_offset"].as_u64().unwrap();
         assert!(through > 0 && through < data.len() as u64);
