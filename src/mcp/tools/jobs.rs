@@ -845,6 +845,7 @@ impl LocalMachine {
         };
         let profile = crate::jobs::dotlink_job_profile(self.config.max_output_bytes);
         let ceiling = match args.limit {
+            Some(0) => return tool_error("jobs_read limit must be at least 1"),
             Some(limit) if limit > profile.read_page_max_bytes => {
                 return tool_error(format!(
                     "jobs_read limit exceeds {}",

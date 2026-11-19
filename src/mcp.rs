@@ -378,30 +378,21 @@ fn fit_call_tool_response_to_budget(
 
     // Text is the only mutable projection. Preserve structured content, typed
     // media/resources, block order, annotations, per-block metadata, result
-    // metadata and error status exactly. If those immutable facts cannot fit
-    // even after every text block is emptied, fail explicitly instead of
-    // converting the result into a misleading text success.
-    let empty_text = fitted_text_blocks(&result, 0, "");
-    if serialized_json_len(&empty_text).is_none_or(|size| size > budget) {
+    // metadata and error status exactly. Truncation must stay explicit: if the
+    // immutable facts plus the generic marker cannot fit, fail instead of
+    // returning shortened text that looks complete.
+    let minimal = fitted_text_blocks(&result, 0, suffix);
+    if serialized_json_len(&minimal).is_none_or(|size| size > budget) {
         tracing::error!(
             tool,
             budget,
-            "immutable tool result facts exceeded the transport response budget"
+            "minimal factual tool result exceeded the transport response budget"
         );
         return Err(McpError::internal_error(
-            "tool result contains immutable structured or typed content that exceeds the transport response budget",
+            "tool result cannot fit the transport response budget with an explicit truncation marker",
             None,
         ));
     }
-
-    let suffix = {
-        let candidate = fitted_text_blocks(&result, 0, suffix);
-        if serialized_json_len(&candidate).is_some_and(|size| size <= budget) {
-            suffix
-        } else {
-            ""
-        }
-    };
 
     let mut low = 0_usize;
     let mut high = total_text_bytes;
@@ -459,8 +450,14 @@ pub(crate) fn set_stored_receipt_ts(
     ts: u64,
 ) -> Result<(), &'static str> {
     let mut meta = result.meta.clone().unwrap_or_default();
-    meta.0
-        .insert(RECEIPT_META_KEY.to_owned(), serde_json::json!({"ts": ts}));
+    let receipt = meta
+        .0
+        .entry(RECEIPT_META_KEY.to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    let object = receipt
+        .as_object_mut()
+        .ok_or("reserved receipt metadata must be an object")?;
+    object.insert("ts".to_owned(), Value::from(ts));
     if serialized_json_len(&meta).is_none_or(|size| size > MAX_MCP_RESULT_META_BYTES) {
         return Err("tool result metadata exceeds the 16 KiB MCP result metadata limit");
     }
@@ -2306,35 +2303,51 @@ impl LocalMachine {
             );
         };
         let marker = format!("ts={ts}");
-        if has_visible_receipt_ts(&result, ts) {
-            return fit_call_tool_response_to_budget(
-                name,
-                CallToolResponse::Complete(result),
-                budget,
-            );
-        }
-
         let Some(budget) = budget else {
             ensure_visible_receipt_ts(&mut result, ts);
             return Ok(CallToolResponse::Complete(result));
         };
-        let base_size = serialized_json_len(&result).unwrap_or(usize::MAX);
-        let mut candidate = result.clone();
+
+        // First fit against the full envelope. If an existing visible receipt
+        // marker survives, do not reserve space for a duplicate sidecar.
+        let fitted = fit_call_tool_response_to_budget(
+            name,
+            CallToolResponse::Complete(result.clone()),
+            Some(budget),
+        )?;
+        let CallToolResponse::Complete(fitted) = fitted else {
+            return Ok(fitted);
+        };
+        if has_visible_receipt_ts(&fitted, ts) {
+            return Ok(CallToolResponse::Complete(fitted));
+        }
+
+        let mut candidate = fitted.clone();
         candidate.content.push(ContentBlock::text(marker.clone()));
+        let fitted_size = serialized_json_len(&fitted).unwrap_or(usize::MAX);
         let candidate_size = serialized_json_len(&candidate).unwrap_or(usize::MAX);
         if candidate_size <= budget {
             return Ok(CallToolResponse::Complete(candidate));
         }
 
-        let receipt_reserve = candidate_size.saturating_sub(base_size);
+        let receipt_reserve = candidate_size.saturating_sub(fitted_size);
+        let body_budget = budget.checked_sub(receipt_reserve).ok_or_else(|| {
+            McpError::internal_error(
+                "tool receipt timestamp cannot fit the transport response budget",
+                None,
+            )
+        })?;
         let fitted = fit_call_tool_response_to_budget(
             name,
             CallToolResponse::Complete(result),
-            Some(budget.saturating_sub(receipt_reserve)),
+            Some(body_budget),
         )?;
         let CallToolResponse::Complete(mut fitted) = fitted else {
             return Ok(fitted);
         };
+        if has_visible_receipt_ts(&fitted, ts) {
+            return Ok(CallToolResponse::Complete(fitted));
+        }
         fitted.content.push(ContentBlock::text(marker));
         if serialized_json_len(&fitted).is_some_and(|size| size <= budget) {
             Ok(CallToolResponse::Complete(fitted))
@@ -4031,7 +4044,7 @@ mod tests {
             .insert("keep".into(), serde_json::json!({"value": 7}));
         meta.0.insert(
             RECEIPT_META_KEY.into(),
-            serde_json::json!({"ts": replay_ts}),
+            serde_json::json!({"kind":"job","ts": replay_ts}),
         );
         replay.meta = Some(meta);
 
@@ -4050,6 +4063,16 @@ mod tests {
                 .and_then(|value| value.get("value"))
                 .and_then(Value::as_u64),
             Some(7)
+        );
+        assert_eq!(
+            replay
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.0.get(RECEIPT_META_KEY))
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str),
+            Some("job"),
+            "receipt timestamp stamping must preserve reserved receipt fields"
         );
         let marker = format!("ts={replay_ts}");
         let marker_count = replay
@@ -4077,10 +4100,52 @@ mod tests {
             "failed receipt stamping must not partially rewrite result metadata"
         );
 
+        let mut invalid = CallToolResult::success(vec![ContentBlock::text("ok")]);
+        let mut invalid_meta = rmcp::model::MetaObject::default();
+        invalid_meta
+            .0
+            .insert(RECEIPT_META_KEY.into(), serde_json::json!("invalid"));
+        invalid.meta = Some(invalid_meta);
+        let before = invalid.meta.clone();
+        let error = set_stored_receipt_ts(&mut invalid, 9)
+            .expect_err("reserved receipt metadata must remain an object");
+        assert!(error.contains("reserved receipt metadata"));
+        assert_eq!(invalid.meta, before);
+
         let error = machine
             .decorate_and_fit_tool_response("jobs_get", CallToolResponse::Complete(oversized), None)
             .expect_err("decorator must reject oversized result metadata");
         assert!(error.message.contains("16 KiB"), "{error:?}");
+
+        let mut visible = CallToolResult::success(vec![
+            ContentBlock::text(format!("ts={replay_ts}\nkept")),
+            ContentBlock::text("x".repeat(4096)),
+        ]);
+        set_stored_receipt_ts(&mut visible, replay_ts).unwrap();
+        let expected = fit_call_tool_response_to_budget(
+            "jobs_get",
+            CallToolResponse::Complete(visible.clone()),
+            Some(512),
+        )
+        .unwrap();
+        let CallToolResponse::Complete(expected) = expected else {
+            panic!("fitted visible receipt must stay complete")
+        };
+        assert!(has_visible_receipt_ts(&expected, replay_ts));
+        let decorated = machine
+            .decorate_and_fit_tool_response(
+                "jobs_get",
+                CallToolResponse::Complete(visible),
+                Some(512),
+            )
+            .unwrap();
+        let CallToolResponse::Complete(decorated) = decorated else {
+            panic!("decorated visible receipt must stay complete")
+        };
+        assert_eq!(
+            decorated, expected,
+            "surviving visible ts needs no sidecar reserve"
+        );
     }
 
     #[test]
@@ -4248,11 +4313,28 @@ mod tests {
             fit_call_tool_response_to_budget("test", CallToolResponse::Complete(result), Some(512))
                 .expect_err("immutable typed/structured facts must not collapse to text");
         assert!(
-            error
-                .message
-                .contains("immutable structured or typed content"),
-            "{error:?}"
+            error.message.contains("transport response budget"),
+            "immutable result must fail explicitly at the bounded response surface: {error:?}"
         );
+    }
+
+    #[test]
+    fn transport_postcondition_never_silently_truncates_without_marker() {
+        let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(4096))]);
+        let empty = fitted_text_blocks(&result, 0, "");
+        let marker =
+            "\n… detailed result omitted because it exceeded the transport response budget";
+        let marked = fitted_text_blocks(&result, 0, marker);
+        let empty_size = serialized_json_len(&empty).unwrap();
+        let marked_size = serialized_json_len(&marked).unwrap();
+        assert!(empty_size < marked_size);
+        let error = fit_call_tool_response_to_budget(
+            "test",
+            CallToolResponse::Complete(result),
+            Some(empty_size),
+        )
+        .expect_err("shortened text without a truncation marker must fail explicitly");
+        assert!(error.message.contains("truncation marker"), "{error:?}");
     }
 
     #[test]

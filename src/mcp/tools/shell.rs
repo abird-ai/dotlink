@@ -76,7 +76,7 @@ pub(crate) struct ShellArgs {
     #[serde(default)]
     pub(crate) stdin: Option<String>,
 
-    /// Command execution timeout in seconds. Defaults to the profile max_shell_timeout_secs ceiling and is capped there. Transport response windows only control how long the caller waits before the same durable execution is handed off.
+    /// Hard command execution deadline in seconds. On expiry dotlink stops the command tree. This is not the caller's response wait; a durable execution may be handed off earlier while continuing to run.
     #[serde(default)]
     pub(crate) timeout_secs: Option<u64>,
 
@@ -143,7 +143,7 @@ const DEFAULT_SHELL_OUTPUT_BYTES: usize = 256 * 1024;
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
-        "Execution timeout in seconds. Defaults to {max_secs} and is capped there. Transport response windows do not shorten execution: a command that is still running when the caller's synchronous window closes continues as the same durable job/task."
+        "Hard execution deadline in seconds. On expiry dotlink stops the command tree and returns a timeout result. Defaults to {max_secs} and is capped there. This is not how long the caller waits: a synchronous response may hand off the same durable job earlier, and background:true returns its handle immediately while execution continues until completion, cancellation, or this deadline."
     )
 }
 
@@ -3152,7 +3152,7 @@ fn direct_shell_command(
 #[tool_router(router = "shell_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Run a Bash command.",
+        description = "Run a Bash command. timeout_secs is a hard execution deadline that stops the command tree; background:true returns the durable job handle immediately instead of waiting.",
         annotations(
             title = "Run Bash command",
             read_only_hint = false,
@@ -3175,7 +3175,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Run a PowerShell Core (pwsh) command.",
+        description = "Run a PowerShell Core (pwsh) command. timeout_secs is a hard execution deadline that stops the command tree; background:true returns the durable job handle immediately instead of waiting.",
         annotations(
             title = "Run pwsh command",
             read_only_hint = false,
@@ -3198,7 +3198,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Run a PowerShell command.",
+        description = "Run a PowerShell command. timeout_secs is a hard execution deadline that stops the command tree; background:true returns the durable job handle immediately instead of waiting.",
         annotations(
             title = "Run PowerShell command",
             read_only_hint = false,
@@ -4088,7 +4088,22 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(timeout.contains("42"), "{timeout}");
+        assert!(timeout.contains("Hard execution deadline"), "{timeout}");
+        assert!(timeout.contains("stops the command tree"), "{timeout}");
+        assert!(
+            timeout.contains("not how long the caller waits"),
+            "{timeout}"
+        );
+        assert!(timeout.contains("background:true"), "{timeout}");
         assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
+        assert!(
+            patched.description.as_deref().is_some_and(|description| {
+                description.contains("hard execution deadline")
+                    && description.contains("background:true")
+            }),
+            "{:?}",
+            patched.description
+        );
         assert!(output.contains("2048"), "{output}");
         assert_eq!(properties["max_output_bytes"]["default"], 2048);
         // Non-shell product routes keep their static schemas. Canonical
