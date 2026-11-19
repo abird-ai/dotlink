@@ -120,12 +120,12 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; reaching `timeout_secs` kills it; {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
+            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; reaching `timeout_secs` kills it; {follow_up}. Processes left in the background die when the command returns, so run one in the foreground of a durable (`background: true`) call when it must outlive it. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
+            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Processes left in the background die when the command returns, so run one in the foreground of a durable (`background: true`) call when it must outlive it. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
     }
@@ -2609,6 +2609,15 @@ impl LocalMachine {
                 if let Some(status) = finished {
                     exit_status = Some(status);
                     output_grace_refreshed = true;
+                    // The command ended; its tree does not get to outlive it. A
+                    // sandboxed tree is already gone with the namespace, so this
+                    // finds nothing and records nothing. An unsandboxed one can
+                    // still hold inherited descriptors — notably stdout, which
+                    // would otherwise keep the spool reader waiting until the
+                    // deadline and turn a successful command into a collection
+                    // failure. Ending it here is what makes one contract hold in
+                    // both modes: descendants die when the command returns.
+                    stop = process_tree.terminate(KillReason::Cleanup);
                 }
             }
             WaitOutcome::StdinFailure(message) => {
@@ -2712,12 +2721,13 @@ impl LocalMachine {
         match terminal {
             JobStatus::Completed => {
                 let status = exit_status.expect("completed job has an exit status");
-                // A normal exit may intentionally launch independent background
-                // work. Keep containment armed until all inherited output has
-                // been collected successfully, matching synchronous shell.
+                // Nothing can still be running under this command: the tree was
+                // ended when the command returned. Disarm so the fail-safe has
+                // nothing to report.
                 process_tree.disarm();
                 JobCompletion::completed(status.code(), status.success(), stdout, stderr)
                     .with_signal(Self::exit_signal(&status))
+                    .with_stop(stop)
                     .with_context(result_context)
             }
             JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)

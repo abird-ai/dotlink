@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- One lifetime contract for both modes: a command's descendants never outlive
+  it. The tree is ended when the command returns instead of being left to the
+  namespace teardown, so a successful command can no longer leave work running
+  that the reply implies is still alive. A sandboxed tree is already gone with
+  its namespace, so this finds nothing there and records nothing; unsandboxed
+  leftovers are ended and reported as `stopped_by: "teardown"`. It also removes a
+  latency trap: a backgrounded writer inheriting stdout used to hold the spool
+  reader open until the command's own deadline, turning a successful command into
+  a collection failure.
+- Tool descriptions now say it: processes left in the background die when the
+  command returns, so a long-lived process belongs in the foreground of a
+  durable (`background: true`) call. `background: true` was never a way to detach
+  work — it only decides whether the caller waits before the handle is returned.
+
 ### Fixed
 
 - Every delivered kill is now attributed. `KillReason::Cleanup` and

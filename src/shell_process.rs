@@ -1,8 +1,10 @@
-//! Whole-command cleanup without imposing lifetime limits on successful jobs.
 //! Kill the contained process group/job on timeout, error or cancellation.
 //! Unsandboxed Unix children can intentionally escape their process group
 //! (setsid); no process-group API can guarantee descendant containment.
-//! A successful command may deliberately leave background processes running.
+//! Descendants never outlive the command: the tree is ended when the command
+//! returns, and a sandboxed tree is already gone with its namespace. Work that
+//! must outlive the call belongs in a durable job (`background: true`), where the
+//! process is the job rather than a leftover of one.
 
 use std::io;
 use tokio::process::{Child, Command};
@@ -466,6 +468,48 @@ mod tests {
 
     /// A group that is already empty is not a stop we performed: claiming one
     /// would read as "dotlink killed your command" when the command had ended.
+    /// The contract a caller is told: descendants do not outlive the command.
+    /// A shell that backgrounds work and returns leaves that work in this tree,
+    /// so ending the tree after the command returns must reach it — and say so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_descendant_outliving_the_command_is_ended_and_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("survived");
+        let mut command = Command::new("sh");
+        configure(&mut command);
+        command
+            .arg("-c")
+            .arg(format!(
+                "(sleep 0.4; echo leaked > '{}') & exit 0",
+                marker.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let trace = StopTrace::new(
+            crate::logging::LogConfig::new(0, false, crate::logging::ColorMode::Never),
+            "job-contract",
+        );
+        let mut tree = Guard::attach(&child, trace.clone()).unwrap();
+        // The command itself is done; the backgrounded writer is not.
+        let _ = child.wait().await;
+        let claimed = tree.terminate(KillReason::Cleanup);
+        tree.disarm();
+
+        assert_eq!(
+            claimed,
+            Some(StopCause::Teardown),
+            "ending live leftovers is a signal dotlink delivered"
+        );
+        assert_eq!(trace.reports(), vec![KillReason::Cleanup]);
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            !marker.exists(),
+            "a descendant that outlived the command must not run"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_empty_group_is_reported_as_gone_and_claims_nothing() {
