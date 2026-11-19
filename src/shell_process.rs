@@ -346,17 +346,30 @@ impl Guard {
     /// the signal was not delivered, so a later failure cannot relabel an
     /// already-stopped tree and a failed signal cannot pass for a stop.
     pub(crate) fn terminate(&mut self, reason: KillReason) -> Option<StopCause> {
+        matches!(self.signal_and_record(reason), StopOutcome::Delivered)
+            .then(|| reason.claim())
+            .flatten()
+    }
+
+    /// End the tree behind a command that has already returned, and report what
+    /// the signal did to it. A sweep claims no cause, because the command's own
+    /// status is what ended it; but whether anything was still running is a fact a
+    /// completion must report, so the outcome is kept rather than reduced to a claim.
+    pub(crate) fn sweep(&mut self) -> StopOutcome {
+        self.signal_and_record(KillReason::Cleanup)
+    }
+
+    /// One attempt, one record. Disarmed guards signal nothing.
+    fn signal_and_record(&mut self, reason: KillReason) -> StopOutcome {
         if !self.active {
-            return None;
+            return StopOutcome::AlreadyGone;
         }
         let outcome = self.signal_tree();
         // A signal that failed leaves the tree running, so stay armed: the
         // fail-safe drop gets one more attempt.
         self.active = outcome == StopOutcome::Failed;
         self.trace.stopped(reason, outcome);
-        matches!(outcome, StopOutcome::Delivered)
-            .then(|| reason.claim())
-            .flatten()
+        outcome
     }
 
     #[cfg(unix)]

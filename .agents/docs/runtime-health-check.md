@@ -238,6 +238,7 @@ Check these explicitly. Each has a known-good value in the baseline.
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
 | `stop id=` lines | rare: `reason=timeout`/`cancel`/`failed` matches a completion that shows the stop, `reason=shutdown` is connector teardown (the revoked job publishes none), and `leftovers`/`fail-safe` are sweeps that ended no command | `outcome=refused`, or a `timeout`/`cancel`/`failed` claim that no completion shows |
 | `exit id=… signal=… from=outside` lines | rare: the command died on a signal dotlink did not deliver; a job may also carry a `stop` line for the sweep, since the two answer different questions | an `exit` line for a job whose result claims `stopped_by`, or a `signal` in a result whose job wrote neither line |
+| `"still running"` in a shell `error` | a command returned while its own group was still running, so dotlink killed the leftovers and failed the invocation while still reporting its exit status | a clean command reporting this, or a `success: true` beside a `reason=leftovers` line |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
 
 A stop line written while the runtime restarts has no completion to match: the

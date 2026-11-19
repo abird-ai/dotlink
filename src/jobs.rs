@@ -249,6 +249,16 @@ pub(crate) struct JobCompletion {
 }
 
 impl JobCompletion {
+    /// The command returned, but the work it started did not: dotlink ended it. The
+    /// command's own status stays exactly as the process reported it — this is not a
+    /// dotlink failure — while `success` says the invocation did not finish. A caller
+    /// that reads `success` must not read "done" here, and `error` is why.
+    pub(crate) fn did_not_finish(mut self, message: impl Into<String>) -> Self {
+        self.success = false;
+        self.error = Some(message.into());
+        self
+    }
+
     pub(crate) fn completed(
         exit_code: Option<i32>,
         success: bool,
@@ -2649,7 +2659,12 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         completion,
     )
     .to_string();
-    Ok(if completion.status == JobStatus::Completed {
+    // A completed *lifecycle* is not a completed *invocation*: a command that
+    // returned with its own group still running carries an error and no success,
+    // and the caller has to see the call fail. An ordinary non-zero exit carries no
+    // error, so it stays a successful tool call with `success: false`, as before.
+    let finished = completion.status == JobStatus::Completed && completion.error.is_none();
+    Ok(if finished {
         CallToolResult::success(vec![ContentBlock::text(text)])
     } else {
         CallToolResult::error(vec![ContentBlock::text(text)])

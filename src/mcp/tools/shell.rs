@@ -97,6 +97,13 @@ const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 /// the spool, so this only bounds what an escaped writer can hold open.
 const COMPLETED_OUTPUT_GRACE: Duration = Duration::from_secs(2);
 
+/// Said when a command returned before the work it started did. The command's own
+/// status is still reported; this is why the invocation did not finish, and it
+/// names the idiom that avoids it rather than leaving the caller to guess.
+const LEFTOVERS_KILLED: &str = "command returned while processes it started were still running; dotlink killed them (keep one alive with `wait`, e.g. `server & wait` in a durable call)";
+const LEFTOVERS_UNKILLED: &str =
+    "command returned while processes it started were still running; dotlink could not kill them";
+
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
         "Hard execution deadline in seconds: on expiry the command tree is killed and the result reports stopped_by: \"timeout\". Defaults to {max_secs} (the ceiling), never how long the caller waits."
@@ -125,7 +132,7 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     // flag, and the script says how long that is.
     // The clause teaches the idiom; the bounds it used to repeat are already
     // stated above as `timeout_secs` and in the follow-up as `job_cancel`.
-    let lifetime = "The command's process group is killed when it returns (a `setsid` descendant can escape it); keep one with `wait` inside a durable call (`server & wait`).";
+    let lifetime = "The command's process group is killed when it returns (a `setsid` descendant can escape it), and leaving work running there fails the call; keep one with `wait` inside a durable call (`server & wait`).";
     // `ts` is a fact of the result. The turn horizon is an advisory, and the
     // server instructions carry it once with the rule that goes with it, so no
     // tool description restates a bare number without that rule.
@@ -2567,6 +2574,9 @@ impl LocalMachine {
         let mut terminal = JobStatus::Completed;
         let mut terminal_error = None;
         let mut stop: Option<StopCause> = None;
+        // What the sweep found when the command ended: anything but `AlreadyGone`
+        // means it returned while its own group was still running.
+        let mut leftovers = StopOutcome::AlreadyGone;
         match outcome {
             WaitOutcome::Child(Ok(status)) => {
                 exit_status = Some(status);
@@ -2576,8 +2586,8 @@ impl LocalMachine {
                 // inherited descriptors — stdout above all — and sweeping it
                 // here is what lets the collector finish now instead of at the
                 // deadline. The sweep claims no cause: the command's own status
-                // already said how it ended.
-                process_tree.terminate(KillReason::Cleanup);
+                // already said how it ended. What it found is the verdict below.
+                leftovers = process_tree.sweep();
             }
             WaitOutcome::Child(Err(error)) => {
                 terminal = JobStatus::Failed;
@@ -2640,7 +2650,7 @@ impl LocalMachine {
                     // deadline and turn a successful command into a collection
                     // failure. Ending it here is what makes one contract hold in
                     // both modes: descendants die when the command returns.
-                    stop = process_tree.terminate(KillReason::Cleanup);
+                    leftovers = process_tree.sweep();
                 }
             }
             WaitOutcome::StdinFailure(message) => {
@@ -2750,10 +2760,21 @@ impl LocalMachine {
                 // nothing left for the fail-safe to report. Disarm instead of
                 // leaving a second, silent kill authority behind.
                 process_tree.disarm();
-                JobCompletion::completed(status.code(), status.success(), stdout, stderr)
-                    .with_signal(Self::exit_signal(&status))
-                    .with_stop(stop)
-                    .with_context(result_context)
+                let completion =
+                    JobCompletion::completed(status.code(), status.success(), stdout, stderr)
+                        .with_signal(Self::exit_signal(&status))
+                        .with_stop(stop)
+                        .with_context(result_context);
+                // A command that returned with its own group still running did not do
+                // what it was asked: dotlink ended that work. Its status is still
+                // reported, but the invocation did not finish — otherwise a script
+                // that backgrounds work and returns would read as complete while its
+                // children were being killed behind the reply.
+                match leftovers {
+                    StopOutcome::AlreadyGone => completion,
+                    StopOutcome::Delivered => completion.did_not_finish(LEFTOVERS_KILLED),
+                    StopOutcome::Failed => completion.did_not_finish(LEFTOVERS_UNKILLED),
+                }
             }
             JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)
                 .with_stop(stop)
@@ -4905,13 +4926,14 @@ mod tests {
         assert!(error.message.contains("unknown field"), "{error:?}");
     }
 
-    /// A command that returns is done: its leftover writer is swept at once, so
-    /// the job completes and the reply carries the command's own status. Waiting
-    /// for the writer's inherited pipe would report a failure for a command that
-    /// succeeded, which is what this test pins in the other direction.
+    /// A command that returns while its own group is still running did not finish:
+    /// the leftovers are swept at once and the invocation is reported as failed, with
+    /// the command's own status still intact. Previously the caller waited for the
+    /// writer's inherited pipe until the deadline and then got a collection error —
+    /// slow, and wrong about why.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_finished_command_sweeps_its_leftovers_and_completes() {
+    async fn a_command_that_returns_leaving_work_running_fails_promptly() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
@@ -4943,8 +4965,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert_eq!(status["status"], "completed", "{status}");
-        assert_eq!(status["success"], true, "{status}");
-        assert!(status["error"].is_null(), "{status}");
+        assert_eq!(status["success"], false, "{status}");
+        assert_eq!(status["exit_code"], 0, "the command's own status: {status}");
+        assert!(
+            status["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("still running")),
+            "{status}"
+        );
         assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
         let partial = machine
             .jobs
@@ -6413,9 +6441,13 @@ mod tests {
         // The command succeeded and its writer was swept, so the reply is the
         // command's own result — not a collection failure.
         let payload: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(payload["success"], true, "{text}");
+        // Failed because the command left work running — not because collection
+        // timed out, which is what the old shared deadline produced.
+        assert_eq!(payload["success"], false, "{text}");
         assert_eq!(payload["stdout"], "done", "{text}");
-        assert!(payload["error"].is_null(), "{text}");
+        let error = payload["error"].as_str().unwrap_or_default();
+        assert!(error.contains("still running"), "{text}");
+        assert!(!error.contains("collecting command output"), "{text}");
     }
 
     #[cfg(unix)]

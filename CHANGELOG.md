@@ -9,12 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - One lifetime contract: a command's process group does not outlive it. The group
-  is swept when the command returns, and the reply carries the command's own
-  status. A sandboxed group is already gone with its namespace, so the sweep finds
-  nothing and records nothing. Unsandboxed, this ends the leftover writer that used
-  to hold the spool reader open until the execution deadline and turn a successful
-  command into a collection failure; output collection now has its own short
-  window rather than borrowing the execution deadline, so an hour-long
+  is swept when the command returns, and a command that returned while that group
+  was still running is reported as a failed invocation — `success: false`, the
+  tool result marked as an error, and an error naming the leftovers and `wait` —
+  while its own exit status is still reported, because that fact did not change. A
+  script that backgrounds work and returns is therefore not silently accepted: the
+  work it started was killed, so the invocation did not finish. A sandboxed group
+  is already gone with its namespace, so the sweep finds nothing there and the
+  command's own status stands. Unsandboxed, this also ends the leftover writer that
+  used to hold the spool reader open until the execution deadline and turn a
+  successful command into a collection failure; output collection now has its own
+  short window rather than borrowing the execution deadline, so an hour-long
   `timeout_secs` can no longer mean an hour-long collection. A `setsid` descendant
   leaves the group and is out of reach — the contract is the group, and the
   descriptions say so instead of implying full containment.
@@ -62,10 +67,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A command that finished no longer reports a collection failure because a
   backgrounded writer inherited stdout. The group is swept when the command
-  returns, so the writer dies with it and the drain finishes at once; reaching that
-  state previously took the execution deadline, so a command that returned in
-  milliseconds could fail seconds later, and its stop line arrived after the job
-  had already succeeded.
+  returns, so the writer dies with it and the drain finishes at once; the verdict is
+  now about the work that was still running, named as such, instead of a collection
+  error that arrived seconds later — and a command that returned in milliseconds can
+  no longer be reported as successful while its children were being killed.
 - A failure that finds the process tree still live now stops it and owns that
   kill (`KillReason::Failed`). It previously left the tree armed and returned,
   which deferred the kill to the guard's fail-safe; the failure was recorded as

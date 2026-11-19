@@ -122,11 +122,14 @@ fn a_finished_command_does_not_wait_for_its_leftovers() {
         elapsed < Duration::from_secs(3),
         "a finished command waited {elapsed:?} for its leftovers"
     );
-    // And the command's own status is what the reply carries.
-    assert_eq!(payload["success"], true, "{payload}");
+    // The command's own status is preserved, and the fact that it left work
+    // running is the verdict: the invocation did not finish.
     assert_eq!(payload["exit_code"], 0, "{payload}");
     assert_eq!(payload["stdout"], "ok", "{payload}");
-    assert!(payload["error"].is_null(), "{payload}");
+    assert_eq!(payload["success"], false, "{payload}");
+    let error = payload["error"].as_str().unwrap_or_default();
+    assert!(error.contains("still running"), "{payload}");
+    assert!(!error.contains("collecting command output"), "{payload}");
     assert!(
         payload.get("stopped_by").is_none(),
         "a sweep claims nothing: {payload}"
@@ -159,9 +162,11 @@ fn a_command_killed_by_someone_else_keeps_its_own_ending() {
     let (payload, journal, _) = one_call(workdir.path(), "(sleep 3) & kill -9 $$");
 
     // The command died on a signal dotlink did not deliver, and no cause claims
-    // it: the reply says so, and says nothing about the sweep.
+    // it: the reply names that ending, separately from the sweep's verdict.
     assert_eq!(payload["success"], false, "{payload}");
     assert_eq!(payload["signal"], 9, "{payload}");
+    let error = payload["error"].as_str().unwrap_or_default();
+    assert!(error.contains("still running"), "{payload}");
     assert!(payload.get("stopped_by").is_none(), "{payload}");
     let next = payload["next"].as_str().unwrap_or_default();
     assert!(next.contains("outside dotlink"), "{next}");

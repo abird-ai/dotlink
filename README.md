@@ -443,6 +443,12 @@ for. The reply keeps the same split — `stopped_by` names what dotlink *ended*
 (`timeout`/`cancel`/`shutdown`/`failed`) and is absent when the command decided its
 own fate, including after a sweep, while `signal` names what something else did.
 
+That sweep is a verdict, not housekeeping: a command whose process group was still
+running when it returned did not finish, so the result is a failure (`success:
+false`, `error` naming the leftovers) with the command's own exit status still
+reported. A command that leaves work running should `wait` for it — that is what
+makes `server & wait` the idiom for a process that must outlive the call.
+
 TOOL logs include bounded command previews plus complete path labels, methods, status, and latency; file contents, binary payloads, Runtime keys, and raw request bodies are not intentionally logged. Interactive `V` removes the command-preview cap while TOOL logging is active, so use it only when command text is safe to retain.
 
 Color is automatic on interactive human-facing output, including `--help`. Override with `--color=always`, `--color=never`, or `--color=auto`. stdio keeps stdin protocol-clean and exposes only `Ctrl+C`.
