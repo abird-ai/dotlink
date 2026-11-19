@@ -97,8 +97,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   happened. The run path owns the sweep and puts its outcome on the completion, so a
   later spool error carries it instead of re-sweeping a disarmed guard and concluding
   that nothing was found — which is how a recorded sweep became an unrecorded one.
-  A refused signal is likewise carried as `tree=alive` before the guard is disarmed,
-  so the run path can never leave the fail-safe to add a second line.
+  A refused signal is likewise carried as `tree=alive` before the guard is disarmed, on
+  every terminal and on the paths that fail before a run starts, so the run path can
+  never leave the fail-safe to add a second line. One `finish()` finalizer owns that
+  carry-and-disarm, so a new return path cannot forget it.
+- A failure that loses a command's output is itself the recorded ending: an internal
+  failure behind a completed command logs `end=error` instead of the command's exit
+  code, which named the wrong event and — when nothing had been swept — wrote no line
+  at all.
 - A guard dropped without a completion writes the job's only line, `end=abandoned`,
   so a job that never published a result is still on the record — and a job that did
   publish one is never written twice.

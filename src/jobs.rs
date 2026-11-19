@@ -236,13 +236,14 @@ pub(crate) struct JobCompletion {
     /// signalled the tree and the signal was delivered. Absent means no stop is
     /// provable — the command ended on its own, was never spawned, was stopped
     /// from outside the connector, or the runner died in a way this record cannot
-    /// see. The stop line is the fuller account: it names tidy-ups and the
-    /// fail-safe too. Read this beside `status`, which says how the job ended.
+    /// see. The lifecycle line is the fuller account of the tree — a sweep, a refusal —
+    /// while this field stays the one question a result asks. Read it beside `status`,
+    /// which says how the job ended.
     pub(crate) stopped_by: Option<crate::shell_process::StopCause>,
-    /// What the sweep found when the command ended: `Some(Delivered)` means work the
-    /// command started was still running and dotlink killed it, `Some(Failed)` means
-    /// it could not, and `None` means there was nothing left to kill. The journal
-    /// says so on the same line, because only a completion knows it.
+    /// What became of the group the command left: `Some(Delivered)` killed it,
+    /// `Some(Failed)` could not and it may still be running, `Some(AlreadyGone)` found
+    /// it empty, and `None` means no sweep ran at all. Set by the one finalizer every
+    /// path uses, so `tree=` on the lifecycle line cannot disagree with it.
     pub(crate) leftovers: Option<crate::shell_process::StopOutcome>,
     pub(crate) success: bool,
     pub(crate) error: Option<String>,

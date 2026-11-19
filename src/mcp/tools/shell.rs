@@ -2353,10 +2353,29 @@ impl LocalMachine {
     /// stopped keeps the cause it was stopped with, so a later spool error cannot
     /// relabel a timeout as a failure.
     ///
-    /// A tree that is still live is stopped here and the failure owns the kill.
-    /// Leaving it armed and returning would defer the kill to the guard's
-    /// fail-safe, which records `dropped` and cannot say why — the reason was
-    /// known at this point and must not be lost.
+    /// The one place a completion is finished. Whatever happened to the tree is carried
+    /// onto the completion — a refused signal becomes `tree=alive` even when nothing was
+    /// swept — and the fail-safe is disarmed, so a job that publishes a result can never
+    /// be written twice and an unproven group is never silent. Every path that returns a
+    /// completion goes through here, including the ones that never start a run.
+    fn finish(
+        completion: JobCompletion,
+        tree: &mut crate::shell_process::Guard,
+        swept: Option<StopOutcome>,
+    ) -> JobCompletion {
+        // A refusal is the newest fact about the group, so it outranks an older sweep.
+        let leftovers = if tree.may_still_run() {
+            Some(StopOutcome::Failed)
+        } else {
+            swept
+        };
+        tree.disarm();
+        completion.with_leftovers(leftovers)
+    }
+
+    /// A tree that is still live is stopped here, so the failure owns the kill rather
+    /// than deferring it to the fail-safe, which cannot say why. A command that already
+    /// ended needs nothing: the run path swept its group and the outcome is in `facts`.
     fn failure_stop(tree: &mut crate::shell_process::Guard, facts: &mut FailureFacts<'_>) {
         // Only a live command needs stopping; the sweep behind a finished one already
         // ran on the path that watches the command end, and its outcome is in `facts`.
@@ -2364,12 +2383,6 @@ impl LocalMachine {
         if facts.exit_status.is_none() {
             facts.stop = facts.stop.or_else(|| tree.terminate(KillReason::Failed));
         }
-        // A refused signal leaves the group unproven; carry that before disarming, so
-        // the alarm survives the guard that would otherwise retry it.
-        if tree.may_still_run() {
-            facts.leftovers = Some(StopOutcome::Failed);
-        }
-        tree.disarm();
     }
 
     /// One internal failure of the output path. The command's status, the stop the
@@ -2385,13 +2398,18 @@ impl LocalMachine {
         context: JobResultContext,
     ) -> JobCompletion {
         Self::failure_stop(tree, &mut facts);
-        facts
-            .apply(JobCompletion::internal_failed(
-                error,
-                stream_summary_from_file(&job.stdout_path, true),
-                stream_summary_from_file(&job.stderr_path, true),
-            ))
-            .with_context(context)
+        let swept = facts.leftovers;
+        Self::finish(
+            facts
+                .apply(JobCompletion::internal_failed(
+                    error,
+                    stream_summary_from_file(&job.stdout_path, true),
+                    stream_summary_from_file(&job.stderr_path, true),
+                ))
+                .with_context(context),
+            tree,
+            swept,
+        )
     }
 
     /// Run one shell command and write its one lifecycle line. This wrapper sees
@@ -2454,14 +2472,24 @@ impl LocalMachine {
             JobStatus::Failed => "error".to_owned(),
             // A completion always carries a terminal; `Running` here would mean a
             // result was published before anything finished, which no path does.
-            JobStatus::Running | JobStatus::Completed => match completion.signal {
-                Some(signal) => format!("signal {}", crate::jobs::signal_token(signal)),
-                // A completed job without a status and without a signal never ran.
-                None => match completion.exit_code {
-                    Some(code) => format!("exit code={code}"),
-                    None => "error".to_owned(),
-                },
-            },
+            JobStatus::Running | JobStatus::Completed => {
+                if completion.internal_error.is_some() {
+                    // The command's own status is on the result; the failure that lost
+                    // its output is what a reader cannot reconstruct, so it is what the
+                    // line names — and naming it forces a line the own-ending rule would
+                    // otherwise suppress.
+                    "error".to_owned()
+                } else {
+                    match completion.signal {
+                        Some(signal) => format!("signal {}", crate::jobs::signal_token(signal)),
+                        // A completed job without a status and without a signal never ran.
+                        None => match completion.exit_code {
+                            Some(code) => format!("exit code={code}"),
+                            None => "error".to_owned(),
+                        },
+                    }
+                }
+            }
         };
         (end, by)
     }
@@ -2494,8 +2522,8 @@ impl LocalMachine {
                 // it, so it claims nothing.
                 let reaped = Self::terminate_child(&mut child).await;
                 let claimed = reaped.kill_alone_ended_it();
-                // The wrapper writes this job's line from the completion, so this path
-                // only has to return the facts. `claimed` says whether the kill landed.
+                // No guard exists on this path, so there is nothing to disarm and no
+                // refusal to carry: the wrapper still writes the job's one line.
                 return JobCompletion::failed(format!("could not contain command tree: {error}"))
                     .with_stop(claimed.then_some(StopCause::Failed))
                     .with_context(result_context);
@@ -2507,9 +2535,13 @@ impl LocalMachine {
                 let claimed = process_tree.terminate(KillReason::Failed);
                 let reaped = Self::terminate_child(&mut child).await;
                 let cause = reaped.claim(claimed);
-                return JobCompletion::failed("failed to capture child stdout")
-                    .with_stop(cause)
-                    .with_context(result_context);
+                return Self::finish(
+                    JobCompletion::failed("failed to capture child stdout")
+                        .with_stop(cause)
+                        .with_context(result_context),
+                    &mut process_tree,
+                    None,
+                );
             }
         };
         let stderr = match child.stderr.take() {
@@ -2518,9 +2550,13 @@ impl LocalMachine {
                 let claimed = process_tree.terminate(KillReason::Failed);
                 let reaped = Self::terminate_child(&mut child).await;
                 let cause = reaped.claim(claimed);
-                return JobCompletion::failed("failed to capture child stderr")
-                    .with_stop(cause)
-                    .with_context(result_context);
+                return Self::finish(
+                    JobCompletion::failed("failed to capture child stderr")
+                        .with_stop(cause)
+                        .with_context(result_context),
+                    &mut process_tree,
+                    None,
+                );
             }
         };
         let Some([stdout_writer, stderr_writer]) = job.begin_spool_writers() else {
@@ -2532,9 +2568,13 @@ impl LocalMachine {
             let claimed = process_tree.terminate(KillReason::Shutdown);
             let reaped = Self::terminate_child(&mut child).await;
             let cause = reaped.claim(claimed);
-            return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
-                .with_stop(cause)
-                .with_context(result_context);
+            return Self::finish(
+                JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                    .with_stop(cause)
+                    .with_context(result_context),
+                &mut process_tree,
+                None,
+            );
         };
         let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
             stdout,
@@ -2711,10 +2751,9 @@ impl LocalMachine {
         let facts = FailureFacts {
             exit_status: exit_status.as_ref(),
             stop,
-            // The sweep that already ran owns this fact. Re-sweeping here would find a
-            // disarmed guard and report that nothing happened, which is how a recorded
-            // sweep became an unrecorded one.
-            // The sweep that already ran owns this fact; only the sweep sets it.
+            // The sweep that already ran owns this fact; only the sweep sets it. Re-sweeping
+            // here would find a disarmed guard and report that nothing happened, which is
+            // how a recorded sweep became an unrecorded one.
             leftovers,
             terminal,
         };
@@ -2792,49 +2831,56 @@ impl LocalMachine {
             }
         };
 
-        // A refused signal leaves the group unproven, and the fail-safe is about to be
-        // disarmed — so the alarm has to travel on the completion or die with the guard.
-        if process_tree.may_still_run() {
-            leftovers = Some(StopOutcome::Failed);
-        }
-        // Nothing will signal this tree again on any path that publishes a result, so
-        // the fail-safe must not add a second line to a job that already has one. A
-        // guard dropped without a completion is the only case it still speaks for.
-        process_tree.disarm();
-
+        // Every terminal finishes through the same finalizer, so a refused signal is
+        // carried as `tree=alive` here exactly as it is on the paths that never run.
         match terminal {
             JobStatus::Completed => {
                 let status = exit_status.expect("completed job has an exit status");
-                let completion =
+                let completion = Self::finish(
                     JobCompletion::completed(status.code(), status.success(), stdout, stderr)
                         .with_signal(Self::exit_signal(&status))
                         .with_stop(stop)
-                        .with_context(result_context);
+                        .with_context(result_context),
+                    &mut process_tree,
+                    leftovers,
+                );
                 // A command that returned with its own group still running did not do
                 // what it was asked: dotlink ended that work. Its status is still
                 // reported, but the invocation did not finish — otherwise a script
                 // that backgrounds work and returns would read as complete while its
                 // children were being killed behind the reply.
-                let completion = completion.with_leftovers(leftovers);
-                match leftovers {
-                    None | Some(StopOutcome::AlreadyGone) => completion,
+                match completion.leftovers {
                     Some(StopOutcome::Delivered) => completion.did_not_finish(LEFTOVERS_KILLED),
                     Some(StopOutcome::Failed) => completion.did_not_finish(LEFTOVERS_UNKILLED),
+                    // Nothing was swept, or the sweep found an empty group.
+                    _ => completion,
                 }
             }
-            JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)
+            JobStatus::TimedOut => Self::finish(
+                JobCompletion::timed_out(stdout, stderr)
+                    .with_stop(stop)
+                    .with_context(result_context),
+                &mut process_tree,
+                leftovers,
+            ),
+            JobStatus::Cancelled => Self::finish(
+                JobCompletion::cancelled(stdout, stderr)
+                    .with_stop(stop)
+                    .with_context(result_context),
+                &mut process_tree,
+                leftovers,
+            ),
+            JobStatus::Failed => Self::finish(
+                JobCompletion::failed_with_output(
+                    terminal_error.unwrap_or_else(|| "shell job failed".to_owned()),
+                    stdout,
+                    stderr,
+                )
                 .with_stop(stop)
                 .with_context(result_context),
-            JobStatus::Cancelled => JobCompletion::cancelled(stdout, stderr)
-                .with_stop(stop)
-                .with_context(result_context),
-            JobStatus::Failed => JobCompletion::failed_with_output(
-                terminal_error.unwrap_or_else(|| "shell job failed".to_owned()),
-                stdout,
-                stderr,
-            )
-            .with_stop(stop)
-            .with_context(result_context),
+                &mut process_tree,
+                leftovers,
+            ),
             JobStatus::Running => unreachable!(),
         }
     }
@@ -2937,7 +2983,6 @@ impl FailureFacts<'_> {
             .with_signal(self.exit_status.and_then(LocalMachine::exit_signal))
             .with_stop(self.stop)
             .after_terminal(self.terminal)
-            .with_leftovers(self.leftovers)
     }
 }
 

@@ -1,7 +1,14 @@
-//! A job's lifecycle line says how it ended and who ended it, in one line and two
-//! words an operator does not have to look up: `by=dotlink|caller|connector` is ours,
-//! `by=external` is not, and a command that simply ended writes no line at all. At
-//! most one line appears per job, so a line always means something happened.
+//! A job's lifecycle line, end to end: one line when something happened, none when the
+//! command simply ended, and the same words at every verbosity.
+//!
+//! `end=` says what ended the job and `by=` names another actor when there was one —
+//! `dotlink` a deadline, `external` a signal from outside the connector. A command that
+//! ended on its own names no actor and writes nothing, so a line always means dotlink
+//! did something to a tree, or somebody else ended the command.
+//!
+//! Driven against the real binary with a piped stderr, because `LOG` lines are not
+//! captured by the in-process tests. Signals are a Unix concept here; on Windows
+//! `exit_code` already carries everything the platform reports.
 
 #![cfg(unix)]
 
@@ -15,7 +22,7 @@ use serde_json::{Value, json};
 
 fn config() -> String {
     json!({
-        "version": 10,
+        "version": 12,
         "transports": {"openai": false, "stdio": true, "http": false,
             "http_bind": "127.0.0.1:3000", "http_ephemeral_url": false,
             "ngrok": false, "ngrok_domain": null, "ngrok_ephemeral_url": false},
@@ -26,7 +33,8 @@ fn config() -> String {
         "caches": [], "tunnel_id": null, "organization_id": null,
         "base_url": "https://api.openai.com",
         "max_shell_timeout_secs": 60, "max_output_bytes": 65536,
-        "max_read_bytes": 65536, "max_write_bytes": 65536
+        "max_read_bytes": 65536, "max_write_bytes": 65536,
+        "job_retention_secs": 600, "job_spool_bytes": 16777216
     })
     .to_string()
 }
@@ -47,7 +55,7 @@ impl Session {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dotlink"))
             .arg("--stdio")
             .args(flags)
-            // No sandbox: this test is about the record, and it must not depend on
+            // No sandbox: these tests are about the record, and must not depend on
             // bubblewrap being installed in the test environment.
             .arg("--unrestricted")
             .current_dir(workdir)
@@ -73,7 +81,7 @@ impl Session {
         };
         session.send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                       "clientInfo": {"name": "exit-line", "version": "0"}}}));
+                       "clientInfo": {"name": "lifecycle-line", "version": "0"}}}));
         let _ = session.answer(1);
         session
             .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}));
@@ -110,13 +118,12 @@ impl Session {
     }
 
     /// Every lifecycle line this session wrote, in order.
-    fn finish(mut self) -> Vec<String> {
+    fn lines(mut self) -> Vec<String> {
         drop(self.stdin);
-        let mut lines = String::new();
-        let _ = std::io::Read::read_to_string(&mut self.stderr, &mut lines);
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut self.stderr, &mut text);
         let _ = self.child.wait();
-        lines
-            .lines()
+        text.lines()
             .filter(|line| line.contains("LOG") && line.contains("job") && line.contains("end="))
             .map(str::to_owned)
             .collect()
@@ -150,8 +157,36 @@ fn kill_from_outside(pid_file: &Path) {
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill {pid}");
 }
 
+/// A deadline is dotlink's own doing, and the line must survive every verbosity —
+/// including `-q`, where nothing else is printed.
 #[test]
-fn an_externally_signalled_job_records_its_exit_at_every_verbosity() {
+fn a_deadline_records_dotlink_at_every_verbosity() {
+    for flags in [vec![], vec!["-v"], vec!["--quiet", "-vv"]] {
+        let workdir = tempfile::tempdir().unwrap();
+        let mut session = Session::start(workdir.path(), &flags);
+        session.shell_call("sleep 30", 1);
+        let response = session.answer(2);
+        let lines = session.lines();
+
+        assert!(
+            result_text(&response).contains("\"stopped_by\":\"timeout\""),
+            "the result must report the stop: {response}"
+        );
+        assert_eq!(lines.len(), 1, "one line per job at {flags:?}: {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("end=timeout"), "{line}");
+        assert!(line.contains("by=dotlink"), "{line}");
+        assert!(
+            !line.contains("by=external"),
+            "our own stop is not an outside ending: {line}"
+        );
+    }
+}
+
+/// The other actor: a signal dotlink did not deliver is somebody else's, and the result
+/// says so without claiming a stop.
+#[test]
+fn an_external_signal_names_the_actor_at_every_verbosity() {
     for flags in [vec![], vec!["-v"], vec!["--quiet", "-vv"]] {
         let workdir = tempfile::tempdir().unwrap();
         let pid_file = workdir.path().join("pid");
@@ -162,7 +197,7 @@ fn an_externally_signalled_job_records_its_exit_at_every_verbosity() {
         );
         kill_from_outside(&pid_file);
         let response = session.answer(2);
-        let lines = session.finish();
+        let lines = session.lines();
 
         let text = result_text(&response);
         assert!(text.contains("\"signal\":\"SIGKILL\""), "{text}");
@@ -174,23 +209,22 @@ fn an_externally_signalled_job_records_its_exit_at_every_verbosity() {
     }
 }
 
+/// Absence is evidence: a command that ended on its own, successfully or not, and left
+/// nothing running, has nothing to reconstruct and says nothing.
 #[test]
-fn a_stop_dotlink_performed_is_not_an_exit() {
+fn a_command_that_ends_on_its_own_writes_no_line() {
     let workdir = tempfile::tempdir().unwrap();
     let mut session = Session::start(workdir.path(), &[]);
-    session.shell_call("sleep 30", 1);
+    session.shell_call("printf ok", 30);
     let response = session.answer(2);
-    let lines = session.finish();
+    let lines = session.lines();
 
     assert!(
-        result_text(&response).contains("\"stopped_by\":\"timeout\""),
+        result_text(&response).contains("\"success\":true"),
         "{response}"
     );
-    assert_eq!(lines.len(), 1, "one line per job, got {lines:?}");
-    assert!(lines[0].contains("end=timeout by=dotlink"), "{}", lines[0]);
     assert!(
-        !lines[0].contains("by=external"),
-        "our own stop is not an outside ending: {}",
-        lines[0]
+        lines.is_empty(),
+        "an ordinary exit is not an event: {lines:?}"
     );
 }
