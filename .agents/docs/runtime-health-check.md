@@ -236,13 +236,13 @@ Check these explicitly. Each has a known-good value in the baseline.
 | poll failures / restarts | 0 / 0 | any — transport instability |
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
-| `stop id=` lines | rare: `reason=timeout`/`cancel`/`failed` matches a completion that shows the stop, `reason=shutdown` is connector teardown (the revoked job publishes none), and `cleanup`/`dropped` are tidy-ups with no claim | `outcome=failed`, or a `timeout`/`cancel`/`failed` claim that no completion shows |
+| `stop id=` lines | rare: `reason=timeout`/`cancel`/`failed` matches a completion that shows the stop, `reason=shutdown` is connector teardown (the revoked job publishes none), and `leftovers`/`fail-safe` are sweeps that ended no command | `outcome=refused`, or a `timeout`/`cancel`/`failed` claim that no completion shows |
 | `exit id=… signal=… from=outside` lines | rare: a process that died on a signal dotlink did not deliver, and never on a job that also wrote a `stop` line | two lines for one job; or a `signal` in a result whose job wrote neither line |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
 
 A stop line written while the runtime restarts has no completion to match: the
 connector revokes those jobs before they can publish one, so a `shutdown` or
-`dropped` line standing alone is expected, not evidence of a lost result.
+`fail-safe` line standing alone is expected, not evidence of a lost result.
 
 The `id=` of a stop line is the durable job handle: when the call returned one
 (`background: true`, or a handoff receipt under a cap) it is the id `job_get` and
@@ -252,10 +252,12 @@ line's reason with the status the caller actually saw.
 
 **The record has two halves, and every job gets exactly one.** `stop` is a signal
 dotlink sent — every delivered kill records one, and the tidy-up and fail-safe
-kills that end a tree rather than a command record `reason=cleanup`/`dropped` with
+kills that end a tree rather than a command record `reason=leftovers`/`fail-safe` with
 `stopped_by: teardown` in the reply. `exit … from=outside` is a signal it did not.
 So "who killed it?" is answered by which line is present, and a job with neither
-was never signalled at all. `from=outside` names the absence of our signal only —
+was never signalled at all. A signal that reached nothing is `outcome=empty`, and
+one the kernel refused is `outcome=refused` — only `outcome=sent` says a live
+process in the group took the signal. `from=outside` names the absence of our signal only —
 a crash and a stranger's SIGKILL read the same, and the signal names distinguish
 them (`SIGSEGV` did not come from an operator's `kill -9`).
 

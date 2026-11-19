@@ -46,7 +46,7 @@ verbosity: absence must mean nothing was signalled, or it is not evidence at
 all. `outcome` distinguishes a delivered signal from a group that was already
 gone and from a signal that failed. It exists so that *absence* of a line is evidence the connector
 did not kill a command. The port must keep it on the path that actually signals
-the process group, including the fail-safe `Drop` (`reason=dropped`), which is the
+the process group, including the fail-safe `Drop` (`reason=fail-safe`), which is the
 only implicit stop.
 
 ### 4. Result fields

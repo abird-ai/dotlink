@@ -41,6 +41,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the horizon still loads: it is capped on the hosted surface and the cap is
   reported at startup, so an upgrade is never a refusal to start.
 
+- Job lifecycle lines use plain words for what happened. `outcome=delivered`
+  read as "the command was stopped", which it never claimed; it is now
+  `outcome=sent` (a live process in the group took the signal), `outcome=empty`
+  (nothing was left to signal) and `outcome=refused` (the kernel would not take
+  it, so the guard stays armed). The two reasons that end a tree rather than a
+  command are named for their target — `reason=leftovers` and `reason=fail-safe` —
+  so a line whose command had already exited no longer reads as its death.
+
 ### Fixed
 
 - Every delivered kill is now attributed. `KillReason::Cleanup` and

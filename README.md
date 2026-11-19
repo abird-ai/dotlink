@@ -421,7 +421,7 @@ With `-vv`, transport diagnostics are added:
 including `-q` — so `-q` is not silence:
 
 ~~~text
-[01:07:12.031] LOG  job        stop id=<job id> reason=timeout outcome=delivered
+[01:07:12.031] LOG  job        stop id=<job id> reason=timeout outcome=sent
 [01:07:12.884] LOG  job        exit id=<job id> signal=SIGKILL from=outside
 ~~~
 
