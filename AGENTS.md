@@ -73,8 +73,8 @@ All paths and validation commands below are relative to the repository root.
 - Linux shell execution is Bubblewrap-sandboxed by default. Network is off unless explicitly granted.
 - Filesystem denies win over allows. Shell mounts (developer caches and explicit mounts) never expand MCP filesystem authority. Deny and protected paths retain lexical and kernel-order resolved identities (`mcp::guard_identities`), including dangling-symlink targets; each sandboxed command re-resolves them. Native MCP filesystem tools always reject dotlink-protected paths. Linux Bubblewrap permits broad ordinary grants such as `$HOME` when a guard names an existing canonical object. The eventual leaf mask/read-only rebind makes that file/directory itself a mountpoint, and every mutable directory entry between the user bind root and that leaf is self-bound from a pinned FD as a namespace anchor. Anchors preserve effective RO/RW semantics inside the directory but make rename/unlink by the sandboxed child fail with `EBUSY`, so the guarded pathname stays stable for the command lifetime. A guarded canonical directory covers redundant protected/read-denied descendants beneath it. Missing guard names and symlink spellings remain fail-closed because there is no stable mountpoint at the configured leaf. Read-denied files/directories use masks; write-denied files/directories use read-only rebinds. An explicit root read+write grant (`--allow-rw=/`) intentionally opts out of enforced private-path isolation for the sandboxed shell; explicit user deny rules still fail if impossible under `/`. `--unrestricted` is the one-flag unsandboxed full-host mode and is exactly equivalent to the legacy `--allow-all --no-sandbox` pair. Saved/CLI sandbox-only host, hardware and cache grants become inert in this full-host mode; the direct shell keeps normal host access without redundant mounts/discovery. Cache/host/runtime remapping keeps stricter overlap rules; runtime aliases become sandbox symlinks to one canonical bind. The runtime layout validated by `shell_guards` must be exactly the one used for Bubblewrap assembly; every anchor/mount source is FD-pinned. The sandbox threat boundary is the child namespace: another already-running process with the same Unix uid is outside dotlink's shell sandbox and already has that user's host authority.
 - **Stop record:** `signal` (the number that ended the waited process) and
-  `stopped_by` (`timeout`/`cancel`/`shutdown`/`failed`) are the only termination
-  facts a result carries, each omitted when it does not apply. `stopped_by` is
+  `stopped_by` (`timeout`/`cancel`/`shutdown`/`failed`/`teardown`) are the only
+  termination facts a result carries, each omitted when it does not apply. `stopped_by` is
   set only by the site that signals the tree, and only when that signal was
   delivered, so a completion built before anything was spawned claims nothing;
   absent means no stop is provable, never that nothing was signalled. A
@@ -99,11 +99,15 @@ All paths and validation commands below are relative to the repository root.
   same record names the other ending, because an unattributed signal is the one
   an operator most needs attributed: a process that died on a signal dotlink did
   not deliver gets one `LOG job exit id=… signal=SIGKILL from=outside` line, also
-  at every verbosity, emitted once at terminal publication from the same
-  predicate as the result sentence so neither can contradict the other. Exactly
-  one of the two lines is written per job — `stop` is what dotlink did, `exit` is
-  what it did not — and `from=outside` claims only that the signal was not ours,
-  never who sent it.
+  at every verbosity, emitted once at terminal publication. Exactly one of the two
+  lines is written per job: every delivered kill records a cause, and the tidy-up
+  and fail-safe kills that end a tree rather than a command record
+  `StopCause::Teardown`, so `stopped_by` is absent exactly when dotlink signalled
+  nothing. `from=outside` claims only that the signal was not ours, never who sent
+  it. Two questions follow from that and must not be merged: the exit line asks
+  "did we signal anything" (`external_signal`), the result sentence asks "did we
+  end this *command*" (`outside_command_signal`, which also fires for `teardown`)
+  — otherwise a tidied-up tree leaves a bare signal number in the reply.
 - Shell mounts are one layer in `src/mounts.rs`: `SandboxMount { source, target, writable, env, origin }`, keyed by sandbox target with last declaration winning over builtin caches, profile `mounts`, `DOTLINK_MOUNTS` and `--mount` (in that order, as an ordered layer slice). Targets stay below `/tmp/home`, must not nest, and are conflict-checked against fixed host integrations; mount `env` may not set the variables the sandbox owns and may not disagree with another mount. Layout is validated before environment wiring, and only on the set the binder will actually bind. Configuration mistakes are `CONFIG`; a declared source that is not usable yet is host state and retries the runtime, while a discovered cache that cannot be prepared is skipped with a warning. A declared mount is never skipped silently, and `-vv` lists the resolved set.
 - Linux native file IO must stay descriptor-rooted with openat2 and fail closed on unsupported resolution. Shared traversal errno comparisons use OS-native libc constants, never Linux numeric literals. Directory discovery reads child metadata under the same descriptor and mount-resolution authority as actual opens (Linux `openat2` O_PATH nofollow; macOS `fstatat` plus device check). Pathname metadata or unchecked mountpoint metadata must never be reintroduced after pinning. Linux/macOS native tools are concurrent by default; `-s/--serialize` opts into one-at-a-time MCP calls. Windows retains a conservative operation gate. Never reintroduce pathname IO following authorization for Linux tools.
 - Logging is quiet by default: `-v` = TOOL, `-vv` = TOOL + REQ. `LOG` lines are
