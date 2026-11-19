@@ -14,6 +14,20 @@
   cfg = config.services.dotlink;
   systemdVersion = lib.getVersion config.systemd.package;
 
+  # Values emitted from typed options or fixed deployment policy. Accepting
+  # them again through environment would silently override one spelling or
+  # create a second source of truth.
+  reservedEnvironment = [
+    "DOTLINK_PROFILE"
+    "DOTLINK_CONFIG_FILE"
+    "DOTLINK_API_KEY_FILE"
+    "NGROK_AUTHTOKEN_FILE"
+    "DOTLINK_STDIO"
+    "DOTLINK_COLOR"
+    "DOTLINK_SUPERVISOR"
+    "DOTLINK_SSH_AGENT_SOCKET"
+  ];
+
   commonOptions = {
     enableDefault,
     userDefault,
@@ -143,7 +157,10 @@
       example = {XDG_CONFIG_HOME = "/home/alice/.config";};
       description = ''
         Additional non-secret environment variables, such as custom XDG paths
-        or RUST_LOG. Do not place credentials here or in settings.
+        or RUST_LOG. Do not place credentials here or in settings. Keys owned
+        by the module are refused: profile/config identity, credential-file and
+        SSH-agent paths come from typed options; stdio, color and supervision
+        are deployment facts set by the module.
       '';
     };
   };
@@ -414,8 +431,12 @@ in {
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
-          assertion = !(instance.environment ? DOTLINK_PROFILE);
-          message = "dotlink ${name}: set the typed profile option, not environment.DOTLINK_PROFILE; the latter bypasses private-state namespace collision checks.";
+          assertion = !(lib.any (key: builtins.hasAttr key instance.environment) reservedEnvironment);
+          message = "services.dotlink${
+            if name == "default"
+            then ""
+            else ".instances.${name}"
+          }.environment must not set ${lib.concatStringsSep ", " reservedEnvironment}: the module owns those values; use typed profile/config/credential/SSH-agent options, while stdio, color and supervision are deployment facts.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {

@@ -45,6 +45,16 @@ choosing `user = "root"` grants the process root-level host authority and is
 strongly discouraged. The default `user = "dotlink"` creates
 a dedicated service user with home `/var/lib/dotlink`.
 
+`environment` rejects keys owned by the module: `DOTLINK_PROFILE`,
+`DOTLINK_CONFIG_FILE`, `DOTLINK_API_KEY_FILE`, `NGROK_AUTHTOKEN_FILE`,
+`DOTLINK_STDIO`, `DOTLINK_COLOR`, `DOTLINK_SUPERVISOR` and
+`DOTLINK_SSH_AGENT_SOCKET`. Profile/config identity, credential-file paths and
+the SSH-agent socket come from typed options; stdio, color and supervision are
+fixed deployment facts. Accepting a second spelling would either be silently
+overridden or create a second source of truth, so the module fails evaluation
+instead. Other `DOTLINK_*` values, `RUST_LOG` and custom XDG variables remain
+available through `environment`.
+
 `workingDirectory` is mandatory and must be absolute. This is deliberate:
 the permission `default_allow = true` reads the directory **dotlink starts
 from**, and relative allow/deny grants are rooted there. We must not silently

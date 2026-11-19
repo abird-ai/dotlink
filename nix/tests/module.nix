@@ -175,6 +175,43 @@
       };
     };
   };
+  # Every module-owned key must be refused through the generic environment
+  # escape hatch, so no future omission silently creates a second source.
+  reservedEnvironmentKeys = [
+    "DOTLINK_PROFILE"
+    "DOTLINK_CONFIG_FILE"
+    "DOTLINK_API_KEY_FILE"
+    "NGROK_AUTHTOKEN_FILE"
+    "DOTLINK_STDIO"
+    "DOTLINK_COLOR"
+    "DOTLINK_SUPERVISOR"
+    "DOTLINK_SSH_AGENT_SOCKET"
+  ];
+  reservedKeysRefused =
+    lib.all
+    (key:
+      !(valid (eval {
+        services.dotlink = {
+          enable = true;
+          user = "alice";
+          workingDirectory = "/home/alice/projects";
+          environment = {${key} = "x";};
+        };
+      })))
+    reservedEnvironmentKeys;
+  supportedEnvironment = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      environment = {
+        DOTLINK_VERBOSITY = "tools";
+        RUST_LOG = "warn";
+        XDG_CONFIG_HOME = "/home/alice/.config-custom";
+        XDG_STATE_HOME = "/home/alice/.state-custom";
+      };
+    };
+  };
   validProfileBoundaries = eval {
     services.dotlink = {
       enable = true;
@@ -464,8 +501,14 @@
     (mutableConfig.config.systemd.services.dotlink.environment.DOTLINK_CONFIG_FILE == "/home/alice/etc/dotlink.jsonc")
     (!valid duplicateSlot)
     (!valid invalidProfileEnvironment)
-    (lib.any (a: !a.assertion && lib.hasInfix "environment.DOTLINK_PROFILE" a.message)
+    (lib.any (a: !a.assertion && lib.hasInfix ".environment must not set" a.message)
       invalidProfileEnvironment.config.assertions)
+    reservedKeysRefused
+    (valid supportedEnvironment)
+    (supportedEnvironment.config.systemd.services.dotlink.environment.DOTLINK_VERBOSITY == "tools")
+    (supportedEnvironment.config.systemd.services.dotlink.environment.RUST_LOG == "warn")
+    (supportedEnvironment.config.systemd.services.dotlink.environment.XDG_CONFIG_HOME == "/home/alice/.config-custom")
+    (supportedEnvironment.config.systemd.services.dotlink.environment.XDG_STATE_HOME == "/home/alice/.state-custom")
     (valid validProfileBoundaries)
     (!(validProfileBoundaries.config.systemd.services.dotlink.environment ? DOTLINK_PROFILE))
     (validProfileBoundaries.config.systemd.services.dotlink-work.environment.DOTLINK_PROFILE
