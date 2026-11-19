@@ -169,7 +169,7 @@ fn an_externally_signalled_job_records_its_exit_at_every_verbosity() {
         let lines = session.finish();
 
         let text = result_text(&response);
-        assert!(text.contains("\"signal\":9"), "{text}");
+        assert!(text.contains("\"signal\":\"SIGKILL\""), "{text}");
         assert!(!text.contains("stopped_by"), "no stop to report: {text}");
         assert_eq!(lines.len(), 1, "one line per job at {flags:?}: {lines:?}");
         let line = &lines[0];

@@ -135,7 +135,7 @@ impl JobFollowUp {
     /// acknowledgement, and a running job can be stopped instead.
     fn obligation(self) -> Option<&'static str> {
         match (self.finished, self.unacked) {
-            (false, _) => Some("job_ack when done, or job_cancel to stop it"),
+            (false, _) => Some("job_ack when done to clean up, or job_cancel to stop it"),
             (true, true) => Some("job_ack to clean it up"),
             (true, false) => None,
         }
@@ -2495,15 +2495,10 @@ fn signal_name(_signal: i32) -> Option<&'static str> {
 }
 
 /// Prose: the name with its number, for a reader who may know neither.
-pub(crate) fn signal_label(signal: i32) -> String {
-    match signal_name(signal) {
-        Some(name) => format!("{name} (signal {signal})"),
-        None => format!("signal {signal}"),
-    }
-}
-
-/// One token, no spaces: the lifecycle line is key=value and a value may not
-/// open a field of its own.
+/// One token, no spaces, and the name rather than the number: `SIGKILL` is what a
+/// reader and a model both know, while `9` needs a mapping only this process has.
+/// The lifecycle line is key=value, so a value may not open a field of its own, and
+/// the same token serves both surfaces.
 pub(crate) fn signal_token(signal: i32) -> String {
     match signal_name(signal) {
         Some(name) => name.to_owned(),
@@ -2523,7 +2518,7 @@ fn external_stop_note(completion: &JobCompletion) -> Option<String> {
     let signal = external_signal(completion)?;
     Some(format!(
         "killed by {} from outside dotlink; check what sent it before retrying",
-        signal_label(signal)
+        signal_token(signal)
     ))
 }
 
@@ -2583,7 +2578,7 @@ fn omit_absences(payload: &mut Value) {
 /// when they do not apply, so ordinary results stay unchanged.
 fn with_termination(mut payload: Value, completion: &JobCompletion) -> Value {
     if let Some(signal) = completion.signal {
-        payload["signal"] = Value::from(signal);
+        payload["signal"] = Value::from(signal_token(signal));
     }
     if let Some(cause) = completion.stopped_by {
         payload["stopped_by"] = Value::from(cause.as_str());
@@ -2746,7 +2741,7 @@ fn failure_error_object(message: &str, completion: &JobCompletion) -> JsonObject
     }
     if let Some(signal) = completion.signal {
         data.insert("signal".to_owned(), Value::from(signal));
-        data.insert("signal_name".to_owned(), Value::from(signal_label(signal)));
+        data.insert("signal_name".to_owned(), Value::from(signal_token(signal)));
     }
     if let Some(cause) = completion.stopped_by {
         data.insert("stopped_by".to_owned(), Value::from(cause.as_str()));
@@ -3829,7 +3824,7 @@ mod tests {
         .with_signal(Some(9));
         let payload = rendered(&completion);
         assert_eq!(payload["exit_code"], Value::Null);
-        assert_eq!(payload["signal"], Value::from(9));
+        assert_eq!(payload["signal"], Value::from("SIGKILL"));
         assert!(payload.get("stopped_by").is_none(), "{payload}");
     }
 
@@ -3868,7 +3863,7 @@ mod tests {
             assert_eq!(external_stop_note(&completion), None, "{cause:?}");
             let payload = rendered(&completion);
             assert_eq!(payload["stopped_by"], Value::from(cause.as_str()));
-            assert_eq!(payload["signal"], Value::from(9));
+            assert_eq!(payload["signal"], Value::from("SIGKILL"));
         }
         // The one ending that is genuinely not ours keeps both surfaces.
         let external = signalled_completion();
@@ -3876,7 +3871,7 @@ mod tests {
         assert!(external_stop_note(&external).is_some());
         let payload = rendered(&external);
         assert!(payload.get("stopped_by").is_none(), "{payload}");
-        assert_eq!(payload["signal"], Value::from(9));
+        assert_eq!(payload["signal"], Value::from("SIGKILL"));
     }
 
     /// A command that something else killed keeps its own ending even when
@@ -3893,9 +3888,9 @@ mod tests {
         .with_signal(Some(9));
         assert_eq!(external_signal(&completion), Some(9));
         let note = external_stop_note(&completion).expect("the command's signal needs a story");
-        assert!(note.contains("SIGKILL (signal 9)"), "{note}");
+        assert!(note.contains("SIGKILL"), "{note}");
         let payload = rendered(&completion);
-        assert_eq!(payload["signal"], Value::from(9));
+        assert_eq!(payload["signal"], Value::from("SIGKILL"));
         assert!(
             payload.get("stopped_by").is_none(),
             "a sweep claims nothing: {payload}"
@@ -3986,7 +3981,7 @@ mod tests {
         assert_eq!(data["exit_code"], Value::from(3), "{data}");
         assert_eq!(data["timed_out"], Value::from(true), "{data}");
         assert_eq!(data["signal"], Value::from(11), "{data}");
-        assert_eq!(data["signal_name"], Value::from(signal_label(11)), "{data}");
+        assert_eq!(data["signal_name"], Value::from("SIGSEGV"), "{data}");
         assert_eq!(data["stopped_by"], Value::from("failed"), "{data}");
         assert_eq!(data["streams_omitted"], Value::from(true), "{data}");
     }
@@ -4036,12 +4031,12 @@ mod tests {
         .with_signal(Some(9))
         .after_terminal(JobStatus::Completed);
         let payload: Value = serde_json::from_str(&internal_failure_payload(&signalled)).unwrap();
-        assert_eq!(payload["signal"], Value::from(9), "{payload}");
+        assert_eq!(payload["signal"], Value::from("SIGKILL"), "{payload}");
         assert!(
             payload["next"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(&signal_label(9)),
+                .contains(&signal_token(9)),
             "{payload}"
         );
     }
@@ -4059,7 +4054,7 @@ mod tests {
     #[test]
     fn external_stop_note_names_the_signal_it_reports() {
         let note = external_stop_note(&signalled_completion()).unwrap();
-        assert!(note.contains(&signal_label(9)), "{note}");
+        assert!(note.contains(&signal_token(9)), "{note}");
         assert!(note.contains("outside dotlink"), "{note}");
     }
 
@@ -4085,7 +4080,7 @@ mod tests {
             StreamSummary::default(),
         )
         .with_signal(Some(42));
-        assert!(external_stop_note(&odd).unwrap().contains("signal 42"));
+        assert!(external_stop_note(&odd).unwrap().contains("42"));
 
         let ordinary = JobCompletion::completed(
             Some(0),
@@ -4133,8 +4128,8 @@ mod tests {
             )
             .with_signal(Some(11)),
         );
-        assert_eq!(killed["signal"], Value::from(9));
-        assert_eq!(crashed["signal"], Value::from(11));
+        assert_eq!(killed["signal"], Value::from("SIGKILL"));
+        assert_eq!(crashed["signal"], Value::from("SIGSEGV"));
     }
 
     #[test]
@@ -4142,13 +4137,14 @@ mod tests {
         let all = shell_job_follow_up(None);
         assert_eq!(
             all,
-            "call job_get=status, job_output=output, job_ack when done, or job_cancel to stop it",
+            "call job_get=status, job_output=output, job_ack when done to clean up, or job_cancel to stop it",
             "{all}"
         );
         // A payload from one job tool never tells the caller to call it again.
         let from_status = shell_job_follow_up(Some("job_get"));
         assert_eq!(
-            from_status, "call job_output=output, job_ack when done, or job_cancel to stop it",
+            from_status,
+            "call job_output=output, job_ack when done to clean up, or job_cancel to stop it",
             "{from_status}"
         );
         assert!(!from_status.contains("job_get"), "{from_status}");
@@ -4158,7 +4154,7 @@ mod tests {
     fn finished_job_follow_up_asks_for_the_ack_and_drops_cancel() {
         assert_eq!(
             job_follow_up(JobFollowUp::RUNNING, Some("job_get")).unwrap(),
-            "call job_output=output, job_ack when done, or job_cancel to stop it"
+            "call job_output=output, job_ack when done to clean up, or job_cancel to stop it"
         );
         let held = JobFollowUp {
             finished: true,
@@ -4210,14 +4206,14 @@ mod tests {
             .with_signal(Some(9)),
         );
         let payload: Value = serde_json::from_str(&manager.status(&signalled.id).unwrap()).unwrap();
-        assert_eq!(payload["signal"], Value::from(9), "{payload}");
+        assert_eq!(payload["signal"], Value::from("SIGKILL"), "{payload}");
         assert!(payload.get("stopped_by").is_none(), "{payload}");
         // The poller sees the same sentence the synchronous result carried.
         assert!(
             payload["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains(&signal_label(9)),
+                .contains(&signal_token(9)),
             "{payload}"
         );
 
@@ -4264,7 +4260,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
         let error = payload["error"].as_str().unwrap_or_default();
         assert!(error.contains("failed spooling stdout"), "{payload}");
-        assert!(error.contains(&signal_label(9)), "{payload}");
+        assert!(error.contains(&signal_token(9)), "{payload}");
         // An internal failure is `failed` here, so the deadline it followed has
         // to travel as its own key.
         assert_eq!(payload["status"], Value::from("failed"), "{payload}");

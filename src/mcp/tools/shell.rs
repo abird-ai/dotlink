@@ -4213,8 +4213,9 @@ mod tests {
             .unwrap()
             .to_owned();
         let payload: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(payload["signal"], Value::from(9), "{text}");
-        assert_eq!(payload["exit_code"], Value::Null, "{text}");
+        assert_eq!(payload["signal"], Value::from("SIGKILL"), "{text}");
+        // A signalled process has no exit code, and an absent field is an absence.
+        assert!(payload.get("exit_code").is_none(), "{text}");
         assert!(payload.get("stopped_by").is_none(), "{text}");
         let next = payload["next"].as_str().unwrap_or_default();
         assert!(next.contains("outside dotlink"), "{text}");

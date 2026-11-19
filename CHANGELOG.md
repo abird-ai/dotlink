@@ -72,6 +72,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `signal` is the signal's name rather than its number: `{"signal":"SIGKILL"}` instead
+  of `{"signal":9}`, and the sentence no longer spells both. The name is what a reader
+  and a model both know; the number needed a mapping only this process had.
+
 - A command that finished no longer reports a collection failure because a
   backgrounded writer inherited stdout: the verdict is about the work that was still
   running, named as such, instead of a collection error that arrived seconds later.

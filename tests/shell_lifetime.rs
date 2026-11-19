@@ -166,7 +166,7 @@ fn a_command_killed_by_someone_else_keeps_its_own_ending() {
     // The command died on a signal dotlink did not deliver, and no cause claims
     // it: the reply names that ending, separately from the sweep's verdict.
     assert_eq!(payload["success"], false, "{payload}");
-    assert_eq!(payload["signal"], 9, "{payload}");
+    assert_eq!(payload["signal"], "SIGKILL", "{payload}");
     let error = payload["error"].as_str().unwrap_or_default();
     assert!(error.contains("still running"), "{payload}");
     assert!(payload.get("stopped_by").is_none(), "{payload}");
