@@ -84,7 +84,7 @@ const JOB_WAIT_POLL: Duration = Duration::from_millis(200);
 /// also lets a payload skip the call its reader has just made.
 const JOB_FOLLOW_UP_CLAUSES: &[(&str, &str)] = &[
     ("job_get", "job_get=status"),
-    ("job_output", "job_output=remaining output"),
+    ("job_output", "job_output=output"),
 ];
 
 /// A receipt always has something to say: `already_used` skips at most one
@@ -135,7 +135,7 @@ impl JobFollowUp {
     /// acknowledgement, and a running job can be stopped instead.
     fn obligation(self) -> Option<&'static str> {
         match (self.finished, self.unacked) {
-            (false, _) => Some("job_ack to clean it up when done, or job_cancel to stop it"),
+            (false, _) => Some("job_ack when done, or job_cancel to stop it"),
             (true, true) => Some("job_ack to clean it up"),
             (true, false) => None,
         }
@@ -1985,7 +1985,6 @@ impl JobManager {
                     .completion
                     .clone()
                     .ok_or_else(|| JobError::Internal(anyhow!("job {id} has no completion")))?,
-                timeout_secs: entry.timeout_secs,
                 result_limit: entry.result_limit,
                 stdout_path: entry.stdout_path.clone(),
                 stderr_path: entry.stderr_path.clone(),
@@ -2395,7 +2394,6 @@ impl JobManager {
                     completion: entry.completion.clone().ok_or_else(|| {
                         JobError::Internal(anyhow!("task {id} has no completion"))
                     })?,
-                    timeout_secs: entry.timeout_secs,
                     result_limit: entry.result_limit,
                     stdout_path: entry.stdout_path.clone(),
                     stderr_path: entry.stderr_path.clone(),
@@ -2445,7 +2443,6 @@ struct OutputSnapshot {
 
 struct ToolResultSnapshot {
     completion: JobCompletion,
-    timeout_secs: u64,
     result_limit: usize,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -2525,7 +2522,7 @@ pub(crate) fn signal_token(signal: i32) -> String {
 fn external_stop_note(completion: &JobCompletion) -> Option<String> {
     let signal = external_signal(completion)?;
     Some(format!(
-        "terminated by {} from outside dotlink; check what signalled it before retrying",
+        "killed by {} from outside dotlink; check what sent it before retrying",
         signal_label(signal)
     ))
 }
@@ -2545,6 +2542,40 @@ fn external_stop_note(completion: &JobCompletion) -> Option<String> {
 pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
     let signal = completion.signal?;
     completion.stopped_by.is_none().then_some(signal)
+}
+
+/// What a result carries is what applies. A null and a flag that is false because
+/// nothing happened are absences, and every absence costs tokens on every call, so
+/// they are omitted rather than rendered — the termination facts already worked that
+/// way. Booleans that state the environment (`sandboxed`, `network`) and the verdict
+/// (`success`) are always rendered: their false is information, not absence.
+fn omit_absences(payload: &mut Value) {
+    /// Flags whose false means "nothing to report".
+    const FALSE_IS_ABSENT: [&str; 4] = [
+        "timed_out",
+        "stdout_truncated",
+        "stderr_truncated",
+        "cancelling",
+    ];
+    let Some(map) = payload.as_object_mut() else {
+        return;
+    };
+    map.retain(|key, value| {
+        let absent = value.is_null()
+            || (value == &Value::Bool(false) && FALSE_IS_ABSENT.contains(&key.as_str()));
+        !absent
+    });
+    // An empty stream says what its absence says, unless the emptiness is itself a
+    // truncation result.
+    for (stream, truncated) in [
+        ("stdout", "stdout_truncated"),
+        ("stderr", "stderr_truncated"),
+    ] {
+        let empty = map.get(stream).and_then(Value::as_str) == Some("");
+        if empty && map.get(truncated) != Some(&Value::Bool(true)) {
+            map.remove(stream);
+        }
+    }
 }
 
 /// Terminal facts a shell result carries beyond `exit_code`/`success`: the signal
@@ -2632,7 +2663,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             completion.signal.is_none() && completion.stopped_by.is_none(),
             "a completion without execution context cannot carry termination facts"
         );
-        let text = serde_json::json!({
+        let mut payload = serde_json::json!({
             "ts": completion.completed_unix,
             "exit_code": completion.exit_code,
             "success": completion.success,
@@ -2641,24 +2672,22 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             "stderr": String::from_utf8_lossy(&stderr),
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
-        })
-        .to_string();
+        });
+        omit_absences(&mut payload);
+        let text = payload.to_string();
         return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
     };
 
     let timed_out = completion.status == JobStatus::TimedOut;
-    let error = timed_out.then(|| {
-        format!(
-            "command timed out after {} seconds and was terminated",
-            snapshot.timeout_secs
-        )
-    });
+    // `timeout_secs` is already on the payload, so the sentence does not repeat it;
+    // it says the one thing the number cannot: the tree was killed.
+    let error = timed_out.then_some("command timed out; the process tree was killed");
     // A timed-out command was killed at its own `timeout_secs`, so the only
     // remedy is a larger one: `background: true` changes who waits, not how long
     // the child may run.
     let next = timed_out.then_some("retry with a larger timeout_secs");
     let stop_note = external_stop_note(completion);
-    let text = with_termination(
+    let mut payload = with_termination(
         serde_json::json!({
         "ts": completion.completed_unix,
         "exit_code": completion.exit_code,
@@ -2671,12 +2700,13 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "stderr": String::from_utf8_lossy(&stderr),
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
-        "error": error.as_deref().or(completion.error.as_deref()),
+        "error": error.or(completion.error.as_deref()),
         "next": next.or(stop_note.as_deref()),
         }),
         completion,
-    )
-    .to_string();
+    );
+    omit_absences(&mut payload);
+    let text = payload.to_string();
     // A completed *lifecycle* is not a completed *invocation*: a command that
     // returned with its own group still running carries an error and no success,
     // and the caller has to see the call fail. An ordinary non-zero exit carries no
@@ -2946,6 +2976,32 @@ fn render_ack_receipt(entry: &JobEntry) -> String {
     payload.to_string()
 }
 
+/// One stream's status: byte positions that matter, and only the flags that are true.
+/// A stream with nothing stored and nothing released has nothing to say.
+fn stream_status(
+    stored: u64,
+    ack: u64,
+    total: Option<u64>,
+    truncated: bool,
+    released: bool,
+) -> Value {
+    let mut status = serde_json::json!({
+        "stored_bytes": stored,
+        "ack_bytes": ack,
+        "total_bytes": total,
+    });
+    // Only the conditions that changed: a stream is truncated or released, and saying
+    // so when it is not would be three more tokens on every probe.
+    if truncated {
+        status["truncated"] = Value::from(true);
+    }
+    if released {
+        status["released"] = Value::from(true);
+    }
+    omit_absences(&mut status);
+    status
+}
+
 fn render_status_locked(entry: &JobEntry) -> Value {
     let completion = entry.completion.as_ref();
     let stdout_stored = retained_bytes(entry, JobStream::Stdout);
@@ -2960,20 +3016,20 @@ fn render_status_locked(entry: &JobEntry) -> Value {
         "exit_code": completion.and_then(|value| value.exit_code),
         "success": completion.map(|value| value.success),
         "error": completion.and_then(|value| value.error.as_deref()),
-        "stdout": {
-            "stored_bytes": stdout_stored,
-            "ack_bytes": entry.stdout_consumed,
-            "total_bytes": completion.map(|value| value.stdout.total_bytes),
-            "truncated": completion.is_some_and(|value| value.stdout.truncated),
-            "released": entry.stdout_released,
-        },
-        "stderr": {
-            "stored_bytes": stderr_stored,
-            "ack_bytes": entry.stderr_consumed,
-            "total_bytes": completion.map(|value| value.stderr.total_bytes),
-            "truncated": completion.is_some_and(|value| value.stderr.truncated),
-            "released": entry.stderr_released,
-        },
+        "stdout": stream_status(
+            stdout_stored,
+            entry.stdout_consumed,
+            completion.map(|value| value.stdout.total_bytes),
+            completion.is_some_and(|value| value.stdout.truncated),
+            entry.stdout_released,
+        ),
+        "stderr": stream_status(
+            stderr_stored,
+            entry.stderr_consumed,
+            completion.map(|value| value.stderr.total_bytes),
+            completion.is_some_and(|value| value.stderr.truncated),
+            entry.stderr_released,
+        ),
     });
     payload["unacked_bytes"] = serde_json::Value::from(unacked_bytes(entry));
     if let Some(completion) = completion {
@@ -2997,6 +3053,7 @@ fn render_status_locked(entry: &JobEntry) -> Value {
     if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_get")) {
         payload["next"] = serde_json::Value::String(next);
     }
+    omit_absences(&mut payload);
     payload
 }
 
@@ -4085,14 +4142,13 @@ mod tests {
         let all = shell_job_follow_up(None);
         assert_eq!(
             all,
-            "call job_get=status, job_output=remaining output, job_ack to clean it up when done, or job_cancel to stop it",
+            "call job_get=status, job_output=output, job_ack when done, or job_cancel to stop it",
             "{all}"
         );
         // A payload from one job tool never tells the caller to call it again.
         let from_status = shell_job_follow_up(Some("job_get"));
         assert_eq!(
-            from_status,
-            "call job_output=remaining output, job_ack to clean it up when done, or job_cancel to stop it",
+            from_status, "call job_output=output, job_ack when done, or job_cancel to stop it",
             "{from_status}"
         );
         assert!(!from_status.contains("job_get"), "{from_status}");
@@ -4102,7 +4158,7 @@ mod tests {
     fn finished_job_follow_up_asks_for_the_ack_and_drops_cancel() {
         assert_eq!(
             job_follow_up(JobFollowUp::RUNNING, Some("job_get")).unwrap(),
-            "call job_output=remaining output, job_ack to clean it up when done, or job_cancel to stop it"
+            "call job_output=output, job_ack when done, or job_cancel to stop it"
         );
         let held = JobFollowUp {
             finished: true,
@@ -4110,7 +4166,7 @@ mod tests {
         };
         assert_eq!(
             job_follow_up(held, Some("job_get")).unwrap(),
-            "output complete: job_output=remaining output, job_ack to clean it up"
+            "output complete: job_output=output, job_ack to clean it up"
         );
         let released = JobFollowUp {
             finished: true,

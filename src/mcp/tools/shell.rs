@@ -100,7 +100,7 @@ const COMPLETED_OUTPUT_GRACE: Duration = Duration::from_secs(2);
 /// Said when a command returned before the work it started did. The command's own
 /// status is still reported; this is why the invocation did not finish, and it
 /// names the idiom that avoids it rather than leaving the caller to guess.
-const LEFTOVERS_KILLED: &str = "command returned while processes it started were still running; dotlink killed them (keep one alive with `wait`, e.g. `server & wait` in a durable call)";
+const LEFTOVERS_KILLED: &str = "command returned while processes it started were still running; dotlink killed them (use `wait` to keep one alive)";
 const LEFTOVERS_UNKILLED: &str =
     "command returned while processes it started were still running; dotlink could not kill them";
 
@@ -2425,7 +2425,8 @@ impl LocalMachine {
         // record is for what an operator would otherwise have to reconstruct, and a
         // line per ordinary exit is noise that hides those. A sweep is never silent,
         // because it changed the verdict.
-        if by != "command" || tree.is_some() {
+        let by = (by != "command").then_some(by);
+        if by.is_some() || tree.is_some() {
             stop_trace.ended(&end, by, tree);
         }
         completion
@@ -6557,12 +6558,11 @@ mod tests {
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["timed_out"], Value::Bool(true));
         assert_eq!(payload["success"], Value::Bool(false));
-        assert_eq!(payload["exit_code"], Value::Null);
+        // An absent field is an absence: a signalled process has no exit code, and
+        // the sentence says the one thing the number cannot.
+        assert!(payload.get("exit_code").is_none(), "{payload}");
         assert!(
-            payload["error"]
-                .as_str()
-                .unwrap()
-                .contains("timed out after 1 seconds"),
+            payload["error"].as_str().unwrap().contains("timed out"),
             "{payload}"
         );
         assert!(

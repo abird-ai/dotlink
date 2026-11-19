@@ -73,14 +73,19 @@ All paths and validation commands below are relative to the repository root.
 - Linux shell execution is Bubblewrap-sandboxed by default. Network is off unless explicitly granted. A command's process group does not outlive it: the group is swept when the command returns, and a command that returned while that group was still running is a failed invocation (`success: false` plus an error naming the leftovers and `wait`), never a success — its own exit status is still reported, because that fact did not change. The contract is the group, not the machine: a `setsid` descendant escapes it, and no description may claim otherwise. A sandboxed group is already gone with its namespace, so the sweep finds nothing there and the command's own status stands.
 - Filesystem denies win over allows. Shell mounts (developer caches and explicit mounts) never expand MCP filesystem authority. Deny and protected paths retain lexical and kernel-order resolved identities (`mcp::guard_identities`), including dangling-symlink targets; each sandboxed command re-resolves them. Native MCP filesystem tools always reject dotlink-protected paths. Linux Bubblewrap permits broad ordinary grants such as `$HOME` when a guard names an existing canonical object. The eventual leaf mask/read-only rebind makes that file/directory itself a mountpoint, and every mutable directory entry between the user bind root and that leaf is self-bound from a pinned FD as a namespace anchor. Anchors preserve effective RO/RW semantics inside the directory but make rename/unlink by the sandboxed child fail with `EBUSY`, so the guarded pathname stays stable for the command lifetime. A guarded canonical directory covers redundant protected/read-denied descendants beneath it. Missing guard names and symlink spellings remain fail-closed because there is no stable mountpoint at the configured leaf. Read-denied files/directories use masks; write-denied files/directories use read-only rebinds. An explicit root read+write grant (`--allow-rw=/`) intentionally opts out of enforced private-path isolation for the sandboxed shell; explicit user deny rules still fail if impossible under `/`. `--unrestricted` is the one-flag unsandboxed full-host mode and is exactly equivalent to the legacy `--allow-all --no-sandbox` pair. Saved/CLI sandbox-only host, hardware and cache grants become inert in this full-host mode; the direct shell keeps normal host access without redundant mounts/discovery. Cache/host/runtime remapping keeps stricter overlap rules; runtime aliases become sandbox symlinks to one canonical bind. The runtime layout validated by `shell_guards` must be exactly the one used for Bubblewrap assembly; every anchor/mount source is FD-pinned. The sandbox threat boundary is the child namespace: another already-running process with the same Unix uid is outside dotlink's shell sandbox and already has that user's host authority.
 - **Stop record:** `signal` (the number that ended the waited process) and
-  `stopped_by` (`timeout`/`cancel`/`shutdown`/`failed`/`teardown`) are the only
-  termination facts a result carries, each omitted when it does not apply. `stopped_by` is
-  set only by the site that signals the tree, and only when that signal was
-  delivered while the command was still running, so a completion built before
-  anything was spawned claims nothing, and a sweep of leftovers behind a command
-  that had already exited claims nothing either — its fate was already decided by
-  its own status. `stopped_by` answers exactly one question: did dotlink end this
-  command. A
+  `stopped_by` (`timeout`/`cancel`/`shutdown`/`failed`) are the only termination
+  facts a result carries, each omitted when it does not apply. `stopped_by` is set
+  only by the site that signals the tree, and only when that signal was delivered
+  while the command was still running, so a completion built before anything was
+  spawned claims nothing, and a sweep of leftovers behind a command that had
+  already exited claims nothing either — its fate was already decided by its own
+  status. `stopped_by` therefore answers exactly one question: did dotlink end this
+  command. Nothing else is rendered that only says "no": a null, a flag that is
+  false because nothing happened (`timed_out`, `*_truncated`, `cancelling`), an
+  empty stream, and a per-stream `truncated`/`released` that is not true are all
+  omitted, since an absence costs nothing and a false costs tokens on every call.
+  `sandboxed`, `network` and `success` are always rendered — their false is
+  information, not absence — and a running job omits `success`/`exit_code`. A
   cancellation records *who* asked before the token fires (`JobCancel` keeps the
   token and its origin together and exposes no cancel), because a caller
   cancelling their own job and the connector withdrawing it mean different

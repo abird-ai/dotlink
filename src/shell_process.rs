@@ -172,7 +172,7 @@ impl StopTrace {
     }
 
     /// The one line a job gets, written where its ending is known.
-    pub(crate) fn ended(&self, end: &str, by: &str, tree: Option<&str>) {
+    pub(crate) fn ended(&self, end: &str, by: Option<&str>, tree: Option<&str>) {
         self.log
             .notice("job", end_message(&self.label, end, by, tree));
     }
@@ -182,18 +182,24 @@ impl StopTrace {
     /// runs without a completion, which is why it cannot be a second line for a job
     /// that already published one — every completion path disarms the guard.
     pub(crate) fn abandoned(&self, tree: Option<&str>) {
-        self.ended("abandoned", "dotlink", tree);
+        self.ended("abandoned", Some("dotlink"), tree);
     }
 }
 
 /// One lifecycle line per job, written only when there is something to say: how it
-/// ended, who ended it, and what became of the process group it left behind. Every
-/// field is a word a reader does not have to look up.
-pub(crate) fn end_message(label: &str, end: &str, by: &str, tree: Option<&str>) -> String {
-    match tree {
-        Some(tree) => format!("id={label} end={end} by={by} tree={tree}"),
-        None => format!("id={label} end={end} by={by}"),
+/// ended, who ended it when that was not the command itself, and what became of the
+/// process group it left behind. Every field is a word a reader does not have to look
+/// up, and an absent `by=` is not an omission to decode — a line that exists at all
+/// because the command ended on its own says so by naming no other actor.
+pub(crate) fn end_message(label: &str, end: &str, by: Option<&str>, tree: Option<&str>) -> String {
+    let mut line = format!("id={label} end={end}");
+    if let Some(by) = by {
+        line.push_str(&format!(" by={by}"));
     }
+    if let Some(tree) = tree {
+        line.push_str(&format!(" tree={tree}"));
+    }
+    line
 }
 
 #[cfg(unix)]
@@ -622,23 +628,23 @@ mod tests {
     #[test]
     fn the_end_line_names_how_it_ended_and_who_ended_it() {
         assert_eq!(
-            end_message("3f0c9d1e", "exit code=0", "command", None),
-            "id=3f0c9d1e end=exit code=0 by=command"
+            end_message("3f0c9d1e", "exit code=0", None, None),
+            "id=3f0c9d1e end=exit code=0"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "signal signal=SIGKILL", "external", None),
+            end_message("3f0c9d1e", "signal signal=SIGKILL", Some("external"), None),
             "id=3f0c9d1e end=signal signal=SIGKILL by=external"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "timeout", "dotlink", None),
+            end_message("3f0c9d1e", "timeout", Some("dotlink"), None),
             "id=3f0c9d1e end=timeout by=dotlink"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "exit code=0", "command", Some("killed")),
-            "id=3f0c9d1e end=exit code=0 by=command tree=killed"
+            end_message("3f0c9d1e", "exit code=0", None, Some("killed")),
+            "id=3f0c9d1e end=exit code=0 tree=killed"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "abandoned", "dotlink", Some("alive")),
+            end_message("3f0c9d1e", "abandoned", Some("dotlink"), Some("alive")),
             "id=3f0c9d1e end=abandoned by=dotlink tree=alive"
         );
     }

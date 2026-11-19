@@ -149,7 +149,11 @@ fn a_finished_command_does_not_wait_for_its_leftovers() {
     assert_eq!(lines.len(), 1, "one line per job: {journal}");
     let line = lines[0];
     assert!(line.contains("end=exit code=0"), "{line}");
-    assert!(line.contains("by=command"), "{line}");
+    // The command ended itself, so the line names no other actor at all.
+    assert!(
+        !line.contains("by="),
+        "an own ending needs no actor: {line}"
+    );
     assert!(line.contains("tree=killed"), "{line}");
 }
 

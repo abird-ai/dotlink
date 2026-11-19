@@ -57,6 +57,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   value above it still loads and is capped, and the cap is reported at startup only
   when the value was the operator's own rather than the default.
 
+- Results carry only what applies. A null, a flag that is false because nothing
+  happened (`timed_out`, `*_truncated`, `cancelling`), an empty stream, and a
+  per-stream `truncated`/`released` that is not true are now omitted rather than
+  rendered: an absence costs nothing, while a rendered false costs tokens on every
+  call. A clean shell result drops from 211 to 106 characters, a timeout from 312 to
+  215, and the externally-signalled case from 463 to 307. `sandboxed`, `network` and
+  `success` stay always-rendered because their false is information, not absence, and
+  a running job omits `success`/`exit_code` it does not have yet.
+- The journal line names no actor when the command ended itself: `by=` appears only
+  for `dotlink`, `caller`, `connector` or `external`, so a line that exists because of
+  a sweep reads `end=exit code=0 tree=killed` and needs no legend to say who ended
+  what.
+
 ### Fixed
 
 - A command that finished no longer reports a collection failure because a
