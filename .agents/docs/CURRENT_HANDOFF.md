@@ -13,111 +13,122 @@ Repo: `/home/pvl/spaces/abird/src/dotlink`
 > [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
 > It preserves this unified-runtime implementation and is not a release/tag.
 
-## LIVE 0.17 shared-consumer update — fresh review 2026-11-19
+## LIVE 0.17 shared-consumer checkpoint — repin + D1-D3 complete 2026-11-19
 
 This section supersedes older dependency/state details below where they conflict.
 
-Current Git boundary:
+Current Git / dependency boundary:
 
-- dotlink product parity checkpoint is now signed at
-  `46215feb3b8f17b0284da45fae5f52ae22e42c55`
-  (`Harden pre-repin MCP and shell boundaries`);
-- `origin/main` remains `5381729cd...` until the current authorized push;
-- committed pre-repin checkpoints:
-  `8a3ed9d` Nix ownership,
-  `a36e976` lifecycle logging,
-  `690cfb5` runtime compatibility,
-  `8e14ee2` consumer docs;
-- the fresh-review parity/product source fixes are committed in `46215fe...`;
-- AW is published at `origin/main = 05dd2ff1163753903371b9f36d29922da1f03a20`;
-- exact signed dependency pin:
-  `AW_IMPL_SHA = 7c7de6c9aeedf714adbe67b17ac863f27697e90e`;
-- dotlink still pins the old `792f0b38...` revision only until the atomic repin
-  performed in the current authorized turn; no sibling/path override exists;
-- the read-only release reference is now fully published at
-  `release/0.17 = origin/release/0.17 = v0.17.5 =`
-  `3995448d7bf33794ef84c7bb51150d77cc260ada`;
-- nothing is staged or pushed.
+- signed dotlink source checkpoint:
+  36d653368c6c4ec47417f355269f661833be8dba
+  (Repin AW and complete D1-D3 process convergence);
+- pre-repin signed checkpoints remain 46215fe product parity and 0aea1f4 consumer docs;
+- origin/main is still 0aea1f4... at this docs-edit instant; the current user
+  turn explicitly authorizes pushing this source/docs checkpoint;
+- AW final published implementation pin:
+  AW_IMPL_SHA = 1a5d0f65208e4a05b737c804a55a3aaad3e2fa59;
+- AW origin/main = 4234447612421069a746c925c76a25e3ba27774a;
+- all direct/transitive AW Git packages in dotlink resolve to exactly 1a5d0f65...;
+- the dotlink registry package/version set is unchanged by the repin;
+- no sibling/path override exists;
+- release/0.17 = origin/release/0.17 = v0.17.5 =
+  3995448d7bf33794ef84c7bb51150d77cc260ada.
 
-The fresh review changed the eventual dependency boundary. D1/D6-D7 should add:
+### D0 repin — complete
 
-- `aw-platform` for process containment/platform facts;
-- lightweight **`aw-mcp-protocol`** for result/receipt/progress projection.
+The direct AW set is now aw-tools, aw-tools-fs-unix, aw-tools-fs-win,
+aw-platform and lightweight aw-mcp-protocol. The full aw-mcp client adapter is
+intentionally absent.
 
-Do **not** add the full `aw-mcp` client adapter. The protocol crate has no
-Agent runtime, reqwest, jsonschema, clap or MCP client/server transport stack.
-For the current atomic repin, all five direct AW Git dependencies and every
-transitive AW Git lock entry must resolve to
-`7c7de6c9aeedf714adbe67b17ac863f27697e90e`.
+The first attempted repin exposed one shared packaging defect before commit:
+aw-mcp-protocol's exact Tokio/serde_json requirements would have downgraded
+dotlink's existing compatible runtime stack. AW fixed that in signed/published
+1a5d0f65...; the final repin preserves dotlink's registry package/version set
+exactly.
 
-Exact source mapping is now complete for the whole blocked consumer cutover:
+### D1-D3 process convergence — complete
 
-- D1-D3: `.agents/plans/017-main-shared-consumer-backport-2026-11-18/D1-D3-SOURCE-CUTOVER-MAP.md`;
-- D4-D7: `.agents/plans/017-main-shared-consumer-backport-2026-11-18/D4-D7-SOURCE-CUTOVER-MAP.md`.
-The shared side now provides:
+Dotlink no longer owns a parallel process-stop model:
 
-- `ManagedProcessGuard`;
-- `exit_signal(&ExitStatus)` / `signal_name(...)`;
-- `StopReason`, `StopEvidence`, `StopRecord`;
-- zero-cost `StopTracker`;
-- `ProcessTerminal` / `TaskTerminalDetail`;
-- attempt-level `ExecutionLifecycleEvent::ProcessStop`;
-- **`ProcessReceipt::stop_record()`**, the one final factual record for a
-  logical stop.
+- src/shell_process.rs is only Tokio child/command glue around
+  aw_platform::ManagedProcessGuard;
+- physical exit is retained as shared ProcessExit::{Code(i32),Signal(i32),Unknown};
+- semantic stop is retained as shared StopRecord / StopReason / StopEvidence;
+- shared StopTracker preserves the original reason across Unknown retries;
+- old stop_proven, synthetic DeadlineExceeded/Cancelled ProcessExit values,
+  private process-group/Job Object Guard semantics and local signal-name tables
+  are gone;
+- later spool/journal/internal failure may downgrade product Job status but
+  cannot erase already observed physical exit or final stop evidence;
+- pre-spawn cancellation/deadline correctly carries no process stop claim.
 
-That distinction closes the operator-log ambiguity: lifecycle events are
-diagnostic attempts. After the D1/D2 cutover, a reasoned final stop record
-renders exactly one `LOG job stop ...`; a physical `ProcessExit::Signal(n)`
-with no reasoned final stop record instead renders exactly one v0.17.5
-`LOG job exit id=<id> signal=<name-or-number> from=outside`. A reasoned stop
-record suppresses the outside line even for NoTarget/Unknown evidence because
-direct-child fallback may have delivered the signal. `from=outside` never
-identifies a culprit.
+Dotlink retains only product context:
 
-Pre-repin product work remains valid:
+- CancelOrigin::{Caller,Connector} lives beside the Job cancellation token;
+- shared Cancelled + Stopped projects to stopped_by:"cancel" for caller
+  cancellation and stopped_by:"shutdown" for connector teardown;
+- shared Timeout projects to "timeout";
+- shared RuntimeError projects to "failed";
+- NoTarget/Unknown never produce stopped_by.
 
-- Nix module generically rejects all module-owned environment keys while
-  retaining supported unrelated env;
-- logger lifecycle/TOOL/REQ writes are locked best-effort and non-panicking,
-  including Drop during unwinding;
-- `LogConfig::lifecycle` is always visible independent of verbosity;
-- hostile 32 KiB Job refs stay compact over stdio/local HTTP;
-- `jobs_read` now rejects `limit=0`, accepts one raw byte, keeps the
-  serialized envelope independent, preserves delivery proof/ACK and absolute
-  continuation offsets;
-- local receipt stamping preserves fields inside the reserved
-  `io.abird/receipt` object, keeps replay timestamps stable, rejects malformed
-  reserved metadata transactionally, and never duplicates the visible marker;
-- local result fitting shrinks text only and **never silently truncates without
-  an explicit marker**;
-- a stored visible `ts=` is revalidated after fitting, so it cannot be fitted
-  away and no unnecessary sidecar budget is reserved;
-- real stdio/hosted Image/Audio/Resource regressions preserve exact typed
-  identity; structured-content identity remains tested at the decorator
-  boundary;
-- local progress sends continue polling the underlying operation, have no
-  detached task, and preserve 10 s / 100 ms product defaults;
-- v0.17.5 hard-deadline wording is ported: `timeout_secs` explicitly stops the
-  command tree and is distinct from caller/transport response waiting;
-  `background:true` changes waiting only. The focused schema regression passes.
+One product mapper now drives synchronous results, jobs_get, Task failure detail
+and lifecycle prose. Physical signal becomes JSON signal; proven semantic stop
+becomes stopped_by; Task failure data is derived through shared
+TaskTerminalDetail; outside-signal prose uses aw_platform::signal_name or the
+bare number.
 
-Fresh dotlink qualification after these review fixes:
+Lifecycle logging is final-result based, not attempt-event based:
 
-- main binary: **698 passed / 0 failed / 1 intentional ignored**;
-- integrations: **40/40**;
-- locked all-target/all-feature check: green;
+    reasoned final StopRecord
+      -> exactly one LOG job stop id=<id> reason=<product reason>
+                     outcome=<delivered|gone|failed>
+
+    ProcessExit::Signal(n) + no reasoned stop sequence
+      -> exactly one LOG job exit id=<id> signal=<name-or-number> from=outside
+
+The two lines are mutually exclusive. from=outside means only that dotlink did
+not enter a semantic stop sequence; it does not identify a sender.
+
+run_shell_job() emits the lifecycle record exactly once after the final
+completion has been assembled. Shared attempt-level lifecycle evidence remains
+diagnostic semantics and is never mapped one-for-one to operator lines.
+
+### Fresh post-repin/D1-D3 qualification
+
+- main binary: **701 passed / 0 failed / 1 intentional ignored**;
+- integrations: **42/42**:
+  - child-env 1/1;
+  - exit-status 15/15;
+  - OAuth live rotation 1/1;
+  - private generations 13/13;
+  - stdio tools 10/10;
+  - real lifecycle exit/stop 2/2;
+- real Unix external SIGKILL proves at default, verbose and quiet:
+  signal 9, no stopped_by, exactly one exit ... from=outside;
+- real timeout proves at the same verbosity modes:
+  stopped_by:"timeout", exactly one stop line and no outside-exit line;
+- locked all-target/all-feature cargo check: green;
 - strict all-target/all-feature Clippy: green;
-- rustfmt and `git diff --check`: green;
+- rustfmt and git diff --check: green;
 - repo-wide Markdown lint: green;
 - NixOS module check: green.
 
-The eventual D4-D7 cutover deletes these temporary generic product helpers only
-after the same regressions pass against shared `JobRef`, receipt/budget
-helpers and `aw-mcp-protocol`.
+One L5 combined gate was externally SIGKILLed while starting Clippy after cargo
+check had already passed; rerunning Clippy alone passed cleanly. This is the
+previously observed host SIGKILL-at-compile-start behavior, not a Rust diagnostic.
 
-Publish/repin remains blocked until the fresh-review AW source changes are
-signed and published. The initial `eb325b31` source commit is **not** the final
-pin; the next signed AW source checkpoint must supersede it.
+### Next consumer slice
+
+D4-D7 remain. Their exact source/deletion/test order is frozen in
+D4-D7-SOURCE-CUTOVER-MAP.md.
+
+Next sequence:
+
+1. D4 typed JobRef, shared receipts and bounded diagnostics;
+2. D5 RawPageBytes / SerializedResultBytes;
+3. D6 shared aw-mcp-protocol receipt/fitter helpers;
+4. D7 shared heartbeat/progress adapter;
+5. full v0.17.5 equivalence rerun.
 
 Frozen sandbox/config-v13 work remains deferred and untouched.
 

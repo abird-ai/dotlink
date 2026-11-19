@@ -350,13 +350,9 @@ the time of every redelivery.
 When comparing logs with a receipt, remember that TOOL log timestamps are local
 wall-clock display while receipt `ts` is UTC Unix seconds.
 
-## 6. Stop evidence after the shared-consumer cutover
+## 6. Stop evidence on current main
 
-This subsection is the **post-D1-D3 expected contract**, not a claim about the
-current pre-repin binary. Until D1-D3 lands, absence of these fields/lines on
-main is expected.
-
-After cutover, shared AW facts are:
+D1-D3 is complete on current main. The runtime now consumes these shared AW facts:
 
 ```text
 ProcessExit::{Code(i32), Signal(i32), Unknown}
@@ -405,8 +401,8 @@ evidence is NoTarget/Unknown, because direct-child fallback may have delivered
 the physical signal. Attempt-level `ExecutionLifecycleEvent::ProcessStop`
 records are diagnostics/metrics and are **not** one operator line each.
 
-D1-D3 must land before using either lifecycle line as a current-main health
-invariant.
+These lifecycle lines are current-main health invariants. Real-binary coverage
+proves their mutual exclusion and visibility at quiet/default/verbose.
 
 ## 7. Reading idle time
 

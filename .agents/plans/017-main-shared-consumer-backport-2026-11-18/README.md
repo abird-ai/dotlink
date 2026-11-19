@@ -38,27 +38,24 @@ logging and deployment behavior.
 
 ## Current sequencing checkpoint
 
-AW fresh-review implementation is now signed/published at
-`7c7de6c9aeedf714adbe67b17ac863f27697e90e`; AW main is published through
-`05dd2ff1163753903371b9f36d29922da1f03a20`. Dotlink still pins
-`792f0b38...` only until the atomic repin in the current authorized turn.
+AW final implementation is signed/published at
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; AW main is published through
+`4234447612421069a746c925c76a25e3ba27774a`. Dotlink is atomically repinned to
+that final SHA with no sibling/path dependency and no registry package/version
+churn.
 
-Therefore D1-D7 must **not** start by inventing compatibility copies or a sibling
-path dependency. They resume only after the user authorizes an exact signed AW
-checkpoint, publication, and atomic dotlink repin.
+D1-D3 process convergence is complete. D4-D7 now continue directly against the
+published shared APIs; do not reintroduce compatibility copies.
 
 The independent product-only D8 Nix hardening is implemented now: module-owned
 environment keys are rejected through one generic assertion and regression
 loop, while non-owned `DOTLINK_*`, `RUST_LOG` and XDG variables remain
 available.
 
-The product-owned D2 logging prerequisite is also implemented independently:
-structured LOG/TOOL/REQ writes are locked best-effort stderr writes and cannot
-panic on BrokenPipe, including when invoked from Drop during unwinding.
-`LogConfig::lifecycle` is the always-visible operator-evidence channel;
-existing production notices use it and tests prove it is ungated by verbosity.
-The actual stop/outside-exit rendering still waits for the shared physical
-exit/final-stop-record repin; attempt-level lifecycle events remain diagnostics.
+D2 process lifecycle logging is now fully connected: structured LOG/TOOL/REQ
+writes are locked best-effort stderr writes, final stop/outside-exit records use
+`LogConfig::lifecycle`, and real-binary tests prove the mutually exclusive lines
+survive quiet/default/verbose. Attempt-level evidence remains diagnostic only.
 
 D6 compatibility-preservation and local fitting semantics are independently
 locked before the shared helper swap: real stdio and hosted
@@ -71,18 +68,19 @@ unrelated keys, keeps stored replay timestamps authoritative, and never adds a
 second exact visible `ts=` marker. The shared helper replacement still waits for
 AW repin.
 
-D4/D5 product-boundary compatibility is also locked pre-repin: hostile finite
+D4/D5 product-boundary compatibility remains locked after repin: hostile finite
 Job refs stay compact over stdio/local HTTP, narrow replay keeps the original
 Job/effect/receipt metadata, `jobs_read(limit=0)` is rejected, and a one-byte
 raw page has an independent serialized envelope with truthful ACK/absolute-offset
-continuation. Shared typed refs/receipts/budget wrappers still wait for AW repin.
+continuation. Shared typed refs/receipts/budget wrappers are now available at
+      the pinned AW revision; D4/D5 source replacement is next.
 
 D7 scheduling is likewise corrected before the type swap: a pending progress
 notification is raced against the underlying operation, so result readiness is
 never charged the 100 ms send budget; when the operation wins, the send future
 is dropped rather than detached. Existing hosted tests retain token-gated,
 monotonic, no-total/no-message heartbeat shape. Shared heartbeat/observer types
-still wait for AW repin.
+are now available at the pinned AW revision; D7 source replacement remains.
 
 ## Active ownership boundary
 

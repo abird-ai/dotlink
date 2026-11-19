@@ -1,19 +1,17 @@
 # D1-D3 source cutover map
 
-Status: pre-repin implementation map; no source cutover yet.
+Status: **completed on current main at `36d653368c6c4ec47417f355269f661833be8dba`**.
 
-This maps the exact dotlink source sites that move onto published AW P1-P3
-contracts after the authority-gated AW publish/repin. It intentionally defines
-no temporary compatibility semantics and no path/sibling dependency strategy.
+This records the exact dotlink source sites moved onto published AW P1-P3
+contracts. No temporary compatibility semantics or sibling/path dependency was
+introduced.
 
-## 1. Blocking condition
+## 1. Completed dependency boundary
 
-Dotlink still consumes AW 792f0b38d104659264b70c31736655df1a46b60f.
-The required P1-P3 APIs exist only in the current unpublished AW working tree.
-
-Do not begin source replacement until the signed AW implementation SHA is
-published and dotlink is atomically repinned according to AW
-PUBLISH-REPIN-PREFLIGHT.md.
+Dotlink is atomically pinned to final published AW implementation
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`. All direct/transitive AW Git
+packages resolve to that SHA, while the registry package/version set remains
+unchanged.
 
 ## 2. D1 private process ownership to remove
 

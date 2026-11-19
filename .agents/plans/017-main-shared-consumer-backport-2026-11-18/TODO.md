@@ -29,24 +29,20 @@ truncation markers, and post-fit visible timestamp preservation.
 
 ### D0 — dependency boundary
 
-- [x] AW fresh-review implementation is signed/published at
-      `7c7de6c9aeedf714adbe67b17ac863f27697e90e`; AW docs/main are published
-      through `05dd2ff1163753903371b9f36d29922da1f03a20`.
+- [x] AW final implementation is signed/published at
+      `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; AW docs/main are published
+      through `4234447612421069a746c925c76a25e3ba27774a`.
 - [x] AW publish authorized and completed in the current turn.
-- [ ] Repin the complete direct AW set atomically to the exact published
-      implementation commit: existing `aw-tools`, `aw-tools-fs-unix`,
-      `aw-tools-fs-win` plus new D1/D6-D7 consumers `aw-platform` and
-      lightweight `aw-mcp-protocol`;
-      every transitive AW Git package in `Cargo.lock` must resolve to that same
-      SHA. Follow AW
-      `017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`.
+- [x] Repin the complete direct AW set atomically to `1a5d0f65...`: existing
+      `aw-tools`, `aw-tools-fs-unix`, `aw-tools-fs-win` plus `aw-platform` and
+      lightweight `aw-mcp-protocol`. Every transitive AW Git package in
+      `Cargo.lock` resolves to that same SHA, and the registry package/version
+      set is unchanged by the repin.
 - [x] No temporary path/sibling dependency introduced.
 - [x] Revalidated dotlink main/release refs and preserved unrelated work.
-- [ ] D1-D7 shared-semantic hookup is blocked only on the current atomic repin;
-      the exact published AW implementation is `7c7de6c9...`;
-      do not recreate those shared semantics locally while waiting. Independent
-      product-owned prerequisites may land only when they do not encode a
-      parallel AW semantic model.
+- [x] D1-D3 shared process-semantic hookup completed against `1a5d0f65...`.
+- [ ] D4-D7 shared ref/budget/MCP/progress hookup remains; do not recreate the
+      shared implementations locally while completing those slices.
 
 ### D1 — process provenance thin consumer
 
@@ -55,61 +51,64 @@ Exact post-repin edit/deletion/test order is frozen in
 found one pre-publish AW API gap only: shared physical Unix signal extraction
 from `ExitStatus`. That gap is now resolved in the AW working tree via
 `aw_platform::exit_signal(&ExitStatus)`, and AW's process adapter consumes the
-same helper; dotlink must use it after repin rather than duplicating cfg logic.
+same helper; current main now consumes it rather than duplicating cfg logic.
 
-- [ ] Replace dotlink-private stop/cancellation semantic enums with AW shared values where architecture permits.
-- [ ] Use AW evidence-preserving managed process-tree stop primitive.
-- [ ] Map reaped launcher status to shared `ProcessExit::Signal(n)`.
-- [ ] Retain no parallel `stop_proven -> Cancelled/DeadlineExceeded` model.
-- [ ] Map shared minimal `StopRecord`/terminal `StopReason` to v0.17.4 `stopped_by` wire spellings.
-- [ ] External signal => signal number, no `stopped_by`; when physical exit is
+- [x] Replace dotlink-private stop semantics with AW shared values; retain only
+      product-only `CancelOrigin::{Caller,Connector}` beside the cancellation token.
+- [x] Use AW `ManagedProcessGuard` for evidence-preserving process containment.
+- [x] Map reaped launcher status to shared `ProcessExit::Signal(n)` via
+      `aw_platform::exit_signal`.
+- [x] Remove the parallel `stop_proven -> Cancelled/DeadlineExceeded` model.
+- [x] Map shared `StopRecord`/terminal `StopReason` to v0.17.x `stopped_by` spellings.
+- [x] External signal => signal number, no `stopped_by`; when physical exit is
       `Signal(n)` and the final stop record has no semantic reason, render the
       v0.17.5 product-only outside-exit line exactly once. A reasoned connector
       stop sequence suppresses `from=outside` even when stop evidence is
       NoTarget/Unknown because direct-child fallback may have delivered the
       physical signal.
-- [ ] Retain only dotlink-owned context needed to map shared `Cancelled` to
-      product `cancel` vs `shutdown`; do not re-expand AW canonical state.
-- [ ] Cleanup/Drop are attempt paths, not stop reasons; housekeeping uses
-      `StopRecord.reason=None`.
-- [ ] NoTarget and Unknown remain distinct: NoTarget disarms; Unknown may retain
-      fail-safe retry responsibility through shared `StopTracker`; use the
-      runner's final `stop_record()` rather than reconstructing stop evidence.
-- [ ] Preserve actual execution deadline/race semantics through local v0.17.5.
+- [x] Retain only dotlink-owned cancellation origin needed to map shared
+      `Cancelled` to product `cancel` vs `shutdown`.
+- [x] Cleanup/Drop are attempt paths, not stop reasons; reasonless housekeeping
+      never produces `stopped_by` or an operator stop line.
+- [x] NoTarget and Unknown remain distinct; shared `StopTracker` preserves an
+      original reason across Unknown retry without reconstructing evidence.
+- [x] Preserve actual execution deadline/race semantics through local v0.17.5.
 
 ### D2 — final stop/exit records -> operator logs; lifecycle events -> diagnostics
 
-- [ ] Consume AW attempt-level `ExecutionLifecycleEvent::ProcessStop` only for
-      diagnostics/metrics; do not render one operator line per attempt.
-- [ ] Render exact fixed-order `LOG job stop id=... reason=... outcome=...`
-      exactly once from `ProcessReceipt::stop_record()` plus product-only
-      cancel-vs-shutdown context. Reason-less housekeeping/external exit emits
-      no connector-stop line.
+- [x] Attempt-level stop evidence is not mapped one-for-one to operator output;
+      dotlink logs only the final assembled completion record.
+- [x] Render exact fixed-order `LOG job stop id=... reason=... outcome=...`
+      exactly once from the final shared `StopRecord` plus product-only
+      cancel-vs-shutdown context. Reasonless housekeeping emits no stop line.
 - [x] Establish an always-visible `LogConfig::lifecycle` channel used by
       production notices today; focused coverage proves identical LOG output at
       quiet, TOOL, TOOL+REQ and REQ-only verbosity.
-- [ ] After final stop/exit projection hookup, prove both mutually exclusive
-      lifecycle lines use the always-visible channel and survive every verbosity.
+- [x] Prove stop/outside-exit lines are mutually exclusive, always-visible and
+      survive default, verbose and quiet modes with real-binary tests.
 - [x] Port non-panicking structured logger writes: LOG/TOOL/REQ lines and
       progress continuations use locked best-effort stderr writes; focused tests
       prove BrokenPipe is returned/ignored and Drop-time logging is safe during
       an active unwind.
-- [ ] Real-binary stop-line test: exactly one stop line on connector stop and
-      no outside-exit line.
-- [ ] v0.17.5 real-binary external kill/crash test at quiet/default/verbose:
+- [x] Real-binary timeout test: exactly one stop line and no outside-exit line
+      at quiet/default/verbose.
+- [x] v0.17.5 real-binary external SIGKILL test at quiet/default/verbose:
       exactly one `LOG job exit id=<id> signal=<token> from=outside`, no stop
       line, no `stopped_by`; signal token is platform name or bare number with
       no whitespace.
-- [ ] Drop/cleanup/gone/failed attempt tests.
+- [x] Focused projection tests cover reasonless housekeeping plus
+      delivered/gone/failed stop evidence without changing `stopped_by` rules.
 
 ### D3 — Job/Task terminal projection
 
-- [ ] Remove private duplicate process termination fields where shared terminal/detail is authoritative.
-- [ ] Project shared compact `TaskTerminalDetail { exit, stop }` into MCP error `data`.
-- [ ] Preserve reaped exit/signal behind later internal/spool failure.
-- [ ] Preserve prior deadline through `stop=Timeout` behind later Task failure.
-- [ ] Use one dotlink compatibility mapper for signal/stopped_by/prose across sync, jobs_get and Task failure.
-- [ ] Compact handoff remains a handle, not a second process verdict.
+- [x] Remove private duplicate process termination types/booleans; host
+      completion retains shared `ProcessExit` and `StopRecord` facts directly.
+- [x] Project shared compact `TaskTerminalDetail { exit, stop }` into MCP error `data`.
+- [x] Preserve reaped exit/signal behind later internal/spool failure.
+- [x] Preserve prior deadline through `stop=Timeout` behind later Task failure.
+- [x] Use one dotlink compatibility mapper for signal/stopped_by/prose across
+      synchronous result, `jobs_get` and Task failure.
+- [x] Compact handoff remains a handle, not a second process verdict.
 
 ### D4 — typed refs, diagnostics and shared receipts
 
@@ -216,14 +215,13 @@ Exact post-repin D4-D7 edit/deletion/test order is frozen in
 - [x] Add/adapt runtime-health-check to current `jobs_*` surface:
       30 s `jobs_get/jobs_read` waits, forward `jobs_read` paging, explicit
       ACK/Finish, compact same-Job/no-rerun handoffs and current progress logs.
-- [x] Document stop-line/evidence semantics from shared AW facts as an explicit
-      **post-D1-D3** contract, not a claim about the current pre-repin binary.
+- [x] Document and implement stop-line/evidence semantics from shared AW facts;
+      D1-D3 now make this a current-main contract rather than a future one.
 - [x] Document current receipt timestamp semantics and the roughly 30-minute
       implementation-turn guidance as workflow, not a runtime timeout.
 - [x] Full semantic disposition matrix written in `V0174-EQUIVALENCE.md`;
-      every v0.17.x item is classified Done / Superseded / Product-only /
-      Blocked / Deferred. The matrix is classified, not falsely declared fully
-      implemented while D1-D7 remain blocked.
+      D1-D3 release behavior is now Done/Superseded on current main; D4-D7 and
+      final/native-platform gates remain explicitly open.
 - [x] Pre-repin full binary/integration baseline green after fresh-review parity fixes:
       main binary **698 passed / 0 failed / 1 intentional ignored**;
       integrations **40/40** across child-env, exit-status, OAuth rotation,
@@ -232,14 +230,19 @@ Exact post-repin D4-D7 edit/deletion/test order is frozen in
 - [x] Pre-repin rustfmt + `git diff --check` green.
 - [x] Nix module + Alejandra + repo-wide Markdown lint green using the existing
       command-local immutable NSS CA bundle.
-- [x] Current D1-D4/B6/pre-0.17 regressions remain green in the full current-main
-      suite. **Mandatory rerun after D1-D7 repin/cutover remains open for final equivalence.**
+- [x] Post-repin D1-D3 + existing D4/B6/pre-0.17 regressions are green in the
+      full current-main suite. **Mandatory rerun after D4-D7 remains open for
+      final equivalence.**
 - [x] Port v0.17.5 hard-deadline tool/schema wording: `timeout_secs` explicitly
       stops the command tree and is distinct from the caller/transport response
       wait; `background:true` changes waiting only. Focused schema regression
-      passes. The v0.17.5 outside-signal line remains correctly blocked on D1/D2
-      shared physical exit/final-stop facts rather than adding a duplicate local
-      signal provenance model.
+      passes. The v0.17.5 outside-signal line is now implemented from shared
+      physical exit/final-stop facts without a duplicate local signal provenance model.
+- [x] Post-repin/D1-D3 qualification: main binary **701 passed / 0 failed /
+      1 intentional ignored**; integrations **42/42** including real external
+      SIGKILL and timeout lifecycle tests at quiet/default/verbose; locked
+      all-target/all-feature check + strict Clippy, rustfmt/diff, Markdown lint
+      and NixOS module check are green.
 
 ### Deferred DS — sandbox/config-v13
 
@@ -248,9 +251,9 @@ Exact post-repin D4-D7 edit/deletion/test order is frozen in
 
 ## Tests and verification
 
-- [ ] physical-exit/final-stop-record matrix, including timeout/cancel/shutdown product projection.
-- [ ] real stop/outside-exit mutual-exclusion integration test at every verbosity.
-- [ ] failed native Task terminal-detail parity.
+- [x] physical-exit/final-stop-record matrix, including timeout/cancel/shutdown product projection.
+- [x] real stop/outside-exit mutual-exclusion integration test at every verbosity.
+- [x] failed native Task terminal-detail parity, including prior timeout + signal retention.
 - [x] huge Job ref/error bound over stdio/local HTTP.
 - [x] zero-byte rejection + one-byte jobs_read page inside normal response envelope.
 - [x] receipt metadata typed-media/structured replay tests.

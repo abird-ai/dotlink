@@ -1,6 +1,6 @@
 # D4-D7 exact source cutover map
 
-Status: **AW published; atomic repin authorized/in progress**
+Status: **repin complete; D4-D7 source replacement is next**
 
 Parent:
 [README.md](README.md)
@@ -9,8 +9,8 @@ AW owner:
 `../../../../aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/`
 
 This file freezes the mechanical D4-D7 consumer swap against the current
-fresh-review AW APIs. It intentionally makes **no semantic source change** while
-dotlink still pins published AW `792f0b38...`.
+fresh-review AW APIs. Dotlink is already repinned to final AW implementation
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; D1-D3 are complete.
 
 Do not add sibling/path overrides and do not recreate unpublished AW APIs
 locally.
@@ -23,32 +23,32 @@ Current direct AW Git dependencies in `Cargo.toml`:
 aw-tools
 aw-tools-fs-unix
 aw-tools-fs-win
+aw-platform
+aw-mcp-protocol
 ```
 
-After the fresh-review AW source checkpoint is signed/published, atomically pin
-all five direct packages to the same exact `AW_IMPL_SHA`:
+The five direct packages are atomically pinned to the final `AW_IMPL_SHA`:
 
 ```toml
-aw-tools = { git = "https://github.com/abird-ai/aw", rev = "7c7de6c9aeedf714adbe67b17ac863f27697e90e",
+aw-tools = { git = "https://github.com/abird-ai/aw", rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59",
              default-features = false, features = ["conformance", "durable"] }
 
 aw-platform = { git = "https://github.com/abird-ai/aw",
-                rev = "7c7de6c9aeedf714adbe67b17ac863f27697e90e", default-features = false }
+                rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59", default-features = false }
 
 aw-mcp-protocol = { git = "https://github.com/abird-ai/aw",
-                    rev = "7c7de6c9aeedf714adbe67b17ac863f27697e90e" }
+                    rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59" }
 ```
 
-Keep the target-specific `aw-tools-fs-unix` / `aw-tools-fs-win` entries and
-repin them to the same SHA.
+The target-specific `aw-tools-fs-unix` / `aw-tools-fs-win` entries are already
+repinned to the same SHA.
 
 The protocol crate enables **no aw-tools feature at all**. Dotlink's existing
 `aw-tools/conformance,durable` feature set therefore stays exactly as-is through
 Cargo feature unification.
 
-After lock update, every
-`git+https://github.com/abird-ai/aw` package in `Cargo.lock` must resolve to
-the same SHA. Mixed AW revisions are a hard stop.
+Every `git+https://github.com/abird-ai/aw` package in `Cargo.lock` currently
+resolves to that same SHA. Mixed AW revisions remain a hard stop.
 
 Do **not** add full `aw-mcp`. It is the AW client adapter and would import
 unneeded Agent/client dependencies.
@@ -129,7 +129,7 @@ standalone_status_locked
 standalone_status
 ```
 
-Shared owner after repin:
+Pinned shared owner:
 
 ```rust
 aw_tools::receipt::{
@@ -267,7 +267,7 @@ Current model-facing handler:
 src/mcp/tools/jobs.rs::jobs_read
 ```
 
-Current pre-repin behavior is already correct:
+Current compatibility behavior is already correct:
 
 - `limit=0` rejected;
 - `limit=1` accepted;
@@ -383,7 +383,7 @@ stamp_receipt_metadata
 LocalMachine::decorate_and_fit_tool_response
 ```
 
-Shared owner after repin:
+Pinned shared owner:
 
 ```rust
 aw_mcp_protocol::{
@@ -624,7 +624,7 @@ After the exact AW SHA is published and repinned:
 Do not combine D4-D7 deletion before each replacement passes its focused
 compatibility gates.
 
-## 13. Current pre-repin tests that must survive
+## 13. Current compatibility tests that must survive
 
 Already green and must remain:
 
