@@ -393,7 +393,8 @@ Useful locations:
 
 ## Logging
 
-Logging is quiet by default:
+Activity logging is quiet by default (lifecycle `LOG` lines below are not
+activity and always appear):
 
 ~~~text
 default   no TOOL / REQ activity
@@ -415,6 +416,22 @@ With `-vv`, transport diagnostics are added:
 [01:06:47.426] REQ  stdio      → initialize
 [01:06:47.427] REQ  stdio      → tools/call
 ~~~
+
+`LOG` lines are lifecycle, not activity, and appear at **every** verbosity —
+including `-q` — so `-q` is not silence:
+
+~~~text
+[01:07:12.031] LOG  job        stop id=<job id> reason=timeout outcome=delivered
+~~~
+
+They cover startup, restart, verbosity changes and every stop dotlink sends to a
+shell process tree. `reason` is `timeout`, `cancel` (the caller cancelled),
+`shutdown` (the connector is being torn down), `failed`, `cleanup` (a tree tidied
+up behind a command that had already ended) or `dropped` (the fail-safe);
+`outcome` says whether that signal was delivered, found the group already gone,
+or failed. The line exists so that *absence* is evidence: no line means dotlink
+signalled nothing. It does not replace the result, which carries `stopped_by`
+only when dotlink can prove it stopped the command.
 
 TOOL logs include bounded command previews plus complete path labels, methods, status, and latency; file contents, binary payloads, Runtime keys, and raw request bodies are not intentionally logged. Interactive `V` removes the command-preview cap while TOOL logging is active, so use it only when command text is safe to retain.
 
