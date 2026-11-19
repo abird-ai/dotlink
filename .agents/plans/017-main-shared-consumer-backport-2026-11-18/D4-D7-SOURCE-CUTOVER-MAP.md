@@ -1,6 +1,6 @@
 # D4-D7 exact source cutover map
 
-Status: **repin complete; D4-D7 source replacement is next**
+Status: **repin + D1-D7 source cutover + final semantic equivalence complete and committed at `fa01e18`**
 
 Parent:
 [README.md](README.md)
@@ -10,7 +10,7 @@ AW owner:
 
 This file freezes the mechanical D4-D7 consumer swap against the current
 fresh-review AW APIs. Dotlink is already repinned to final AW implementation
-`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; D1-D3 are complete.
+`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; D1-D7 are complete.
 
 Do not add sibling/path overrides and do not recreate unpublished AW APIs
 locally.
@@ -366,7 +366,7 @@ No generic `MIN_BYTE_LIMIT` belongs in the raw-page path.
 
 ## 8. D6 — generic MCP result/receipt projection
 
-Current local duplicates in `src/mcp.rs`:
+Pre-D6 local duplicates in `src/mcp.rs` — now removed:
 
 ```text
 fitted_text_blocks
@@ -396,7 +396,7 @@ aw_mcp_protocol::{
 }
 ```
 
-### Final response path
+### Final response path — implemented
 
 Keep a tiny dotlink wrapper around `CallToolResponse` only to:
 
@@ -425,7 +425,7 @@ For a generic complete result with no semantic operation, use
 
 Do not retain a second text fitter.
 
-### Cached Remote Start receipt
+### Cached Remote Start receipt — implemented
 
 `stamp_cached_mcp_receipt` occurs before final response-envelope projection.
 Keep the **host clock / cache timing decision** product-owned, but use shared
@@ -454,9 +454,9 @@ serialized_json_len (where needed for McpError / product envelopes)
 The shared protocol helper deliberately owns only complete
 `CallToolResult` model projection.
 
-## 9. D6 — mandatory compatibility gates
+## 9. D6 — mandatory compatibility gates — complete
 
-Before deleting local helpers, the shared path must pass:
+The shared path passes:
 
 - exact Image/PNG identity;
 - exact Audio/WAV identity;
@@ -475,7 +475,7 @@ The existing stdio/hosted and `src/mcp.rs` tests are the compatibility oracle.
 
 ## 10. D7 — progress heartbeat
 
-Current duplicate implementation:
+Pre-D7 duplicate implementation — now removed:
 
 ```text
 src/mcp/tools/mod.rs
@@ -502,7 +502,7 @@ aw_mcp_protocol::{
 }
 ```
 
-### Request/token boundary stays in dotlink
+### Request/token boundary stays in dotlink — implemented
 
 Dotlink still owns rmcp server request context:
 
@@ -526,7 +526,7 @@ Use default 10 s / 100 ms in production.
 A small cfg(test) helper may construct a shorter validated config for tests;
 do not reintroduce a second scheduler.
 
-### Delivery closure
+### Delivery closure — implemented
 
 The shared helper accepts a send closure. Dotlink supplies the server peer:
 
@@ -542,7 +542,7 @@ log.progress_mark(delivered)
 
 Return the same boolean to the shared helper.
 
-### Final observer
+### Final observer — implemented
 
 Replace the local `Drop for ProgressHeartbeat` summary with one product
 observer carrying only:
@@ -584,9 +584,11 @@ deadline unless they already have a real one.
 
 No handler starts a detached progress task.
 
-## 11. D7 — real semantic progress
+## 11. D7 — real semantic progress — audited
 
-Heartbeats remain advisory and unknown-total.
+Heartbeats remain advisory and unknown-total. Current dotlink exposes no real
+cumulative AW semantic-progress source, so D7 intentionally adds no synthetic
+progress.
 
 If/when a real AW operation exposes cumulative semantic progress, project only
 that fact through:

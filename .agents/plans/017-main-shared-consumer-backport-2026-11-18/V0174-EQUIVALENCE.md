@@ -19,8 +19,10 @@ Status meanings:
 - **Superseded** — current main/shared AW has a newer equivalent contract; do
   not restore the release-local mechanism.
 - **Product-only** — intentionally remains dotlink-owned.
-- **Blocked** — only still-open D4-D7 consumer replacement/final gates use this
-  status. AW is pinned at `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; D0-D3 are complete.
+- **Blocked** — no current semantic row remains blocked after final closeout;
+  unavailable host/platform runtime smokes are recorded separately rather than
+  weakening or misclassifying the semantic matrix. AW is pinned at
+  `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; D0-D7 are complete.
 - **Deferred** — intentionally outside this active workstream.
 
 ## v0.17.0 / v0.17.1 behavior
@@ -29,9 +31,9 @@ Status meanings:
 | --- | --- |
 | response-window invariant / hosted hold | **Done.** Current authenticated transport remaining-window logic narrows synchronous observation without rewriting Process execution timeout. |
 | explicit output cleanup / ACK | **Superseded.** Current `jobs_ack` has explicit Through(offset) and omitted-offset Finish semantics with delivery/owner proof. Do not restore old one-shot `job_ack`. |
-| progress continuations | **Done locally; shared cutover blocked.** Current main has token-gated bounded progress and attempted/delivered summaries. D7 now replaces the local helper with lightweight `aw-mcp-protocol`; the full AW MCP client adapter is not a dotlink dependency. |
+| progress continuations | **Done D7.** Current main uses lightweight `aw-mcp-protocol` for token-gated heartbeat scheduling, monotonic unknown-total ticks, bounded delivery and attempted/delivered summaries; dotlink retains only rmcp peer/token extraction plus product logging. Full `aw-mcp` is not a dependency. |
 | both-stream cleanup | **Superseded.** Current Job ownership/Finish semantics cover retained stdout+stderr and other owners; no release-local cleanup path should return. |
-| compact ACK receipt | **Done locally; shared cutover blocked.** Current `ControlReceipt` preserves same-Job/no-rerun semantics; D4 now moves rendering to shared AW receipts. |
+| compact ACK receipt | **Done D4.** Current `jobs_ack` renders shared typed `Receipt::Ack` facts from authoritative output ACK state; the local `ControlReceipt` grammar is gone and exact replay keeps typed Job identity without reparsing prose. |
 | `--no-tunnel` | **Done.** Applied before OpenAI credential/connection environment parsing. |
 | compact durable Job payloads | **Superseded.** Current flat `jobs_*` surface and compact `j:<id> ... no-rerun` receipts replace release `job_*` payloads. |
 | `utf8_lossy` output projection | **Done.** Current retained output projection labels lossy UTF-8 explicitly and keeps raw-byte offsets. |
@@ -73,8 +75,8 @@ runtime behavior.
 | external Unix signal number | **Done.** Reaped status maps through `aw_platform::exit_signal` to shared `ProcessExit::Signal(i32)` and is projected consistently to result/Job/Task surfaces. |
 | `stopped_by` compatibility spelling | **Product-only — Done.** One mapper owns exact `timeout/cancel/shutdown/failed`; only `Stopped + semantic reason` may emit it. |
 | `LOG job stop ...` | **Product-only — Done.** Final completion emits exactly one fixed-order lifecycle line; attempt evidence is never mapped one-for-one. Quiet/default/verbose real-binary tests are green. |
-| `74820ff` bounded caller-controlled Job diagnostics | **Done defensively; shared cutover blocked.** Current main has a 16 KiB UTF-8-safe private `bounded_job_error`; D4 now replaces generic duplicate bounding with AW `bounded_diagnostic`. |
-| `06d5548` raw page vs serialized response envelope | **Behavior fixed locally; shared type cutover blocked.** Current main rejects `jobs_read(limit=0)`, accepts one raw byte, keeps page bytes independent from serialized response capacity, and proves one-byte delivery/ACK/absolute-offset continuation over real stdio. AW owns `RawPageBytes` / `SerializedResultBytes` and the rejecting resolver; D5 now consumes them. |
+| `74820ff` bounded caller-controlled Job diagnostics | **Done D4.** Current main uses AW `bounded_diagnostic` for generic Job diagnostics while product MCP envelope fitting remains dotlink-owned. |
+| `06d5548` raw page vs serialized response envelope | **Done D5.** Current main resolves raw pages through shared `JobProfile::resolve_read_page` into `RawPageBytes`, carries an independent `SerializedResultBytes` envelope, reads the requested raw source window before projection, and credits only the fitted prefix. Real stdio proves zero-byte rejection, one-byte delivery/ACK and absolute-offset continuation. |
 | `30099aa` module-owned Nix environment | **Product-only — Done D8.** Current module rejects all eight owned keys through one assertion and loop-test while preserving non-owned DOTLINK/RUST_LOG/XDG environment. |
 | `5b27784` runtime-health/stop docs | **Docs adapted.** Current health doc uses `jobs_*`, current wait/tail semantics, current receipt timestamps, 30-minute workflow guidance, and labels stop evidence as post-D1-D3 expectation rather than current fact. |
 | `8874013` platform signal-label ownership | **Superseded/Done.** Current main consumes `aw_platform::signal_name(number)` and keeps product prose outside canonical state; no local signal table remains. |
@@ -92,7 +94,7 @@ runtime behavior.
 
 ## Current timestamp equivalence
 
-Current main already has local receipt timestamp behavior:
+Current main has shared receipt timestamp behavior:
 
 ```text
 _meta["io.abird/receipt"]["ts"] = UTC Unix seconds
@@ -100,31 +102,31 @@ visible result line             = ts=<same value>
 replay                           = reuse stored ts
 ```
 
-`aw-mcp-protocol` implements the shared equivalent. D6 is a thin-consumer
-replacement, not a behavior invention. Current-main compatibility is fully
-behavior-locked: typed media identity is exact; structured/result metadata is
-preserved; reserved receipt fields survive timestamp mutation; malformed
-reserved metadata fails transactionally; stored timestamps win; a visible
-`ts=` is rechecked after fitting and never pays a duplicate sidecar reserve;
-text truncation always has an explicit marker; immutable facts fail explicitly.
+**Done D6.** Current main consumes lightweight `aw-mcp-protocol` directly for
+Complete-result validation/fitting and receipt projection. Typed media identity
+is exact; structured/result metadata is preserved; reserved receipt fields
+survive timestamp mutation; malformed reserved metadata fails transactionally;
+stored timestamps win; a visible `ts=` is rechecked after fitting and never pays
+a duplicate sidecar reserve; text truncation always has an explicit marker; and
+immutable facts fail explicitly. Cached replay state is stamped but never fitted
+to one request, and native Task replay uses the same shared decorator with its
+stable first-finalization timestamp.
 
 ## Current progress equivalence
 
-Current main already has bounded progress and only emits when a request carries
-a progress token. Lightweight `aw-mcp-protocol` owns the final shared helper.
+**Done D7.** Current main uses lightweight `aw-mcp-protocol` and only emits
+heartbeats when a request carries a progress token. Production defaults remain
+10 s heartbeat interval / 100 ms send budget; ticks are monotonic,
+unknown-total and message-free; shared attempted/delivered summary maps to the
+existing product progress log.
 
-D7 must preserve:
-
-- 10 s default heartbeat interval;
-- 100 ms per-send budget;
-- monotonic unknown-total/no-message heartbeat ticks;
-- attempted/delivered product logging.
-
-Current main now already matches AW's stronger scheduling behavior: a
-backpressured notification does not stop polling the underlying operation, and
-an in-flight send is dropped if the operation completes first. D7 therefore
-remains a shared type/observer/semantic-progress cutover rather than a pending
-behavioral fix.
+The shared scheduler preserves the stronger backpressure contract: a blocked
+notification never stops polling the underlying operation, and an in-flight send
+is dropped if the operation completes first. Shell waits retain their real
+response-window deadline. Current dotlink exposes no real cumulative AW semantic
+progress source, so no percentages/totals/messages are synthesized from heartbeat
+count, elapsed time, Job revision or output bytes; shared semantic-progress
+projection remains the required path when factual progress exists.
 
 ## Current operational workflow guidance
 
@@ -137,15 +139,31 @@ not a protocol/runtime timeout. It must never be conflated with:
 - Job retention;
 - cancellation/deadline semantics.
 
-## Equivalence blockers before the matrix can be called fully green
+## Final equivalence qualification
 
-1. D4 typed refs/shared receipts/bounded diagnostics.
-2. D5 shared raw-page vs serialized-result budget types.
-3. D6 shared `aw-mcp-protocol` receipt/result fitter replacement.
-4. D7 shared heartbeat/progress adapter replacement.
-5. Full post-D4-D7 binary/integration/Nix equivalence rerun.
-6. Native platform gates where capable.
+The v0.17.x → current-main **semantic matrix is fully green** for every
+non-deferred behavior through local release `0.17.5`. The reviewed signed
+implementation checkpoint is
+`fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`.
 
-D1-D3/v0.17.5 process lifecycle behavior is implemented and qualified on
-current main. The matrix remains not fully green only because D4-D7 shared
-consumer replacement and native/final gates remain open.
+Closing checkpoint on x86_64 Linux:
+
+- final post-D4-D7 main suite: **701 passed / 0 failed / 1 intentional ignored**;
+- integrations: **42/42** across child environment, lifecycle, exit/status,
+  OAuth live rotation, private generations and stdio tools;
+- locked all-target/all-feature `cargo check` and strict Clippy `-D warnings`:
+  green;
+- rustfmt, Alejandra, repo-wide Markdown lint and `git diff --check`: green;
+- real flake `checks.x86_64-linux.nixos-module`: green against the current
+  working tree and pinned inputs;
+- executable native Linux closeout: hardware discovery/policy **4/4**,
+  process-tree timeout containment **1/1**, and real signal/timeout lifecycle
+  **2/2**.
+
+Runtime/deployment gates unavailable on this host do not weaken the semantic
+result: the connector exposes Bubblewrap only through a direct Nix-store path,
+which dotlink correctly rejects as launcher selection authority, so the forced
+Bubblewrap device-isolation smoke is host-gated rather than bypassed. Native
+Windows/macOS runtime/deployment checks remain external. The v0.17.2/v0.17.3
+sandbox/config-v13 bundle remains intentionally **Deferred** until explicitly
+promoted by the user.

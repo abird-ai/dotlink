@@ -8,7 +8,8 @@ Dotlink-side companion to AW's active shared-first plan:
 
 - `../../../../aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/`
 - canonical comprehensive handoff: `../../../../aw/.agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-18.md`
-- next-agent entrypoint: `../../../../aw/.agents/docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-18.md`
+- comprehensive handoff: `../../../../aw/.agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-19.md`
+- next-agent entrypoint: `../../../../aw/.agents/docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-19.md`
 - authority-gated publish/repin preflight: `../../../../aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`
 - D1-D3 exact source cutover map: [D1-D3-SOURCE-CUTOVER-MAP.md](D1-D3-SOURCE-CUTOVER-MAP.md)
 - D4-D7 exact source cutover map: [D4-D7-SOURCE-CUTOVER-MAP.md](D4-D7-SOURCE-CUTOVER-MAP.md)
@@ -44,8 +45,12 @@ AW final implementation is signed/published at
 that final SHA with no sibling/path dependency and no registry package/version
 churn.
 
-D1-D3 process convergence is complete. D4-D7 now continue directly against the
-published shared APIs; do not reintroduce compatibility copies.
+D1-D7 convergence and the closing v0.17.x semantic equivalence gate are
+complete and reviewed. The signed implementation checkpoint is
+`fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`
+(`Complete D4-D7 shared consumer convergence`). Do not reintroduce compatibility
+copies; the remaining unavailable runtime/deployment smokes are
+platform/connector external, not open semantic work.
 
 The independent product-only D8 Nix hardening is implemented now: module-owned
 environment keys are rejected through one generic assertion and regression
@@ -57,30 +62,45 @@ writes are locked best-effort stderr writes, final stop/outside-exit records use
 `LogConfig::lifecycle`, and real-binary tests prove the mutually exclusive lines
 survive quiet/default/verbose. Attempt-level evidence remains diagnostic only.
 
-D6 compatibility-preservation and local fitting semantics are independently
-locked before the shared helper swap: real stdio and hosted
-`bread(format=mcp)` calls preserve exact Image/Audio/Resource MIME + payload
-identity; decorator coverage preserves structured content and receipt
-metadata/replay identity; the local generic fitter now mutates text only and
-returns an explicit MCP budget error when immutable facts cannot fit. Receipt
-stamping is also transactionally capped at 16 KiB result metadata, preserves
-unrelated keys, keeps stored replay timestamps authoritative, and never adds a
-second exact visible `ts=` marker. The shared helper replacement still waits for
-AW repin.
+D6 is fully cut over to lightweight `aw-mcp-protocol`: shared validation,
+`fit_complete_result` and `decorate_and_fit_complete_result` now own generic
+Complete-result fitting and receipt projection. Cached Remote Start state uses
+shared transactional metadata mutation without request-specific fitting, and
+native Task finalization uses the same shared decorator with its first stable
+Task timestamp. Real stdio and hosted `bread(format=mcp)` preserve exact
+Image/Audio/Resource MIME + payload identity; structured content and result
+metadata remain immutable; stored replay timestamps win; visible timestamps do
+not pay duplicate sidecar reserve; immutable facts fail explicitly when they
+cannot fit. The former local generic fitter/receipt helper implementation is
+deleted.
 
-D4/D5 product-boundary compatibility remains locked after repin: hostile finite
-Job refs stay compact over stdio/local HTTP, narrow replay keeps the original
-Job/effect/receipt metadata, `jobs_read(limit=0)` is rejected, and a one-byte
-raw page has an independent serialized envelope with truthful ACK/absolute-offset
-continuation. Shared typed refs/receipts/budget wrappers are now available at
-      the pinned AW revision; D4/D5 source replacement is next.
+D4 is fully cut over to the pinned shared APIs: finite Job identity is `JobRef`,
+shared-backed status/handoff/cancel/ACK uses shared receipts, generic Job
+diagnostics use `bounded_diagnostic`, and replay retains typed Job identity
+instead of reparsing rendered prose. D5 is now also fully cut over:
+`JobProfile::resolve_read_page` produces `RawPageBytes`, the response envelope is
+an independent `SerializedResultBytes`, raw source reads never depend on the
+serialized budget, and only the fitted prefix becomes delivery/ACK proof. Schema
+and runtime use the same effective profile. Real stdio still proves zero-byte
+rejection, one-byte pages, ACK-through-1 and absolute-offset continuation. D6
+and D7 are complete.
 
-D7 scheduling is likewise corrected before the type swap: a pending progress
-notification is raced against the underlying operation, so result readiness is
-never charged the 100 ms send budget; when the operation wins, the send future
-is dropped rather than detached. Existing hosted tests retain token-gated,
-monotonic, no-total/no-message heartbeat shape. Shared heartbeat/observer types
-are now available at the pinned AW revision; D7 source replacement remains.
+D7 is fully cut over to lightweight `aw-mcp-protocol`: shared
+`ProgressHeartbeat::from_token` + `await_with_progress_heartbeat` now own the
+10 s/100 ms production schedule, monotonic unknown-total ticks, deadline-bounded
+send and operation-vs-backpressure race. Dotlink retains only request token/peer
+extraction plus product logging through `ProgressHeartbeatObserver` and the send
+closure. No local timer/counter/send-budget scheduler or detached progress task
+remains. Current dotlink exposes no real cumulative semantic-progress source, so
+no heartbeat-derived percentage/total/message is fabricated; shared semantic
+projection remains the required boundary when real facts exist.
+
+Final closeout is green: main **701/0/1**, integrations **42/42**, locked
+check/strict Clippy/format/lint gates green, real NixOS flake module check green,
+and executable Linux hardware/process/signal native gates green. Trusted-selector
+Bubblewrap runtime smoke is unavailable through this connector, and native
+Windows/macOS runtime/deployment validation remains external. Neither is treated
+as a semantic-equivalence failure or bypassed by weakening trust policy.
 
 ## Active ownership boundary
 

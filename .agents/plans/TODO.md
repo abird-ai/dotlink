@@ -3,7 +3,7 @@
 ## Active
 
 - [~] P1 DL-060 — @pvl — [details](dotlink-handoff-2026-10-01/TODO.md)
-- [~] P1 017-main-shared-consumer-backport-2026-11-18 — @pvl — Consume AW shared process/Job/Task/MCP semantics and mirror dotlink v0.17.4 with sandbox deferred — [details](017-main-shared-consumer-backport-2026-11-18/README.md)
+- [~] P1 017-main-shared-consumer-backport-2026-11-18 — @pvl — D1-D7 implementation + final v0.17.x semantic equivalence reviewed and committed locally; sandbox deferred; awaiting explicit push authorization — [details](017-main-shared-consumer-backport-2026-11-18/README.md)
 - [!] P2 DL-110 — @agent — Remediation committed; native Windows/macOS and Bubblewrap smoke checks blocked in connector — [details](dotlink-reliability-2026-10-26/README.md)
 - [!] P2 DL-120 — @agent — All seven review fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-recovery-2026-10-26/README.md)
 - [!] P2 DL-130 — @agent — Runtime/OAuth fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-live-credentials-2026-10-26/README.md)

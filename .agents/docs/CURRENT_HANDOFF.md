@@ -1,6 +1,11 @@
 # CURRENT HANDOFF — dotlink unified Jobs + Agent runtime
 
-Prepared: 2026-11-18
+Current cross-repo 0.17.x bootstrap:
+`../../../aw/.agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-19.md`.
+Copy-ready next-agent entrypoint:
+`../../../aw/.agents/docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-19.md`.
+
+Prepared: 2026-11-19
 Owner: @pvl
 Machine: **L5 implementation/source authority**
 Repo: `/home/pvl/spaces/abird/src/dotlink`
@@ -13,18 +18,21 @@ Repo: `/home/pvl/spaces/abird/src/dotlink`
 > [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
 > It preserves this unified-runtime implementation and is not a release/tag.
 
-## LIVE 0.17 shared-consumer checkpoint — repin + D1-D3 complete 2026-11-19
+## LIVE 0.17 shared-consumer checkpoint — D1-D7 reviewed, qualified and committed 2026-11-19
 
 This section supersedes older dependency/state details below where they conflict.
 
 Current Git / dependency boundary:
 
-- signed dotlink source checkpoint:
-  36d653368c6c4ec47417f355269f661833be8dba
-  (Repin AW and complete D1-D3 process convergence);
-- pre-repin signed checkpoints remain 46215fe product parity and 0aea1f4 consumer docs;
-- origin/main is still 0aea1f4... at this docs-edit instant; the current user
-  turn explicitly authorizes pushing this source/docs checkpoint;
+- signed final D4-D7 source checkpoint:
+  `fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`
+  (`Complete D4-D7 shared consumer convergence`);
+- prior signed/pushed D1-D3 docs checkpoint remains
+  `4c3b96fd5ba9e6772bc159f10a3ad893c9729887`
+  (`Record repinned D1-D3 convergence checkpoint`);
+- `origin/main` remains `4c3b96fd...` because push has not been authorized;
+- this handoff/plan closeout is committed separately on top of `fa01e18...`;
+- pre-repin signed checkpoints remain `46215fe` product parity and `0aea1f4` consumer docs;
 - AW final published implementation pin:
   AW_IMPL_SHA = 1a5d0f65208e4a05b737c804a55a3aaad3e2fa59;
 - AW origin/main = 4234447612421069a746c925c76a25e3ba27774a;
@@ -93,8 +101,144 @@ run_shell_job() emits the lifecycle record exactly once after the final
 completion has been assembled. Shared attempt-level lifecycle evidence remains
 diagnostic semantics and is never mapped one-for-one to operator lines.
 
-### Fresh post-repin/D1-D3 qualification
+### D4 typed refs, shared receipts and diagnostics — complete
 
+The finite Jobs surface now consumes the pinned shared D4 primitives directly:
+
+- model Job refs parse as `aw_tools::execution_ref::JobRef`; trusted internal
+  construction uses the same `Handle + NodeCoordinate -> JobRef` grammar;
+- shared-backed root/node status uses shared `Receipt::JobStatus/NodeStatus`;
+- compatibility handoff uses shared `render_handoff` and typed
+  `Receipt::Handoff` fallback for the same retained Job;
+- cancel and ACK use shared typed receipts; the local `ControlReceipt` grammar
+  is gone;
+- `jobs_send` intentionally keeps its tiny product-specific receipt;
+- the remote replay ledger retains typed `JobRef` beside the immutable MCP
+  result, so narrow replay never reparses rendered receipt prose as identity;
+- shared `Snapshot.sequence` is the public Jobs revision for shared-backed
+  controls; stdin/cancel reserve it immediately before their effect;
+- generic Job diagnostic truncation now uses shared `bounded_diagnostic`;
+- D6 below supersedes the former local generic MCP Complete-result fitter.
+
+Hostile refs are rejected before reflection, narrow Graph handoff re-reads the
+same retained Job rather than rerunning, exact cancel replay still precedes
+revision recheck, and stored replay timestamp metadata remains authoritative.
+
+### D5 raw-page vs serialized-result budgets — complete
+
+The Jobs read boundary now consumes AW's zero-cost typed budgets directly:
+
+- caller `limit` resolves exactly once through the effective
+  `JobProfile::resolve_read_page(...)` to `RawPageBytes`;
+- the authenticated/fallback MCP result ceiling becomes an independent
+  `SerializedResultBytes`;
+- `OutputPageRequest`, legacy Process reads, shared Process/node reads and
+  synthesized Graph-result reads carry those distinct types;
+- raw source reads use only `RawPageBytes`; response-envelope capacity no longer
+  shrinks the retained source window before projection;
+- response fitting happens only after the raw window is fixed, and only the
+  fitted raw prefix is recorded as delivery credit;
+- raw absolute offsets, retained length, EOF and ACK proof therefore remain
+  independent of response fitting;
+- `jobs_read` schema default/max and runtime validation derive from the same
+  effective `JobProfile`;
+- the old unrelated generic MCP minimum-byte floor is no longer applied to a
+  Jobs page. A small serialized budget succeeds when the factual page fits and
+  fails only when the actual response cannot fit.
+
+The existing legacy delivery fence remains only for genuinely non-shared
+historical/test entries; shared output continues to use AW's owner-specific
+delivery proof.
+
+### D6 shared MCP result/receipt projection — complete
+
+Dotlink now consumes the pinned lightweight `aw-mcp-protocol` result helpers
+instead of retaining a parallel generic MCP fitter/receipt implementation:
+
+- `fit_complete_result` owns generic Complete-result fitting;
+- `decorate_and_fit_complete_result` owns selected-operation receipt metadata,
+  stored timestamp replay, visible `ts=` placement and bounded fitting;
+- `validate_complete_result`, `stored_receipt_timestamp` and
+  `set_stored_receipt_timestamp` own cached Remote Start receipt validation and
+  metadata mutation without fitting immutable cache state;
+- only text may shrink; typed Image/Audio/Resource blocks, structured content,
+  block order/metadata, result metadata and error status remain factual identity;
+- immutable facts that cannot fit fail explicitly rather than collapsing to
+  replacement text;
+- stored receipt timestamps win over a fresh host clock and a surviving visible
+  timestamp never pays a duplicate sidecar reserve;
+- native MCP Task finalization also uses the shared decorator, deriving the
+  actual shared Bash/Pwsh/PowerShell operation and retaining the first Task
+  timestamp across replay.
+
+Dotlink retains only the product boundary decisions: transport/fallback result
+budget selection, `OperationId` selection, host UTC clock acquisition,
+`aw-mcp-protocol::Error -> McpError` mapping, and protocol-error fitting. Cached
+Remote Start results are never request-budget fitted before entering the replay
+ledger. The full `aw-mcp` client adapter remains absent.
+
+The deleted local owners are `fitted_text_blocks`,
+`fit_call_tool_response_to_budget`, local receipt metadata constants/helpers,
+`ensure_visible_receipt_ts` and `stamp_receipt_metadata`.
+
+### D7 shared progress heartbeat — complete
+
+The generic heartbeat scheduler now lives entirely in lightweight
+`aw-mcp-protocol`:
+
+- `ProgressHeartbeat::from_token(...)` owns token-gated shared heartbeat state;
+- `ProgressHeartbeatConfig::default()` supplies the production **10 s / 100 ms**
+  interval/send-budget contract; tests use one validated 100 ms interval helper
+  only to keep focused/hosted regressions fast;
+- `await_with_progress_heartbeat(...)` owns tick timing, monotonic unknown-total
+  progress numbers, send deadlines, and the operation-vs-backpressured-delivery
+  race;
+- dotlink's `RequestProgress` is only rmcp transport context: shared heartbeat +
+  request peer + product log; it owns no timer, counter or scheduling state;
+- the send closure calls `peer.notify_progress(...)`, records the existing
+  per-tick `progress_mark(delivered)`, and returns the same boolean to the shared
+  helper;
+- product-only `ProgressLogObserver` implements
+  `ProgressHeartbeatObserver::completed(...)` and maps the shared
+  attempted/delivered summary to `progress_done(...)`, including wrapper
+  cancellation/drop paths;
+- shell waits still pass their real response-window deadline; non-shell outer
+  calls remain deadline-free unless they already have a real one;
+- no detached progress task exists.
+
+A source audit found no current dotlink operation exposing real cumulative AW
+semantic progress. Therefore D7 deliberately adds no fabricated percentage,
+total or message from heartbeat count, elapsed time, Job revision or output
+bytes. When a real source exists, the shared
+`semantic_progress_notification`/`notify_semantic_progress_bounded` path remains
+the required projection boundary.
+
+The deleted local scheduler owners are `PROGRESS_HEARTBEAT_INTERVAL`,
+`PROGRESS_SEND_BUDGET`, `deliver_heartbeat_bounded`, local `ProgressHeartbeat`
+and its Drop counters, `heartbeat_tick`, `await_wait_or_delivery`, and
+`await_with_heartbeat`.
+
+### Final post-repin/D1-D7 equivalence qualification
+
+- focused D4/D5 Jobs receipt/ref/replay/read suite: **17/17**;
+- focused D6 compatibility oracle green: shared fitting/timestamp replay,
+  transactional metadata limits, structured/typed preservation, immutable-fact
+  failure, native Task exact replay/fallback, real stdio and hosted media +
+  receipt timestamp paths;
+- frozen D7 progress regressions **4/4** green:
+  pending delivery never delays/outlives a ready operation, expired shell
+  deadline prevents delivery polling, outer `jobs_get` emits progress, and shell
+  heartbeat ticks stay monotonic with no total/message;
+- mandatory D4 compatibility regressions green:
+  huge-ref stdio/HTTP, duplicate Graph no-rerun replay and cancel
+  replay-before-revision;
+- focused D5 page/budget regressions green:
+  profile resolver/schema parity, full raw-window then fitted-prefix credit,
+  response-envelope reservation, wait-for-bytes/EOF and no polling gap;
+- real stdio D5 contracts green:
+  `limit=0` rejection, one-byte raw page inside its independent response
+  envelope, ACK-through-1, absolute-offset continuation and unread-gap ACK
+  rejection;
 - main binary: **701 passed / 0 failed / 1 intentional ignored**;
 - integrations: **42/42**:
   - child-env 1/1;
@@ -111,26 +255,51 @@ diagnostic semantics and is never mapped one-for-one to operator lines.
 - strict all-target/all-feature Clippy: green;
 - rustfmt and git diff --check: green;
 - repo-wide Markdown lint: green;
-- NixOS module check: green.
+- final real flake `checks.x86_64-linux.nixos-module` build: green against the current dirty working tree and pinned flake inputs;
+- Alejandra `nix/module.nix` + `nix/tests/module.nix`: green;
+- available native Linux closeout: hardware discovery/policy **4/4**, process-tree timeout containment **1/1**, real signal/timeout lifecycle **2/2**;
+- Bubblewrap runtime device-isolation smoke remains host-gated: this connector exposes `bwrap` only as a direct Nix-store selector, which dotlink correctly rejects as launcher selection authority. Do not bypass that policy to manufacture a smoke result;
+- native Windows/macOS runtime/deployment validation remains external to this x86_64 Linux host.
 
-One L5 combined gate was externally SIGKILLed while starting Clippy after cargo
-check had already passed; rerunning Clippy alone passed cleanly. This is the
-previously observed host SIGKILL-at-compile-start behavior, not a Rust diagnostic.
+L5 intermittently externally SIGKILLed several compile/Nix-client invocations
+before diagnostics. The host still had roughly 24 GiB available RAM and 66 GiB
+free swap, low load and no kernel OOM/cgroup kill evidence. D6's locked check
+passed before one combined strict-Clippy invocation was externally killed;
+rerunning only Clippy serially passed cleanly. D7 itself completed its strict
+check/Clippy gates without a kill. These were host/connector kills, not
+timeout/cancel attribution and not Rust/test failures.
 
-### Next consumer slice
+One first-pass D7 full-suite run hit the pre-existing zero-window shell handoff
+race in `client_window_reaches_the_shell_deadline_end_to_end`: the immediate
+receipt was valid `j:... process waiting rev=1` before the shared Bash node had
+claimed its tool identity, while the assertion happened to require `bash` even
+for `waiting`. No source was changed; the exact test passed **3/3** in isolation,
+and the complete second full run passed **701/0/1**. Treat this as timing noise,
+not a D7 behavior change.
 
-D4-D7 remain. Their exact source/deletion/test order is frozen in
-D4-D7-SOURCE-CUTOVER-MAP.md.
+### Final qualified checkpoint
 
-Next sequence:
+D4-D7 consumer cutover and the full v0.17.x semantic equivalence gate are
+complete. Do not reopen those slices without a newly reproduced regression.
+The only unavailable runtime/deployment smokes are explicitly host/platform
+external: trusted-selector Bubblewrap on this connector and native
+Windows/macOS.
 
-1. D4 typed JobRef, shared receipts and bounded diagnostics;
-2. D5 RawPageBytes / SerializedResultBytes;
-3. D6 shared aw-mcp-protocol receipt/fitter helpers;
-4. D7 shared heartbeat/progress adapter;
-5. full v0.17.5 equivalence rerun.
+The implementation source is committed as `fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`;
+this documentation closeout is committed separately on top. No push, version,
+tag, release or deployment was performed. The next repository action is only an
+explicitly authorized push (and, separately, any release bookkeeping the user
+requests).
 
 Frozen sandbox/config-v13 work remains deferred and untouched.
+
+## Archived historical handoff material below
+
+Everything below this marker predates the live 0.17 shared-consumer checkpoint at
+the top of this file. It is retained only for chronology. Historical AW pins,
+dependency counts, test totals, working-tree notes and "what is next" statements
+below are **not current state** and must not override the final-qualified
+checkpoint above.
 
 ## Final implementation state
 
