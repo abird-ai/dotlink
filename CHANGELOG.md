@@ -9,9 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - One lifecycle line per job, in words that need no legend, and only when there is
-  something to say: `LOG job id=… end=… by=… [tree=…]`. `end=` says what ended the
-  job (`exit`, `signal`, `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and
-  `by=` says who (`command`, `dotlink`, `caller`, `connector`, `external`). A command
+  something to say: `LOG job id=… end=… [by=…] [tree=…]`. `end=` says what ended the
+  job (`exit code=N`, `signal SIGKILL`, `timeout`, `cancel`, `shutdown`, `error`,
+  `abandoned`) and `by=` names another actor only when there was one (`dotlink`,
+  `caller`, `connector`, `external`) — a command's own ending names none. A command
   that simply ended writes nothing — an ordinary exit needs no reconstruction — so
   the record stays short enough to read. The previous pair of lines — `stop …
   reason=… outcome=…` and `exit … from=outside` — each needed the other to be read,
@@ -65,10 +66,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   215, and the externally-signalled case from 463 to 307. `sandboxed`, `network` and
   `success` stay always-rendered because their false is information, not absence, and
   a running job omits `success`/`exit_code` it does not have yet.
-- The journal line names no actor when the command ended itself: `by=` appears only
-  for `dotlink`, `caller`, `connector` or `external`, so a line that exists because of
-  a sweep reads `end=exit code=0 tree=killed` and needs no legend to say who ended
-  what.
+- The journal line names no actor when the command ended itself, so a line that exists
+  because of a sweep reads `end=exit code=0 tree=killed` and needs no legend.
+- A drain that closes with a writer still holding the pipe is no longer an internal
+  failure. The command had ended and everything it wrote was in the spool, so the
+  reply is that prefix marked truncated; previously the reply claimed the *execution*
+  deadline had elapsed (`collecting command output timed out after 3600 seconds` after
+  two seconds), hid the output the command had produced, and left no record at all.
 
 ### Fixed
 
@@ -83,6 +87,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   kill (`KillReason::Failed`). It previously left the tree armed and returned,
   which deferred the kill to the guard's fail-safe; the failure was recorded as
   an unattributed drop even though its cause was known at the call site.
+- A failure behind an already-finished command now reports the sweep it performed.
+  `failure_stop` swept the tree and dropped the outcome, so a spool error after a
+  successful sweep recorded nothing at all: the one path where a sweep happened was
+  the one path that could not say so.
 - A guard dropped without a completion writes the job's only line, `end=abandoned`,
   so a job that never published a result is still on the record — and a job that did
   publish one is never written twice.

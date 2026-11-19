@@ -1,6 +1,6 @@
 //! A job's lifecycle line says how it ended and who ended it, in one line and two
 //! words an operator does not have to look up: `by=dotlink|caller|connector` is
-//! ours, `by=external` is not, and `end_src=command` means the command ended
+//! ours, `by=external` is not, and a command that simply ended writes no line at all
 //! itself. Exactly one line appears per job, so its absence is still evidence.
 //!
 //! Driven against the real binary with a piped stderr, since `LOG` lines are not
@@ -173,7 +173,7 @@ fn an_externally_signalled_job_records_its_exit_at_every_verbosity() {
         assert!(!text.contains("stopped_by"), "no stop to report: {text}");
         assert_eq!(lines.len(), 1, "one line per job at {flags:?}: {lines:?}");
         let line = &lines[0];
-        assert!(line.contains("end=signal signal=SIGKILL"), "{line}");
+        assert!(line.contains("end=signal SIGKILL"), "{line}");
         assert!(line.contains("by=external"), "{line}");
     }
 }

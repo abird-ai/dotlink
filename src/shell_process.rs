@@ -1,4 +1,11 @@
 //! Kill the contained process group/job on timeout, error or cancellation.
+//!
+//! Signalling is by process group id, which the kernel may recycle once the group
+//! is empty: between the sweep and the `kill(-pgid)` another process could in
+//! principle be given that number. The window is the syscall pair on a group this
+//! shell owned a moment earlier, and closing it would need a pidfd per member, so
+//! the record says what the signal found (`tree=killed`/`alive`) rather than
+//! pretending the group cannot have been reaped.
 //! Unsandboxed Unix children can intentionally escape their process group
 //! (setsid); no process-group API can guarantee descendant containment, so the
 //! contract is the group: it is swept when the command returns, and a sandboxed
@@ -97,25 +104,17 @@ pub(crate) enum StopOutcome {
     Failed,
 }
 
-impl StopOutcome {
-    /// Did anything happen to the tree? A signal that found an empty group did
-    /// not, and a line saying so would be pure noise.
-    #[cfg(test)]
-    fn is_event(self) -> bool {
-        self != Self::AlreadyGone
-    }
-
-    /// Test-facing names. The lifecycle line says `also_killed=processes|unsent`,
-    /// which is the reader's word for the same three facts.
-    #[cfg(test)]
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Delivered => "killed",
-            // There was nothing in the group to signal, so nothing happened.
-            Self::AlreadyGone => "none",
-            // The kernel would not take the signal; the guard stays armed.
-            Self::Failed => "refused",
-        }
+/// What became of the tree, as the one word a record uses — or nothing, because a
+/// group already empty had nothing happen to it and a line saying so is noise. One
+/// mapping serves the completion's line and the fail-safe's, so the two cannot
+/// disagree about the same outcome.
+pub(crate) fn tree_word(outcome: StopOutcome) -> Option<&'static str> {
+    match outcome {
+        StopOutcome::Delivered => Some("killed"),
+        StopOutcome::AlreadyGone => None,
+        // The kernel refused: these may still be running, which is the one place
+        // where saying so is an alarm rather than noise.
+        StopOutcome::Failed => Some("alive"),
     }
 }
 
@@ -428,14 +427,8 @@ impl Drop for Guard {
         // Reaching here while still armed means a path returned without
         // disarming. The kill is right; so is saying so, and this is the one
         // ending no completion can report.
-        let tree = match self.signal_and_record(KillReason::Dropped) {
-            StopOutcome::Delivered => Some("killed"),
-            // The kernel refused: these may still be running, and this is the one
-            // place where saying so is an alarm rather than noise.
-            StopOutcome::Failed => Some("alive"),
-            StopOutcome::AlreadyGone => None,
-        };
-        self.trace.abandoned(tree);
+        let outcome = self.signal_and_record(KillReason::Dropped);
+        self.trace.abandoned(tree_word(outcome));
     }
 }
 
@@ -505,17 +498,20 @@ mod tests {
                 "{reason:?} ends a tree, not a command"
             );
             // Still on the record, so the kill is never a stranger's.
-            assert!(!reason.as_str().is_empty());
+            assert!(
+                !reason.as_str().is_empty(),
+                "{reason:?} must still be named"
+            );
         }
     }
 
-    /// A signal that found nothing is not an event: no line, or every sandboxed
+    /// A signal that found nothing has no word: no line, or every sandboxed
     /// command's sweep would write one saying nothing happened.
     #[test]
-    fn an_empty_group_writes_no_line() {
-        assert!(!StopOutcome::AlreadyGone.is_event());
-        assert!(StopOutcome::Delivered.is_event());
-        assert!(StopOutcome::Failed.is_event());
+    fn an_empty_group_has_no_word() {
+        assert_eq!(tree_word(StopOutcome::AlreadyGone), None);
+        assert_eq!(tree_word(StopOutcome::Delivered), Some("killed"));
+        assert_eq!(tree_word(StopOutcome::Failed), Some("alive"));
     }
 
     /// The contract a caller is told: a command's process group does not outlive
@@ -580,7 +576,6 @@ mod tests {
         assert_eq!(guard.terminate(KillReason::Timeout), None);
         assert_eq!(trace.reports(), vec![KillReason::Timeout]);
         assert_eq!(trace.outcomes(), vec![StopOutcome::AlreadyGone]);
-        assert_eq!(StopOutcome::AlreadyGone.as_str(), "none");
     }
 
     /// A command that finished is disarmed first, so nothing is reported.
@@ -602,24 +597,6 @@ mod tests {
         drop(guard);
         let _ = child.wait().await;
         assert!(trace.reports().is_empty(), "{:?}", trace.reports());
-    }
-
-    /// The two ends of a kill are separate facts, so they are asserted
-    /// separately: a command-ending kill claims its cause on the result, and a
-    /// sweep is a journal line only. Conflating them is what once let a sweep
-    /// claim `teardown` on the wire and, when a sweep was refused the claim, read
-    /// as a stranger's SIGKILL.
-    #[test]
-    fn a_sweep_is_recorded_without_claiming_a_cause() {
-        // The four that end the command keep their own claim.
-        for (reason, cause) in [
-            (KillReason::Timeout, StopCause::Timeout),
-            (KillReason::Cancel, StopCause::Cancel),
-            (KillReason::Shutdown, StopCause::Shutdown),
-            (KillReason::Failed, StopCause::Failed),
-        ] {
-            assert_eq!(reason.claim(), Some(cause), "{reason:?}");
-        }
     }
 
     /// The whole vocabulary, in one place: how it ended, who ended it, and whether

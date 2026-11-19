@@ -39,15 +39,20 @@ not stop it", which is the same information as an absent `stopped_by`.
 
 ### 3. Stop log line
 
-`release/0.17` emits one `LOG job stop id=<id> reason=<reason> outcome=<...>` line
-from the guard that signals the tree (`StopTrace` in `src/shell_process.rs`,
-threaded through `run_shell_job`). It is a lifecycle line, so it survives every
-verbosity: absence must mean nothing was signalled, or it is not evidence at
-all. `outcome` distinguishes a delivered signal from a group that was already
-gone and from a signal that failed. It exists so that *absence* of a line is evidence the connector
-did not kill a command. The port must keep it on the path that actually signals
-the process group, including the fail-safe `Drop` (`reason=fail-safe`), which is the
-only implicit stop.
+`release/0.17` emits at most one
+`LOG job id=<id> end=<what> [by=<who>] [tree=<what became of the group>]` line per
+job. It is a lifecycle line, so it survives every verbosity: for it to be evidence,
+absence must mean the command simply ended. `end=` comes from the terminal the runner
+reached (`exit code=N`, `signal SIGKILL`, `timeout`, `cancel`, `shutdown`, `error`,
+`abandoned`), and `by=` names another actor only when there was one (`dotlink`,
+`caller`, `connector`, `external`) — a command's own ending names none. `tree=killed`
+or `tree=alive` rides on the same line when the command left its group running and
+dotlink swept it. One line, because two lines each needing the other to be read is
+how a record stops being evidence.
+
+The port must keep the writer single: the completion writes it, and the fail-safe
+`Drop` writes `end=abandoned` only when no completion exists — every completion path
+disarms the guard, so a job is never written twice.
 
 ### 4. Result fields
 

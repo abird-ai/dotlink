@@ -423,23 +423,24 @@ including `-q` — so `-q` is not silence:
 ~~~text
 [01:07:12.031] LOG  job        id=<job id> end=timeout by=dotlink
 [01:07:13.117] LOG  job        id=<job id> end=signal signal=SIGKILL by=external
-[01:07:13.884] LOG  job        id=<job id> end=exit code=0 by=command tree=killed
+[01:07:13.884] LOG  job        id=<job id> end=exit code=0 tree=killed
 ~~~
 
 They cover startup, restart, verbosity changes, and how a shell job ended. A job
 writes a line only when there is something to say, so a command that simply ended —
 successful or not — writes nothing, and the record stays short enough to read. Every
-word on the line can be read without a legend: `end=` says what ended it (`exit`,
-`signal`, `timeout`, `cancel`, `shutdown`, `error`, or `abandoned` when dotlink
-dropped the job without a result), and `by=` says who that was — `dotlink` for a
-deadline or an internal error, `caller` for a cancelled call, `connector` when the
-connector withdrew the work, `external` when something else signalled it, and
-`command` for its own status. `external` names only the absence of our signal, never
-a culprit: a crash and a stranger's `kill -9` read the same there, and the printed
-signal name is what separates them.
+word on the line can be read without a legend: `end=` says what ended it (`exit code=N`,
+`signal SIGKILL`, `timeout`, `cancel`, `shutdown`, `error`, or `abandoned` when
+dotlink dropped the job without a result), and `by=` names another actor when there
+was one — `dotlink` for a deadline or an internal error, `caller` for a cancelled
+call, `connector` when the connector withdrew the work, `external` when something
+else signalled it. A command that ended on its own names no actor, because the line
+exists only for what needs reconstructing. `external` claims only the absence of our
+signal, never a culprit: a crash and a stranger's `kill -9` read the same there, and
+the signal name is what separates them.
 
-When the command returned while processes it started were still running, dotlink
-kills them and the same line says `tree=killed` (`tree=alive` when the kernel refused,
+When the command left processes running — it returned, or was killed, with its group
+still live — dotlink kills them and the same line says `tree=killed` (`tree=alive` when the kernel refused,
 which is a real alarm). That is a verdict, not housekeeping: the invocation did not
 finish, so the result is a failure — `success: false`, the tool result marked as an
 error, and `error` naming the work — while the command's own exit status is still

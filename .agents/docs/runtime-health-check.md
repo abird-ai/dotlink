@@ -236,27 +236,27 @@ Check these explicitly. Each has a known-good value in the baseline.
 | poll failures / restarts | 0 / 0 | any — transport instability |
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
-| `end=` lines | only when there is something to say: `end=` names what ended it, `by=` names who | any line for an ordinary exit; a second line for one job; `by=dotlink` with a completion that shows no `stopped_by` |
+| `end=` lines | only when there is something to say: `end=` names what ended it, `by=` names who | any line for an ordinary exit; a second line for one job; `by=external` or `by=caller` with a completion that claims no `stopped_by` |
 | `by=external` | rare: something else signalled the command; `end=signal` prints the signal name, and `tree=killed` may follow | `by=external` on a job whose result claims `stopped_by`, or a `signal` in a result whose job wrote no line |
-| `"still running"` in a shell `error` | a command returned while its own group was still running, so dotlink killed the leftovers and failed the invocation while still reporting its exit status | a clean command reporting this, or a `success: true` beside a `reason=leftovers` line |
+| `"left processes running"` in a shell `error` | the command left its own group running, so dotlink killed that work and failed the invocation while still reporting the command's status | a clean command reporting this, or a `success: true` beside a `tree=killed` line |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
 
-A stop line written while the runtime restarts has no completion to match: the
-connector revokes those jobs before they can publish one, so a `shutdown` or
-`fail-safe` line standing alone is expected, not evidence of a lost result.
+A line written while the runtime restarts has no completion to match: the connector
+revokes those jobs before they can publish one, so an `end=abandoned` standing alone
+is expected, not evidence of a lost result.
 
-The `id=` of a stop line is the durable job handle: when the call returned one
+The `id=` of a line is the durable job handle: when the call returned one
 (`background: true`, or a handoff receipt under a cap) it is the id `job_get` and
-`job_output` use. A synchronous call returns no handle, so match its line by time
-— the line's timestamp and the result's `ts` are the same call — and compare the
-line's reason with the status the caller actually saw.
+`job_output` use. A synchronous call returns no handle, so match its line by time —
+the line's timestamp and the result's `ts` are the same call — and compare `end=`
+with the status the caller actually saw.
 
 **One line per job, when there is one to write.** `end=` says what ended the job and
-`by=` says who: `by=command` its own status, `by=dotlink` a deadline or an internal
+`by=` names another actor when there was one: `by=dotlink` a deadline or an internal
 error, `by=caller` a cancelled call, `by=connector` a withdrawn one, `by=external`
 something else entirely, and `end=abandoned` a job dotlink dropped without publishing
-a result. An ordinary exit writes nothing, so the record only holds events worth
-reconstructing. A sweep of work the command left running rides on the same line as
+a result. A command that ended on its own names no actor, and writes no line unless a
+sweep changed the verdict — so the record only holds events worth reconstructing. A sweep of work the command left running rides on the same line as
 `tree=killed` — or `tree=alive` when the kernel refused, which is the one case that is
 an alarm — and it is also what makes the invocation a failure; an empty group adds
 nothing. Because the line is written once — from the completion, or by the fail-safe

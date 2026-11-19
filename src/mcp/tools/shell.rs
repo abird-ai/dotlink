@@ -100,9 +100,11 @@ const COMPLETED_OUTPUT_GRACE: Duration = Duration::from_secs(2);
 /// Said when a command returned before the work it started did. The command's own
 /// status is still reported; this is why the invocation did not finish, and it
 /// names the idiom that avoids it rather than leaving the caller to guess.
-const LEFTOVERS_KILLED: &str = "command returned while processes it started were still running; dotlink killed them (use `wait` to keep one alive)";
-const LEFTOVERS_UNKILLED: &str =
-    "command returned while processes it started were still running; dotlink could not kill them";
+// "left processes running" holds for both endings: a command that returned, and one
+// something else killed, can each leave a group behind.
+const LEFTOVERS_KILLED: &str =
+    "the command left processes running; dotlink killed them (use `wait` to keep one alive)";
+const LEFTOVERS_UNKILLED: &str = "the command left processes running; dotlink could not kill them";
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
@@ -2317,7 +2319,6 @@ impl LocalMachine {
                         dir: runtime.config.access.relative_display(&working_dir),
                         sandboxed: runtime.config.sandbox_shell,
                         network: runtime.config.allow_network,
-                        timeout_secs,
                     };
                     // Built unconditionally: verbosity can be cycled at runtime, so
                     // deciding at capture time would make the record depend on when
@@ -2356,18 +2357,16 @@ impl LocalMachine {
     /// Leaving it armed and returning would defer the kill to the guard's
     /// fail-safe, which records `dropped` and cannot say why — the reason was
     /// known at this point and must not be lost.
-    fn failure_stop(
-        tree: &mut crate::shell_process::Guard,
-        cause: Option<StopCause>,
-        command_exited: bool,
-    ) -> Option<StopCause> {
-        if !command_exited {
-            return cause.or_else(|| tree.terminate(KillReason::Failed));
+    fn failure_stop(tree: &mut crate::shell_process::Guard, facts: &mut FailureFacts<'_>) {
+        if facts.exit_status.is_none() {
+            // The command is still live, so this failure ends it and owns the kill.
+            facts.stop = facts.stop.or_else(|| tree.terminate(KillReason::Failed));
+            return;
         }
-        // Only the command's leftovers are left to sweep. A sweep ends a tree,
-        // not a command, so it claims no cause: the record is its stop line.
-        tree.terminate(KillReason::Cleanup);
-        None
+        // Only the command's leftovers are left. A sweep ends a tree, not a command,
+        // so it claims no cause — but what it found is a fact this failure must
+        // carry, or the one sweep that happened would be the one nobody recorded.
+        facts.leftovers = Some(tree.sweep());
     }
 
     /// One internal failure of the output path. The command's status, the stop the
@@ -2377,13 +2376,13 @@ impl LocalMachine {
     /// carry a different subset of the facts.
     fn spool_failure(
         tree: &mut crate::shell_process::Guard,
-        facts: FailureFacts<'_>,
+        mut facts: FailureFacts<'_>,
         error: String,
         job: &JobHandle,
         context: JobResultContext,
     ) -> JobCompletion {
-        let stop = Self::failure_stop(tree, facts.stop, facts.exit_status.is_some());
-        FailureFacts { stop, ..facts }
+        Self::failure_stop(tree, &mut facts);
+        facts
             .apply(JobCompletion::internal_failed(
                 error,
                 stream_summary_from_file(&job.stdout_path, true),
@@ -2413,19 +2412,13 @@ impl LocalMachine {
         )
         .await;
         let (end, by) = Self::ending(&completion);
-        let tree = match completion.leftovers {
-            None => None,
-            Some(crate::shell_process::StopOutcome::Delivered) => Some("killed"),
-            // The kernel would not take the signal, so work may still be running.
-            // This is the one place where saying so is an alarm, not noise.
-            Some(crate::shell_process::StopOutcome::Failed) => Some("alive"),
-            Some(crate::shell_process::StopOutcome::AlreadyGone) => None,
-        };
+        let tree = completion
+            .leftovers
+            .and_then(crate::shell_process::tree_word);
         // A command that simply ended is the expected case, so it writes nothing: the
         // record is for what an operator would otherwise have to reconstruct, and a
         // line per ordinary exit is noise that hides those. A sweep is never silent,
         // because it changed the verdict.
-        let by = (by != "command").then_some(by);
         if by.is_some() || tree.is_some() {
             stop_trace.ended(&end, by, tree);
         }
@@ -2433,29 +2426,36 @@ impl LocalMachine {
     }
 
     /// How this job ended and who ended it — two words per job, and neither needs a
-    /// legend. A cause dotlink recorded is dotlink's, and the two cancel origins stay
-    /// apart because a caller and the connector are not the same actor. A signal no
-    /// cause claims came from outside the connector; a plain status is the command's
-    /// own, which is the one ending that needs no line.
-    fn ending(completion: &JobCompletion) -> (String, &'static str) {
+    /// legend. `end=` comes from the terminal the runner reached, not from the cause,
+    /// because a kill the kernel refused leaves no cause while the ending is unchanged:
+    /// a deadline that could not signal is still a deadline. `by=` names an actor only
+    /// when one is known — an own ending names none, and a cancelled job whose kill was
+    /// refused cannot say whether a caller or the connector asked, so it claims neither.
+    fn ending(completion: &JobCompletion) -> (String, Option<&'static str>) {
         use crate::shell_process::StopCause;
-        match completion.stopped_by {
-            Some(StopCause::Timeout) => ("timeout".to_owned(), "dotlink"),
-            Some(StopCause::Cancel) => ("cancel".to_owned(), "caller"),
-            Some(StopCause::Shutdown) => ("shutdown".to_owned(), "connector"),
-            Some(StopCause::Failed) => ("error".to_owned(), "dotlink"),
-            None => match completion.signal {
-                Some(signal) => (
-                    format!("signal signal={}", crate::jobs::signal_token(signal)),
-                    "external",
-                ),
+        let by = match completion.stopped_by {
+            Some(StopCause::Timeout | StopCause::Failed) => Some("dotlink"),
+            Some(StopCause::Cancel) => Some("caller"),
+            Some(StopCause::Shutdown) => Some("connector"),
+            None if completion.signal.is_some() => Some("external"),
+            None => None,
+        };
+        let end = match completion.status {
+            JobStatus::TimedOut => "timeout".to_owned(),
+            JobStatus::Cancelled => "cancel".to_owned(),
+            JobStatus::Failed => "error".to_owned(),
+            // A completion always carries a terminal; `Running` here would mean a
+            // result was published before anything finished, which no path does.
+            JobStatus::Running | JobStatus::Completed => match completion.signal {
+                Some(signal) => format!("signal {}", crate::jobs::signal_token(signal)),
+                // A completed job without a status and without a signal never ran.
                 None => match completion.exit_code {
-                    Some(code) => (format!("exit code={code}"), "command"),
-                    // No status and no cause: dotlink never got the command running.
-                    None => ("error".to_owned(), "dotlink"),
+                    Some(code) => format!("exit code={code}"),
+                    None => "error".to_owned(),
                 },
             },
-        }
+        };
+        (end, by)
     }
 
     async fn run_shell_job_inner(
@@ -2703,6 +2703,7 @@ impl LocalMachine {
         let facts = FailureFacts {
             exit_status: exit_status.as_ref(),
             stop,
+            leftovers: None,
             terminal,
         };
 
@@ -2765,19 +2766,11 @@ impl LocalMachine {
                 };
                 (stdout, stderr)
             }
-            Err(_) if terminal == JobStatus::Completed => {
-                abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
-                return Self::spool_failure(
-                    &mut process_tree,
-                    facts,
-                    format!(
-                        "collecting command output timed out after {} seconds",
-                        result_context.timeout_secs
-                    ),
-                    &job,
-                    result_context,
-                );
-            }
+            // The drain window closed with a writer still holding the pipe — a
+            // `setsid` descendant, which the contract does not cover. The command
+            // itself already ended, and everything it wrote is in the spool, so the
+            // answer is the retained prefix marked truncated, not a failure: the
+            // execution did not fail, and the deadline is not what elapsed.
             Err(_) => {
                 abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
                 (
@@ -2913,6 +2906,9 @@ impl ChildStop {
 struct FailureFacts<'a> {
     exit_status: Option<&'a std::process::ExitStatus>,
     stop: Option<StopCause>,
+    /// What a sweep behind an already-finished command found. `None` means no sweep
+    /// ran, so a failure that never touched a tree says nothing about one.
+    leftovers: Option<StopOutcome>,
     terminal: JobStatus,
 }
 
@@ -2923,6 +2919,7 @@ impl FailureFacts<'_> {
             .with_signal(self.exit_status.and_then(LocalMachine::exit_signal))
             .with_stop(self.stop)
             .after_terminal(self.terminal)
+            .with_leftovers_found(self.leftovers)
     }
 }
 
@@ -4148,30 +4145,58 @@ mod tests {
             tree.terminate(KillReason::Timeout),
             Some(StopCause::Timeout)
         );
-        assert_eq!(
-            LocalMachine::failure_stop(&mut tree, Some(StopCause::Timeout), false),
-            Some(StopCause::Timeout)
-        );
+        let mut facts = FailureFacts {
+            exit_status: None,
+            stop: Some(StopCause::Timeout),
+            leftovers: None,
+            terminal: JobStatus::Failed,
+        };
+        LocalMachine::failure_stop(&mut tree, &mut facts);
+        assert_eq!(facts.stop, Some(StopCause::Timeout));
+        assert_eq!(facts.leftovers, None, "a live tree is stopped, not swept");
         // Disarmed: nothing to stop, so nothing is claimed.
+        let mut disarmed = FailureFacts {
+            exit_status: None,
+            stop: None,
+            leftovers: None,
+            terminal: JobStatus::Failed,
+        };
+        LocalMachine::failure_stop(&mut tree, &mut disarmed);
         assert_eq!(
-            LocalMachine::failure_stop(&mut tree, None, true),
-            None,
+            disarmed.stop, None,
             "a disarmed tree cannot be stopped again"
         );
     }
 
-    /// A command that already ended leaves a tree to clean up, and cleanup is not
-    /// a stop of that command.
+    /// A command that already ended leaves a tree to sweep. The sweep claims no cause,
+    /// because the command's own status ended it — but what the sweep found is a fact
+    /// the failure has to carry, or the one sweep that ran is the one nobody recorded.
     #[cfg(unix)]
     #[tokio::test]
-    async fn cleanup_after_an_own_exit_is_logged_but_never_claimed() {
+    async fn a_sweep_behind_a_finished_command_is_reported_not_claimed() {
         let mut command = tokio::process::Command::new("sh");
         crate::shell_process::configure(&mut command);
         command.arg("-c").arg("sleep 5");
         let child = command.spawn().unwrap();
         let trace = StopTrace::new(LogConfig::default(), "cleanup");
         let mut tree = crate::shell_process::Guard::attach(&child, trace.clone()).unwrap();
-        assert_eq!(LocalMachine::failure_stop(&mut tree, None, true), None);
+        // A status proves the command ended, so only its leftovers remain.
+        let ended = std::process::Command::new("true")
+            .status()
+            .expect("a status to carry");
+        let mut facts = FailureFacts {
+            exit_status: Some(&ended),
+            stop: None,
+            leftovers: None,
+            terminal: JobStatus::Completed,
+        };
+        LocalMachine::failure_stop(&mut tree, &mut facts);
+        assert_eq!(facts.stop, None, "a sweep is not a stop of the command");
+        assert_eq!(
+            facts.leftovers.and_then(crate::shell_process::tree_word),
+            Some("killed"),
+            "the sweep's finding must survive the failure"
+        );
         assert_eq!(trace.reports(), vec![KillReason::Cleanup]);
     }
 
@@ -5006,7 +5031,7 @@ mod tests {
         assert!(
             status["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("still running")),
+                .is_some_and(|error| error.contains("left processes running")),
             "{status}"
         );
         assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
@@ -6482,7 +6507,7 @@ mod tests {
         assert_eq!(payload["success"], false, "{text}");
         assert_eq!(payload["stdout"], "done", "{text}");
         let error = payload["error"].as_str().unwrap_or_default();
-        assert!(error.contains("still running"), "{text}");
+        assert!(error.contains("left processes running"), "{text}");
         assert!(!error.contains("collecting command output"), "{text}");
     }
 

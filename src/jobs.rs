@@ -211,7 +211,6 @@ pub(crate) struct JobResultContext {
     pub(crate) dir: String,
     pub(crate) sandboxed: bool,
     pub(crate) network: bool,
-    pub(crate) timeout_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +262,18 @@ impl JobCompletion {
     /// the verdict travels in `error`, and the journal carries the kill.
     pub(crate) fn with_leftovers(mut self, leftovers: crate::shell_process::StopOutcome) -> Self {
         self.leftovers = Some(leftovers);
+        self
+    }
+
+    /// The sweep a failure performed, when it performed one. `None` leaves the field
+    /// as it was, so a path that never touched a tree says nothing about one.
+    pub(crate) fn with_leftovers_found(
+        mut self,
+        leftovers: Option<crate::shell_process::StopOutcome>,
+    ) -> Self {
+        if let Some(leftovers) = leftovers {
+            self.leftovers = Some(leftovers);
+        }
         self
     }
 
@@ -1068,12 +1079,23 @@ struct JobOutputPage<'a> {
     offset: u64,
     next_offset: u64,
     stored_bytes: u64,
+    /// Absent while the job runs, because nothing is final yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
     total_bytes: Option<u64>,
+    /// Always rendered: `complete: false` is the answer "read another page".
     complete: bool,
+    #[serde(skip_serializing_if = "is_absent_bool")]
     truncated: bool,
+    #[serde(skip_serializing_if = "is_absent_bool")]
     released: bool,
     encoding: &'static str,
+    /// Always rendered, even empty: a page's bytes are the payload, not a status.
     data: String,
+}
+
+/// The typed form of [`FALSE_IS_ABSENT`], for structs that serialize directly.
+fn is_absent_bool(value: &bool) -> bool {
+    !*value
 }
 
 struct PendingJobFiles {
@@ -1441,7 +1463,7 @@ impl JobManager {
                     // it kills its tree on the way out — but this side cannot see
                     // whether a guard existed, and claiming a stop it cannot
                     // observe is the one mistake this record must not make. The
-                    // stop line stays the evidence: `reason=dropped` appears there
+                    // lifecycle line stays the evidence: `end=abandoned` appears there
                     // exactly when a tree was still armed.
                     JobCompletion::internal_failed(
                         "shell job runner panicked",
@@ -2544,32 +2566,45 @@ pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
 /// they are omitted rather than rendered — the termination facts already worked that
 /// way. Booleans that state the environment (`sandboxed`, `network`) and the verdict
 /// (`success`) are always rendered: their false is information, not absence.
+/// Flags whose `false` means "nothing to report". Everything else — `success`,
+/// `sandboxed`, `network`, `complete` — is rendered even when false, because there
+/// its false is the answer a reader came for.
+const FALSE_IS_ABSENT: [&str; 6] = [
+    "timed_out",
+    "truncated",
+    "stdout_truncated",
+    "stderr_truncated",
+    "cancelling",
+    "released",
+];
+
+/// Drop every field that only says "no", at any depth. One rule for every payload
+/// this module renders, so a new surface cannot be cheaper or chattier by accident:
+/// an absence costs nothing, while a rendered false costs on every call.
 fn omit_absences(payload: &mut Value) {
-    /// Flags whose false means "nothing to report".
-    const FALSE_IS_ABSENT: [&str; 4] = [
-        "timed_out",
-        "stdout_truncated",
-        "stderr_truncated",
-        "cancelling",
-    ];
-    let Some(map) = payload.as_object_mut() else {
-        return;
-    };
-    map.retain(|key, value| {
-        let absent = value.is_null()
-            || (value == &Value::Bool(false) && FALSE_IS_ABSENT.contains(&key.as_str()));
-        !absent
-    });
-    // An empty stream says what its absence says, unless the emptiness is itself a
-    // truncation result.
-    for (stream, truncated) in [
-        ("stdout", "stdout_truncated"),
-        ("stderr", "stderr_truncated"),
-    ] {
-        let empty = map.get(stream).and_then(Value::as_str) == Some("");
-        if empty && map.get(truncated) != Some(&Value::Bool(true)) {
-            map.remove(stream);
+    match payload {
+        Value::Object(map) => {
+            map.retain(|key, value| {
+                let absent = value.is_null()
+                    || (value == &Value::Bool(false) && FALSE_IS_ABSENT.contains(&key.as_str()));
+                !absent
+            });
+            // An empty stream says what its absence says.
+            for stream in ["stdout", "stderr"] {
+                if map.get(stream).and_then(Value::as_str) == Some("") {
+                    map.remove(stream);
+                }
+            }
+            for value in map.values_mut() {
+                omit_absences(value);
+            }
         }
+        Value::Array(items) => {
+            for item in items {
+                omit_absences(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2620,7 +2655,9 @@ fn internal_failure_payload(completion: &JobCompletion) -> String {
     if let Some(note) = external_stop_note(completion) {
         payload["next"] = serde_json::Value::from(note);
     }
-    with_termination(payload, completion).to_string()
+    let mut payload = with_termination(payload, completion);
+    omit_absences(&mut payload);
+    payload.to_string()
 }
 
 fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
@@ -2740,8 +2777,9 @@ fn failure_error_object(message: &str, completion: &JobCompletion) -> JsonObject
         data.insert("timed_out".to_owned(), Value::from(true));
     }
     if let Some(signal) = completion.signal {
-        data.insert("signal".to_owned(), Value::from(signal));
-        data.insert("signal_name".to_owned(), Value::from(signal_token(signal)));
+        // One representation on every surface: the name. A second numeric field
+        // would let a task error and a tool result disagree about the same job.
+        data.insert("signal".to_owned(), Value::from(signal_token(signal)));
     }
     if let Some(cause) = completion.stopped_by {
         data.insert("stopped_by".to_owned(), Value::from(cause.as_str()));
@@ -2968,6 +3006,7 @@ fn render_ack_receipt(entry: &JobEntry) -> String {
     if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_ack")) {
         payload["next"] = serde_json::Value::String(next);
     }
+    omit_absences(&mut payload);
     payload.to_string()
 }
 
@@ -2980,21 +3019,15 @@ fn stream_status(
     truncated: bool,
     released: bool,
 ) -> Value {
-    let mut status = serde_json::json!({
+    // Every field is rendered and the absence rule trims it, so this stays one shape
+    // and cannot drift from the payloads around it.
+    serde_json::json!({
         "stored_bytes": stored,
         "ack_bytes": ack,
         "total_bytes": total,
-    });
-    // Only the conditions that changed: a stream is truncated or released, and saying
-    // so when it is not would be three more tokens on every probe.
-    if truncated {
-        status["truncated"] = Value::from(true);
-    }
-    if released {
-        status["released"] = Value::from(true);
-    }
-    omit_absences(&mut status);
-    status
+        "truncated": truncated,
+        "released": released,
+    })
 }
 
 fn render_status_locked(entry: &JobEntry) -> Value {
@@ -3980,10 +4013,46 @@ mod tests {
         let data = error.get("data").expect("error carries structured detail");
         assert_eq!(data["exit_code"], Value::from(3), "{data}");
         assert_eq!(data["timed_out"], Value::from(true), "{data}");
-        assert_eq!(data["signal"], Value::from(11), "{data}");
-        assert_eq!(data["signal_name"], Value::from("SIGSEGV"), "{data}");
+        assert_eq!(data["signal"], Value::from("SIGSEGV"), "{data}");
+        assert!(
+            data.get("signal_name").is_none(),
+            "one representation, or surfaces disagree: {data}"
+        );
         assert_eq!(data["stopped_by"], Value::from("failed"), "{data}");
         assert_eq!(data["streams_omitted"], Value::from(true), "{data}");
+    }
+
+    /// The absence rule is one rule: a field that only says "no" disappears, at any
+    /// depth, while a false that is an answer stays. Every renderer routes through it,
+    /// so a new surface cannot be chattier by accident.
+    #[test]
+    fn nothing_that_only_says_no_reaches_the_wire() {
+        let nested = serde_json::json!({
+            "stdout": {"stored_bytes": 3, "truncated": false, "released": false},
+            "stderr": {"stored_bytes": 0, "truncated": true},
+            "cancelling": false,
+            "timed_out": false,
+            // Answers, not absences: these must survive.
+            "success": false,
+            "sandboxed": false,
+            "network": false,
+            "complete": false,
+            "error": null,
+            "stdout_truncated": false,
+        });
+        let mut payload = nested;
+        omit_absences(&mut payload);
+        assert_eq!(payload["stdout"]["stored_bytes"], 3, "{payload}");
+        assert!(payload["stdout"].get("truncated").is_none(), "{payload}");
+        assert!(payload["stdout"].get("released").is_none(), "{payload}");
+        assert_eq!(payload["stderr"]["truncated"], true, "{payload}");
+        assert!(payload.get("cancelling").is_none(), "{payload}");
+        assert!(payload.get("timed_out").is_none(), "{payload}");
+        assert!(payload.get("error").is_none(), "{payload}");
+        assert!(payload.get("stdout_truncated").is_none(), "{payload}");
+        for answer in ["success", "sandboxed", "network", "complete"] {
+            assert_eq!(payload[answer], false, "{answer} is an answer: {payload}");
+        }
     }
 
     #[test]
@@ -4006,7 +4075,10 @@ mod tests {
         assert!(payload.get("stdout").is_none(), "{payload}");
         assert!(payload.get("dir").is_none(), "{payload}");
         assert_eq!(payload["success"], Value::from(false), "{payload}");
-        assert_eq!(payload["timed_out"], Value::from(false), "{payload}");
+        assert!(
+            payload.get("timed_out").is_none(),
+            "a false that says nothing is an absence: {payload}"
+        );
 
         // A failure behind a deadline reports the deadline, from the terminal it
         // followed — even when the signal found an empty group and claims nothing.
@@ -5408,7 +5480,10 @@ mod tests {
             .unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).unwrap();
         assert_eq!(status["stdout"]["released"], true);
-        assert_eq!(status["stderr"]["released"], false);
+        assert!(
+            status["stderr"].get("released").is_none(),
+            "a stream that still holds output says so by staying quiet: {status}"
+        );
         // Retained bytes are the status payload's job, not the ack receipt's.
         let retained: serde_json::Value =
             serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
@@ -5605,7 +5680,6 @@ mod tests {
                         dir: ".".to_owned(),
                         sandboxed: true,
                         network: false,
-                        timeout_secs: 30,
                     })
                 },
             )

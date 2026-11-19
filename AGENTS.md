@@ -82,9 +82,10 @@ All paths and validation commands below are relative to the repository root.
   already exited claims nothing either — its fate was already decided by its own
   status. `stopped_by` therefore answers exactly one question: did dotlink end this
   command. Nothing else is rendered that only says "no": a null, a flag that is
-  false because nothing happened (`timed_out`, `*_truncated`, `cancelling`), an
-  empty stream, and a per-stream `truncated`/`released` that is not true are all
-  omitted, since an absence costs nothing and a false costs tokens on every call.
+  false because nothing happened (`timed_out`, `*_truncated`, `cancelling`,
+  `released`), an empty stream, and a `truncated` that is not true, all omitted at
+  any depth by one shared rule, since an absence costs nothing and a false costs
+  tokens on every call.
   `sandboxed`, `network` and `success` are always rendered — their false is
   information, not absence — and a running job omits `success`/`exit_code`. A
   cancellation records *who* asked before the token fires (`JobCancel` keeps the
@@ -104,11 +105,12 @@ All paths and validation commands below are relative to the repository root.
   failure trims keys that say nothing, but its stop facts and `next` stay exactly
   what the ordinary result carries. A job writes at most one lifecycle line,
   `LOG job id=… end=… by=… [tree=…]`, at every verbosity and only when it has
-  something to say: `end=` says what ended it (`exit`, `signal`, `timeout`,
-  `cancel`, `shutdown`, `error`, `abandoned`) and `by=` says who (`command`,
-  `dotlink`, `caller`, `connector`, `external`). A command that simply ended writes
-  nothing — an ordinary exit needs no reconstruction — while anything dotlink did,
-  any foreign signal, and any sweep writes a line. A sweep of work still running
+  something to say: `end=` says what ended it (`exit code=N`, `signal SIGKILL`,
+  `timeout`, `cancel`, `shutdown`, `error`, `abandoned`) and `by=` names another actor
+  only when there was one (`dotlink`, `caller`, `connector`, `external`), because an
+  own ending has none to name. A command that simply ended writes nothing — an
+  ordinary exit needs no reconstruction — while anything dotlink did, any foreign
+  signal, and any sweep writes a line. A sweep of work still running
   rides on the same line as `tree=killed`, or `tree=alive` when the kernel refused,
   which is the one place where saying it is an alarm; an empty group adds nothing.
   A job is written once because every completion path disarms the guard, whose
@@ -120,8 +122,8 @@ All paths and validation commands below are relative to the repository root.
 - Shell mounts are one layer in `src/mounts.rs`: `SandboxMount { source, target, writable, env, origin }`, keyed by sandbox target with last declaration winning over builtin caches, profile `mounts`, `DOTLINK_MOUNTS` and `--mount` (in that order, as an ordered layer slice). Targets stay below `/tmp/home`, must not nest, and are conflict-checked against fixed host integrations; mount `env` may not set the variables the sandbox owns and may not disagree with another mount. Layout is validated before environment wiring, and only on the set the binder will actually bind. Configuration mistakes are `CONFIG`; a declared source that is not usable yet is host state and retries the runtime, while a discovered cache that cannot be prepared is skipped with a warning. A declared mount is never skipped silently, and `-vv` lists the resolved set.
 - Linux native file IO must stay descriptor-rooted with openat2 and fail closed on unsupported resolution. Shared traversal errno comparisons use OS-native libc constants, never Linux numeric literals. Directory discovery reads child metadata under the same descriptor and mount-resolution authority as actual opens (Linux `openat2` O_PATH nofollow; macOS `fstatat` plus device check). Pathname metadata or unchecked mountpoint metadata must never be reintroduced after pinning. Linux/macOS native tools are concurrent by default; `-s/--serialize` opts into one-at-a-time MCP calls. Windows retains a conservative operation gate. Never reintroduce pathname IO following authorization for Linux tools.
 - Logging is quiet by default: `-v` = TOOL, `-vv` = TOOL + REQ. `LOG` lines are
-  lifecycle (startup, restart, verbosity, and each stop or external exit of a
-  shell process tree with its reason and outcome) and appear at every verbosity;
+  lifecycle (startup, restart, verbosity, and each shell job that ended for a reason
+  worth reconstructing, with `end=` and `by=`) and appear at every verbosity;
   nothing else may use that level. Interactive non-stdio runs support live `v` verbosity cycling, `V` full-command toggling, and `Ctrl+R` restart; stdio never shares stdin with runtime controls. Runtime controls must snapshot/restore the exact terminal state on every exit/error path. `--quiet -vv` is REQ-only. TOOL logs default to 256 rendered characters for escaped `c="..."`, including quotes and `…` when truncated. `V` permits full, still-escaped commands only while interactive stdin controls **and TOOL logging** are active; hide the key hint and ignore the modifier (without a notice) in quiet/REQ-only mode. Reset full mode when TOOL logging turns off and on shutdown/restart. `p=`, `d=`, and `paths=[...]` must never truncate path names: log all up to 64 distinct valid `edit` paths, without processing more than 512 operations or over-limit file sets. When interactive, with color enabled, style TOOL/REQ keys, values and outcomes separately; do not parse user-controlled log text for fields or put ANSI in noninteractive argument summaries. Keep bulk payloads as byte counts. Format `p`, `d`, `c` before other fields; render paths inside launch cwd as `./...` and outside as `/...` on Unix. Use `max_t`/`max_b` and aggregate payload bytes as `b="N"`. Multi-file `edit` logs bounded, distinct `paths=[...]` relative to the same cwd; the advertised schema has only `edits[].path`, with legacy default paths accepted at decode. The global `MAX_EDIT_OPS=512` and `MAX_EDIT_FILES=64` ceilings in `mcp::tools` govern the wire reader, planner, schema, and log preview. TOOL path labels resolve symlinks best-effort before deciding `./` vs absolute; this never authorizes access. The `MAX_MUTATION_PLAN_BYTES=64 MiB` shared budget applies to `edit`, `patch`, and `bedit`; one shared staged-commit engine and bounded receipt plan keep successful mutating-tool replies within `max_output_bytes` before any commit. `write`/`bwrite` use the same single-result preflight. Match ambiguities use constant-width previews, never unbounded offset vectors. Inline shell secrets in the visible command excerpt, or in interactive full-command mode, can enter journald. Other payloads (file bytes, stdin, patches, grep patterns) remain byte counts. Log scopes and network metadata labels stay bounded/sanitized. Never include control-plane response bodies or malformed protocol payloads in errors; rmcp tracing stays suppressed regardless of `RUST_LOG` because it renders complete MCP payloads.
 - Linux KVM/GPU grants are independent opt-ins: vendor-check DRM devices, pin character-device FDs and use Bubblewrap `--dev-bind` rather than regular `--bind-fd`; read-only driver resources must not expand native MCP FS grants. NixOS hardware permissions affect only the corresponding systemd unit.
 - **Advertised tool text:** every tool and argument description is exactly one line, and every number in it resolves from the constant that enforces it, so prose and the machine-readable bound (`maximum`/`maxLength`) state the same limit. `substitute_description_tokens` rewrites the whole input schema (nested `$defs` included) through one recursive walker that leaves data keywords (`default`/`enum`/`const`/`examples`) alone. A test fails on a control character, an unresolved placeholder or an unused token anywhere in the authored or shipped text, renders every registry tool through both shell variants, and requires a description on each property and a title on each tool — `--list-tools` prints that title, never raw description text. Every argument object is closed (`#[serde(deny_unknown_fields)]`, advertised as `additionalProperties: false`), so a misspelled argument is an error naming the field rather than a silently ignored one, and the schema walk covers each tool's root object as well as every nested definition.

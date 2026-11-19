@@ -128,7 +128,7 @@ fn a_finished_command_does_not_wait_for_its_leftovers() {
     assert_eq!(payload["stdout"], "ok", "{payload}");
     assert_eq!(payload["success"], false, "{payload}");
     let error = payload["error"].as_str().unwrap_or_default();
-    assert!(error.contains("still running"), "{payload}");
+    assert!(error.contains("left processes running"), "{payload}");
     assert!(!error.contains("collecting command output"), "{payload}");
     assert!(
         payload.get("stopped_by").is_none(),
@@ -168,7 +168,7 @@ fn a_command_killed_by_someone_else_keeps_its_own_ending() {
     assert_eq!(payload["success"], false, "{payload}");
     assert_eq!(payload["signal"], "SIGKILL", "{payload}");
     let error = payload["error"].as_str().unwrap_or_default();
-    assert!(error.contains("still running"), "{payload}");
+    assert!(error.contains("left processes running"), "{payload}");
     assert!(payload.get("stopped_by").is_none(), "{payload}");
     let next = payload["next"].as_str().unwrap_or_default();
     assert!(next.contains("outside dotlink"), "{next}");
@@ -181,7 +181,7 @@ fn a_command_killed_by_someone_else_keeps_its_own_ending() {
         .collect();
     assert_eq!(lines.len(), 1, "one line per job: {journal}");
     let line = lines[0];
-    assert!(line.contains("end=signal signal=SIGKILL"), "{line}");
+    assert!(line.contains("end=signal SIGKILL"), "{line}");
     assert!(line.contains("by=external"), "{line}");
     assert!(line.contains("tree=killed"), "{line}");
 }
