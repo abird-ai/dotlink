@@ -18,9 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   reader open until the command's own deadline, turning a successful command into
   a collection failure.
 - Tool descriptions now say it: processes left in the background die when the
-  command returns, so a long-lived process belongs in the foreground of a
-  durable (`background: true`) call. `background: true` was never a way to detach
-  work — it only decides whether the caller waits before the handle is returned.
+  command returns, and a long-lived one is kept by waiting for it inside a
+  durable call (`background: true`, e.g. `server & wait`), bounded by
+  `timeout_secs` and ended by `job_cancel`. `background: true` was never a way to
+  detach work — it only decides whether the caller waits before the handle is
+  returned — and the command itself is the right place to say how long its tree
+  lives: `wait` is ordinary shell, visible in the call, and needs no second
+  lifetime flag.
 
 ### Fixed
 

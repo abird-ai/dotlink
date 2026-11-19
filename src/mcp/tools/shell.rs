@@ -120,12 +120,12 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; reaching `timeout_secs` kills it; {follow_up}. Processes left in the background die when the command returns, so run one in the foreground of a durable (`background: true`) call when it must outlive it. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
+            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; reaching `timeout_secs` kills it; {follow_up}. Processes left in the background die when the command returns; to keep one running, `wait` for it inside a durable call (`background: true`, e.g. `server & wait`), which stays alive until it exits, `timeout_secs` expires, or you cancel the job. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Processes left in the background die when the command returns, so run one in the foreground of a durable (`background: true`) call when it must outlive it. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
+            "Run a {shell} command; waits until it finishes, or kills it at `timeout_secs`. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Processes left in the background die when the command returns; to keep one running, `wait` for it inside a durable call (`background: true`, e.g. `server & wait`), which stays alive until it exits, `timeout_secs` expires, or you cancel the job. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
     }
