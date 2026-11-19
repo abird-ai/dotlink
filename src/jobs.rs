@@ -21,6 +21,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use aw_tools::execution_stop::{
+    StopReason as SharedProcessStopReason, StopRecord as SharedProcessStopRecord,
+};
 use aw_tools::filesystem::{
     batch::{Graph as SharedGraph, NodeTool as SharedNodeTool, Status as SharedStatus},
     footprint::Footprint as SharedFootprint,
@@ -42,7 +45,7 @@ use aw_tools::filesystem::{
     },
     status::Primary as SharedPrimary,
 };
-use aw_tools::toolset::JobProfile;
+use aw_tools::{task_ops::TaskTerminalDetail as SharedTaskTerminalDetail, toolset::JobProfile};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::FutureExt as _;
 use rmcp::{
@@ -184,7 +187,12 @@ pub(crate) struct JobResultContext {
 #[derive(Clone, Debug)]
 pub(crate) struct JobCompletion {
     pub(crate) status: JobStatus,
-    pub(crate) exit_code: Option<i32>,
+    /// Physical process exit, independent from product/Job lifecycle status.
+    pub(crate) process_exit: SharedProcessExit,
+    /// Final factual logical stop record, when a process stop sequence occurred.
+    pub(crate) stop_record: Option<SharedProcessStopRecord>,
+    /// Product-only provenance for a shared `Cancelled` reason.
+    pub(crate) cancel_origin: Option<CancelOrigin>,
     pub(crate) success: bool,
     pub(crate) error: Option<String>,
     pub(crate) stdout: StreamSummary,
@@ -197,69 +205,83 @@ pub(crate) struct JobCompletion {
     pub(crate) observed_status: Option<JobStatus>,
     /// Whether the host proved stdout/stderr readers quiesced after process settlement.
     pub(crate) output_complete: bool,
-    /// For timeout/cancel only: whether OS custody proved the launched process
-    /// tree stopped. Other terminal classes do not consult this bit.
-    pub(crate) stop_proven: bool,
     /// The canonical Start checkpoint committed, but `Command::spawn` itself
     /// definitively failed, so no process/effect was created.
     pub(crate) spawn_failed: bool,
 }
 
 impl JobCompletion {
+    fn base(
+        status: JobStatus,
+        success: bool,
+        error: Option<String>,
+        stdout: StreamSummary,
+        stderr: StreamSummary,
+    ) -> Self {
+        Self {
+            status,
+            process_exit: SharedProcessExit::Unknown,
+            stop_record: None,
+            cancel_origin: None,
+            success,
+            error,
+            stdout,
+            stderr,
+            context: None,
+            internal_error: None,
+            observed_status: None,
+            output_complete: true,
+            spawn_failed: false,
+        }
+    }
+
+    /// Compatibility constructor for tests and legacy non-process callers that
+    /// only have an exit code. Real process execution uses completed_with_exit
+    /// so Unix signal identity is never collapsed into None.
+    #[cfg(test)]
     pub(crate) fn completed(
         exit_code: Option<i32>,
         success: bool,
         stdout: StreamSummary,
         stderr: StreamSummary,
     ) -> Self {
-        Self {
-            status: JobStatus::Completed,
-            exit_code,
-            success,
-            error: None,
-            stdout,
-            stderr,
-            context: None,
-            internal_error: None,
-            observed_status: None,
-            output_complete: true,
-            stop_proven: true,
-            spawn_failed: false,
-        }
+        let exit = match exit_code {
+            Some(code) => SharedProcessExit::Code(code),
+            None if success => SharedProcessExit::Code(0),
+            None => SharedProcessExit::Unknown,
+        };
+        Self::completed_with_exit(exit, success, stdout, stderr)
+    }
+
+    pub(crate) fn completed_with_exit(
+        process_exit: SharedProcessExit,
+        success: bool,
+        stdout: StreamSummary,
+        stderr: StreamSummary,
+    ) -> Self {
+        let mut completion = Self::base(JobStatus::Completed, success, None, stdout, stderr);
+        completion.process_exit = process_exit;
+        completion
     }
 
     pub(crate) fn timed_out(stdout: StreamSummary, stderr: StreamSummary) -> Self {
-        Self {
-            status: JobStatus::TimedOut,
-            exit_code: None,
-            success: false,
-            error: Some("shell job reached its requested timeout".to_owned()),
+        Self::base(
+            JobStatus::TimedOut,
+            false,
+            Some("shell job reached its requested timeout".to_owned()),
             stdout,
             stderr,
-            context: None,
-            internal_error: None,
-            observed_status: None,
-            output_complete: true,
-            stop_proven: true,
-            spawn_failed: false,
-        }
+        )
     }
 
     pub(crate) fn cancelled(stdout: StreamSummary, stderr: StreamSummary) -> Self {
-        Self {
-            status: JobStatus::Cancelled,
-            exit_code: None,
-            success: false,
-            error: Some("shell job was cancelled".to_owned()),
+        Self::base(
+            JobStatus::Cancelled,
+            false,
+            Some("shell job was cancelled".to_owned()),
             stdout,
             stderr,
-            context: None,
-            internal_error: None,
-            observed_status: None,
-            output_complete: true,
-            stop_proven: true,
-            spawn_failed: false,
-        }
+        )
     }
 
     pub(crate) fn failed(message: impl Into<String>) -> Self {
@@ -271,20 +293,13 @@ impl JobCompletion {
         stdout: StreamSummary,
         stderr: StreamSummary,
     ) -> Self {
-        Self {
-            status: JobStatus::Unknown,
-            exit_code: None,
-            success: false,
-            error: Some(bounded_job_error(message)),
+        Self::base(
+            JobStatus::Unknown,
+            false,
+            Some(bounded_job_error(message)),
             stdout,
             stderr,
-            context: None,
-            internal_error: None,
-            observed_status: None,
-            output_complete: true,
-            stop_proven: false,
-            spawn_failed: false,
-        }
+        )
     }
 
     pub(crate) fn failed_with_output(
@@ -292,20 +307,13 @@ impl JobCompletion {
         stdout: StreamSummary,
         stderr: StreamSummary,
     ) -> Self {
-        Self {
-            status: JobStatus::Failed,
-            exit_code: None,
-            success: false,
-            error: Some(bounded_job_error(message)),
+        Self::base(
+            JobStatus::Failed,
+            false,
+            Some(bounded_job_error(message)),
             stdout,
             stderr,
-            context: None,
-            internal_error: None,
-            observed_status: None,
-            output_complete: true,
-            stop_proven: true,
-            spawn_failed: false,
-        }
+        )
     }
 
     pub(crate) fn spawn_failed(message: impl Into<String>) -> Self {
@@ -320,20 +328,16 @@ impl JobCompletion {
         stderr: StreamSummary,
     ) -> Self {
         let message = bounded_job_error(message);
-        Self {
-            status: JobStatus::Failed,
-            exit_code: None,
-            success: false,
-            error: Some(message.clone()),
+        let mut completion = Self::base(
+            JobStatus::Failed,
+            false,
+            Some(message.clone()),
             stdout,
             stderr,
-            context: None,
-            internal_error: Some(message),
-            observed_status: None,
-            output_complete: false,
-            stop_proven: false,
-            spawn_failed: false,
-        }
+        );
+        completion.internal_error = Some(message);
+        completion.output_complete = false;
+        completion
     }
 
     pub(crate) fn with_context(mut self, context: JobResultContext) -> Self {
@@ -346,9 +350,45 @@ impl JobCompletion {
         self
     }
 
-    pub(crate) fn with_unproven_stop(mut self) -> Self {
-        self.stop_proven = false;
+    pub(crate) fn with_observed_status(mut self, status: JobStatus) -> Self {
+        self.observed_status = Some(status);
         self
+    }
+
+    pub(crate) fn with_process_facts(
+        mut self,
+        process_exit: SharedProcessExit,
+        stop_record: Option<SharedProcessStopRecord>,
+    ) -> Self {
+        self.process_exit = process_exit;
+        self.stop_record = stop_record;
+        self
+    }
+
+    pub(crate) fn with_cancel_origin(mut self, origin: CancelOrigin) -> Self {
+        self.cancel_origin = Some(origin);
+        self
+    }
+
+    pub(crate) const fn exit_code(&self) -> Option<i32> {
+        match self.process_exit {
+            SharedProcessExit::Code(code) => Some(code),
+            SharedProcessExit::Signal(_) | SharedProcessExit::Unknown => None,
+        }
+    }
+
+    pub(crate) const fn signal(&self) -> Option<i32> {
+        match self.process_exit {
+            SharedProcessExit::Signal(signal) => Some(signal),
+            SharedProcessExit::Code(_) | SharedProcessExit::Unknown => None,
+        }
+    }
+
+    pub(crate) const fn terminal_stop_reason(&self) -> Option<SharedProcessStopReason> {
+        match self.stop_record {
+            Some(record) => record.terminal_reason(),
+            None => None,
+        }
     }
 
     pub(crate) fn from_shared_graph(snapshot: &SharedSnapshot) -> Self {
@@ -396,20 +436,13 @@ impl JobCompletion {
                 },
             }
         };
-        Self {
+        Self::base(
             status,
-            exit_code: None,
             success,
             error,
-            stdout: StreamSummary::default(),
-            stderr: StreamSummary::default(),
-            context: None,
-            internal_error: None,
-            observed_status: None,
-            output_complete: true,
-            stop_proven: status != JobStatus::Unknown,
-            spawn_failed: false,
-        }
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
     }
 }
 
@@ -479,6 +512,60 @@ pub(crate) enum JobHandoff {
     NativeTask(Task),
 }
 
+/// Product-only cancellation provenance. AW owns the semantic process reason;
+/// dotlink keeps who asked so the same shared `Cancelled` fact can render
+/// `cancel` for the caller or `shutdown` for connector teardown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CancelOrigin {
+    Caller,
+    Connector,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JobCancel {
+    token: CancellationToken,
+    connector: Arc<AtomicBool>,
+}
+
+impl JobCancel {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            connector: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn origin(&self) -> CancelOrigin {
+        if self.connector.load(Ordering::Acquire) {
+            CancelOrigin::Connector
+        } else {
+            CancelOrigin::Caller
+        }
+    }
+
+    pub(crate) fn cancelled(&self) -> impl Future<Output = ()> + '_ {
+        self.token.cancelled()
+    }
+
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    pub(crate) fn cancel_as(&self, origin: CancelOrigin) {
+        self.connector
+            .store(origin == CancelOrigin::Connector, Ordering::Release);
+        self.token.cancel();
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancel_as(CancelOrigin::Caller);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 struct SharedJobLease {
     manager: Arc<SharedJobManager>,
     id: String,
@@ -524,7 +611,7 @@ struct JobEntry {
     timeout_secs: u64,
     result_limit: usize,
     phase: JobPhase,
-    cancel: CancellationToken,
+    cancel: JobCancel,
     runner: Option<JoinHandle<()>>,
     completion: Option<JobCompletion>,
     /// First successful materialization time of the immutable native MCP Task
@@ -1009,7 +1096,7 @@ impl Drop for JobManagerInner {
             state.closed = true;
             for entry in state.jobs.values_mut() {
                 entry.drain_writers.seal();
-                entry.cancel.cancel();
+                entry.cancel.cancel_as(CancelOrigin::Connector);
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
                 }
@@ -1065,7 +1152,7 @@ struct JobFinisher {
 #[derive(Clone, Debug)]
 pub(crate) struct JobHandle {
     pub(crate) id: String,
-    pub(crate) cancel: CancellationToken,
+    pub(crate) cancel: JobCancel,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
     stdout_file: Arc<File>,
@@ -2183,7 +2270,7 @@ impl JobManager {
         let files = PendingJobFiles::create(&self.inner.root, &id)?;
         let [stdout_path, stderr_path] = files.paths.clone();
         let [stdout_file, stderr_file] = files.handles();
-        let cancel = CancellationToken::new();
+        let cancel = JobCancel::new();
         let notify = Arc::new(Notify::new());
         let drain_writers = DrainWriters::new();
         let shared_transition_gate = Arc::new(Mutex::new(()));
@@ -2323,7 +2410,7 @@ impl JobManager {
         let files = PendingJobFiles::create(&self.inner.root, &id)?;
         let [stdout_path, stderr_path] = files.paths.clone();
         let [stdout_file, stderr_file] = files.handles();
-        let cancel = CancellationToken::new();
+        let cancel = JobCancel::new();
         let drain_writers = DrainWriters::new();
         let shared_transition_gate = Arc::new(Mutex::new(()));
         let legacy_spool = LegacySpoolAccount::new(&self.inner);
@@ -2618,7 +2705,7 @@ impl JobManager {
                 // register a new writer after shutdown has observed an idle count.
                 entry.drain_writers.seal();
                 drain_sets.push(entry.drain_writers.clone());
-                entry.cancel.cancel();
+                entry.cancel.cancel_as(CancelOrigin::Connector);
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
                     runners.push(handle);
@@ -3927,7 +4014,7 @@ impl JobManager {
             return RequestRetirement::Busy;
         }
         if !entry.status().terminal() {
-            entry.cancel.cancel();
+            entry.cancel.cancel_as(CancelOrigin::Connector);
             return RequestRetirement::Busy;
         }
 
@@ -4923,7 +5010,7 @@ impl JobManager {
 
     pub(crate) fn detailed_task(&self, id: &str) -> JobResult<DetailedTask> {
         sweep_expired(&self.inner);
-        let (task, status, internal_error, snapshot) = {
+        let (task, status, internal_error, completion, snapshot) = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             let entry = state
                 .available_mut(id)
@@ -4931,8 +5018,8 @@ impl JobManager {
                 .ok_or_else(|| JobError::Unknown(format!("unknown task {id}")))?;
             let task = task_from_entry(entry, self.retention());
             let status = entry.status();
-            let internal_error = entry
-                .completion
+            let completion = entry.completion.clone();
+            let internal_error = completion
                 .as_ref()
                 .and_then(|completion| completion.internal_error.clone());
             let snapshot = if matches!(
@@ -4957,27 +5044,30 @@ impl JobManager {
             } else {
                 None
             };
-            (task, status, internal_error, snapshot)
+            (task, status, internal_error, completion, snapshot)
         };
         let payload = match status {
             JobStatus::Working => TaskPayload::Working,
             JobStatus::Cancelled => TaskPayload::Cancelled,
-            JobStatus::Unknown => TaskPayload::Failed {
-                error: error_object(
-                    internal_error
-                        .as_deref()
-                        .or_else(|| {
-                            snapshot
-                                .as_ref()
-                                .and_then(|value| value.completion.error.as_deref())
-                        })
-                        .unwrap_or("shell effect state is unknown; inspect before retrying"),
-                ),
-            },
+            JobStatus::Unknown => {
+                let message = internal_error
+                    .as_deref()
+                    .or_else(|| completion.as_ref().and_then(|value| value.error.as_deref()))
+                    .unwrap_or("shell effect state is unknown; inspect before retrying");
+                TaskPayload::Failed {
+                    error: completion.as_ref().map_or_else(
+                        || error_object(message),
+                        |completion| failure_error_object(message, completion),
+                    ),
+                }
+            }
             JobStatus::Completed | JobStatus::TimedOut | JobStatus::Failed => {
                 if let Some(message) = internal_error {
                     TaskPayload::Failed {
-                        error: error_object(&message),
+                        error: completion.as_ref().map_or_else(
+                            || error_object(&message),
+                            |completion| failure_error_object(&message, completion),
+                        ),
                     }
                 } else {
                     let mut result = crate::blocking::run(|| {
@@ -5041,6 +5131,97 @@ fn tool_result_output(entry: &JobEntry) -> ToolResultOutput {
     }
 }
 
+pub(crate) fn product_stopped_by(completion: &JobCompletion) -> Option<&'static str> {
+    let reason = completion.stop_record?.terminal_reason()?;
+    Some(match reason {
+        SharedProcessStopReason::Timeout => "timeout",
+        SharedProcessStopReason::RuntimeError => "failed",
+        SharedProcessStopReason::Cancelled => {
+            match completion.cancel_origin.unwrap_or(CancelOrigin::Caller) {
+                CancelOrigin::Caller => "cancel",
+                CancelOrigin::Connector => "shutdown",
+            }
+        }
+    })
+}
+
+pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
+    let signal = completion.signal()?;
+    completion
+        .stop_record
+        .is_none_or(|record| record.reason.is_none())
+        .then_some(signal)
+}
+
+pub(crate) fn signal_label(signal: i32) -> String {
+    match aw_platform::signal_name(signal) {
+        Some(name) => format!("{name} (signal {signal})"),
+        None => format!("signal {signal}"),
+    }
+}
+
+pub(crate) fn signal_token(signal: i32) -> String {
+    aw_platform::signal_name(signal)
+        .map(str::to_owned)
+        .unwrap_or_else(|| signal.to_string())
+}
+
+fn external_stop_note(completion: &JobCompletion) -> Option<String> {
+    let signal = external_signal(completion)?;
+    Some(format!(
+        "terminated by {} from outside dotlink; check what signalled it before retrying",
+        signal_label(signal)
+    ))
+}
+
+fn with_termination(
+    mut payload: serde_json::Value,
+    completion: &JobCompletion,
+) -> serde_json::Value {
+    if let Some(signal) = completion.signal() {
+        payload["signal"] = serde_json::Value::from(signal);
+    }
+    if let Some(stopped_by) = product_stopped_by(completion) {
+        payload["stopped_by"] = serde_json::Value::from(stopped_by);
+    }
+    payload
+}
+
+pub(crate) fn process_lifecycle_message(id: &str, completion: &JobCompletion) -> Option<String> {
+    if let Some(record) = completion.stop_record
+        && let Some(reason) = record.reason
+    {
+        let reason = match reason {
+            SharedProcessStopReason::Timeout => "timeout",
+            SharedProcessStopReason::RuntimeError => "failed",
+            SharedProcessStopReason::Cancelled => {
+                match completion.cancel_origin.unwrap_or(CancelOrigin::Caller) {
+                    CancelOrigin::Caller => "cancel",
+                    CancelOrigin::Connector => "shutdown",
+                }
+            }
+        };
+        let outcome = match record.evidence {
+            aw_tools::execution_stop::StopEvidence::Stopped => "delivered",
+            aw_tools::execution_stop::StopEvidence::NoTarget => "gone",
+            aw_tools::execution_stop::StopEvidence::Unknown => "failed",
+        };
+        return Some(format!("stop id={id} reason={reason} outcome={outcome}"));
+    }
+    external_signal(completion)
+        .map(|signal| format!("exit id={id} signal={} from=outside", signal_token(signal)))
+}
+
+pub(crate) fn log_process_lifecycle(
+    log: &crate::logging::LogConfig,
+    id: &str,
+    completion: &JobCompletion,
+) {
+    if let Some(message) = process_lifecycle_message(id, completion) {
+        log.lifecycle("job", message);
+    }
+}
+
 fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
@@ -5088,14 +5269,36 @@ fn read_shared_prefix(
     Ok(bytes)
 }
 
+fn internal_failure_payload(completion: &JobCompletion) -> String {
+    let observed = completion.observed_status.unwrap_or(completion.status);
+    let mut payload = serde_json::json!({
+        "exit_code": completion.exit_code(),
+        "success": false,
+        "timed_out": observed == JobStatus::TimedOut,
+        "streams_omitted": true,
+        "error": completion.internal_error.as_deref().or(completion.error.as_deref()),
+    });
+    if let Some(context) = completion.context.as_ref() {
+        payload["dir"] = serde_json::Value::from(context.dir.as_str());
+        payload["sandboxed"] = serde_json::Value::from(context.sandboxed);
+        payload["network"] = serde_json::Value::from(context.network);
+    }
+    if let Some(note) = external_stop_note(completion) {
+        payload["next"] = serde_json::Value::from(note);
+    }
+    with_termination(payload, completion).to_string()
+}
+
+fn internal_failure_result(completion: &JobCompletion) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(internal_failure_payload(
+        completion,
+    ))])
+}
+
 fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let completion = &snapshot.completion;
-    if completion.status != JobStatus::Unknown
-        && let Some(message) = completion.internal_error.as_deref()
-    {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(
-            message.to_owned(),
-        )]));
+    if completion.internal_error.is_some() {
+        return Ok(internal_failure_result(completion));
     }
     let stdout_limit = usize::try_from(completion.stdout.stored_bytes)
         .unwrap_or(usize::MAX)
@@ -5145,15 +5348,18 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
                     .unwrap_or_else(|| "shell command failed before execution".to_owned()),
             )]));
         }
-        let text = serde_json::json!({
-            "exit_code": completion.exit_code,
-            "success": completion.success,
-            "timed_out": false,
-            "stdout": String::from_utf8_lossy(&stdout),
-            "stderr": String::from_utf8_lossy(&stderr),
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-        })
+        let text = with_termination(
+            serde_json::json!({
+                "exit_code": completion.exit_code(),
+                "success": completion.success,
+                "timed_out": false,
+                "stdout": String::from_utf8_lossy(&stdout),
+                "stderr": String::from_utf8_lossy(&stderr),
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            }),
+            completion,
+        )
         .to_string();
         return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
     };
@@ -5172,7 +5378,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let mut payload = serde_json::json!({
         "status": completion.status.as_str(),
         "observed_status": completion.observed_status.map(JobStatus::as_str),
-        "exit_code": completion.exit_code,
+        "exit_code": completion.exit_code(),
         "success": completion.success,
         "timed_out": observed == JobStatus::TimedOut,
         "dir": context.dir,
@@ -5187,7 +5393,10 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     if completion.status == JobStatus::Unknown {
         payload["job_id"] = serde_json::Value::String(snapshot.id.clone());
     }
-    let text = payload.to_string();
+    if let Some(note) = external_stop_note(completion) {
+        payload["next"] = serde_json::Value::from(note);
+    }
+    let text = with_termination(payload, completion).to_string();
     Ok(if completion.status == JobStatus::Completed {
         CallToolResult::success(vec![ContentBlock::text(text)])
     } else {
@@ -5205,6 +5414,37 @@ fn error_object(message: &str) -> JsonObject {
         .as_object()
         .expect("MCP error is an object")
         .clone()
+}
+
+fn failure_error_object(message: &str, completion: &JobCompletion) -> JsonObject {
+    let mut error = error_object(message);
+    let terminal = SharedTaskTerminalDetail::from(shared_process_terminal(completion));
+    let mut data = serde_json::Map::new();
+    data.insert("streams_omitted".to_owned(), serde_json::Value::from(true));
+    match terminal.exit {
+        SharedProcessExit::Code(code) => {
+            data.insert("exit_code".to_owned(), serde_json::Value::from(code));
+        }
+        SharedProcessExit::Signal(signal) => {
+            data.insert("signal".to_owned(), serde_json::Value::from(signal));
+            data.insert(
+                "signal_name".to_owned(),
+                serde_json::Value::from(signal_label(signal)),
+            );
+        }
+        SharedProcessExit::Unknown => {}
+    }
+    if let Some(stop) = terminal.stop {
+        data.insert("stop".to_owned(), serde_json::Value::from(stop.as_str()));
+    }
+    if completion.observed_status.unwrap_or(completion.status) == JobStatus::TimedOut {
+        data.insert("timed_out".to_owned(), serde_json::Value::from(true));
+    }
+    if let Some(stopped_by) = product_stopped_by(completion) {
+        data.insert("stopped_by".to_owned(), serde_json::Value::from(stopped_by));
+    }
+    error.insert("data".to_owned(), serde_json::Value::Object(data));
+    error
 }
 
 fn result_object(result: CallToolResult) -> JsonObject {
@@ -5661,7 +5901,8 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
         });
     let stdout_stored = stdout_owner.retained;
     let stderr_stored = stderr_owner.retained;
-    serde_json::json!({
+    let external_note = completion.and_then(external_stop_note);
+    let mut payload = serde_json::json!({
         "job_id": entry.id,
         "task_id": entry.id,
         "status": status,
@@ -5673,9 +5914,11 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
         "spool_used_bytes": spool_used_bytes,
         "spool_session_limit_bytes": spool_session_limit_bytes,
         "cancel_requested": entry.cancel.is_cancelled(),
-        "exit_code": completion.and_then(|value| value.exit_code),
+        "exit_code": completion.and_then(JobCompletion::exit_code),
         "success": completion.map(|value| value.success),
-        "error": completion.and_then(|value| value.error.as_deref()),
+        "error": completion
+            .and_then(|value| value.error.as_deref())
+            .or(external_note.as_deref()),
         "observed_status": completion.and_then(|value| value.observed_status.map(JobStatus::as_str)),
         "stdout": {
             "stored_bytes": stdout_stored,
@@ -5693,8 +5936,11 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
         },
         "output": "use jobs_read to read; jobs_ack explicitly advances cleanup watermarks",
         "cancel": "use jobs_cancel while status=working",
-    })
-    .to_string()
+    });
+    if let Some(completion) = completion {
+        payload = with_termination(payload, completion);
+    }
+    payload.to_string()
 }
 
 fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
@@ -5855,19 +6101,11 @@ pub(crate) fn shared_process_terminal(completion: &JobCompletion) -> SharedProce
         stderr_truncated: completion.stderr.truncated,
         complete: completion.output_complete,
     };
-    let exit = match completion.status {
-        JobStatus::Completed => match completion.exit_code {
-            Some(code) => SharedProcessExit::Code(code),
-            None if completion.success => SharedProcessExit::Code(0),
-            None => SharedProcessExit::Signal,
-        },
-        JobStatus::TimedOut if completion.stop_proven => SharedProcessExit::DeadlineExceeded,
-        JobStatus::Cancelled if completion.stop_proven => SharedProcessExit::Cancelled,
-        JobStatus::TimedOut | JobStatus::Cancelled => SharedProcessExit::Unknown,
-        JobStatus::Failed | JobStatus::Unknown => SharedProcessExit::Unknown,
-        JobStatus::Working => SharedProcessExit::Unknown,
-    };
-    SharedProcessTerminal { exit, output }
+    SharedProcessTerminal {
+        exit: completion.process_exit,
+        stop: completion.terminal_stop_reason(),
+        output,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6033,7 +6271,8 @@ fn fail_closed_shared_completion(mut completion: JobCompletion) -> JobCompletion
     }
     completion.status = JobStatus::Unknown;
     completion.success = false;
-    completion.stop_proven = false;
+    // Fail-closed product status must not erase already observed physical exit
+    // or final stop evidence.
     completion.error = Some(bounded_job_error(format!(
         "shared shell lifecycle outcome is uncertain after observed {}: {}; inspect the Job/effects before retrying",
         observed.as_str(),
@@ -6955,6 +7194,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_projection_keeps_physical_exit_stop_evidence_and_product_context_orthogonal() {
+        let stream = StreamSummary::default();
+        let external =
+            JobCompletion::completed_with_exit(SharedProcessExit::Signal(9), false, stream, stream);
+        assert_eq!(external_signal(&external), Some(9));
+        assert_eq!(product_stopped_by(&external), None);
+        assert_eq!(
+            process_lifecycle_message("j:1", &external).as_deref(),
+            Some("exit id=j:1 signal=SIGKILL from=outside")
+        );
+
+        let timeout = JobCompletion::timed_out(stream, stream).with_process_facts(
+            SharedProcessExit::Signal(9),
+            Some(SharedProcessStopRecord::stopped(
+                SharedProcessStopReason::Timeout,
+            )),
+        );
+        assert_eq!(external_signal(&timeout), None);
+        assert_eq!(product_stopped_by(&timeout), Some("timeout"));
+        assert_eq!(
+            process_lifecycle_message("j:2", &timeout).as_deref(),
+            Some("stop id=j:2 reason=timeout outcome=delivered")
+        );
+
+        let unresolved = JobCompletion::timed_out(stream, stream).with_process_facts(
+            SharedProcessExit::Signal(9),
+            Some(SharedProcessStopRecord::unknown(
+                SharedProcessStopReason::Timeout,
+            )),
+        );
+        assert_eq!(external_signal(&unresolved), None);
+        assert_eq!(product_stopped_by(&unresolved), None);
+        assert_eq!(
+            process_lifecycle_message("j:3", &unresolved).as_deref(),
+            Some("stop id=j:3 reason=timeout outcome=failed")
+        );
+
+        let gone = JobCompletion::failed("cleanup").with_process_facts(
+            SharedProcessExit::Unknown,
+            Some(SharedProcessStopRecord::no_target(
+                SharedProcessStopReason::RuntimeError,
+            )),
+        );
+        assert_eq!(product_stopped_by(&gone), None);
+        assert_eq!(
+            process_lifecycle_message("j:4", &gone).as_deref(),
+            Some("stop id=j:4 reason=failed outcome=gone")
+        );
+
+        let failed = JobCompletion::failed("runtime failure").with_process_facts(
+            SharedProcessExit::Signal(9),
+            Some(SharedProcessStopRecord::stopped(
+                SharedProcessStopReason::RuntimeError,
+            )),
+        );
+        assert_eq!(product_stopped_by(&failed), Some("failed"));
+        assert_eq!(
+            process_lifecycle_message("j:failed", &failed).as_deref(),
+            Some("stop id=j:failed reason=failed outcome=delivered")
+        );
+
+        let housekeeping = JobCompletion::failed("cleanup").with_process_facts(
+            SharedProcessExit::Unknown,
+            Some(SharedProcessStopRecord::housekeeping(
+                aw_tools::execution_stop::StopEvidence::NoTarget,
+            )),
+        );
+        assert_eq!(product_stopped_by(&housekeeping), None);
+        assert_eq!(process_lifecycle_message("j:cleanup", &housekeeping), None);
+
+        for (origin, stopped_by, line_reason) in [
+            (CancelOrigin::Caller, "cancel", "cancel"),
+            (CancelOrigin::Connector, "shutdown", "shutdown"),
+        ] {
+            let cancelled = JobCompletion::cancelled(stream, stream)
+                .with_process_facts(
+                    SharedProcessExit::Signal(9),
+                    Some(SharedProcessStopRecord::stopped(
+                        SharedProcessStopReason::Cancelled,
+                    )),
+                )
+                .with_cancel_origin(origin);
+            assert_eq!(product_stopped_by(&cancelled), Some(stopped_by));
+            assert_eq!(external_signal(&cancelled), None);
+            let expected = format!("stop id=j:5 reason={line_reason} outcome=delivered");
+            assert_eq!(
+                process_lifecycle_message("j:5", &cancelled).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn task_failure_data_preserves_prior_timeout_and_signal() {
+        let completion = JobCompletion::internal_failed(
+            "spool failed",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_observed_status(JobStatus::TimedOut)
+        .with_process_facts(
+            SharedProcessExit::Signal(9),
+            Some(SharedProcessStopRecord::stopped(
+                SharedProcessStopReason::Timeout,
+            )),
+        );
+        let error = failure_error_object("spool failed", &completion);
+        let data = error
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .expect("Task failure data");
+        assert_eq!(data.get("signal"), Some(&serde_json::Value::from(9)));
+        assert_eq!(data.get("stop"), Some(&serde_json::Value::from("timeout")));
+        assert_eq!(
+            data.get("stopped_by"),
+            Some(&serde_json::Value::from("timeout"))
+        );
+        assert_eq!(data.get("timed_out"), Some(&serde_json::Value::from(true)));
+    }
+
+    #[test]
+    fn cancellation_origin_is_recorded_before_token_delivery() {
+        let caller = JobCancel::new();
+        caller.cancel();
+        assert_eq!(caller.origin(), CancelOrigin::Caller);
+        assert!(caller.is_cancelled());
+
+        let connector = JobCancel::new();
+        connector.cancel_as(CancelOrigin::Connector);
+        assert_eq!(connector.origin(), CancelOrigin::Connector);
+        assert!(connector.is_cancelled());
+    }
+
+    #[test]
     fn explicit_unknown_completion_preserves_fail_closed_process_evidence() {
         let stdout = StreamSummary {
             total_bytes: 7,
@@ -6968,7 +7341,8 @@ mod tests {
         );
         assert_eq!(completion.status, JobStatus::Unknown);
         assert!(!completion.success);
-        assert!(!completion.stop_proven);
+        assert_eq!(completion.process_exit, SharedProcessExit::Unknown);
+        assert_eq!(completion.stop_record, None);
         assert!(completion.internal_error.is_none());
         assert_eq!(completion.stdout.stored_bytes, 7);
         assert_eq!(
@@ -6994,7 +7368,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&skipped);
         assert_eq!(completion.status, JobStatus::Failed);
         assert!(!completion.success);
-        assert!(completion.stop_proven);
+        assert_eq!(completion.stop_record, None);
 
         let cancelled = SharedSnapshot {
             id: "cancelled".into(),
@@ -7004,7 +7378,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&cancelled);
         assert_eq!(completion.status, JobStatus::Cancelled);
         assert!(!completion.success);
-        assert!(completion.stop_proven);
+        assert_eq!(completion.stop_record, None);
 
         let cancelled_unknown = SharedSnapshot {
             id: "cancelled-unknown".into(),
@@ -7014,7 +7388,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&cancelled_unknown);
         assert_eq!(completion.status, JobStatus::Unknown);
         assert!(!completion.success);
-        assert!(!completion.stop_proven);
+        assert_eq!(completion.stop_record, None);
 
         let journal_unknown = SharedSnapshot {
             id: "journal-unknown".into(),
@@ -7025,7 +7399,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&journal_unknown);
         assert_eq!(completion.status, JobStatus::Unknown);
         assert!(!completion.success);
-        assert!(!completion.stop_proven);
+        assert_eq!(completion.stop_record, None);
     }
 
     #[test]
@@ -7112,19 +7486,24 @@ mod tests {
 
     #[test]
     fn unproven_cancel_or_timeout_maps_to_shared_unknown() {
-        for mut completion in [
-            JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default()),
-            JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default()),
+        for (completion, reason) in [
+            (
+                JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default()),
+                SharedProcessStopReason::Cancelled,
+            ),
+            (
+                JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default()),
+                SharedProcessStopReason::Timeout,
+            ),
         ] {
-            completion.stop_proven = false;
-            assert_eq!(
-                shared_process_terminal(&completion).exit,
-                SharedProcessExit::Unknown
+            let completion = completion.with_process_facts(
+                SharedProcessExit::Unknown,
+                Some(SharedProcessStopRecord::unknown(reason)),
             );
-            assert_eq!(
-                shared_process_terminal(&completion).status().primary,
-                SharedPrimary::Unknown
-            );
+            let terminal = shared_process_terminal(&completion);
+            assert_eq!(terminal.exit, SharedProcessExit::Unknown);
+            assert_eq!(terminal.stop, None);
+            assert_eq!(terminal.status().primary, SharedPrimary::Unknown);
         }
     }
 

@@ -10,6 +10,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use aw_tools::{
+    execution_stop::{
+        StopEvidence as SharedStopEvidence, StopReason as SharedProcessStopReason,
+        StopRecord as SharedProcessStopRecord, StopTracker as SharedStopTracker,
+    },
+    filesystem::runner::ProcessExit as SharedProcessExit,
+};
 use rmcp::{
     ErrorData as McpError,
     handler::server::wrapper::Parameters,
@@ -114,10 +121,14 @@ pub(crate) struct ShellCallArgs {
 
 pub(crate) struct ShellJobRun {
     pub(crate) command: Command,
+    pub(crate) log: crate::logging::LogConfig,
     pub(crate) stdin_text: Option<String>,
     pub(crate) interactive: bool,
     pub(crate) deadline: Instant,
     pub(crate) job: JobHandle,
+    /// Product lifecycle label for this concrete process. Standalone shell uses
+    /// the root Job id; Graph shell nodes append their canonical node coordinate.
+    pub(crate) lifecycle_id: String,
     pub(crate) coordinate: usize,
     pub(crate) shared_writers: SharedShellWriters,
     pub(crate) result_context: JobResultContext,
@@ -1605,6 +1616,10 @@ pub(crate) struct ShellRuntime {
 }
 
 impl ShellRuntime {
+    pub(crate) fn log_config(&self) -> crate::logging::LogConfig {
+        self.config.log.clone()
+    }
+
     pub(crate) async fn prepare_shell_command(
         &self,
         args: &ShellArgs,
@@ -2551,9 +2566,11 @@ impl LocalMachine {
                     };
                     let completion = LocalMachine::run_shell_job(ShellJobRun {
                         command,
+                        log: runtime.config.log.clone(),
                         stdin_text: args.stdin,
                         interactive,
                         deadline,
+                        lifecycle_id: job.id.clone(),
                         job,
                         coordinate: 1,
                         shared_writers,
@@ -2567,38 +2584,73 @@ impl LocalMachine {
         })
     }
 
-    fn tree_stop_proven(
-        sandboxed: bool,
-        containment_terminated: bool,
-        direct_child_stopped: bool,
-    ) -> bool {
-        if !direct_child_stopped || !containment_terminated {
-            return false;
-        }
-        #[cfg(windows)]
-        {
-            true
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Bubblewrap uses --unshare-pid, so once the containing launcher is
-            // stopped the PID namespace cannot retain escaped descendants.
-            sandboxed
-        }
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            let _ = sandboxed;
-            false
+    fn process_exit(status: std::process::ExitStatus) -> SharedProcessExit {
+        if let Some(code) = status.code() {
+            SharedProcessExit::Code(code)
+        } else if let Some(signal) = aw_platform::exit_signal(&status) {
+            SharedProcessExit::Signal(signal)
+        } else {
+            SharedProcessExit::Unknown
         }
     }
 
+    fn stop_evidence(result: std::io::Result<bool>) -> SharedStopEvidence {
+        match result {
+            Ok(true) => SharedStopEvidence::Stopped,
+            Ok(false) => SharedStopEvidence::NoTarget,
+            Err(_) => SharedStopEvidence::Unknown,
+        }
+    }
+
+    fn stop_tree(
+        tree: &mut aw_platform::ManagedProcessGuard,
+        tracker: &mut SharedStopTracker,
+        reason: Option<SharedProcessStopReason>,
+    ) -> SharedProcessStopRecord {
+        tracker.record(reason, Self::stop_evidence(tree.terminate()))
+    }
+
+    fn merge_stop_record(
+        current: &mut Option<SharedProcessStopRecord>,
+        record: SharedProcessStopRecord,
+    ) {
+        if current.is_none() || record.reason.is_some() {
+            *current = Some(record);
+        }
+    }
+
+    fn cleanup_tree(
+        tree: &mut aw_platform::ManagedProcessGuard,
+        tracker: &mut SharedStopTracker,
+        current: &mut Option<SharedProcessStopRecord>,
+        reason_if_live: SharedProcessStopReason,
+        command_exited: bool,
+    ) {
+        // Once the waited command has exited, descendant/output cleanup is
+        // housekeeping only. If a prior stop attempt was Unknown, StopTracker
+        // still carries its original semantic reason into this retry.
+        let reason = (current.is_none() && !command_exited).then_some(reason_if_live);
+        let record = Self::stop_tree(tree, tracker, reason);
+        Self::merge_stop_record(current, record);
+    }
+
     pub(crate) async fn run_shell_job(run: ShellJobRun) -> JobCompletion {
+        let id = run.lifecycle_id.clone();
+        let log = run.log.clone();
+        let completion = Self::run_shell_job_inner(run).await;
+        crate::jobs::log_process_lifecycle(&log, &id, &completion);
+        completion
+    }
+
+    async fn run_shell_job_inner(run: ShellJobRun) -> JobCompletion {
         let ShellJobRun {
             mut command,
+            log: _,
             stdin_text,
             interactive,
             deadline,
             job,
+            lifecycle_id: _,
             coordinate,
             shared_writers,
             result_context,
@@ -2641,36 +2693,61 @@ impl LocalMachine {
                 return JobCompletion::spawn_failed(error.to_string()).with_context(result_context);
             }
         };
-        let mut process_tree = match crate::shell_process::Guard::attach(&child) {
+        let mut process_tree = match crate::shell_process::attach(&child) {
             Ok(group) => group,
             Err(error) => {
-                Self::terminate_child(&mut child).await;
+                let process_exit = Self::terminate_child(&mut child).await;
                 return JobCompletion::failed(format!("could not contain command tree: {error}"))
+                    .with_process_facts(
+                        process_exit,
+                        Some(SharedProcessStopRecord::unknown(
+                            SharedProcessStopReason::RuntimeError,
+                        )),
+                    )
                     .with_context(result_context);
             }
         };
+        let mut stop_tracker = SharedStopTracker::default();
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                let _ = process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let stop = Self::stop_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    Some(SharedProcessStopReason::RuntimeError),
+                );
+                let process_exit = Self::terminate_child(&mut child).await;
                 return JobCompletion::failed("failed to capture child stdout")
+                    .with_process_facts(process_exit, Some(stop))
                     .with_context(result_context);
             }
         };
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                let _ = process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let stop = Self::stop_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    Some(SharedProcessStopReason::RuntimeError),
+                );
+                let process_exit = Self::terminate_child(&mut child).await;
                 return JobCompletion::failed("failed to capture child stderr")
+                    .with_process_facts(process_exit, Some(stop))
                     .with_context(result_context);
             }
         };
         let Some([stdout_writer, stderr_writer]) = job.begin_spool_writers() else {
-            let _ = process_tree.terminate();
-            Self::terminate_child(&mut child).await;
+            // Only connector teardown seals writer registration. A caller cancel
+            // sets the token but leaves the drain account open.
+            let stop = Self::stop_tree(
+                &mut process_tree,
+                &mut stop_tracker,
+                Some(SharedProcessStopReason::Cancelled),
+            );
+            let process_exit = Self::terminate_child(&mut child).await;
             return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_process_facts(process_exit, Some(stop))
+                .with_cancel_origin(crate::jobs::CancelOrigin::Connector)
                 .with_incomplete_output()
                 .with_context(result_context);
         };
@@ -2692,21 +2769,31 @@ impl LocalMachine {
 
         let mut stdin_task = if stdin_text.is_some() || interactive {
             let Some(stdin) = child.stdin.take() else {
-                let _ = process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let stop = Self::stop_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    Some(SharedProcessStopReason::RuntimeError),
+                );
+                let process_exit = Self::terminate_child(&mut child).await;
                 stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
                 return JobCompletion::failed("failed to capture child stdin")
+                    .with_process_facts(process_exit, Some(stop))
                     .with_context(result_context);
             };
             if interactive {
                 let (sender, mut receiver) = tokio::sync::mpsc::channel::<ProcessInputRequest>(16);
                 if let Err(error) = job.install_process_input(coordinate, sender) {
-                    let _ = process_tree.terminate();
-                    Self::terminate_child(&mut child).await;
+                    let stop = Self::stop_tree(
+                        &mut process_tree,
+                        &mut stop_tracker,
+                        Some(SharedProcessStopReason::RuntimeError),
+                    );
+                    let process_exit = Self::terminate_child(&mut child).await;
                     stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
                     return JobCompletion::failed(format!(
                         "failed to retain interactive stdin custody: {error}"
                     ))
+                    .with_process_facts(process_exit, Some(stop))
                     .with_context(result_context);
                 }
                 Some(AbortOnDropHandle::new(tokio::spawn(async move {
@@ -2767,7 +2854,7 @@ impl LocalMachine {
         enum WaitOutcome {
             Child(std::result::Result<std::process::ExitStatus, std::io::Error>),
             Timeout,
-            Cancelled,
+            Cancelled(crate::jobs::CancelOrigin),
             StdinFailure(String),
         }
         let outcome = {
@@ -2776,7 +2863,9 @@ impl LocalMachine {
             loop {
                 tokio::select! {
                     biased;
-                    _ = job.cancel.cancelled() => break WaitOutcome::Cancelled,
+                    _ = job.cancel.cancelled() => {
+                        break WaitOutcome::Cancelled(job.cancel.origin());
+                    },
                     _ = sleep_until(deadline) => break WaitOutcome::Timeout,
                     result = &mut wait => break WaitOutcome::Child(result),
                     result = async {
@@ -2804,45 +2893,72 @@ impl LocalMachine {
             }
         };
 
-        let mut exit_status = None;
-        let mut terminal = JobStatus::Completed;
-        let mut terminal_error = None;
-        let mut stop_proven = true;
-        match outcome {
-            WaitOutcome::Child(Ok(status)) => exit_status = Some(status),
+        let (process_exit, mut stop_record, cancel_origin, terminal, terminal_error) = match outcome
+        {
+            WaitOutcome::Child(Ok(status)) => (
+                Self::process_exit(status),
+                None,
+                None,
+                JobStatus::Completed,
+                None,
+            ),
             WaitOutcome::Child(Err(error)) => {
-                terminal = JobStatus::Failed;
-                terminal_error = Some(error.to_string());
-                let _ = process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let stop = Self::stop_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    Some(SharedProcessStopReason::RuntimeError),
+                );
+                (
+                    Self::terminate_child(&mut child).await,
+                    Some(stop),
+                    None,
+                    JobStatus::Failed,
+                    Some(error.to_string()),
+                )
             }
             WaitOutcome::Timeout => {
-                terminal = JobStatus::TimedOut;
-                let containment_terminated = process_tree.terminate().is_ok();
-                let direct_child_stopped = Self::terminate_child(&mut child).await;
-                stop_proven = Self::tree_stop_proven(
-                    result_context.sandboxed,
-                    containment_terminated,
-                    direct_child_stopped,
+                let stop = Self::stop_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    Some(SharedProcessStopReason::Timeout),
                 );
+                (
+                    Self::terminate_child(&mut child).await,
+                    Some(stop),
+                    None,
+                    JobStatus::TimedOut,
+                    None,
+                )
             }
-            WaitOutcome::Cancelled => {
-                terminal = JobStatus::Cancelled;
-                let containment_terminated = process_tree.terminate().is_ok();
-                let direct_child_stopped = Self::terminate_child(&mut child).await;
-                stop_proven = Self::tree_stop_proven(
-                    result_context.sandboxed,
-                    containment_terminated,
-                    direct_child_stopped,
+            WaitOutcome::Cancelled(cancel_origin) => {
+                let stop = Self::stop_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    Some(SharedProcessStopReason::Cancelled),
                 );
+                (
+                    Self::terminate_child(&mut child).await,
+                    Some(stop),
+                    Some(cancel_origin),
+                    JobStatus::Cancelled,
+                    None,
+                )
             }
             WaitOutcome::StdinFailure(message) => {
-                terminal = JobStatus::Failed;
-                terminal_error = Some(message);
-                let _ = process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let stop = Self::stop_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    Some(SharedProcessStopReason::RuntimeError),
+                );
+                (
+                    Self::terminate_child(&mut child).await,
+                    Some(stop),
+                    None,
+                    JobStatus::Failed,
+                    Some(message),
+                )
             }
-        }
+        };
         job.retire_process_input(coordinate);
         if let Some(task) = stdin_task.take() {
             task.abort();
@@ -2864,7 +2980,13 @@ impl LocalMachine {
                 match stdout_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        let _ = process_tree.terminate();
+                        Self::cleanup_tree(
+                            &mut process_tree,
+                            &mut stop_tracker,
+                            &mut stop_record,
+                            SharedProcessStopReason::RuntimeError,
+                            terminal == JobStatus::Completed,
+                        );
                         return JobCompletion::internal_failed(
                             format!("failed spooling stdout: {error}"),
                             job.shared_node_stream_summary(
@@ -2878,10 +3000,18 @@ impl LocalMachine {
                                 true,
                             ),
                         )
+                        .with_process_facts(process_exit, stop_record)
+                        .with_observed_status(terminal)
                         .with_context(result_context);
                     }
                     Err(error) => {
-                        let _ = process_tree.terminate();
+                        Self::cleanup_tree(
+                            &mut process_tree,
+                            &mut stop_tracker,
+                            &mut stop_record,
+                            SharedProcessStopReason::RuntimeError,
+                            terminal == JobStatus::Completed,
+                        );
                         return JobCompletion::internal_failed(
                             format!("stdout spool task failed: {error}"),
                             job.shared_node_stream_summary(
@@ -2895,13 +3025,21 @@ impl LocalMachine {
                                 true,
                             ),
                         )
+                        .with_process_facts(process_exit, stop_record)
+                        .with_observed_status(terminal)
                         .with_context(result_context);
                     }
                 }
                 match stderr_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        let _ = process_tree.terminate();
+                        Self::cleanup_tree(
+                            &mut process_tree,
+                            &mut stop_tracker,
+                            &mut stop_record,
+                            SharedProcessStopReason::RuntimeError,
+                            terminal == JobStatus::Completed,
+                        );
                         return JobCompletion::internal_failed(
                             format!("failed spooling stderr: {error}"),
                             job.shared_node_stream_summary(
@@ -2915,10 +3053,18 @@ impl LocalMachine {
                                 true,
                             ),
                         )
+                        .with_process_facts(process_exit, stop_record)
+                        .with_observed_status(terminal)
                         .with_context(result_context);
                     }
                     Err(error) => {
-                        let _ = process_tree.terminate();
+                        Self::cleanup_tree(
+                            &mut process_tree,
+                            &mut stop_tracker,
+                            &mut stop_record,
+                            SharedProcessStopReason::RuntimeError,
+                            terminal == JobStatus::Completed,
+                        );
                         return JobCompletion::internal_failed(
                             format!("stderr spool task failed: {error}"),
                             job.shared_node_stream_summary(
@@ -2932,6 +3078,8 @@ impl LocalMachine {
                                 true,
                             ),
                         )
+                        .with_process_facts(process_exit, stop_record)
+                        .with_observed_status(terminal)
                         .with_context(result_context);
                     }
                 }
@@ -2951,7 +3099,13 @@ impl LocalMachine {
             }
             Err(_) if terminal == JobStatus::Completed => {
                 stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
-                let _ = process_tree.terminate();
+                Self::cleanup_tree(
+                    &mut process_tree,
+                    &mut stop_tracker,
+                    &mut stop_record,
+                    SharedProcessStopReason::RuntimeError,
+                    true,
+                );
                 return JobCompletion::internal_failed(
                     format!(
                         "collecting command output timed out after {} seconds",
@@ -2968,6 +3122,7 @@ impl LocalMachine {
                         true,
                     ),
                 )
+                .with_process_facts(process_exit, stop_record)
                 .with_context(result_context);
             }
             Err(_) => {
@@ -2990,30 +3145,28 @@ impl LocalMachine {
 
         let completion = match terminal {
             JobStatus::Completed => {
-                let status = exit_status.expect("completed job has an exit status");
                 // A normal exit may intentionally launch independent background
                 // work. Keep containment armed until all inherited output has
                 // been collected successfully, matching synchronous shell.
                 process_tree.disarm();
-                JobCompletion::completed(status.code(), status.success(), stdout, stderr)
-                    .with_context(result_context)
+                JobCompletion::completed_with_exit(
+                    process_exit,
+                    process_exit == SharedProcessExit::Code(0),
+                    stdout,
+                    stderr,
+                )
+                .with_context(result_context)
             }
-            JobStatus::TimedOut => {
-                let completion =
-                    JobCompletion::timed_out(stdout, stderr).with_context(result_context);
-                if stop_proven {
-                    completion
-                } else {
-                    completion.with_unproven_stop()
-                }
-            }
+            JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)
+                .with_process_facts(process_exit, stop_record)
+                .with_context(result_context),
             JobStatus::Cancelled => {
-                let completion =
-                    JobCompletion::cancelled(stdout, stderr).with_context(result_context);
-                if stop_proven {
-                    completion
-                } else {
-                    completion.with_unproven_stop()
+                let completion = JobCompletion::cancelled(stdout, stderr)
+                    .with_process_facts(process_exit, stop_record)
+                    .with_context(result_context);
+                match cancel_origin {
+                    Some(origin) => completion.with_cancel_origin(origin),
+                    None => completion,
                 }
             }
             JobStatus::Failed => JobCompletion::failed_with_output(
@@ -3021,6 +3174,7 @@ impl LocalMachine {
                 stdout,
                 stderr,
             )
+            .with_process_facts(process_exit, stop_record)
             .with_context(result_context),
             JobStatus::Unknown => JobCompletion::unknown_with_output(
                 terminal_error.unwrap_or_else(|| {
@@ -3030,6 +3184,7 @@ impl LocalMachine {
                 stdout,
                 stderr,
             )
+            .with_process_facts(process_exit, stop_record)
             .with_context(result_context),
             JobStatus::Working => unreachable!(),
         };
@@ -3040,9 +3195,12 @@ impl LocalMachine {
         }
     }
 
-    async fn terminate_child(child: &mut tokio::process::Child) -> bool {
+    async fn terminate_child(child: &mut tokio::process::Child) -> SharedProcessExit {
         let _ = child.start_kill();
-        child.wait().await.is_ok()
+        match child.wait().await {
+            Ok(status) => Self::process_exit(status),
+            Err(_) => SharedProcessExit::Unknown,
+        }
     }
 }
 
@@ -3224,16 +3382,19 @@ impl LocalMachine {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn stop_proof_requires_platform_containment_and_direct_settlement() {
-        assert!(!LocalMachine::tree_stop_proven(false, true, true));
-        assert!(!LocalMachine::tree_stop_proven(true, false, true));
-        assert!(!LocalMachine::tree_stop_proven(true, true, false));
-        #[cfg(target_os = "linux")]
-        assert!(LocalMachine::tree_stop_proven(true, true, true));
-        #[cfg(windows)]
-        assert!(LocalMachine::tree_stop_proven(false, true, true));
-        #[cfg(all(unix, not(target_os = "linux")))]
-        assert!(!LocalMachine::tree_stop_proven(true, true, true));
+    fn platform_stop_result_maps_to_shared_evidence_without_collapsing_absence() {
+        assert_eq!(
+            LocalMachine::stop_evidence(Ok(true)),
+            SharedStopEvidence::Stopped
+        );
+        assert_eq!(
+            LocalMachine::stop_evidence(Ok(false)),
+            SharedStopEvidence::NoTarget
+        );
+        assert_eq!(
+            LocalMachine::stop_evidence(Err(std::io::Error::other("unknown"))),
+            SharedStopEvidence::Unknown
+        );
     }
 
     use super::*;
@@ -6664,14 +6825,16 @@ mod tests {
         let serialized = serde_json::to_value(&result).unwrap();
         let text = serialized["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(payload["status"], "unknown");
-        assert!(payload["job_id"].as_str().is_some_and(|id| !id.is_empty()));
-        assert_eq!(payload["observed_status"], "timed_out");
+        assert_eq!(payload["status"], "timed_out");
+        assert_eq!(payload["observed_status"], Value::Null);
         assert_eq!(payload["timed_out"], Value::Bool(true));
         assert_eq!(payload["success"], Value::Bool(false));
         assert_eq!(payload["exit_code"], Value::Null);
+        assert_eq!(payload["stopped_by"], "timeout");
+        #[cfg(unix)]
+        assert!(payload["signal"].as_i64().is_some(), "{payload}");
         assert!(
-            payload["error"].as_str().unwrap().contains("uncertain"),
+            payload["error"].as_str().unwrap().contains("timed out"),
             "{payload}"
         );
         assert!(

@@ -501,7 +501,7 @@ async fn execute_native(
         );
     }
     let running_sequence = start_native(&job, coordinate, claimed_sequence)?;
-    let cancellation = job.cancel.clone();
+    let cancellation = job.cancel.token();
     let outcome = crate::blocking::run(|| node.execute_graph(&cancellation));
     if outcome.text.len() > node.result_bytes() {
         let _ = manager.mark_output_failed(&id, coordinate, OutputStream::Result, 0);
@@ -628,10 +628,12 @@ async fn execute_shell(
         .job_result_context(&working_dir, node.timeout_secs);
     let completion = LocalMachine::run_shell_job(ShellJobRun {
         command,
+        log: runtime.shell.log_config(),
         stdin_text: node.args.stdin,
         interactive: node.interactive,
         deadline,
         job: job.clone(),
+        lifecycle_id: format!("{}/n:{coordinate}", job.id),
         coordinate,
         shared_writers: SharedShellWriters { stdout, stderr },
         result_context: context,
@@ -971,7 +973,7 @@ async fn run_inner(
                 // already-running wave so process containment/output drains
                 // quiesce before authoritative unknown settlement.
                 fatal = Some(error);
-                job.cancel.cancel();
+                job.cancel.cancel_as(crate::jobs::CancelOrigin::Connector);
                 let snapshot = manager
                     .runtime_snapshot(&job.id)
                     .map_err(|error| anyhow!("Graph status unavailable during abort: {error:?}"))?;
