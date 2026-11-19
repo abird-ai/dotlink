@@ -363,6 +363,8 @@ ProcessExit::{Code(i32), Signal(i32), Unknown}
 StopReason::{Timeout, Cancelled, RuntimeError}
 StopEvidence::{Stopped, NoTarget, Unknown}
 StopRecord { reason: Option<StopReason>, evidence }
+StopTracker                  # Unknown -> retry reason preservation
+ProcessReceipt::stop_record  # final factual logical stop record
 ```
 
 Only `evidence=Stopped + reason=Some(...)` may produce `stopped_by`.
@@ -382,16 +384,29 @@ No `stopped_by` for:
 - `Unknown`;
 - housekeeping (`reason=None`).
 
-An externally reaped Unix signal is instead `signal: <n>`.
+A physical Unix signal is retained as `signal: <n>` independently of stop
+semantics.
 
-The future operator line remains product-owned:
+After the v0.17.5-compatible cutover, operator lifecycle records are mutually
+exclusive at the logical-job level:
 
 ```text
-LOG job stop id=<id> reason=<reason> outcome=<delivered|gone|failed>
+reasoned final stop record
+  -> LOG job stop id=<id> reason=<reason> outcome=<delivered|gone|failed>
+
+ProcessExit::Signal(n) + no reasoned final stop record
+  -> LOG job exit id=<id> signal=<name-or-number> from=outside
 ```
 
-Treat it as attempt/evidence telemetry, not as a second canonical stop model.
-D1-D3 must land before using this line as a health invariant.
+`from=outside` means only that dotlink did not enter a semantic stop sequence;
+it never identifies the sender. A crash and another process's SIGKILL both land
+there. A reasoned final stop record suppresses `from=outside` even when its
+evidence is NoTarget/Unknown, because direct-child fallback may have delivered
+the physical signal. Attempt-level `ExecutionLifecycleEvent::ProcessStop`
+records are diagnostics/metrics and are **not** one operator line each.
+
+D1-D3 must land before using either lifecycle line as a current-main health
+invariant.
 
 ## 7. Reading idle time
 
@@ -419,7 +434,12 @@ The project workflow asks implementation agents to work for roughly **30 minutes
 per user turn**, stop at the next coherent checkpoint, record durable state, and
 pause.
 
-That is **human/agent workflow guidance only**. It is not:
+That is **human/agent workflow guidance only**. In contrast,
+`timeout_secs` on a shell tool is a hard execution deadline: reaching it stops
+the command tree. `background:true` only changes how long the caller waits; it
+does not remove that deadline.
+
+The 30-minute workflow rule is not:
 
 - a shell execution timeout;
 - a transport response window;

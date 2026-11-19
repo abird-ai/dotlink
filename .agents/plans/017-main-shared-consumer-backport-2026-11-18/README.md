@@ -11,15 +11,20 @@ Dotlink-side companion to AW's active shared-first plan:
 - next-agent entrypoint: `../../../../aw/.agents/docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-18.md`
 - authority-gated publish/repin preflight: `../../../../aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`
 - D1-D3 exact source cutover map: [D1-D3-SOURCE-CUTOVER-MAP.md](D1-D3-SOURCE-CUTOVER-MAP.md)
+- D4-D7 exact source cutover map: [D4-D7-SOURCE-CUTOVER-MAP.md](D4-D7-SOURCE-CUTOVER-MAP.md)
 - v0.17.x disposition matrix: [V0174-EQUIVALENCE.md](V0174-EQUIVALENCE.md)
 
-Authoritative release reference:
+Current release reference worktree (read-only here):
 
-- `release/0.17 = 887401398da297c458ffa2a152a07e1b85870c35`
-- `v0.17.4 = fd1cdb6429a341a4e3d27805cae0bec288fc26df`
-- post-tag `8874013` delegates signal labels to the platform helper in tests
-- final stop/provenance implementation: `c185558`
-- final hardening: `74820ff`, `06d5548`, `30099aa`, `5b27784`
+- local `release/0.17 = 3995448d7bf33794ef84c7bb51150d77cc260ada`
+  (`chore(release): 0.17.5`);
+- `origin/release/0.17 = 3995448d7bf33794ef84c7bb51150d77cc260ada`;
+- `v0.17.5` resolves to `3995448d7bf33794ef84c7bb51150d77cc260ada`;
+- `v0.17.4 = fd1cdb6429a341a4e3d27805cae0bec288fc26df`;
+- v0.17.5 additions: `f9537bb` outside-signal lifecycle record and `a1f8505`
+  hard execution-deadline wording;
+- v0.17.4 stop/provenance implementation: `c185558`;
+- v0.17.4 hardening: `74820ff`, `06d5548`, `30099aa`, `5b27784`.
 
 Current dotlink main checkpoint before this effort:
 
@@ -33,9 +38,10 @@ logging and deployment behavior.
 
 ## Current sequencing checkpoint
 
-AW P1-P8 is implemented and host-qualified in its current working tree, but the
-exact implementation has not been authorized for commit/publish yet. Dotlink
-still pins published AW `792f0b38...`, which does not contain the P1-P8 APIs.
+AW fresh-review implementation is now signed/published at
+`7c7de6c9aeedf714adbe67b17ac863f27697e90e`; AW main is published through
+`05dd2ff1163753903371b9f36d29922da1f03a20`. Dotlink still pins
+`792f0b38...` only until the atomic repin in the current authorized turn.
 
 Therefore D1-D7 must **not** start by inventing compatibility copies or a sibling
 path dependency. They resume only after the user authorizes an exact signed AW
@@ -51,8 +57,8 @@ structured LOG/TOOL/REQ writes are locked best-effort stderr writes and cannot
 panic on BrokenPipe, including when invoked from Drop during unwinding.
 `LogConfig::lifecycle` is the always-visible operator-evidence channel;
 existing production notices use it and tests prove it is ungated by verbosity.
-The actual stop observer/fixed stop rendering still waits for AW lifecycle-event
-repin.
+The actual stop/outside-exit rendering still waits for the shared physical
+exit/final-stop-record repin; attempt-level lifecycle events remain diagnostics.
 
 D6 compatibility-preservation and local fitting semantics are independently
 locked before the shared helper swap: real stdio and hosted
@@ -67,9 +73,9 @@ AW repin.
 
 D4/D5 product-boundary compatibility is also locked pre-repin: hostile finite
 Job refs stay compact over stdio/local HTTP, narrow replay keeps the original
-Job/effect/receipt metadata, and a one-byte `jobs_read` raw page now has an
-independent serialized envelope and truthful ACK/absolute-offset continuation.
-Shared typed refs/receipts/budget wrappers still wait for AW repin.
+Job/effect/receipt metadata, `jobs_read(limit=0)` is rejected, and a one-byte
+raw page has an independent serialized envelope with truthful ACK/absolute-offset
+continuation. Shared typed refs/receipts/budget wrappers still wait for AW repin.
 
 D7 scheduling is likewise corrected before the type swap: a pending progress
 notification is raced against the underlying operation, so result readiness is
@@ -86,8 +92,10 @@ Dotlink must consume rather than duplicate:
 
 - physical `ProcessExit::{Code,Signal(n),Unknown}`;
 - minimal `StopReason::{Timeout,Cancelled,RuntimeError}`;
-- `StopEvidence::{Stopped,NoTarget,Unknown}` and `StopRecord`;
-- evidence-preserving managed process-tree stop outcome;
+- `StopEvidence::{Stopped,NoTarget,Unknown}`, `StopRecord` and zero-cost
+  `StopTracker` for Unknown->retry reason preservation;
+- evidence-preserving managed process-tree stop outcome and final
+  `ProcessReceipt::stop_record()`;
 - canonical `ProcessTerminal { exit, stop, output }`;
 - typed Task terminal/failure detail;
 - execution lifecycle event values;
@@ -95,9 +103,9 @@ Dotlink must consume rather than duplicate:
 - bounded shared diagnostics;
 - Job handoff/control/ACK receipt grammar;
 - raw page vs serialized response budget separation;
-- MCP receipt metadata decoration;
+- lightweight `aw-mcp-protocol` receipt metadata decoration;
 - complete MCP result fitting;
-- MCP heartbeat/progress utility;
+- MCP heartbeat/progress utility without pulling the full AW client adapter;
 - signal-name utility.
 
 ### Dotlink owns
@@ -105,15 +113,15 @@ Dotlink must consume rather than duplicate:
 - profile/CLI/environment configuration and precedence;
 - OpenAI/HTTP/stdio transport response windows;
 - outer OpenAI request replay body/lease/tombstone ledger;
-- exact v0.17.4 wire spelling such as `stopped_by="shutdown"`;
-- outside-dotlink explanatory prose;
-- exact `LOG job stop ...` format and logging sink;
+- exact v0.17.x wire spelling such as `stopped_by="shutdown"`;
+- outside-dotlink explanatory prose and v0.17.5 `LOG job exit ... from=outside`;
+- exact mutually exclusive `LOG job stop ...` / `LOG job exit ...` formats and logging sink;
 - non-panicking logger implementation used by that sink;
 - NixOS module/systemd deployment policy;
 - runtime-health deployment documentation;
 - release/version/tagging, only when separately authorized.
 
-## Canonical v0.17.4 mapping
+## Canonical v0.17.x mapping through local 0.17.5
 
 ### Stop provenance
 
@@ -143,17 +151,32 @@ No `stopped_by` unless the canonical AW `StopRecord` has
 
 Caller/parent/runtime/authority provenance and explicit-vs-Drop path are not AW
 process-stop semantics. Dotlink retains only the product context it needs for
-wire compatibility and operator diagnostics through its higher-layer state or
-lifecycle observer.
+wire compatibility and operator diagnostics.
 
-The exact stop attempt still reaches dotlink's lifecycle-event sink so the
-operator can see:
+`ExecutionLifecycleEvent::ProcessStop` is attempt-level evidence and may fire
+for graceful, forced and housekeeping attempts. It is useful for diagnostics,
+but must not map one-for-one to operator lines. The runner exposes one final
+`ProcessReceipt::stop_record()` for the logical stop. Dotlink renders exactly
+one product line from that final record plus its own cancel-vs-shutdown context:
 
 ```text
 LOG job stop id=<id> reason=<reason> outcome=<delivered|gone|failed>
 ```
 
-The sink is visible at every verbosity and must use non-panicking stderr writes.
+Reason-less housekeeping/external exit emits no connector-stop line. For
+v0.17.5, a physical `ProcessExit::Signal(n)` with no reasoned final stop record
+instead emits exactly one product-only line:
+
+```text
+LOG job exit id=<id> signal=<name-or-number> from=outside
+```
+
+`from=outside` means only that dotlink did not enter a semantic stop sequence;
+it never identifies the sender. A reasoned final stop record suppresses this
+outside line even when evidence is NoTarget/Unknown, because direct-child
+fallback may have delivered the physical signal. Signal tokens use
+`aw_platform::signal_name(n)` or bare decimal when unknown, with no whitespace.
+The sink is visible at every verbosity and uses non-panicking stderr writes.
 
 ### Task failure projection
 
@@ -208,12 +231,12 @@ Every finite receipt takes a typed `JobRef`. The shared handoff fallback keeps
 the same Job and explicit `no-rerun` semantics under a tighter result budget;
 dotlink must not rebuild that grammar locally.
 
-Dotlink may add its receipt metadata/timestamp only through the shared aw-mcp
-decorator.
+Dotlink may add its receipt metadata/timestamp only through the shared
+`aw-mcp-protocol` decorator.
 
 ### MCP result handling
 
-Consume the implemented shared `aw-mcp` helpers:
+Consume the implemented lightweight `aw-mcp-protocol` helpers:
 
 - `stored_receipt_timestamp`;
 - `has_visible_receipt_timestamp`;
@@ -232,7 +255,7 @@ identity-preserving; if immutable facts cannot fit, the result is an explicit
 budget error rather than replacement prose. D6 therefore retains only the
 shared helper/type adoption, not a behavioral correction.
 
-P7 heartbeat/progress is now implemented in shared `aw-mcp`:
+P7 heartbeat/progress is implemented in shared `aw-mcp-protocol`:
 
 - obtain the authenticated/request-scoped rmcp progress token in dotlink;
 - construct `ProgressHeartbeat::from_token(...)`;
@@ -241,10 +264,11 @@ P7 heartbeat/progress is now implemented in shared `aw-mcp`:
 - implement `ProgressHeartbeatObserver` in the product logging layer to retain
   attempted/delivered summaries.
 
-The shared helper preserves dotlink's 10 s heartbeat / 100 ms per-send defaults,
-but improves one behavior: the underlying operation remains polled while a
-progress send is backpressured, so the send budget can never add latency after
-the operation itself is ready. There is no detached task or queue.
+The protocol crate depends on `aw-tools` with no aw-tools features, rmcp model
+types, `serde_json` and Tokio timing/macros; it carries no Agent/runtime, reqwest,
+jsonschema, clap or MCP transport stack. It preserves dotlink's 10 s heartbeat /
+100 ms per-send defaults, while the underlying operation remains polled during
+send backpressure. There is no detached task or queue.
 
 Bare heartbeats remain monotonic unknown-total/no-message ticks. Real semantic
 progress uses `semantic_progress_notification` /
@@ -253,7 +277,7 @@ semantics rather than inventing percentages.
 
 Delete/reduce dotlink-local generic equivalents after parity is proved.
 
-## Product-only v0.17.4 hardening
+## Product-only v0.17.x hardening through local 0.17.5
 
 ### Nix environment ownership — `30099aa`
 
@@ -271,6 +295,16 @@ Still dotlink-owned. Reject module-owned keys in
 
 Allow unrelated environment such as `DOTLINK_VERBOSITY`, `RUST_LOG`, XDG
 variables and, once the deferred sandbox plan is promoted, `DOTLINK_MOUNTS`.
+
+### v0.17.5 shell deadline / outside-exit projection — `a1f8505`, `f9537bb`
+
+Current main already ports the product-only deadline wording: `timeout_secs` is
+a hard execution deadline that stops the command tree; the caller's response
+window and `background:true` affect waiting/handoff only.
+
+The outside-signal lifecycle line waits for D1/D2 shared physical exit + final
+stop facts rather than reintroducing a local signal/provenance model. After
+repin, use the mutually exclusive stop/outside-exit projection defined above.
 
 ### Runtime-health docs — `5b27784`
 
@@ -325,5 +359,5 @@ main/shared AW already supersede:
 5. remove a dotlink-local generic mechanism only after focused parity tests pass;
 6. preserve the existing outer OpenAI replay ledger;
 7. keep sandbox frozen;
-8. run full v0.17.4 semantic equivalence;
+8. run full v0.17.x semantic equivalence through the current local 0.17.5 reference;
 9. version/tag/release only as a separate authorized action.

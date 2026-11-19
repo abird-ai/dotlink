@@ -5,31 +5,45 @@ Base: `4f60bc3d4d2edb42c7d75f91d5dc6e8bae02d02a`
 AW owner plan:
 `../../../../aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/TODO.md`
 
-Release reference:
-`release/0.17 @ 887401398da297c458ffa2a152a07e1b85870c35`
-(`v0.17.4 fd1cdb6` plus post-tag platform signal-label test cleanup)
+Release reference (read-only in this workstream):
+`release/0.17 @ 3995448d7bf33794ef84c7bb51150d77cc260ada`,
+`origin/release/0.17 @ 3995448d7bf33794ef84c7bb51150d77cc260ada`,
+and `v0.17.5` resolves to that same commit.
 
 ## Committed
 
-None in this plan. The pre-0.17 convergence is already committed separately at
-`4f60bc3`.
+Signed pre-repin checkpoints:
 
-## Uncommitted
+- `8a3ed9d` — Nix service environment ownership hardening;
+- `a36e976` — best-effort lifecycle logging;
+- `690cfb5` — pre-repin runtime/MCP compatibility hardening;
+- `8e14ee2` — 0.17 consumer plans/handoff.
+
+The pre-0.17 shared convergence remains committed at `4f60bc3`.
+
+## Uncommitted fresh-review parity fixes
+
+Current review fixes are intentionally small and local until the shared repin:
+zero-byte `jobs_read` rejection, receipt-object merge/validation, mandatory
+truncation markers, and post-fit visible timestamp preservation.
 
 ### D0 — dependency boundary
 
-- [x] AW shared-runtime P1-P8 reached the reviewed host-available checkpoint.
-- [ ] Publish AW only with explicit user authorization.
+- [x] AW fresh-review implementation is signed/published at
+      `7c7de6c9aeedf714adbe67b17ac863f27697e90e`; AW docs/main are published
+      through `05dd2ff1163753903371b9f36d29922da1f03a20`.
+- [x] AW publish authorized and completed in the current turn.
 - [ ] Repin the complete direct AW set atomically to the exact published
       implementation commit: existing `aw-tools`, `aw-tools-fs-unix`,
-      `aw-tools-fs-win` plus new D1/D6-D7 consumers `aw-platform` and `aw-mcp`;
+      `aw-tools-fs-win` plus new D1/D6-D7 consumers `aw-platform` and
+      lightweight `aw-mcp-protocol`;
       every transitive AW Git package in `Cargo.lock` must resolve to that same
       SHA. Follow AW
       `017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`.
 - [x] No temporary path/sibling dependency introduced.
 - [x] Revalidated dotlink main/release refs and preserved unrelated work.
-- [ ] D1-D7 shared-semantic hookup is dependency-blocked until the exact
-      P1-P8 AW implementation is authorized, signed, published and repinned;
+- [ ] D1-D7 shared-semantic hookup is blocked only on the current atomic repin;
+      the exact published AW implementation is `7c7de6c9...`;
       do not recreate those shared semantics locally while waiting. Independent
       product-owned prerequisites may land only when they do not encode a
       parallel AW semantic model.
@@ -48,32 +62,44 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
 - [ ] Map reaped launcher status to shared `ProcessExit::Signal(n)`.
 - [ ] Retain no parallel `stop_proven -> Cancelled/DeadlineExceeded` model.
 - [ ] Map shared minimal `StopRecord`/terminal `StopReason` to v0.17.4 `stopped_by` wire spellings.
-- [ ] External signal => signal number, no `stopped_by`.
+- [ ] External signal => signal number, no `stopped_by`; when physical exit is
+      `Signal(n)` and the final stop record has no semantic reason, render the
+      v0.17.5 product-only outside-exit line exactly once. A reasoned connector
+      stop sequence suppresses `from=outside` even when stop evidence is
+      NoTarget/Unknown because direct-child fallback may have delivered the
+      physical signal.
 - [ ] Retain only dotlink-owned context needed to map shared `Cancelled` to
       product `cancel` vs `shutdown`; do not re-expand AW canonical state.
 - [ ] Cleanup/Drop are attempt paths, not stop reasons; housekeeping uses
       `StopRecord.reason=None`.
 - [ ] NoTarget and Unknown remain distinct: NoTarget disarms; Unknown may retain
-      fail-safe retry responsibility while preserving any original semantic reason.
-- [ ] Preserve actual execution deadline/race semantics from v0.17.4.
+      fail-safe retry responsibility through shared `StopTracker`; use the
+      runner's final `stop_record()` rather than reconstructing stop evidence.
+- [ ] Preserve actual execution deadline/race semantics through local v0.17.5.
 
-### D2 — lifecycle event -> operator log
+### D2 — final stop/exit records -> operator logs; lifecycle events -> diagnostics
 
-- [ ] Consume AW `ExecutionLifecycleEvent::ProcessStop` and capture any
-      product-only provenance/path context in the observer layer.
+- [ ] Consume AW attempt-level `ExecutionLifecycleEvent::ProcessStop` only for
+      diagnostics/metrics; do not render one operator line per attempt.
 - [ ] Render exact fixed-order `LOG job stop id=... reason=... outcome=...`
-      after the AW lifecycle-event repin; do not prewire a dead local stop API.
+      exactly once from `ProcessReceipt::stop_record()` plus product-only
+      cancel-vs-shutdown context. Reason-less housekeeping/external exit emits
+      no connector-stop line.
 - [x] Establish an always-visible `LogConfig::lifecycle` channel used by
       production notices today; focused coverage proves identical LOG output at
       quiet, TOOL, TOOL+REQ and REQ-only verbosity.
-- [ ] After event hookup, prove the actual stop line uses that lifecycle channel
-      and survives every verbosity.
+- [ ] After final stop/exit projection hookup, prove both mutually exclusive
+      lifecycle lines use the always-visible channel and survive every verbosity.
 - [x] Port non-panicking structured logger writes: LOG/TOOL/REQ lines and
       progress continuations use locked best-effort stderr writes; focused tests
       prove BrokenPipe is returned/ignored and Drop-time logging is safe during
       an active unwind.
-- [ ] Real-binary stop-line test: one line on connector stop.
-- [ ] External kill test: no connector stop line.
+- [ ] Real-binary stop-line test: exactly one stop line on connector stop and
+      no outside-exit line.
+- [ ] v0.17.5 real-binary external kill/crash test at quiet/default/verbose:
+      exactly one `LOG job exit id=<id> signal=<token> from=outside`, no stop
+      line, no `stopped_by`; signal token is platform name or bare number with
+      no whitespace.
 - [ ] Drop/cleanup/gone/failed attempt tests.
 
 ### D3 — Job/Task terminal projection
@@ -86,6 +112,9 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
 - [ ] Compact handoff remains a handle, not a second process verdict.
 
 ### D4 — typed refs, diagnostics and shared receipts
+
+Exact post-repin D4-D7 edit/deletion/test order is frozen in
+[D4-D7-SOURCE-CUTOVER-MAP.md](D4-D7-SOURCE-CUTOVER-MAP.md).
 
 - [ ] Replace local raw flat Job ref parsing with
       `aw_tools::execution_ref::JobRef`; do not flatten AW's hierarchical
@@ -106,35 +135,38 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
 
 - [ ] Consume shared raw-page budget resolver.
 - [ ] Consume shared serialized response-envelope budget.
-- [x] Fix current `jobs_read(limit=1)` no-transport-budget envelope bug:
-      schema now permits a one-byte raw page and local/stdio fallback uses the
+- [x] Fix current `jobs_read` raw-page boundary: schema/runtime accept a
+      one-byte page, reject `limit=0`, and local/stdio fallback uses the
       profile-derived serialized response capacity instead of the raw page size.
-      End-to-end stdio proves 1-byte page -> ACK through 1 -> absolute offset 1
-      next page without changing delivery proof.
+      End-to-end stdio proves rejection at zero plus 1-byte page -> ACK through
+      1 -> absolute offset 1 next page without changing delivery proof.
 - [ ] Schema/default/max and runtime derive from same JobProfile.
 - [ ] Raw offsets/EOF/delivery/ACK proof unchanged under response fitting.
 
-### D6 — aw-mcp receipt metadata and fitter
+### D6 — shared MCP protocol receipt metadata and fitter
 
-- [ ] Replace local receipt helpers with shared
+- [ ] Add only lightweight `aw-mcp-protocol` and replace local receipt helpers
+      with shared
       `stored/has_visible/set_stored_receipt_timestamp` and
       `decorate_and_fit_complete_result`.
 - [x] Preserve immutable stored replay timestamp: a pre-stamped replay keeps its
       original `ts`, while fresh selected results still receive a new host UTC
       Unix timestamp. Focused coverage locks stored-wins replay behavior.
 - [x] Preserve bounded `_meta["io.abird/receipt"]` and visible `ts=` without
-      duplication: result metadata is transactionally capped at **16 KiB**
-      serialized, unrelated keys survive, an existing exact visible marker is
-      not appended twice, and oversized metadata fails explicitly without
-      partially stamping/replacing the original map.
+      duplication: result metadata is transactionally capped at **16 KiB**;
+      unrelated keys and fields inside the reserved receipt object survive;
+      malformed/non-object reserved metadata and oversized metadata fail
+      transactionally; a visible stored marker is rechecked after fitting and
+      never pays a duplicate sidecar reserve.
 - [ ] Replace local generic serialized `CallToolResult` fitter with shared
       `fit_complete_result`.
 - [x] Remove dotlink's semantics-changing typed-result-to-text fallback now:
       the local postcondition mutates **text only**, preserving structured
       content, typed media/resources, block order, annotations, per-block/result
-      metadata and error status. If immutable facts alone cannot fit, it returns
-      an explicit MCP budget error instead of fabricating a text success. The
-      shared `fit_complete_result` replacement remains pending on AW repin.
+      metadata and error status. Truncation always carries an explicit marker;
+      if the factual minimum plus marker cannot fit, it returns an MCP budget
+      error instead of silently shortening text. The shared
+      `fit_complete_result` replacement remains pending on AW repin.
 - [x] Compatibility-preservation matrix locked before shared-helper swap: real
       stdio + hosted `bread(format=mcp)` prove exact Image/Audio/Resource block
       type, MIME and base64/blob payload identity; decorator coverage preserves
@@ -143,14 +175,15 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
       `ts=`. No live tool currently emits `structuredContent`, so that invariant
       belongs at the decorator boundary rather than a fake transport route.
 
-### D7 — aw-mcp heartbeat
+### D7 — shared MCP protocol heartbeat
 
 - [ ] Replace local generic `ProgressHeartbeat` /
       `await_with_heartbeat` with shared `ProgressHeartbeat::from_token` and
       `await_with_progress_heartbeat`.
 - [ ] Extract the request-scoped rmcp progress token in dotlink and pass the
-      request peer as the shared send closure; do not enable rmcp server features
-      inside `aw-mcp`.
+      request peer as the shared send closure. `aw-mcp-protocol` has no MCP
+      client/server transport feature and must remain the only new MCP helper
+      dependency; do not pull the full `aw-mcp` client adapter into dotlink.
 - [x] Pre-repin compatibility locked: production defaults remain 10 s / 100 ms;
       real hosted shell coverage proves token-gated monotonic heartbeats with no
       fake total/message. The shared cutover must preserve those values/shape.
@@ -178,7 +211,7 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
 - [x] NixOS module derivation evaluates/builds green with command-local verified
       CA bundle; Alejandra and `git diff --check` green.
 
-### D9 — v0.17.4 operational docs and equivalence
+### D9 — v0.17.x operational docs and equivalence
 
 - [x] Add/adapt runtime-health-check to current `jobs_*` surface:
       30 s `jobs_get/jobs_read` waits, forward `jobs_read` paging, explicit
@@ -191,8 +224,8 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
       every v0.17.x item is classified Done / Superseded / Product-only /
       Blocked / Deferred. The matrix is classified, not falsely declared fully
       implemented while D1-D7 remain blocked.
-- [x] Pre-repin full binary/integration baseline green after D2 logger hardening:
-      main binary **697 passed / 0 failed / 1 intentional ignored**;
+- [x] Pre-repin full binary/integration baseline green after fresh-review parity fixes:
+      main binary **698 passed / 0 failed / 1 intentional ignored**;
       integrations **40/40** across child-env, exit-status, OAuth rotation,
       private generations and stdio tool suites.
 - [x] Pre-repin strict all-target/all-feature `cargo check` + Clippy green.
@@ -201,6 +234,12 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
       command-local immutable NSS CA bundle.
 - [x] Current D1-D4/B6/pre-0.17 regressions remain green in the full current-main
       suite. **Mandatory rerun after D1-D7 repin/cutover remains open for final equivalence.**
+- [x] Port v0.17.5 hard-deadline tool/schema wording: `timeout_secs` explicitly
+      stops the command tree and is distinct from the caller/transport response
+      wait; `background:true` changes waiting only. Focused schema regression
+      passes. The v0.17.5 outside-signal line remains correctly blocked on D1/D2
+      shared physical exit/final-stop facts rather than adding a duplicate local
+      signal provenance model.
 
 ### Deferred DS — sandbox/config-v13
 
@@ -209,12 +248,12 @@ same helper; dotlink must use it after repin rather than duplicating cfg logic.
 
 ## Tests and verification
 
-- [ ] process signal/stop/cancellation-origin matrix.
-- [ ] real stop-line integration test at every verbosity.
+- [ ] physical-exit/final-stop-record matrix, including timeout/cancel/shutdown product projection.
+- [ ] real stop/outside-exit mutual-exclusion integration test at every verbosity.
 - [ ] failed native Task terminal-detail parity.
-- [ ] huge Job ref/error bound over stdio/local HTTP.
-- [ ] one-byte jobs_read page inside normal response envelope.
-- [ ] receipt metadata typed-media/structured replay tests.
-- [ ] heartbeat backpressure/deadline tests.
-- [ ] Nix reserved-environment evaluation tests.
-- [ ] full dotlink v0.17.4 equivalence gate.
+- [x] huge Job ref/error bound over stdio/local HTTP.
+- [x] zero-byte rejection + one-byte jobs_read page inside normal response envelope.
+- [x] receipt metadata typed-media/structured replay tests.
+- [x] heartbeat backpressure/deadline tests.
+- [x] Nix reserved-environment evaluation tests.
+- [ ] full dotlink v0.17.x equivalence gate through local release 0.17.5.

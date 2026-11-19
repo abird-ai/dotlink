@@ -89,13 +89,16 @@ Replace with factual StopRecord values:
 Direct child wait/reap remains physical exit evidence, independent of stop
 attribution.
 
-Final shared terminal keeps two axes:
+Final shared terminal keeps two axes, while the adapter receipt retains the
+final factual stop record separately:
 
     ProcessTerminal {
         exit: observed ProcessExit,
-        stop: stop_record.terminal_reason(),
+        stop: final_stop_record.and_then(StopRecord::terminal_reason),
         output: ProcessOutputMeta,
     }
+
+    ProcessReceipt::stop_record() -> Option<StopRecord>
 
 Valid examples:
 
@@ -104,7 +107,7 @@ Valid examples:
 
 A requested stop never manufactures Signal(n).
 
-## 5. Physical ExitStatus mapping gap
+## 5. Physical ExitStatus mapping — resolved shared fact
 
 Dotlink currently records only ExitStatus::code(), losing Unix signal numbers.
 
@@ -224,13 +227,18 @@ Allowed result:
 
 The same rule applies to later internal/spool failures.
 
-## 9. D2 lifecycle observer
+## 9. D2 final stop record and attempt observer
 
 Shared inputs:
 
+    ProcessReceipt::stop_record() -> Option<StopRecord>
     ExecutionLifecycleEvent::ProcessStop
     ExecutionEventSink
-    StopRecord
+    StopTracker
+
+The receipt record is the final factual result for one logical stop. Lifecycle
+events are attempt-level evidence and may include graceful, forced and
+housekeeping attempts. Dotlink must not render one operator line per event.
 
 Dotlink observer may retain higher-layer context separately:
 
@@ -253,7 +261,8 @@ No stopped_by for:
 - Unknown;
 - housekeeping reason=None.
 
-Operator line remains dotlink-owned:
+Operator line remains dotlink-owned and is rendered exactly once from the final
+receipt record plus product cancel-vs-shutdown context:
 
     LOG job stop id=<id> reason=<reason> outcome=<delivered|gone|failed>
 
@@ -264,8 +273,22 @@ Presentation mapping:
     Unknown  -> failed
 
 Use the existing always-visible LogConfig::lifecycle path.
-External process death emits no connector-stop line unless a connector stop
-attempt actually occurred.
+External process death emits no connector-stop line. v0.17.5 additionally
+requires one product-only outside-exit line when and only when:
+
+    terminal.exit = ProcessExit::Signal(n)
+    final_stop_record.is_none_or(|record| record.reason.is_none())
+
+Then render:
+
+    LOG job exit id=<id> signal=<name-or-number> from=outside
+
+`from=outside` means only "dotlink did not start a semantic stop sequence"; it
+must not identify a culprit. A reasoned stop record suppresses this line even
+for NoTarget/Unknown evidence, because direct-child fallback may still have
+delivered the physical signal. This conservative predicate avoids falsely
+claiming an outside killer. Use `aw_platform::signal_name(n)` for the token;
+unknown numbers remain bare decimal values with no whitespace.
 
 ## 10. D3 Task projection
 
@@ -343,7 +366,8 @@ Replace with tests of independent factual axes:
 D1:
 
 1. external Unix SIGTERM/SIGKILL -> ProcessExit::Signal(n), no stopped_by, no
-   connector stop log;
+   connector stop line, exactly one outside-exit line when no reasoned final
+   stop record exists;
 2. proved timeout -> stop=Some(Timeout), physical exit independently retained;
 3. cancellation -> stop=Some(Cancelled) only for Stopped evidence, with
    product cancel/shutdown selection;
@@ -353,11 +377,13 @@ D1:
 
 D2:
 
-1. exactly one fixed-order stop line for connector stop;
-2. line survives all verbosity modes;
-3. external kill produces no connector stop line;
-4. housekeeping/Drop has no semantic reason;
-5. BrokenPipe/unwind remains non-panicking.
+1. exactly one fixed-order stop line for a reasoned connector stop;
+2. stop line survives all verbosity modes and suppresses outside-exit;
+3. external kill/crash with no reasoned final stop record produces exactly one
+   `LOG job exit ... from=outside` at all verbosity modes and no stop line;
+4. known signal token uses platform name, unknown signal uses bare number;
+5. housekeeping/Drop has no semantic reason;
+6. BrokenPipe/unwind remains non-panicking.
 
 D3:
 
@@ -379,8 +405,10 @@ D3:
 8. Delete old shared_process_terminal reconstruction.
 9. Pass retained terminal directly into shared Job settlement.
 10. Preserve retained terminal through fail-closed settlement.
-11. Hook ProcessStop lifecycle events to the product observer.
-12. Add the one product compatibility mapper.
+11. Use `ProcessReceipt::stop_record()` for the one product stop-line decision;
+    combine it with `ProcessTerminal.exit` for the mutually exclusive v0.17.5
+    outside-exit decision; retain ProcessStop events only for diagnostics/metrics.
+12. Add the one product compatibility mapper for signal/stopped_by/stop-vs-exit prose.
 13. Project TaskTerminalDetail into failed Task data.
 14. Rewrite obsolete tests.
 15. Run focused D1-D3 suite, then full dotlink qualification before D4.
@@ -393,6 +421,8 @@ The cutover is wrong if any of these become true:
 - requested timeout/cancel manufactures a signal number;
 - NoTarget and Unknown collapse;
 - external signal produces stopped_by;
+- a reasoned connector stop sequence is mislabeled `from=outside`;
+- an unattributed physical signal loses its single outside-exit record;
 - later infrastructure failure erases an observed signal/stop;
 - cancellation provenance is added back into AW canonical stop enums;
 - dotlink retains a second process Guard;
