@@ -2790,15 +2790,15 @@ impl LocalMachine {
 }
 
 /// Instructions for the transports actually serving this bridge. The turn
-/// horizon belongs to the hosted surface alone: it paces a conversation turn,
-/// and a stdio or local HTTP client has no such turn to pace. `hosted` is the
-/// same fact the shell description reads — a transport that imposes a response
-/// window — so the two cannot disagree about which surface this is.
-pub(crate) fn server_instructions(hosted: bool) -> String {
+/// horizon belongs to a capped runtime alone: it paces a turn, and an uncapped
+/// transport — a stdio or local HTTP client with no window to hand back from — has
+/// none to pace. `capped` is the same fact the shell description reads, so the two
+/// cannot disagree about which kind of runtime this is.
+pub(crate) fn server_instructions(capped: bool) -> String {
     let mut text = String::from(
         "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline.",
     );
-    if hosted {
+    if capped {
         // The one place the horizon is stated, with the rule that makes it
         // actionable. A tool description hands back `ts` as a fact instead.
         text.push_str(&format!(
@@ -2944,10 +2944,10 @@ mod tests {
 
     use crate::mcp::tools::test_support::access;
 
-    /// The turn horizon lives here and nowhere else, and only on the hosted
-    /// surface: a tool description states `ts` as a fact, while the anchor, the
-    /// horizon and the hand-back rule are one advisory. A client with no turn
-    /// must not be handed a clock to pace.
+    /// The turn horizon lives here and nowhere else, and only on a capped runtime: a
+    /// tool description states `ts` as a fact, while the anchor, the horizon and the
+    /// hand-back rule are one advisory. A client with no window to hand back from has
+    /// no turn to pace, so it must not be handed a clock.
     #[test]
     fn the_turn_horizon_is_stated_once_with_its_rule() {
         let local = server_instructions(false);

@@ -46,6 +46,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   escape, and `Wait-Process` instead of `server & wait`.
 - `end=` is a type, not a string, so "is this the command's own ending" is a match the
   compiler checks rather than a prefix comparison.
+- "Hosted" is gone from the runtime: the fact it named is `capped` — the active
+  transports hand a shell call back instead of waiting, so the runtime bounds one
+  command by a turn and gives the caller the turn advice. Naming it after the property
+  rather than after the OpenAI tunnel means a transport that starts bounding its
+  window joins automatically, and the docs stop implying a deployment identity the
+  code never tested for.
 
 ### Fixed
 

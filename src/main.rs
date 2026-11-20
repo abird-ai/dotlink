@@ -1592,14 +1592,14 @@ async fn prepare_runtime(
     // process then lowers is worth one line, or the cap would be silent.
     if policy.allow_shell
         && transports.constraints().sync_hold.is_some()
-        && setup.config.max_shell_timeout_secs > crate::limits::HOSTED_SHELL_TIMEOUT_SECS
+        && setup.config.max_shell_timeout_secs > crate::limits::CAPPED_SHELL_TIMEOUT_SECS
         && setup.config.max_shell_timeout_secs != setup::DEFAULT_MAX_SHELL_TIMEOUT_SECS
     {
         tracing::warn!(
-            "max_shell_timeout_secs={} exceeds the {} minute turn horizon; hosted commands are capped at {} s",
+            "max_shell_timeout_secs={} exceeds the {} minute turn horizon; commands are capped at {} s",
             setup.config.max_shell_timeout_secs,
             crate::limits::TURN_CHECKPOINT_MINUTES,
-            crate::limits::HOSTED_SHELL_TIMEOUT_SECS
+            crate::limits::CAPPED_SHELL_TIMEOUT_SECS
         );
     }
 

@@ -4159,7 +4159,7 @@ mod tests {
     /// schema states whichever ceiling that surface will actually run.
     #[test]
     fn the_turn_horizon_bounds_the_hosted_surface_only() {
-        let horizon = crate::limits::HOSTED_SHELL_TIMEOUT_SECS;
+        let horizon = crate::limits::CAPPED_SHELL_TIMEOUT_SECS;
         assert_eq!(horizon, crate::limits::TURN_CHECKPOINT_MINUTES * 60);
         assert_eq!(crate::limits::shell_timeout_ceiling(3_600, true), horizon);
         assert_eq!(crate::limits::shell_timeout_ceiling(3_600, false), 3_600);
