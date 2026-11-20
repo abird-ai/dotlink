@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS no longer logs `cleanup=kill-failed` for an exited shell whose process
+  group has no live members. Unconfirmed cleanup still raises the alarm.
+
 ## [0.17.6] - 2026-11-21
 
 ### Breaking

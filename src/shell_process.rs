@@ -600,10 +600,19 @@ impl<'a> Guard<'a> {
         }
         // An empty group is the state the caller wanted, but it is not a stop we
         // performed: the command may have ended on its own, or left the group.
-        if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            StopOutcome::AlreadyGone
-        } else {
-            StopOutcome::Failed
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => StopOutcome::AlreadyGone,
+            // Darwin's killpg1 excludes zombies and can return EPERM when no
+            // signalable member exists. The scan skips the leader, so first
+            // prove it exited without reaping it. Live or unknown stays failed.
+            #[cfg(target_os = "macos")]
+            Some(libc::EPERM)
+                if matches!(unix_wait::exited(self.group), Ok(true))
+                    && self.observe_direct_tree() == TreeObservation::None =>
+            {
+                StopOutcome::AlreadyGone
+            }
+            _ => StopOutcome::Failed,
         }
     }
 
@@ -1120,9 +1129,33 @@ mod tests {
             .await
             .unwrap();
         assert!(guard.wait().await.unwrap().success());
+        assert!(
+            !guard.kill_failed(),
+            "an exited leader alone needs no cleanup"
+        );
         let swept = trace.outcomes();
         assert_eq!(guard.signal(), StopOutcome::AlreadyGone);
         assert_eq!(trace.outcomes(), swept, "no group signal after reaping");
+    }
+
+    // A stop can reach the zombie before the regular sweep. Neither Darwin's
+    // refusal nor Linux's accepted signal is evidence the timeout ended it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_zombie_only_group_preserves_its_exit() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 23"]);
+        let mut child = spawn(&mut command).unwrap();
+        let trace = StopTrace::new(crate::logging::LogConfig::default(), "gone");
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace)
+            .await
+            .unwrap();
+        unix_wait::wait(guard.group).await.unwrap();
+        let ChildEnd::Exited(status) = guard.stop(StopCause::Timeout).await else {
+            panic!("a zombie cannot have been stopped by the timeout");
+        };
+        assert_eq!(status.code(), Some(23));
+        assert!(!guard.kill_failed());
     }
 
     /// A command that finished is disarmed first, so nothing is reported.
