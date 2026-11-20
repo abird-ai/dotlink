@@ -1,6 +1,6 @@
 # D1-D3 source cutover map
 
-Status: **completed on current main at `36d653368c6c4ec47417f355269f661833be8dba`**.
+Status: **completed and republished in signed dotlink source checkpoint `648519add3d174b9e13de81aeca62431591dac6d` against AW `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`**.
 
 This records the exact dotlink source sites moved onto published AW P1-P3
 contracts. No temporary compatibility semantics or sibling/path dependency was
@@ -9,7 +9,7 @@ introduced.
 ## 1. Completed dependency boundary
 
 Dotlink is atomically pinned to final published AW implementation
-`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`. All direct/transitive AW Git
+`b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`. All direct/transitive AW Git
 packages resolve to that SHA, while the registry package/version set remains
 unchanged.
 

@@ -32,17 +32,17 @@ oracle while D4-D7 delete the corresponding generic local helpers.
 ### D0 — dependency boundary
 
 - [x] AW final implementation is signed/published at
-      `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; AW docs/main are published
+      `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`; AW docs/main are published
       through `4234447612421069a746c925c76a25e3ba27774a`.
 - [x] AW publish authorized and completed in the current turn.
-- [x] Repin the complete direct AW set atomically to `1a5d0f65...`: existing
+- [x] Repin the complete direct AW set atomically to `b8a46a94...`: existing
       `aw-tools`, `aw-tools-fs-unix`, `aw-tools-fs-win` plus `aw-platform` and
       lightweight `aw-mcp-protocol`. Every transitive AW Git package in
       `Cargo.lock` resolves to that same SHA, and the registry package/version
       set is unchanged by the repin.
 - [x] No temporary path/sibling dependency introduced.
 - [x] Revalidated dotlink main/release refs and preserved unrelated work.
-- [x] D1-D3 shared process-semantic hookup completed against `1a5d0f65...`.
+- [x] D1-D3 shared process-semantic hookup completed against `b8a46a94...`.
 - [x] D7 shared progress hookup complete; the local heartbeat scheduler is
       removed and lightweight `aw-mcp-protocol` is the sole generic owner.
 
@@ -304,3 +304,98 @@ Exact post-repin D4-D7 edit/deletion/test order is frozen in
       **8/8**, full **701/0/1 + 42/42**, locked check/strict Clippy/fmt/diff green.
       Signed remediation:
       `d32a3196ec18ada7f85176a9feed42667e5f2d6b`.
+- [x] Post-commit fresh review hardened `jobs_get` Process-tail fitting:
+      the Job layer now accepts a host final-response fit predicate, so D6
+      receipt/timestamp overhead is included before choosing optional tail bytes.
+      One private monomorphized search helper returns the exact admitted
+      projection (never re-reading a winner), keeps logarithmic search for ASCII,
+      and uses a bounded exact fallback for non-ASCII lossy-UTF8 boundaries.
+      Adversarial 512/513-byte coverage proves largest-fit behavior. D5/D6
+      `jobs_read` is exhaustively checked for every ceiling **1..=1024** where a
+      page can be produced, proving decoration leaves credited text unchanged.
+      The hardening is now included in signed source checkpoint
+      `648519add3d174b9e13de81aeca62431591dac6d`; final repinned gate is
+      **706/0/1 + 42/42** with strict Clippy/fmt/diff green.
+
+## Post-equivalence process/control hardening — 2026-11-20
+
+Canonical current handoff:
+../../../../aw/.agents/docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md
+
+D4-D7 and v0.17.5 semantic equivalence are complete. Do not reopen them without
+a reproduced regression.
+
+### Implemented and signed in `648519add3d174b9e13de81aeca62431591dac6d`
+
+- [x] Canonical replay result is cached before request-specific projection.
+- [x] Jobs fit/preflight checks measure final D6-decorated MCP envelope.
+- [x] jobs_send proves the complete timestamped minimal receipt before
+      irreversible stdin acceptance.
+- [x] jobs_read page credit remains byte-identical after D6 decoration for every
+      tested ceiling 1..=1024 where a page can be produced.
+- [x] jobs_get Process-tail fitting uses a host final-envelope predicate.
+- [x] Tail search returns the exact admitted candidate; ASCII uses logarithmic
+      search and non-ASCII uses bounded exact fallback for lossy-UTF8 boundaries.
+- [x] Full working-tree Rust/equivalence gates recorded in CURRENT_HANDOFF and
+      the canonical cross-repo handoff.
+
+### Process/control + trusted issuer batch — complete and signed
+
+- [x] Ordinary waited-child exit immediately closes the remaining managed
+      process group / Windows Job Object through the existing
+      `ManagedProcessGuard` as **reasonless housekeeping**. No synthetic
+      Cleanup/Dropped stop reason was introduced.
+- [x] Inherited stdout/stderr drains have one short **250 ms post-exit grace**
+      created only after the child wait resolves; the Process execution deadline
+      no longer controls post-exit pipe draining.
+- [x] An unsandboxed `setsid`-escaped writer that retains an inherited FD past
+      grace preserves the factual command exit and marks output incomplete.
+      Shared settlement now uses the existing `ProcessSettlement` API with
+      `Status.incomplete` as an orthogonal output-coverage fact, so known
+      `Code(0)`, nonzero and signal exits are not rewritten to `Unknown`
+      solely because output is incomplete.
+- [x] Model-visible revision-fenced cancel requires canonical shared Job
+      ownership before compare-and-act. The public non-shared cancel CAS fallback
+      is gone; a focused negative regression proves failed owner verification
+      does not signal the runner.
+- [x] Process stdin authority is linearized at the per-Job transition boundary:
+      channel capacity is reserved effect-free, then the shared tool/shell
+      generation is re-derived, the host-supplied synchronous verifier runs,
+      the shared revision CAS is checked/advanced, and only then are bytes
+      accepted.
+- [x] The duplicate static MCP server-instruction copy was removed. `get_info`
+      remains the single instruction owner and the existing one-occurrence
+      regression is green.
+- [x] Control-plane wait/read/cancel tests no longer depend on child-process
+      sleeps or host utility discovery. They use deterministic canonical shared
+      Running Process fixtures with real shared output writers and notifications.
+- [x] Focused process/control regressions are green, including immediate
+      descendant cleanup, escaped-`setsid` incomplete output, stdin
+      revoke-before-bytes, shared-owner cancel, replay-before-revision cancel,
+      Job wait/read wake behavior and single instruction ownership.
+- [x] Published AW repin + final process/control/issuer-trust gate:
+      AW source `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`, signed dotlink
+      source `648519add3d174b9e13de81aeca62431591dac6d`. Main binary
+      **706 passed / 0 failed / 1 intentional ignored**, integrations **42/42**,
+      strict all-target/all-feature Clippy `-D warnings`, rustfmt,
+      `git diff --check`, Alejandra and repo-wide Markdown lint (**0 issues /
+      86 files**) are green.
+- [x] Trusted AW Remote Start issuer enforcement is live on the dotlink
+      OAuth/client side. Ordinary OAuth and AW-bridge authority are separate:
+      owner `trust-aw-bridge` / `untrust-aw-bridge` controls persist a
+      monotonic per-client trust epoch; lease issuance is 401 unauthenticated,
+      403 authenticated-but-untrusted, and issuer-bearing for trusted clients.
+- [x] Exact committed Remote Start replay is resolved before current issuer
+      trust; revoke blocks a genuinely new claim, while replay of the exact
+      committed effect remains factual. Re-trust increments the epoch and cannot
+      revive an older lease.
+- [x] The temporary `shared_process_status` compatibility projection is
+      removed; dotlink consumes the corrected shared
+      `ProcessTerminal::status()` directly from the published AW pin.
+
+### Remaining external / deferred boundaries
+
+- [ ] Native Windows Job Object and macOS runtime/deployment validation remain
+      external to this L5 Linux checkpoint.
+- [ ] Trusted-selector Bubblewrap runtime smoke remains host-gated.
+- [ ] Sandbox/config-v13 remains frozen pending explicit user promotion.

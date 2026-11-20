@@ -4,8 +4,7 @@ Authority:
 
 - current dotlink source/tests on L5;
 - AW P1-P8 shared-runtime design/implementation;
-- current release worktree `release/0.17 @ 3995448d7bf33794ef84c7bb51150d77cc260ada`
-  (`0.17.5`; read-only in this workstream);
+- current read-only release worktree `release/0.17 @ a2be5098e990f78656db746e10f5652a494347c2`, clean and 28 commits ahead of the published release baseline;
 - `origin/release/0.17 @ 3995448d7bf33794ef84c7bb51150d77cc260ada`;
 - `v0.17.5` resolves to `3995448d7bf33794ef84c7bb51150d77cc260ada`;
 - tagged `v0.17.4 @ fd1cdb6429a341a4e3d27805cae0bec288fc26df`.
@@ -22,7 +21,7 @@ Status meanings:
 - **Blocked** — no current semantic row remains blocked after final closeout;
   unavailable host/platform runtime smokes are recorded separately rather than
   weakening or misclassifying the semantic matrix. AW is pinned at
-  `1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; D0-D7 are complete.
+  `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`; D0-D7 are complete.
 - **Deferred** — intentionally outside this active workstream.
 
 ## v0.17.0 / v0.17.1 behavior
@@ -142,14 +141,15 @@ not a protocol/runtime timeout. It must never be conflated with:
 ## Final equivalence qualification
 
 The v0.17.x → current-main **semantic matrix is fully green** for every
-non-deferred behavior through local release `0.17.5`. A fresh independent review
-found and remediated the final-envelope/replay-cache boundary issues described
-below. The latest reviewed signed source checkpoint is
-`d32a3196ec18ada7f85176a9feed42667e5f2d6b`.
+non-deferred behavior through the published `v0.17.5` baseline. Subsequent
+fresh review, process/control hardening, AW repin and trusted Remote Start issuer
+cutover are complete in signed source checkpoint
+`648519add3d174b9e13de81aeca62431591dac6d`, pinned to published AW
+`b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`.
 
 Closing checkpoint on x86_64 Linux:
 
-- final post-D4-D7 main suite: **701 passed / 0 failed / 1 intentional ignored**;
+- final repinned main suite: **706 passed / 0 failed / 1 intentional ignored**;
 - integrations: **42/42** across child environment, lifecycle, exit/status,
   OAuth live rotation, private generations and stdio tools;
 - locked all-target/all-feature `cargo check` and strict Clippy `-D warnings`:
@@ -163,7 +163,16 @@ Closing checkpoint on x86_64 Linux:
 - fresh-review cache/final-envelope regressions: **8/8**, including narrow-first
   Graph/Cancel replay recovering canonical cached success, final-decorated
   Control/Send sizing, irreversible stdin preflight, and D5 page-credit text
-  remaining byte-identical after D6 receipt decoration.
+  remaining byte-identical after D6 receipt decoration;
+- the `jobs_get` final-envelope/exact-tail hardening is included in the signed
+  checkpoint: candidate generation stays in Jobs, MCP supplies the final
+  decorated-result predicate, ASCII keeps logarithmic search and non-ASCII uses
+  the bounded exact fallback; D5/D6 `jobs_read` remains exhaustive for
+  ceilings 1..=1024;
+- trusted Remote Start issuer semantics are qualified: ordinary OAuth remains
+  usable after bridge-trust revocation, trust epochs are monotonic, untrusted
+  clients cannot mint leases/new claims, and exact committed replay survives
+  later trust revocation without rerunning the effect.
 
 Runtime/deployment gates unavailable on this host do not weaken the semantic
 result: the connector exposes Bubblewrap only through a direct Nix-store path,

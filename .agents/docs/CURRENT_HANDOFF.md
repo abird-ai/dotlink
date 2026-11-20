@@ -1,11 +1,15 @@
 # CURRENT HANDOFF — dotlink unified Jobs + Agent runtime
 
-Current cross-repo 0.17.x bootstrap:
-`../../../aw/.agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-19.md`.
-Copy-ready next-agent entrypoint:
-`../../../aw/.agents/docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-19.md`.
+Canonical cross-repo comprehensive handoff:
+`../../../aw/.agents/docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`.
 
-Prepared: 2026-11-19
+Copy-ready next-agent entrypoint:
+`../../../aw/.agents/docs/AW-DOTLINK-NEXT-AGENT-2026-11-20.md`.
+
+The 2026-11-19 017 handoff is historical and is embedded in the canonical
+2026-11-20 document. Its older current-state/next-action claims are superseded.
+
+Prepared: 2026-11-20
 Owner: @pvl
 Machine: **L5 implementation/source authority**
 Repo: `/home/pvl/spaces/abird/src/dotlink`
@@ -17,6 +21,186 @@ Repo: `/home/pvl/spaces/abird/src/dotlink`
 > Later operational convergence with the 0.17.1 release branch is tracked in
 > [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
 > It preserves this unified-runtime implementation and is not a release/tag.
+
+## LIVE published AW repin + process/control/Remote Start trust checkpoint — 2026-11-20
+
+This section supersedes older dependency, pending-work and validation totals
+below where they conflict. D4-D7 and v0.17.5 semantic equivalence remain
+closed.
+
+Current source boundary:
+
+- AW source implementation is signed/published at
+  `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`
+  (`Complete v36 runtime admission and process semantics`);
+- dotlink signed source checkpoint is
+  `648519add3d174b9e13de81aeca62431591dac6d`
+  (`Repin AW and complete process-control hardening`);
+- all seven direct/transitive AW Git packages in dotlink are pinned exactly to
+  `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`;
+- no sibling/path override and no registry package/version drift were introduced;
+- the read-only release worktree remains clean at local
+  `release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`,
+  28 commits ahead / 0 behind published
+  `origin/release/0.17 = v0.17.5 = 3995448d7bf33794ef84c7bb51150d77cc260ada`;
+- sandbox/mount/config-v13 remains frozen and untouched.
+
+### Process lifetime and output truth
+
+The waited child, managed containment target and inherited output pipes have
+three deliberately independent lifetimes:
+
+1. **Process execution** ends at the waited child result or requested stop.
+2. **Managed descendants** are closed immediately after ordinary child exit
+   through the existing `ManagedProcessGuard` as **reasonless housekeeping**.
+3. **Inherited stdout/stderr** receive a fresh **250 ms post-exit grace**,
+   independent of the Process execution deadline.
+
+If an unsandboxed `setsid` descendant retains an inherited FD past that grace,
+dotlink seals the drain and preserves the factual command exit while marking
+output incomplete. The repinned shared AW owner now projects this directly:
+
+```text
+ProcessExit::Code(0) + no semantic stop  -> Primary::Ok
+nonzero code or physical signal          -> Primary::Fail
+unknown physical exit                     -> Primary::Unknown
+proven semantic stop                      -> Primary::Fail
+!ProcessTerminal.output.complete          -> Status.incomplete=true
+```
+
+Dotlink's temporary `shared_process_status` compatibility projection is gone.
+`JobManager` calls shared `settle_process(...)` and consumes
+`ProcessTerminal::status()` directly. Known exit truth and output coverage are
+therefore orthogonal in the shared owner, with no second lifecycle taxonomy.
+
+### Job control linearization
+
+Public model-visible control is shared-owner first:
+
+- revision-fenced `jobs_cancel` requires a canonical shared Job owner before
+  compare-and-act; there is no public non-shared cancel CAS fallback;
+- the per-Job transition gate serializes canonical revision checkpointing with
+  the local cancel signal;
+- Remote Start exact replay still resolves before current revision checks.
+
+Process stdin acceptance is one transition:
+
+1. reserve channel capacity without effect;
+2. acquire the per-Job transition gate;
+3. re-derive exact shared process tool + shell-guard generation;
+4. synchronously revalidate current host authority;
+5. compare/advance the canonical shared revision;
+6. enqueue bytes.
+
+A revoke/generation change before step 6 cannot cross the input-acceptance
+boundary. No second stdin-authority registry was added.
+
+### Trusted AW Remote Start issuer
+
+Ordinary OAuth authentication and AW Remote Start issuer authority are now
+separate capabilities.
+
+Private OAuth state owns one optional trust record per approved DCR client:
+
+```text
+RemoteStartTrust { epoch: u64, enabled: bool }
+```
+
+Owner controls:
+
+```bash
+dotlink oauth clients -p <profile>
+dotlink oauth trust-aw-bridge -p <profile> <client-id>
+dotlink oauth untrust-aw-bridge -p <profile> <client-id>
+```
+
+Trust transitions are monotonic and idempotent:
+
+```text
+untrusted -> trust       epoch 1
+trust -> trust           epoch 1
+trust -> untrust         epoch 2
+untrust -> untrust       epoch 2
+untrust -> trust         epoch 3
+```
+
+The same bearer token remains valid ordinary MCP authentication after AW-bridge
+trust is revoked. Only its Remote Start issuer annotation disappears.
+
+Lease issuance is explicit:
+
+- unauthenticated lease request -> HTTP 401;
+- authenticated ordinary OAuth client without AW-bridge trust -> HTTP 403;
+- trusted client -> `RemoteStartLease { target, issuer }`, where issuer binds
+  the authenticated `client_id` and current trust epoch.
+
+New Start validation requires the authorization issuer's client ID to equal the
+authenticated MCP client. The authorization's v2 digest binds that issuer.
+Current trust epoch is enforced only at the **new-claim** boundary:
+
+```text
+exact committed Start replay
+    -> replay existing factual receipt first
+    -> does not require current trust epoch
+
+genuinely new Start
+    -> current authenticated client must still be trusted
+    -> current epoch must equal authorization issuer epoch
+```
+
+Therefore issuer revocation blocks new effects without erasing committed replay,
+and re-trust at a later epoch cannot revive an old lease.
+
+### Instruction ownership and deterministic regressions
+
+The duplicate static `#[tool_handler(... instructions = ...)]` copy is removed.
+`get_info().server_info.instructions` is the single instruction owner.
+
+Control-plane wait/read/cancel tests use canonical shared Running Process
+fixtures with real shared output writers and notifications rather than
+child-process sleeps or ambient utility discovery.
+
+### Qualification after repin
+
+Focused trust/replay regressions are green for:
+
+- monotonic/idempotent trust epochs with live state observation;
+- bearer authentication surviving AW-bridge trust revocation;
+- unauthenticated/untrusted/trusted lease 401/403/200 behavior;
+- issuer-bound HTTP wire execution + exact replay;
+- revoked issuer blocking a fresh claim while exact committed replay survives;
+- Graph, shell and filesystem Remote Start no-rerun replay;
+- shared process outcome vs output-incomplete projection;
+- immediate descendant cleanup, escaped-`setsid` output handling;
+- stdin revoke-before-bytes, shared-owner cancel and replay-before-revision.
+
+Final host-available repinned gate:
+
+- main binary: **706 passed / 0 failed / 1 intentional ignored**;
+- integrations: **42/42**:
+  child-env 1/1, exit-line 2/2, exit-status 15/15,
+  OAuth live rotation 1/1, private generations 13/13, stdio tools 10/10;
+- strict
+  `cargo clippy --locked --all-targets --all-features -j1 -- -D warnings`:
+  green;
+- `cargo fmt --all -- --check`: green;
+- `git diff --check`: green;
+- `alejandra --check flake.nix nix`: green;
+- Markdown lint: **0 issues across 86 files**.
+
+Two combined `cargo test --locked --all-features` invocations were externally
+SIGKILLed by L5 before producing test output or Rust diagnostics. The same test
+set was then qualified as the complete main binary plus all six integration
+targets serially, all green. Treat those external kills as host noise, not a
+source failure.
+
+### Remaining boundaries
+
+- native Windows Job Object runtime qualification remains external;
+- native macOS runtime/deployment qualification remains external;
+- trusted-selector Bubblewrap runtime smoke remains host-gated;
+- sandbox/config-v13 remains frozen pending explicit user promotion;
+- no release/tag/deploy action is implied by this source publication.
 
 ## LIVE 0.17 shared-consumer checkpoint — D1-D7 fresh-reviewed, remediated and qualified 2026-11-19
 
@@ -92,12 +276,14 @@ bare number.
 
 Lifecycle logging is final-result based, not attempt-event based:
 
-    reasoned final StopRecord
-      -> exactly one LOG job stop id=<id> reason=<product reason>
-                     outcome=<delivered|gone|failed>
+```text
+reasoned final StopRecord
+  -> exactly one LOG job stop id=<id> reason=<product reason>
+                 outcome=<delivered|gone|failed>
 
-    ProcessExit::Signal(n) + no reasoned stop sequence
-      -> exactly one LOG job exit id=<id> signal=<name-or-number> from=outside
+ProcessExit::Signal(n) + no reasoned stop sequence
+  -> exactly one LOG job exit id=<id> signal=<name-or-number> from=outside
+```
 
 The two lines are mutually exclusive. from=outside means only that dotlink did
 not enter a semantic stop sequence; it does not identify a sender.
@@ -327,6 +513,65 @@ Fresh-review qualification after `d32a319...`:
 - no Nix files changed, so the prior real flake NixOS/native closeout remains
   the applicable Nix/platform evidence.
 
+### Post-commit fresh-review hardening — working tree complete
+
+Independent review from clean committed checkpoint
+`20b6f045f79fa7725f286e05b40e9262b1c9e4d3` found and fixed two related
+`jobs_get` Process-tail projection defects:
+
+1. Tail selection fitted the **bare** `CallToolResult` before D6 added required
+   receipt metadata and visible `ts=`. A smaller valid tail could therefore
+   exist while the handler returned a response-budget error.
+2. The old binary search assumed serialized size was monotone in raw tail bytes.
+   That is true for ASCII, but lossy UTF-8 can make a larger raw suffix serialize
+   smaller when a boundary rejoins a valid multibyte character.
+
+Final design:
+
+- production exposes one API:
+  `JobManager::standalone_process_tail_fitted(..., fits)`;
+- the Job layer owns factual tail generation; the host supplies a zero-cost
+  final-response fit predicate, so MCP/receipt policy never leaks into Jobs;
+- the requested tail is tried once first, then optional bytes shrink before
+  required status/receipt facts;
+- private `largest_fitting_projection` returns the **exact candidate it proved
+  fits**—a winning candidate is never re-read after admission;
+- ASCII projections use logarithmic search; any observed non-ASCII projection
+  switches to an exact descending fallback bounded by the public **1024-byte**
+  tail maximum;
+- shared AW JobManager remains the sole output/owner authority; tail observation
+  never creates delivery or ACK proof;
+- legacy byte-ceiling helpers now live only in test modules, leaving one
+  production tail surface.
+
+Regression coverage proves:
+
+- a bare tail can fit while its D6-decorated result does not, and the final
+  predicate-driven projection still succeeds;
+- a UTF-8 lead/continuation boundary where 513 raw bytes fit better than 512
+  still returns the largest valid tail;
+- D5/D6 `jobs_read` composition is safe for **every ceiling 1..=1024** where a
+  page can be produced: D6 leaves the credited page text byte-for-byte unchanged,
+  so `next_offset` remains exactly the ACKable raw prefix.
+
+No-change audits remain clean for D1-D3 stop/cancellation provenance, D4
+revision/control ordering, Remote Start fail-closed replay, D6 native Task
+timestamp/operation replay, exact AW Graph-result fallback and D7 heartbeat
+backpressure/accounting.
+
+Working-tree qualification:
+
+- full main binary: **701 passed / 0 failed / 1 intentional ignored**;
+- integrations: **42/42**;
+- locked all-target/all-feature `cargo check`: green;
+- strict Clippy `-D warnings`: green;
+- rustfmt and `git diff --check`: green;
+- no Cargo/Nix/dependency changes.
+
+Several L5 compilation attempts were externally SIGKILLed without Rust
+diagnostics; completed warmed/serial runs above are green. This source/docs
+checkpoint remains intentionally **unstaged, uncommitted and unpushed**.
+
 ### Final qualified checkpoint
 
 D4-D7 consumer cutover and the full v0.17.x semantic equivalence gate are
@@ -335,11 +580,10 @@ The only unavailable runtime/deployment smokes are explicitly host/platform
 external: trusted-selector Bubblewrap on this connector and native
 Windows/macOS.
 
-The latest reviewed source is committed as
-`d32a3196ec18ada7f85176a9feed42667e5f2d6b`; this fresh-review documentation
-closeout is committed separately on top. No push, version, tag, release or
-deployment was performed. The next repository action is only an explicitly
-authorized push (and, separately, any release bookkeeping the user requests).
+The latest **signed** source checkpoint remains
+`d32a3196ec18ada7f85176a9feed42667e5f2d6b`; the newer second/third-review
+tail-envelope hardening above is green but intentionally uncommitted. No push,
+version, tag, release or deployment was performed.
 
 Frozen sandbox/config-v13 work remains deferred and untouched.
 

@@ -7,9 +7,9 @@ Owner: @pvl
 Dotlink-side companion to AW's active shared-first plan:
 
 - `../../../../aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/`
-- canonical comprehensive handoff: `../../../../aw/.agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-18.md`
-- comprehensive handoff: `../../../../aw/.agents/docs/AW-DOTLINK-017-FULL-COMPREHENSIVE-HANDOFF-2026-11-19.md`
-- next-agent entrypoint: `../../../../aw/.agents/docs/AW-DOTLINK-017-NEXT-AGENT-2026-11-19.md`
+- canonical comprehensive handoff: `../../../../aw/.agents/docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`
+- current next-agent entrypoint: `../../../../aw/.agents/docs/AW-DOTLINK-NEXT-AGENT-2026-11-20.md`
+- historical 2026-11-19 / 2026-11-18 handoffs remain available for chronology
 - authority-gated publish/repin preflight: `../../../../aw/.agents/plans/017-shared-runtime-convergence-2026-11-18/PUBLISH-REPIN-PREFLIGHT.md`
 - D1-D3 exact source cutover map: [D1-D3-SOURCE-CUTOVER-MAP.md](D1-D3-SOURCE-CUTOVER-MAP.md)
 - D4-D7 exact source cutover map: [D4-D7-SOURCE-CUTOVER-MAP.md](D4-D7-SOURCE-CUTOVER-MAP.md)
@@ -17,8 +17,8 @@ Dotlink-side companion to AW's active shared-first plan:
 
 Current release reference worktree (read-only here):
 
-- local `release/0.17 = 3995448d7bf33794ef84c7bb51150d77cc260ada`
-  (`chore(release): 0.17.5`);
+- local `release/0.17 = a2be5098e990f78656db746e10f5652a494347c2`,
+  clean and **28 commits ahead / 0 behind** published release;
 - `origin/release/0.17 = 3995448d7bf33794ef84c7bb51150d77cc260ada`;
 - `v0.17.5` resolves to `3995448d7bf33794ef84c7bb51150d77cc260ada`;
 - `v0.17.4 = fd1cdb6429a341a4e3d27805cae0bec288fc26df`;
@@ -39,21 +39,29 @@ logging and deployment behavior.
 
 ## Current sequencing checkpoint
 
-AW final implementation is signed/published at
-`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; AW main is published through
-`4234447612421069a746c925c76a25e3ba27774a`. Dotlink is atomically repinned to
-that final SHA with no sibling/path dependency and no registry package/version
+AW final shared implementation is signed/published at
+`b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`. Dotlink is atomically repinned
+to that exact SHA with no sibling/path dependency and no registry package/version
 churn.
 
-D1-D7 convergence and the closing v0.17.x semantic equivalence gate are
-complete and freshly reviewed. The latest signed source checkpoint is
-`d32a3196ec18ada7f85176a9feed42667e5f2d6b`
-(`Harden Jobs replay and response budget boundaries`), on top of D4-D7 source
-checkpoint `fa01e18e3bb023dfe1d60b8ed45fd0ce53bfc0f7`. The fresh review fixed
-canonical Remote Start cache-before-projection ordering and made Jobs fit/
-preflight decisions measure the final D6-decorated MCP result. Do not
-reintroduce compatibility copies; the remaining unavailable runtime/deployment
-smokes are platform/connector external, not open semantic work.
+D1-D7 convergence, the v0.17.x semantic-equivalence gate, the post-review
+`jobs_get` final-envelope/exact-tail hardening, process/control ownership
+hardening and trusted AW Remote Start issuer cutover are complete in signed
+dotlink source checkpoint
+`648519add3d174b9e13de81aeca62431591dac6d`
+(`Repin AW and complete process-control hardening`).
+
+Dotlink now consumes shared `ProcessTerminal::status()` directly; the temporary
+published-pin process-status shim is gone. AW Remote Start issuance is explicitly
+separate from ordinary OAuth through persisted per-client trust epochs and owner
+`trust-aw-bridge` / `untrust-aw-bridge` controls. Exact committed replay is
+resolved before current trust, while genuinely new Starts require the current
+trusted issuer epoch.
+
+Final repinned gate is green: **706/0/1 + 42/42**, strict all-target/all-feature
+Clippy, fmt/diff, Alejandra and Markdown lint. The remaining unavailable
+runtime/deployment smokes are platform/connector external, not open semantic
+work.
 
 The independent product-only D8 Nix hardening is implemented now: module-owned
 environment keys are rejected through one generic assertion and regression
@@ -98,8 +106,8 @@ remains. Current dotlink exposes no real cumulative semantic-progress source, so
 no heartbeat-derived percentage/total/message is fabricated; shared semantic
 projection remains the required boundary when real facts exist.
 
-Final closeout is green: main **701/0/1**, integrations **42/42**, locked
-check/strict Clippy/format/lint gates green, real NixOS flake module check green,
+Final repinned closeout is green: main **706/0/1**, integrations **42/42**,
+locked strict Clippy/format/lint gates green; the earlier real NixOS flake module check remains green,
 and executable Linux hardware/process/signal native gates green. Trusted-selector
 Bubblewrap runtime smoke is unavailable through this connector, and native
 Windows/macOS runtime/deployment validation remains external. Neither is treated

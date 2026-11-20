@@ -1,6 +1,6 @@
 # D4-D7 exact source cutover map
 
-Status: **D1-D7 cutover + final equivalence + fresh replay/envelope review complete; latest source `d32a319`**
+Status: **D1-D7 + final equivalence + post-review process/control/Remote Start trust cutover complete in signed source checkpoint `648519add3d174b9e13de81aeca62431591dac6d`**
 
 Parent:
 [README.md](README.md)
@@ -10,7 +10,7 @@ AW owner:
 
 This file freezes the mechanical D4-D7 consumer swap against the current
 fresh-review AW APIs. Dotlink is already repinned to final AW implementation
-`1a5d0f65208e4a05b737c804a55a3aaad3e2fa59`; D1-D7 are complete.
+`b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`; D1-D7 are complete.
 
 Do not add sibling/path overrides and do not recreate unpublished AW APIs
 locally.
@@ -30,14 +30,14 @@ aw-mcp-protocol
 The five direct packages are atomically pinned to the final `AW_IMPL_SHA`:
 
 ```toml
-aw-tools = { git = "https://github.com/abird-ai/aw", rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59",
+aw-tools = { git = "https://github.com/abird-ai/aw", rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b",
              default-features = false, features = ["conformance", "durable"] }
 
 aw-platform = { git = "https://github.com/abird-ai/aw",
-                rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59", default-features = false }
+                rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b", default-features = false }
 
 aw-mcp-protocol = { git = "https://github.com/abird-ai/aw",
-                    rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59" }
+                    rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b" }
 ```
 
 The target-specific `aw-tools-fs-unix` / `aw-tools-fs-win` entries are already
