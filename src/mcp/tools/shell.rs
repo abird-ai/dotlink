@@ -5,12 +5,15 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use crate::jobs::CancelOrigin;
-use crate::shell_process::{KillReason, StopCause, StopOutcome, StopTrace};
+use crate::shell_process::{ChildEnd, StopCause, StopTrace, TreeObserver};
 use anyhow::{Context, Result};
 use rmcp::{
     ErrorData as McpError,
@@ -95,7 +98,7 @@ pub(crate) struct ShellArgs {
 /// different facts and only one of them is a failure.
 enum Drained {
     Ready(StreamSummary),
-    /// The window closed with a writer still holding the pipe.
+    /// The collector hadn't finished when the drain window closed.
     Cut,
     Failed(String),
 }
@@ -116,22 +119,12 @@ impl Drained {
 
 /// Salvage window for partial output after a killed child.
 const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
-/// Drain window after a command that ended on its own. Its output is already in
-/// the spool, so this only bounds what an escaped writer can hold open.
+/// Bound post-exit collection even if another writer still holds the pipe.
 const COMPLETED_OUTPUT_GRACE: Duration = Duration::from_secs(2);
-
-/// Said when a command returned before the work it started did. The command's own
-/// status is still reported; this is why the invocation did not finish, and it
-/// names the idiom that avoids it rather than leaving the caller to guess.
-// "left processes running" holds for both endings: a command that returned, and one
-// something else killed, can each leave a group behind.
-const LEFTOVERS_KILLED: &str =
-    "the command left processes running; dotlink killed them (use `wait` to keep one alive)";
-const LEFTOVERS_UNKILLED: &str = "the command left processes running; dotlink could not kill them";
 
 fn shell_timeout_description(max_secs: u64) -> String {
     format!(
-        "Hard execution deadline in seconds: on expiry the command tree is killed and the result reports stopped_by: \"timeout\". Defaults to {max_secs} (the ceiling), never how long the caller waits."
+        "Hard execution deadline in seconds, not the caller's wait. On expiry dotlink attempts to kill the command tree; `stopped_by: \"timeout\"` means it stopped the command. Defaults to {max_secs} (the ceiling)."
     )
 }
 
@@ -153,21 +146,17 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
         crate::jobs::shell_job_follow_up(None),
         crate::jobs::SHELL_JOB_DO_NOT_REPEAT
     );
-    // Said once, on every surface: the command owns its tree's lifetime, not the
-    // flag, and the script says how long that is.
-    // The clause teaches the idiom; the bounds it used to repeat are already
-    // stated above as `timeout_secs` and in the follow-up as `job_cancel`.
     let lifetime = if shell == "PowerShell" {
-        // Windows has no process groups and no `setsid`: the job object holds the tree,
-        // so the escape caveat would describe a hazard that does not exist here.
-        "The command's process tree is killed when it returns, and leaving work running there fails the call; keep one with `Wait-Process` inside a durable call."
+        "To keep a child in the job, use `Wait-Process` with `background: true`."
     } else {
-        "The command's process group is killed when it returns (a `setsid` descendant can escape it), and leaving work running there fails the call; keep one with `wait` inside a durable call (`server & wait`)."
+        "To keep a child in the job, use `server & wait` with `background: true`. Direct Unix cleanup covers only the original process group; Bash job control and GNU `timeout` can create other groups. Use `timeout_secs` for a deadline."
     };
     // `ts` is a fact of the result. The turn horizon is an advisory, and the
     // server instructions carry it once with the rule that goes with it, so no
     // tool description restates a bare number without that rule.
-    let tail = format!("{lifetime} `ts` = epoch seconds.");
+    let tail = format!(
+        r#"`tree: "leftovers"` means live work remained inside the cleanup boundary. Dotlink attempts to kill it; `success: false` even at exit 0. `tree: "unknown"` means the check was inconclusive; the exit verdict stands. Inspect output before retrying. {lifetime} `ts` = epoch seconds."#
+    );
     match sync_hold {
         Some(hold) => format!(
             "Run a {shell} command. Waits, then after at most {}s of response window returns a job handle and keeps running; `background: true` returns that handle at once; `timeout_secs` kills it; {follow_up}. {tail}",
@@ -244,6 +233,7 @@ async fn spool_job_output<R>(
     mut reader: R,
     path: PathBuf,
     writer_guard: SpoolWriterGuard,
+    read_bytes: Arc<AtomicU64>,
 ) -> std::io::Result<StreamSummary>
 where
     R: AsyncRead + Unpin,
@@ -269,6 +259,7 @@ where
             break;
         }
         total = total.saturating_add(read as u64);
+        read_bytes.store(total, Ordering::Relaxed);
         if truncated {
             // Once any byte is omitted, the durable file must remain an exact
             // prefix forever. Aggregate quota can become available later, but
@@ -311,22 +302,7 @@ where
             truncated = true;
         }
     }
-    let summary = StreamSummary {
-        total_bytes: total,
-        stored_bytes: stored,
-        truncated,
-    };
-    drop(writer_guard);
-    Ok(summary)
-}
-
-fn stream_summary_from_file(path: &Path, truncated: bool) -> StreamSummary {
-    let stored = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-    StreamSummary {
-        total_bytes: stored,
-        stored_bytes: stored,
-        truncated,
-    }
+    Ok(StreamSummary::complete(total, stored))
 }
 
 #[cfg(unix)]
@@ -367,23 +343,6 @@ fn descriptor_filesystem_type(file: &File) -> Result<u64> {
     }
     // SAFETY: successful `fstatfs` initialized the complete structure.
     Ok(unsafe { stats.assume_init() }.f_type as u64)
-}
-
-#[cfg(target_os = "linux")]
-fn descriptor_mount_id(file: &File) -> Result<u64> {
-    // `/proc/self/fdinfo` exposes the kernel mount id for this exact live
-    // descriptor. Using the proc ABI directly avoids libc/statx target-surface
-    // differences (notably musl) while keeping the check descriptor-bound and
-    // fail-closed when proc metadata is unavailable.
-    let path = format!("/proc/self/fdinfo/{}", file.as_raw_fd());
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read launcher descriptor metadata {path}"))?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("mnt_id:"))
-        .map(str::trim)
-        .ok_or_else(|| anyhow::anyhow!("launcher descriptor metadata has no mount id"))?
-        .parse::<u64>()
-        .context("launcher descriptor mount id is invalid")
 }
 
 #[cfg(target_os = "linux")]
@@ -486,7 +445,7 @@ fn trusted_nix_store_launcher(
     let store_metadata = store.metadata()?;
     if !store_metadata.is_dir()
         || descriptor_filesystem_type(&store)? == libc::FUSE_SUPER_MAGIC as u64
-        || descriptor_mount_id(&store)? != descriptor_mount_id(source)?
+        || crate::linux_procfs::mount_id(&store)? != crate::linux_procfs::mount_id(source)?
     {
         return Ok(None);
     }
@@ -513,8 +472,11 @@ fn trusted_nix_store_launcher(
 }
 
 #[cfg(target_os = "linux")]
+const BUILD_BWRAP: Option<&str> = option_env!("DOTLINK_BUILD_BWRAP"); // tracked by Cargo's rustc dep-info
+
+#[cfg(target_os = "linux")]
 fn build_pinned_bubblewrap(path: &Path) -> bool {
-    option_env!("DOTLINK_BUILD_BWRAP")
+    BUILD_BWRAP
         .and_then(|value| std::fs::canonicalize(value).ok())
         .is_some_and(|trusted| trusted == path)
 }
@@ -582,8 +544,9 @@ impl std::fmt::Display for UntrustedSandboxLauncher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Bubblewrap launcher {} is not from a trusted host-managed source; use a root-owned native executable under a root-owned non-writable path, a root-managed selector such as the system profile, or dotlink's Nix package so the exact Bubblewrap derivation is build-pinned (Nix-store immutability alone is not selection authority)",
-            self.path.display()
+            "Bubblewrap launcher {} is not from a trusted host-managed source; use a root-owned native executable under a root-owned non-writable path, a root-managed selector such as the system profile, or dotlink's Nix package so the exact Bubblewrap derivation is build-pinned (Nix-store immutability alone is not selection authority). DOTLINK_BUILD_BWRAP in this binary: {:?}",
+            self.path.display(),
+            BUILD_BWRAP.unwrap_or("<unset>")
         )
     }
 }
@@ -689,10 +652,10 @@ fn validate_sandbox_launcher(prepared: &PreparedExecutable) -> Result<()> {
         );
     }
     if prepared.sandbox_trust.is_none() {
-        anyhow::bail!(
-            "Bubblewrap launcher {} is not from a trusted host-managed source; use a root-owned native executable under a root-owned non-writable path, a root-managed selector such as the system profile, or dotlink's Nix package so the exact Bubblewrap derivation is build-pinned (Nix-store immutability alone is not selection authority)",
-            prepared.path.display()
-        );
+        return Err(UntrustedSandboxLauncher {
+            path: prepared.path.clone(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -809,11 +772,7 @@ fn sealed_executable_snapshot(
     }
     snapshot.flush()?;
     snapshot.seek(SeekFrom::Start(0))?;
-    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
-    // SAFETY: fcntl operates on the live memfd and does not alias Rust memory.
-    if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
-        return Err(std::io::Error::last_os_error()).context("cannot seal executable snapshot");
-    }
+    seal_executable(&snapshot)?;
     let digest: [u8; 32] = digest.finalize().into();
     Ok((
         snapshot,
@@ -821,6 +780,35 @@ fn sealed_executable_snapshot(
         prefix_len == 2 && prefix == *b"#!",
         privileged_source,
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn seal_executable(snapshot: &File) -> Result<()> {
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl operates on the live memfd and does not alias Rust memory.
+    if unsafe { libc::fcntl(snapshot.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot seal executable snapshot");
+    }
+    Ok(())
+}
+
+/// Cache immutable target-native observer bytes; each launch inherits only its
+/// own descriptor. No writable path or extra host bind enters the namespace.
+#[cfg(target_os = "linux")]
+fn observer_image() -> Result<File> {
+    use std::os::unix::fs::PermissionsExt;
+    static IMAGE: std::sync::OnceLock<File> = std::sync::OnceLock::new();
+    if let Some(image) = IMAGE.get() {
+        return Ok(image.try_clone()?);
+    }
+    let mut file = create_executable_memfd()?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o500))?;
+    file.write_all(include_bytes!(concat!(env!("OUT_DIR"), "/observe-shell")))?;
+    seal_executable(&file)?;
+    // Reopen once read-only: dup would retain the writable file description for exec.
+    let reader = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    let _ = IMAGE.set(reader.try_clone()?);
+    Ok(reader)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1262,6 +1250,9 @@ pub(crate) async fn validate_bubblewrap(program: &PreparedExecutable) -> Result<
         "--perms",
         "--dev-bind",
     ];
+    // Materialize the cached observer during launcher activation, so setup
+    // failures retain their recovery classification instead of failing every job.
+    observer_image().context("cannot prepare sandbox shell observer")?;
     let mut command = program.sandbox_host_command()?;
     let mut child = command
         .arg("--help")
@@ -1546,8 +1537,24 @@ fn shell_guard_generation(guards: &ShellGuards) -> [u8; 32] {
 struct ShellRuntime {
     config: RuntimeConfig,
     launchers: crate::mcp::PreparedLaunchers,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     secure_fs: Arc<crate::secure_fs::SecureFs>,
+}
+
+/// Prepared together so each spawned launcher consumes its own observer endpoint.
+#[derive(Debug)]
+struct ShellCommand {
+    command: Command,
+    observer: TreeObserver,
+}
+
+impl ShellCommand {
+    fn direct(command: Command) -> Self {
+        Self {
+            command,
+            observer: TreeObserver::Direct,
+        }
+    }
 }
 
 impl ShellRuntime {
@@ -1555,7 +1562,7 @@ impl ShellRuntime {
         &self,
         args: &ShellArgs,
         powershell: bool,
-    ) -> Result<(Command, PathBuf, Option<[u8; 32]>)> {
+    ) -> Result<(ShellCommand, PathBuf, Option<[u8; 32]>)> {
         if let Some(stdin_text) = args.stdin.as_ref()
             && stdin_text.len() > self.config.max_write_bytes
         {
@@ -1576,30 +1583,20 @@ impl ShellRuntime {
             .ok_or_else(|| anyhow::anyhow!("shell execution is disabled"))?;
 
         #[cfg(target_os = "linux")]
-        let (command, shell_guard_generation) = if self.config.sandbox_shell && !powershell {
+        if self.config.sandbox_shell && !powershell {
             let guards = self.shell_guards()?;
             let generation = shell_guard_generation(&guards);
-            (
-                self.bubblewrap_command_with_guards(
-                    shell_launcher,
-                    &working_dir,
-                    &args.command,
-                    guards,
-                )?,
-                Some(generation),
-            )
-        } else {
-            (
-                direct_shell_command(shell_launcher, powershell, &working_dir, &args.command)?,
-                None,
-            )
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (command, shell_guard_generation) = (
-            direct_shell_command(shell_launcher, powershell, &working_dir, &args.command)?,
-            None,
-        );
-        Ok((command, working_dir, shell_guard_generation))
+            let launch = self.bubblewrap_command_with_guards(
+                shell_launcher,
+                &working_dir,
+                &args.command,
+                guards,
+            )?;
+            return Ok((launch, working_dir, Some(generation)));
+        }
+        let command =
+            direct_shell_command(shell_launcher, powershell, &working_dir, &args.command)?;
+        Ok((ShellCommand::direct(command), working_dir, None))
     }
 
     #[cfg(target_os = "linux")]
@@ -1612,25 +1609,13 @@ impl ShellRuntime {
     }
 
     #[cfg(target_os = "linux")]
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn bubblewrap_command(
-        &self,
-        shell: &PreparedExecutable,
-        working_dir: &Path,
-        script: &str,
-    ) -> Result<Command> {
-        let guards = self.shell_guards()?;
-        self.bubblewrap_command_with_guards(shell, working_dir, script, guards)
-    }
-
-    #[cfg(target_os = "linux")]
     fn bubblewrap_command_with_guards(
         &self,
         shell: &PreparedExecutable,
         working_dir: &Path,
         script: &str,
         guards: ShellGuards,
-    ) -> Result<Command> {
+    ) -> Result<ShellCommand> {
         let bwrap = self
             .launchers
             .bwrap
@@ -1842,10 +1827,25 @@ impl ShellRuntime {
             }
         }
 
+        let (recv, send) = std::os::unix::net::UnixDatagram::pair()?;
+        recv.set_nonblocking(true)?;
+        let observer = observer_image()?;
+        let image_fd = observer.as_raw_fd();
+        let report_fd = send.as_raw_fd();
+        mount_fds.push(observer);
+        mount_fds.push(std::os::fd::OwnedFd::from(send).into());
+        // Bubblewrap must preserve these inherited FDs through exec (not consume
+        // them as mount sources). The real-binary shell_lifetime parity test covers this.
+        // The observer starts with an empty environment. Only the actual shell
+        // receives configured variables (including any loader controls).
         command
             .arg("--chdir")
             .arg(working_dir)
             .arg("--clearenv")
+            .arg("--")
+            .arg(format!("/proc/self/fd/{image_fd}"))
+            .arg(image_fd.to_string())
+            .arg(report_fd.to_string())
             .arg("--setenv")
             .arg("HOME")
             .arg("/tmp/home")
@@ -1878,13 +1878,8 @@ impl ShellRuntime {
             command.arg("--setenv").arg(name).arg(value);
         }
 
-        command
-            .arg("--")
-            .arg(shell.path())
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg("-lc")
-            .arg(script);
+        command.arg("--").arg(shell.path());
+        bash_script(&mut command, script);
 
         if !mount_fds.is_empty() {
             use std::os::{fd::AsRawFd, unix::process::CommandExt};
@@ -1902,7 +1897,10 @@ impl ShellRuntime {
                 });
             }
         }
-        Ok(command)
+        Ok(ShellCommand {
+            command,
+            observer: TreeObserver::Namespace(recv),
+        })
     }
 }
 
@@ -1926,7 +1924,7 @@ impl LocalMachine {
         ShellRuntime {
             config: self.config.clone(),
             launchers: self.launchers.clone(),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(target_os = "linux")]
             secure_fs: self.secure_fs.clone(),
         }
     }
@@ -1939,8 +1937,10 @@ impl LocalMachine {
         script: &str,
     ) -> Result<Command> {
         let shell = PreparedExecutable::for_test(shell.to_path_buf());
-        self.shell_runtime()
-            .bubblewrap_command(&shell, working_dir, script)
+        let runtime = self.shell_runtime();
+        Ok(runtime
+            .bubblewrap_command_with_guards(&shell, working_dir, script, runtime.shell_guards()?)?
+            .command)
     }
 
     /// Run one shell call as the caller asked: `background: true` answers with
@@ -2299,7 +2299,8 @@ impl LocalMachine {
                         );
                     }
 
-                    let (mut command, working_dir, shell_guard_generation) =
+                    let stop_trace = StopTrace::new(runtime.config.log.clone(), job.id.clone());
+                    let (mut launch, working_dir, shell_guard_generation) =
                         match runtime.prepare_shell_command(&args, powershell).await {
                             Ok(prepared) => prepared,
                             Err(error) => {
@@ -2313,23 +2314,14 @@ impl LocalMachine {
                             StreamSummary::default(),
                         );
                     }
-                    crate::shell_process::configure(&mut command);
-                    crate::credentials::hide_from_child(&mut command)
+                    crate::credentials::hide_from_child(&mut launch.command)
                         .stdin(if args.stdin.is_some() {
                             Stdio::piped()
                         } else {
                             Stdio::null()
                         })
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        // Reaper only, never the authority: `process_tree` is
-                        // declared after `child`, so Rust drops the guard first,
-                        // which kills the group through `Guard::terminate` and
-                        // records the reason and outcome. This flag then reaps the
-                        // already-dead leader instead of leaving a zombie. Do not
-                        // read it as the kill path — a kill that never reaches the
-                        // guard can never be attributed.
-                        .kill_on_drop(true);
+                        .stderr(Stdio::piped());
                     if !job.mark_running(shell_guard_generation) {
                         return JobCompletion::cancelled(
                             StreamSummary::default(),
@@ -2351,9 +2343,8 @@ impl LocalMachine {
                     // Built unconditionally: verbosity can be cycled at runtime, so
                     // deciding at capture time would make the record depend on when
                     // the operator pressed `v`. The gate stays at the log line.
-                    let stop_trace = StopTrace::new(runtime.config.log.clone(), job.id.clone());
                     let completion = LocalMachine::run_shell_job(
-                        command,
+                        launch,
                         args.stdin,
                         deadline,
                         job,
@@ -2370,81 +2361,27 @@ impl LocalMachine {
 
     /// The vocabulary for a cancellation: a caller who cancelled their own job
     /// and a connector withdrawing the work are different facts in the result.
-    fn cancel_reason(origin: CancelOrigin) -> KillReason {
+    fn cancel_reason(origin: CancelOrigin) -> StopCause {
         match origin {
-            CancelOrigin::Caller => KillReason::Cancel,
-            CancelOrigin::Connector => KillReason::Shutdown,
+            CancelOrigin::Caller => StopCause::Cancel,
+            CancelOrigin::Connector => StopCause::Shutdown,
         }
     }
 
-    /// What a failure may say about the stop it follows. A tree that is already
-    /// stopped keeps the cause it was stopped with, so a later spool error cannot
-    /// relabel a timeout as a failure.
-    ///
-    /// The one place a completion is finished. Whatever happened to the tree is carried
-    /// onto the completion — a refused signal becomes `tree=alive` even when nothing was
-    /// swept — and the fail-safe is disarmed, so a job that publishes a result can never
-    /// be written twice and an unproven group is never silent. Every path that returns a
-    /// completion goes through here, including the ones that never start a run.
-    fn finish(
-        completion: JobCompletion,
-        tree: &mut crate::shell_process::Guard,
-        swept: Option<StopOutcome>,
-    ) -> JobCompletion {
-        // A refusal is the newest fact about the group, so it outranks an older sweep.
-        let leftovers = if tree.may_still_run() {
-            Some(StopOutcome::Failed)
-        } else {
-            swept
-        };
+    /// Freeze post-exit evidence and cleanup failures once, before Drop can log.
+    fn finish(completion: JobCompletion, tree: &mut crate::shell_process::Guard) -> JobCompletion {
+        let kill_failed = tree.kill_failed();
         tree.disarm();
-        completion.with_leftovers(leftovers)
-    }
-
-    /// A tree that is still live is stopped here, so the failure owns the kill rather
-    /// than deferring it to the fail-safe, which cannot say why. A command that already
-    /// ended needs nothing: the run path swept its group and the outcome is in `facts`.
-    fn failure_stop(tree: &mut crate::shell_process::Guard, facts: &mut FailureFacts<'_>) {
-        // Only a live command needs stopping; the sweep behind a finished one already
-        // ran on the path that watches the command end, and its outcome is in `facts`.
-        // Sweeping a second time would find the guard disarmed and report nothing.
-        if facts.exit_status.is_none() {
-            facts.stop = facts.stop.or_else(|| tree.terminate(KillReason::Failed));
-        }
-    }
-
-    /// One internal failure of the output path. The command's status, the stop the
-    /// failure followed and the terminal it reached all come from the same run, and
-    /// the streams are re-read from the spool because the collector that failed
-    /// cannot be trusted. Every such site goes through here, so no surface can
-    /// carry a different subset of the facts.
-    fn spool_failure(
-        tree: &mut crate::shell_process::Guard,
-        mut facts: FailureFacts<'_>,
-        error: String,
-        job: &JobHandle,
-        context: JobResultContext,
-    ) -> JobCompletion {
-        Self::failure_stop(tree, &mut facts);
-        let swept = facts.leftovers;
-        Self::finish(
-            facts
-                .apply(JobCompletion::internal_failed(
-                    error,
-                    stream_summary_from_file(&job.stdout_path, true),
-                    stream_summary_from_file(&job.stderr_path, true),
-                ))
-                .with_context(context),
-            tree,
-            swept,
-        )
+        completion
+            .with_tree(tree.observation)
+            .with_kill_failed(kill_failed)
     }
 
     /// Run one shell command and write its one lifecycle line. This wrapper sees
     /// every completion, including the failure paths, so how a job is recorded
     /// cannot depend on which path ended it.
     async fn run_shell_job(
-        command: Command,
+        command: ShellCommand,
         stdin_text: Option<String>,
         deadline: Instant,
         job: JobHandle,
@@ -2460,19 +2397,19 @@ impl LocalMachine {
             stop_trace.clone(),
         )
         .await;
-        let (end, by) = Self::ending(&completion);
-        let tree = completion
-            .leftovers
-            .and_then(crate::shell_process::tree_word);
-        // A command that simply ended is the expected case, so it writes nothing: the
-        // record is for what an operator would otherwise have to reconstruct, and a
-        // line per ordinary exit is noise that hides those. Everything else records —
-        // including an ending that names no actor, because a deadline or an internal
-        // error is an event whether or not its kill landed.
-        if !end.is_own() || tree.is_some() {
-            stop_trace.ended(&end, by, tree);
+        if let Some((end, by)) = Self::lifecycle_line(&completion) {
+            stop_trace.ended(&end, by, completion.tree, completion.kill_failed);
         }
         completion
+    }
+
+    /// A plain exit is silent. Other endings, tree observations and cleanup alarms are not.
+    fn lifecycle_line(
+        completion: &JobCompletion,
+    ) -> Option<(crate::shell_process::End, Option<&'static str>)> {
+        let (end, by) = Self::ending(completion);
+        (!end.is_own() || completion.tree.word().is_some() || completion.kill_failed)
+            .then_some((end, by))
     }
 
     /// How this job ended and who ended it — two words per job, and neither needs a
@@ -2490,8 +2427,7 @@ impl LocalMachine {
             Some(StopCause::Cancel) => Some("caller"),
             Some(StopCause::Shutdown) => Some("connector"),
             Some(StopCause::Timeout | StopCause::Failed) => None,
-            None if completion.signal.is_some() => Some("external"),
-            None => None,
+            None => crate::jobs::external_signal(completion).map(|_| "external"),
         };
         // The terminal a failure followed, not the `Failed` it is rendered as: an
         // internal failure behind a deadline is still a deadline, and the reply says
@@ -2523,7 +2459,10 @@ impl LocalMachine {
     }
 
     async fn run_shell_job_inner(
-        mut command: Command,
+        ShellCommand {
+            mut command,
+            observer,
+        }: ShellCommand,
         stdin_text: Option<String>,
         deadline: Instant,
         job: JobHandle,
@@ -2534,56 +2473,46 @@ impl LocalMachine {
             return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
                 .with_context(result_context);
         }
-        let mut child = match command.spawn() {
+        let mut child = match crate::shell_process::spawn(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 return JobCompletion::failed(error.to_string()).with_context(result_context);
             }
         };
-        let mut process_tree = match crate::shell_process::Guard::attach(&child, stop_trace.clone())
-        {
-            Ok(group) => group,
-            Err(error) => {
-                // The child exists and we are about to kill it, so this is a
-                // connector stop. No guard exists yet, so the kill is the child
-                // handle's; a command that had already finished was not stopped by
-                // it, so it claims nothing.
-                let reaped = Self::terminate_child(&mut child).await;
-                let claimed = reaped.kill_alone_ended_it();
-                // No guard exists on this path, so there is nothing to disarm and no
-                // refusal to carry: the wrapper still writes the job's one line.
-                return JobCompletion::failed(format!("could not contain command tree: {error}"))
-                    .with_stop(claimed.then_some(StopCause::Failed))
+        let (stdout, stderr, stdin) =
+            (child.stdout.take(), child.stderr.take(), child.stdin.take());
+        let mut process_tree =
+            match crate::shell_process::Guard::attach(&mut child, observer, stop_trace).await {
+                Ok(group) => group,
+                Err((error, end)) => {
+                    return JobCompletion::failed(format!(
+                        "could not contain command tree: {error}"
+                    ))
+                    .with_child_end(end)
                     .with_context(result_context);
-            }
-        };
-        let stdout = match child.stdout.take() {
+                }
+            };
+        let stdout = match stdout {
             Some(stdout) => stdout,
             None => {
-                let claimed = process_tree.terminate(KillReason::Failed);
-                let reaped = Self::terminate_child(&mut child).await;
-                let cause = reaped.claim(claimed);
+                let end = process_tree.stop(StopCause::Failed).await;
                 return Self::finish(
                     JobCompletion::failed("failed to capture child stdout")
-                        .with_stop(cause)
+                        .with_child_end(end)
                         .with_context(result_context),
                     &mut process_tree,
-                    None,
                 );
             }
         };
-        let stderr = match child.stderr.take() {
+        let stderr = match stderr {
             Some(stderr) => stderr,
             None => {
-                let claimed = process_tree.terminate(KillReason::Failed);
-                let reaped = Self::terminate_child(&mut child).await;
-                let cause = reaped.claim(claimed);
+                let end = process_tree.stop(StopCause::Failed).await;
                 return Self::finish(
                     JobCompletion::failed("failed to capture child stderr")
-                        .with_stop(cause)
+                        .with_child_end(end)
                         .with_context(result_context),
                     &mut process_tree,
-                    None,
                 );
             }
         };
@@ -2593,30 +2522,31 @@ impl LocalMachine {
             // command that cannot register its writers is being torn down with
             // the connector. Reading the recorded origin here would race the
             // seal, which deliberately happens first.
-            let claimed = process_tree.terminate(KillReason::Shutdown);
-            let reaped = Self::terminate_child(&mut child).await;
-            let cause = reaped.claim(claimed);
+            let end = process_tree.stop(StopCause::Shutdown).await;
             return Self::finish(
                 JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
-                    .with_stop(cause)
+                    .with_child_end(end)
                     .with_context(result_context),
                 &mut process_tree,
-                None,
             );
         };
+        let stdout_read = Arc::new(AtomicU64::new(0));
+        let stderr_read = Arc::new(AtomicU64::new(0));
         let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
             stdout,
             job.stdout_path.clone(),
             stdout_writer,
+            stdout_read.clone(),
         )));
         let mut stderr_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
             stderr,
             job.stderr_path.clone(),
             stderr_writer,
+            stderr_read.clone(),
         )));
 
         let (mut stdin_task, mut stdin_rx) = match stdin_text {
-            Some(stdin_text) => match child.stdin.take() {
+            Some(stdin_text) => match stdin {
                 Some(mut stdin) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let task = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -2626,33 +2556,37 @@ impl LocalMachine {
                     (Some(task), Some(rx))
                 }
                 None => {
-                    let claimed = process_tree.terminate(KillReason::Failed);
-                    let reaped = Self::terminate_child(&mut child).await;
-                    let cause = reaped.claim(claimed);
+                    let end = process_tree.stop(StopCause::Failed).await;
                     abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
-                    return JobCompletion::failed("failed to capture child stdin")
-                        .with_stop(cause)
-                        .with_context(result_context);
+                    return Self::finish(
+                        JobCompletion::failed("failed to capture child stdin")
+                            .with_child_end(end)
+                            .with_context(result_context),
+                        &mut process_tree,
+                    );
                 }
             },
             None => (None, None),
         };
 
         enum WaitOutcome {
-            Child(std::result::Result<std::process::ExitStatus, std::io::Error>),
+            Exit(std::process::ExitStatus),
             Timeout,
             Cancelled,
-            StdinFailure(String),
+            Failure(String),
         }
         let outcome = {
-            let wait = child.wait();
+            let wait = process_tree.wait();
             tokio::pin!(wait);
             loop {
                 tokio::select! {
                     biased;
                     _ = job.cancel.cancelled() => break WaitOutcome::Cancelled,
                     _ = sleep_until(deadline) => break WaitOutcome::Timeout,
-                    result = &mut wait => break WaitOutcome::Child(result),
+                    result = &mut wait => break match result {
+                        Ok(status) => WaitOutcome::Exit(status),
+                        Err(error) => WaitOutcome::Failure(error.to_string()),
+                    },
                     result = async {
                         match stdin_rx.as_mut() {
                             Some(rx) => rx.await,
@@ -2672,312 +2606,101 @@ impl LocalMachine {
                                 stdin_rx = None;
                                 stdin_task.take();
                             }
-                            Ok(Err(error)) => break WaitOutcome::StdinFailure(format!("failed writing stdin: {error}")),
-                            Err(_) => break WaitOutcome::StdinFailure("stdin writer task failed".to_owned()),
+                            Ok(Err(error)) => break WaitOutcome::Failure(format!("failed writing stdin: {error}")),
+                            Err(_) => break WaitOutcome::Failure("stdin writer task failed".to_owned()),
                         }
                     }
                 }
             }
         };
 
-        let mut exit_status = None;
-        let mut terminal = JobStatus::Completed;
-        let mut terminal_error = None;
-        let mut stop: Option<StopCause> = None;
-        // What the sweep found when the command ended: anything but `AlreadyGone`
-        // means it returned while its own group was still running.
-        let mut leftovers = Some(StopOutcome::AlreadyGone);
-        match outcome {
-            WaitOutcome::Child(Ok(status)) => {
-                exit_status = Some(status);
-                // The command returned; its group must not outlive it. A
-                // sandboxed group is already gone with the namespace, so this
-                // finds nothing there. An unsandboxed one can still hold
-                // inherited descriptors — stdout above all — and sweeping it
-                // here is what lets the collector finish now instead of at the
-                // deadline. The sweep claims no cause: the command's own status
-                // already said how it ended. What it found is the verdict below.
-                leftovers = Some(process_tree.sweep());
-            }
-            WaitOutcome::Child(Err(error)) => {
-                terminal = JobStatus::Failed;
-                terminal_error = Some(error.to_string());
-                let claimed = process_tree.terminate(KillReason::Failed);
-                let reaped = Self::terminate_child(&mut child).await;
-                stop = reaped.claim(claimed);
+        let ending = match outcome {
+            WaitOutcome::Exit(status) => ShellEnd::Completed(status),
+            WaitOutcome::Failure(message) => {
+                ShellEnd::Failed(message, process_tree.stop(StopCause::Failed).await)
             }
             WaitOutcome::Timeout | WaitOutcome::Cancelled => {
                 let deadline = matches!(outcome, WaitOutcome::Timeout);
-                // The select is biased, so a command that exited in the same turn
-                // as its deadline would otherwise be reported as stopped. Its own
-                // status wins, and the output grace is refreshed because the
-                // execution deadline has already passed.
-                let finished = match child.try_wait() {
-                    Ok(Some(status)) => Some(status),
-                    _ => None,
-                };
-                let finished = match finished {
-                    Some(status) => Some(status),
-                    None => {
-                        let reason = if deadline {
-                            KillReason::Timeout
-                        } else {
-                            Self::cancel_reason(job.cancel.origin())
-                        };
-                        let claimed = process_tree.terminate(reason);
-                        let reaped = Self::terminate_child(&mut child).await;
-                        // The group signal is the stop. A status the command
-                        // produced itself overrides it: we did not stop it,
-                        // whatever the signal did to the tree behind it. Whether
-                        // the follow-up child kill was accepted is deliberately
-                        // not evidence here — the group termination already ended
-                        // that child, so on Windows the second kill is rejected
-                        // and its delivery proves nothing either way.
-                        match reaped.status {
-                            Some(status) if Self::ended_on_its_own(&status) => {
-                                stop = None;
-                                // The command ended on its own, so no cause is claimed —
-                                // but the kill just made did end the tree behind it, and
-                                // the record would otherwise say nothing happened.
-                                leftovers = process_tree.last_outcome();
-                                Some(status)
-                            }
-                            _ => {
-                                stop = claimed;
-                                terminal = if deadline {
-                                    JobStatus::TimedOut
-                                } else {
-                                    JobStatus::Cancelled
-                                };
-                                None
-                            }
-                        }
+                // A biased wake is not a stop. Preserve an independent exit on either side of the signal.
+                if let Ok(Some(status)) = process_tree.try_wait() {
+                    ShellEnd::Completed(status)
+                } else {
+                    let reason = if deadline {
+                        StopCause::Timeout
+                    } else {
+                        Self::cancel_reason(job.cancel.origin())
+                    };
+                    match process_tree.stop(reason).await {
+                        ChildEnd::Exited(status) => ShellEnd::Completed(status),
+                        ChildEnd::Stopped(cause) if deadline => ShellEnd::TimedOut(cause),
+                        ChildEnd::Stopped(cause) => ShellEnd::Cancelled(cause),
                     }
-                };
-                if let Some(status) = finished {
-                    exit_status = Some(status);
-                    // The command ended; its tree does not get to outlive it. A
-                    // sandboxed tree is already gone with the namespace, so this
-                    // finds nothing and records nothing. An unsandboxed one can
-                    // still hold inherited descriptors — notably stdout, which
-                    // would otherwise keep the spool reader waiting until the
-                    // deadline and turn a successful command into a collection
-                    // failure. Ending it here is what makes one contract hold in
-                    // both modes: descendants die when the command returns.
-                    leftovers = Some(process_tree.sweep());
                 }
             }
-            WaitOutcome::StdinFailure(message) => {
-                terminal = JobStatus::Failed;
-                terminal_error = Some(message);
-                let claimed = process_tree.terminate(KillReason::Failed);
-                let reaped = Self::terminate_child(&mut child).await;
-                stop = reaped.claim(claimed);
-            }
-        }
+        };
         if let Some(task) = stdin_task.take() {
             task.abort();
         }
-        // Everything a result may still say about how the command ended is final
-        // here, so a failure past this point reports this one set of facts.
-        let facts = FailureFacts {
-            exit_status: exit_status.as_ref(),
-            stop,
-            // The sweep that already ran owns this fact; only the sweep sets it. Re-sweeping
-            // here would find a disarmed guard and report that nothing happened, which is
-            // how a recorded sweep became an unrecorded one.
-            leftovers,
-            terminal,
-        };
-
-        // A completed command's own output is already in the spool, so anything
-        // still holding the pipe is an escaped writer. Bound that drain instead of
-        // borrowing the execution deadline, which can be hours away.
-        let collect_deadline = match terminal {
-            JobStatus::Completed => Instant::now() + COMPLETED_OUTPUT_GRACE,
+        // The command is reaped, but buffered bytes or a surviving pipe writer
+        // may remain. Don't borrow the execution deadline to finish draining.
+        let collect_deadline = match ending {
+            ShellEnd::Completed(_) => Instant::now() + COMPLETED_OUTPUT_GRACE,
             _ => Instant::now() + TIMEOUT_OUTPUT_GRACE,
         };
-        // Each stream gets its own window, so a writer holding one pipe open cannot
-        // cancel the other stream's answer.
+        // One deadline, independent outcomes: a stalled pipe must not hide a spool error.
         let stdout_ready = timeout_at(collect_deadline, &mut stdout_task).await.ok();
         let stderr_ready = timeout_at(collect_deadline, &mut stderr_task).await.ok();
         let stdout = Drained::of("stdout", stdout_ready);
         let stderr = Drained::of("stderr", stderr_ready);
-        // A storage failure is the failure, whichever stream reported it and even when
-        // the other window never closed: a cut stream is no reason to lose an error.
-        if let Some(error) = [&stdout, &stderr]
-            .into_iter()
-            .find_map(|drained| match drained {
-                Drained::Failed(error) => Some(error.clone()),
-                _ => None,
-            })
-        {
-            return Self::spool_failure(&mut process_tree, facts, error, &job, result_context);
-        }
-        // A window that closed with the writer still holding the pipe is out of contract
-        // — a `setsid` descendant — so the answer is the retained prefix, marked cut.
+        // Stop the collectors before reading a retained prefix, including on the
+        // error path. Neither summary may race bytes still landing.
         if matches!(stdout, Drained::Cut) || matches!(stderr, Drained::Cut) {
             abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
         }
-        let settle = |drained: Drained, path: &std::path::Path| match drained {
-            Drained::Ready(summary) => summary,
-            _ => stream_summary_from_file(path, true),
-        };
-        let (stdout, stderr) = (
-            settle(stdout, &job.stdout_path),
-            settle(stderr, &job.stderr_path),
-        );
-
-        match terminal {
-            JobStatus::Completed => {
-                let status = exit_status.expect("completed job has an exit status");
-                let completion = Self::finish(
-                    JobCompletion::completed(status.code(), status.success(), stdout, stderr)
-                        .with_signal(Self::exit_signal(&status))
-                        .with_stop(stop)
-                        .with_context(result_context),
-                    &mut process_tree,
-                    leftovers,
-                );
-                // A command that returned with its own group still running did not do
-                // what it was asked: dotlink ended that work. Its status is still
-                // reported, but the invocation did not finish — otherwise a script
-                // that backgrounds work and returns would read as complete while its
-                // children were being killed behind the reply.
-                match completion.leftovers {
-                    Some(StopOutcome::Delivered) => completion.did_not_finish(LEFTOVERS_KILLED),
-                    Some(StopOutcome::Failed) => completion.did_not_finish(LEFTOVERS_UNKILLED),
-                    // Nothing was swept, or the sweep found an empty group.
-                    _ => completion,
+        // Settle each stream independently. A failure on one side cannot
+        // change the other's EOF, byte counts, or retention verdict.
+        let mut error = None;
+        let mut settle = |drained, path: &Path, read: &AtomicU64| {
+            match drained {
+                Drained::Ready(summary) => return summary,
+                Drained::Failed(message) => {
+                    error.get_or_insert(message);
                 }
+                Drained::Cut => (),
             }
-            JobStatus::TimedOut => Self::finish(
-                JobCompletion::timed_out(stdout, stderr)
-                    .with_stop(stop)
-                    .with_context(result_context),
-                &mut process_tree,
-                leftovers,
-            ),
-            JobStatus::Cancelled => Self::finish(
-                JobCompletion::cancelled(stdout, stderr)
-                    .with_stop(stop)
-                    .with_context(result_context),
-                &mut process_tree,
-                leftovers,
-            ),
-            JobStatus::Failed => Self::finish(
-                JobCompletion::failed_with_output(
-                    terminal_error.unwrap_or_else(|| "shell job failed".to_owned()),
-                    stdout,
-                    stderr,
-                )
-                .with_stop(stop)
-                .with_context(result_context),
-                &mut process_tree,
-                leftovers,
-            ),
-            JobStatus::Running => unreachable!(),
+            StreamSummary::incomplete(path, read.load(Ordering::Relaxed))
+        };
+        let stdout = settle(stdout, &job.stdout_path, &stdout_read);
+        let stderr = settle(stderr, &job.stderr_path, &stderr_read);
+        let mut completion = ending.completion(stdout, stderr);
+        if let Some(error) = error {
+            completion = completion.with_output_failure(error);
         }
+        Self::finish(completion.with_context(result_context), &mut process_tree)
     }
+}
 
-    /// Signal that ended the waited process. `code()` is `None` exactly when
-    /// this is `Some`, so callers need both to tell a kill from a crash.
-    #[cfg(unix)]
-    fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
-        use std::os::unix::process::ExitStatusExt as _;
-        status.signal()
-    }
+/// Freeze the runner's ending before draining. Capture failures keep the same process evidence.
+enum ShellEnd {
+    Completed(std::process::ExitStatus),
+    TimedOut(Option<StopCause>),
+    Cancelled(Option<StopCause>),
+    Failed(String, ChildEnd),
+}
 
-    #[cfg(not(unix))]
-    fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
-        None
-    }
-
-    /// Whether a reaped status proves the command ended before our signal
-    /// landed, so a claim on it would be a lie.
-    ///
-    /// Unix: a signalled process has no exit code, so a code proves the stop was
-    /// not ours. Windows always carries a code — its own termination uses exit
-    /// code 1 (`TerminateJobObject`, `TerminateProcess`) — so its status can
-    /// never prove that, and the guard's claim stands.
-    #[cfg(unix)]
-    fn ended_on_its_own(status: &std::process::ExitStatus) -> bool {
-        status.code().is_some()
-    }
-
-    #[cfg(not(unix))]
-    fn ended_on_its_own(_status: &std::process::ExitStatus) -> bool {
-        false
-    }
-
-    /// Kill a child and report what that proved, so a caller can tell "we ended
-    /// it" from "it had already finished".
-    async fn terminate_child(child: &mut tokio::process::Child) -> ChildStop {
-        let delivered = child.kill().await.is_ok();
-        ChildStop {
-            delivered,
-            status: child.wait().await.ok(),
+impl ShellEnd {
+    fn completion(self, stdout: StreamSummary, stderr: StreamSummary) -> JobCompletion {
+        match self {
+            Self::Completed(status) => {
+                JobCompletion::completed(status.code(), status.success(), stdout, stderr)
+                    .with_child_end(ChildEnd::Exited(status))
+            }
+            Self::TimedOut(cause) => JobCompletion::timed_out(stdout, stderr).with_stop(cause),
+            Self::Cancelled(cause) => JobCompletion::cancelled(stdout, stderr).with_stop(cause),
+            Self::Failed(error, end) => {
+                JobCompletion::failed_with_output(error, stdout, stderr).with_child_end(end)
+            }
         }
-    }
-}
-
-/// What killing the waited child proved. The two facts are separate because
-/// neither alone is portable evidence: a kill can be accepted for a process that
-/// has already exited (Unix zombies), and a kill can be rejected while a status
-/// is still readable (Windows).
-struct ChildStop {
-    /// The kill was accepted, so the process was still live when it was sent.
-    delivered: bool,
-    /// The status the process was finally reaped with, when one was readable.
-    status: Option<std::process::ExitStatus>,
-}
-
-impl ChildStop {
-    /// The claim a group signal supports, given the status the child was reaped
-    /// with. A command that ended on its own was not stopped by that signal, on
-    /// the same evidence the deadline path uses.
-    fn claim(&self, cause: Option<StopCause>) -> Option<StopCause> {
-        let ended_alone = self
-            .status
-            .as_ref()
-            .is_some_and(LocalMachine::ended_on_its_own);
-        if ended_alone { None } else { cause }
-    }
-
-    /// Whether this kill alone ended the waited process — the only fact a result
-    /// may claim. Only valid where nothing else signalled the tree first: after a
-    /// process-group termination the child is already dead, so Windows rejects
-    /// the follow-up kill and delivery cannot be observed.
-    fn kill_alone_ended_it(&self) -> bool {
-        self.delivered
-            && self
-                .status
-                .as_ref()
-                .is_none_or(|status| !LocalMachine::ended_on_its_own(status))
-    }
-}
-
-/// The termination facts an internal failure can still report: the status the
-/// command was reaped with, the stop this failure followed, and the terminal the
-/// runner had reached. Grouped so every failure site applies the same set — a
-/// subset is how a result and `job_get` start disagreeing.
-#[derive(Clone, Copy)]
-struct FailureFacts<'a> {
-    exit_status: Option<&'a std::process::ExitStatus>,
-    stop: Option<StopCause>,
-    /// What a sweep behind an already-finished command found. `None` means no sweep
-    /// ran, so a failure that never touched a tree says nothing about one.
-    leftovers: Option<StopOutcome>,
-    terminal: JobStatus,
-}
-
-impl FailureFacts<'_> {
-    fn apply(self, completion: JobCompletion) -> JobCompletion {
-        completion
-            .with_exit_code(self.exit_status.and_then(|status| status.code()))
-            .with_signal(self.exit_status.and_then(LocalMachine::exit_signal))
-            .with_stop(self.stop)
-            .after_terminal(self.terminal)
     }
 }
 
@@ -3060,6 +2783,11 @@ fn prepare_dirs(command: &mut Command, directory: &Path) {
     }
 }
 
+/// Script invocations are not login shells: explicit exit must not run bash_logout.
+fn bash_script(command: &mut Command, script: &str) {
+    command.args(["--noprofile", "--norc", "-c", script]);
+}
+
 fn direct_shell_command(
     shell: &PreparedExecutable,
     powershell: bool,
@@ -3075,11 +2803,7 @@ fn direct_shell_command(
             .arg("-Command")
             .arg(script);
     } else {
-        command
-            .arg("--noprofile")
-            .arg("--norc")
-            .arg("-lc")
-            .arg(script);
+        bash_script(&mut command, script);
     }
     command.current_dir(working_dir);
     Ok(command)
@@ -3137,21 +2861,16 @@ impl LocalMachine {
 mod tests {
     use super::*;
 
-    /// The launcher's own status is the only place a signal survives: an inner
-    /// command killed by a signal reaches dotlink as exit 128 + signal instead.
     #[cfg(unix)]
     #[tokio::test]
     async fn signalled_launcher_is_reported_as_a_signal_not_an_exit_code() {
-        use std::os::unix::process::ExitStatusExt as _;
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg("kill -9 $$");
         let status = command.spawn().unwrap().wait().await.unwrap();
-        assert_eq!(status.signal(), Some(9));
-        assert_eq!(status.code(), None);
-        assert_eq!(LocalMachine::exit_signal(&status), Some(9));
-        // A signalled status cannot prove the command ended on its own, which is
-        // what lets the guard's claim stand.
-        assert!(!LocalMachine::ended_on_its_own(&status));
+        let completion =
+            ShellEnd::Completed(status).completion(Default::default(), Default::default());
+        assert_eq!(completion.signal, Some(libc::SIGKILL));
+        assert_eq!(completion.exit_code, None);
     }
 
     /// The two cancellations keep distinct spellings in the result and the stop
@@ -3159,46 +2878,12 @@ mod tests {
     #[test]
     fn a_cancel_names_who_asked_for_it() {
         for (origin, reason, text) in [
-            (CancelOrigin::Caller, KillReason::Cancel, "cancel"),
-            (CancelOrigin::Connector, KillReason::Shutdown, "shutdown"),
+            (CancelOrigin::Caller, StopCause::Cancel, "cancel"),
+            (CancelOrigin::Connector, StopCause::Shutdown, "shutdown"),
         ] {
             assert_eq!(LocalMachine::cancel_reason(origin), reason);
             assert_eq!(reason.as_str(), text);
         }
-    }
-
-    /// Only an exit that proves itself suppresses a claim. A normal exit does;
-    /// a signalled one does not.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn only_a_self_proving_exit_keeps_a_claim_off_the_result() {
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg("exit 3");
-        let status = command.spawn().unwrap().wait().await.unwrap();
-        assert_eq!(status.code(), Some(3));
-        assert!(LocalMachine::ended_on_its_own(&status));
-    }
-
-    /// Windows kill codes are ordinary exit codes, so no status there can prove
-    /// the kill was not the cause. This pins the platform fact the predicate rests
-    /// on, not just the branch it takes.
-    #[cfg(not(unix))]
-    #[tokio::test]
-    async fn a_windows_kill_code_proves_nothing_about_its_cause() {
-        let mut command = tokio::process::Command::new("cmd");
-        command
-            .arg("/C")
-            .arg("ping -n 30 127.0.0.1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let mut child = command.spawn().unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let delivered = child.kill().await;
-        let status = child.wait().await.unwrap();
-        assert!(delivered.is_ok(), "the child must be live for this check");
-        assert_eq!(status.code(), Some(1), "a Windows kill is exit code 1");
-        assert!(!LocalMachine::ended_on_its_own(&status));
     }
 
     /// A crash and an external kill must not collapse into one value.
@@ -3208,7 +2893,9 @@ mod tests {
         let run = |cmd: &'static str| async move {
             let mut command = tokio::process::Command::new("sh");
             command.arg("-c").arg(cmd);
-            LocalMachine::exit_signal(&command.spawn().unwrap().wait().await.unwrap())
+            ShellEnd::Completed(command.spawn().unwrap().wait().await.unwrap())
+                .completion(Default::default(), Default::default())
+                .signal
         };
         assert_eq!(run("kill -9 $$").await, Some(9));
         // Signal numbers are not portable: SIGBUS is 7 on Linux, 10 on macOS.
@@ -3325,12 +3012,13 @@ mod tests {
                     job.stdout_path.clone(),
                     job.begin_spool_writer()
                         .expect("test spool writer registration is open"),
+                    Arc::default(),
                 )
                 .await
                 .unwrap();
-                assert_eq!(summary.total_bytes, 12);
+                assert_eq!(summary.total(), Some(12));
                 assert_eq!(summary.stored_bytes, 4);
-                assert!(summary.truncated);
+                assert!(summary.truncated());
                 crate::jobs::JobCompletion::completed(
                     Some(0),
                     true,
@@ -3352,6 +3040,92 @@ mod tests {
         );
         drop(started);
         manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_spool_preserves_the_other_streams_eof_and_counts() {
+        for quota in [4, 32] {
+            let manager =
+                crate::jobs::JobManager::with_spool_limit(Duration::from_secs(60), quota).unwrap();
+            let job = manager.create_for_test(30).unwrap();
+            std::fs::remove_file(&job.stderr_path).unwrap();
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "printf abcdef; exit 7"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let result = LocalMachine::run_shell_job(
+                ShellCommand::direct(command),
+                None,
+                Instant::now() + Duration::from_secs(30),
+                job.clone(),
+                JobResultContext {
+                    dir: ".".to_owned(),
+                    sandboxed: false,
+                    network: false,
+                },
+                StopTrace::new(LogConfig::default(), job.id.clone()),
+            )
+            .await;
+            assert!(result.internal_error.is_some());
+            assert_eq!(result.exit_code, Some(7));
+            assert_eq!(result.stdout.total(), Some(6));
+            assert_eq!(result.stdout.stored_bytes, 6.min(quota));
+            assert_eq!(result.stdout.truncated(), quota < 6);
+            assert_eq!(result.stderr.total(), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cut_pipe_does_not_hide_the_other_streams_spool_failure() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        for stream in ["stdout", "stderr"] {
+            let job = manager.create_for_test(30).unwrap();
+            std::fs::remove_file(if stream == "stdout" {
+                &job.stdout_path
+            } else {
+                &job.stderr_path
+            })
+            .unwrap();
+            // Job control puts the reader in its own group. It holds the other output
+            // pipe open until this test drops `release`, with no sleep or PID race.
+            let (input, release) = std::io::pipe().unwrap();
+            let mut command = Command::new(&bash);
+            command
+                .args(["-c", "set -m; exec 3<&0; read -r _ <&3 & exit 7"])
+                .stdin(input)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let result = LocalMachine::run_shell_job(
+                ShellCommand::direct(command),
+                None,
+                Instant::now() + Duration::from_secs(30),
+                job.clone(),
+                JobResultContext {
+                    dir: ".".to_owned(),
+                    sandboxed: false,
+                    network: false,
+                },
+                StopTrace::new(LogConfig::default(), job.id.clone()),
+            )
+            .await;
+            drop(release);
+            assert!(
+                job.begin_spool_writer().is_none(),
+                "the other stream must have been cut and sealed"
+            );
+            assert_eq!(result.exit_code, Some(7));
+            let error = result.internal_error.expect("expected a spool failure");
+            assert!(
+                error.contains(&format!("failed spooling {stream}")),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3686,6 +3460,13 @@ mod tests {
         );
         assert!(error.contains("root-owned non-writable path"), "{error}");
         assert!(error.contains("dotlink's Nix package"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "DOTLINK_BUILD_BWRAP in this binary: {:?}",
+                BUILD_BWRAP.unwrap_or("<unset>")
+            )),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4076,7 +3857,7 @@ mod tests {
         assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
         // The one fact a caller must not have to infer: the deadline ends the
         // command, and it is not the wait before the reply.
-        assert!(timeout.contains("killed"), "{timeout}");
+        assert!(timeout.contains("kill the command tree"), "{timeout}");
         assert!(!timeout.contains("response window"), "{timeout}");
         // Prose is human-readable; the exact number stays machine-readable.
         assert!(output.contains("2 KiB"), "{output}");
@@ -4127,6 +3908,27 @@ mod tests {
             with_profile_limits(read.clone(), 42, 2048, None).input_schema,
             read.input_schema
         );
+    }
+
+    #[test]
+    fn powershell_help_teaches_wait_process_without_a_unix_escape_caveat() {
+        let powershell = shell_tool_description("PowerShell", None);
+        let bash = shell_tool_description("Bash", None);
+        assert!(powershell.contains("Wait-Process"), "{powershell}");
+        for help in [&powershell, &bash] {
+            for fact in [
+                "leftovers",
+                "attempts to kill",
+                "unknown",
+                "Inspect output before retrying",
+            ] {
+                assert!(help.contains(fact), "{help}");
+            }
+        }
+        assert!(bash.contains("original process group") && bash.contains("GNU `timeout`"));
+        for unix_only in ["process group", "setsid", "server & wait"] {
+            assert!(!powershell.contains(unix_only), "{powershell}");
+        }
     }
 
     #[test]
@@ -4185,83 +3987,109 @@ mod tests {
         assert!(!local.contains(&horizon.to_string()), "{local}");
     }
 
-    /// The decision that keeps the record honest: an already-stopped tree keeps
-    /// its cause, a command that already ended is only cleaned up, and only a
-    /// real kill is claimable.
-    #[cfg(unix)]
     #[tokio::test]
-    async fn failure_stop_keeps_the_cause_that_actually_stopped_the_tree() {
-        let mut command = tokio::process::Command::new("sh");
-        crate::shell_process::configure(&mut command);
-        command.arg("-c").arg("sleep 5");
-        let child = command.spawn().unwrap();
-        let trace = StopTrace::new(LogConfig::default(), "failure-stop");
-        let mut tree = crate::shell_process::Guard::attach(&child, trace).unwrap();
+    async fn failed_sweep_preserves_exit_and_writes_one_alarm() {
+        let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let mut trace = StopTrace::new(LogConfig::default(), job.id.clone());
+        trace.refuse_first = 2;
+        let expected = format!("id={} end=exit code=0 cleanup=kill-failed", job.id);
 
-        // Already stopped: a later failure must not relabel the deadline.
-        assert_eq!(
-            tree.terminate(KillReason::Timeout),
-            Some(StopCause::Timeout)
-        );
-        let mut facts = FailureFacts {
-            exit_status: None,
-            stop: Some(StopCause::Timeout),
-            leftovers: None,
-            terminal: JobStatus::Failed,
+        // Already exited, no descendants: refusing the sweep cannot leak a child.
+        #[cfg(unix)]
+        let mut command = Command::new("true");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/d", "/c", "exit 0"]);
+            command
         };
-        LocalMachine::failure_stop(&mut tree, &mut facts);
-        assert_eq!(facts.stop, Some(StopCause::Timeout));
-        assert_eq!(facts.leftovers, None, "a live tree is stopped, not swept");
-        // Disarmed: nothing to stop, so nothing is claimed.
-        let mut disarmed = FailureFacts {
-            exit_status: None,
-            stop: None,
-            leftovers: None,
-            terminal: JobStatus::Failed,
-        };
-        LocalMachine::failure_stop(&mut tree, &mut disarmed);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let completed = LocalMachine::run_shell_job(
+            ShellCommand::direct(command),
+            None,
+            Instant::now() + Duration::from_secs(30),
+            job,
+            JobResultContext {
+                dir: ".".into(),
+                sandboxed: false,
+                network: false,
+            },
+            trace.clone(),
+        )
+        .await;
+        assert_eq!(completed.status, JobStatus::Completed);
+        assert!(completed.success);
+        assert_eq!(completed.exit_code, Some(0));
+        assert_eq!(completed.stopped_by, None);
         assert_eq!(
-            disarmed.stop, None,
-            "a disarmed tree cannot be stopped again"
+            trace.outcomes(),
+            [crate::shell_process::StopOutcome::Failed; 2]
         );
+        assert_eq!(trace.lines(), [expected]); // no second end=abandoned on drop
+        manager.shutdown().await.unwrap();
     }
 
-    /// A command that already ended leaves a tree to sweep. The sweep claims no cause,
-    /// because the command's own status ended it — but what the sweep found is a fact
-    /// the failure has to carry, or the one sweep that ran is the one nobody recorded.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn a_sweep_behind_a_finished_command_is_reported_not_claimed() {
-        let mut command = tokio::process::Command::new("sh");
-        crate::shell_process::configure(&mut command);
-        command.arg("-c").arg("sleep 5");
-        let child = command.spawn().unwrap();
-        let trace = StopTrace::new(LogConfig::default(), "cleanup");
-        let mut tree = crate::shell_process::Guard::attach(&child, trace.clone()).unwrap();
-        // The run path sweeps when the command ends, so by the time a failure is built
-        // the finding is already a fact of the completion. A failure must carry it, not
-        // sweep a disarmed guard and report that nothing happened.
-        let ended = std::process::Command::new("true")
-            .status()
-            .expect("a status to carry");
-        let mut facts = FailureFacts {
-            exit_status: Some(&ended),
-            stop: None,
-            leftovers: Some(StopOutcome::Delivered),
-            terminal: JobStatus::Completed,
-        };
-        LocalMachine::failure_stop(&mut tree, &mut facts);
-        assert_eq!(facts.stop, None, "a sweep is not a stop of the command");
-        assert_eq!(
-            facts.leftovers.and_then(crate::shell_process::tree_word),
-            Some("killed"),
-            "the sweep's finding must survive the failure"
-        );
+    #[test]
+    fn runner_failure_keeps_the_independent_exit_even_if_output_also_fails() {
+        use std::os::unix::process::ExitStatusExt;
+        for (raw, code, signal) in [
+            (0, Some(0), None),
+            (42 << 8, Some(42), None),
+            (libc::SIGTERM, None, Some(libc::SIGTERM)),
+        ] {
+            let end = ChildEnd::Exited(std::process::ExitStatus::from_raw(raw));
+            let failed = ShellEnd::Failed("stdin write failed".into(), end)
+                .completion(StreamSummary::default(), StreamSummary::default());
+            assert_eq!(failed.error.as_deref(), Some("stdin write failed"));
+            let lost = failed.clone().with_output_failure("disk full".into());
+            assert_eq!(lost.internal_error.as_deref(), Some("disk full"));
+            assert_eq!(lost.terminal, Some(JobStatus::Failed));
+            for completion in [failed, lost] {
+                assert_eq!(completion.status, JobStatus::Failed);
+                assert!(!completion.success);
+                assert_eq!((completion.exit_code, completion.signal), (code, signal));
+                assert_eq!(completion.stopped_by, None);
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_ending_worth_reconstructing_writes_a_line() {
+        use crate::shell_process::End;
+        let none = || StreamSummary::default();
+        let line = |completion: &JobCompletion| LocalMachine::lifecycle_line(completion);
+
+        let exited = JobCompletion::completed(Some(0), true, none(), none());
+        assert_eq!(line(&exited), None);
+        let unknown = exited
+            .clone()
+            .with_tree(crate::shell_process::TreeObservation::Unknown);
         assert!(
-            trace.reports().is_empty(),
-            "a disarmed guard is not swept a second time: {:?}",
-            trace.reports()
+            unknown.success,
+            "unavailable evidence does not override exit 0"
         );
+        assert_eq!(line(&unknown), Some((End::Exit(0), None)));
+        let failed_exit = JobCompletion::completed(Some(3), false, none(), none());
+        assert_eq!(line(&failed_exit), None, "a non-zero exit is still its own");
+        assert_eq!(
+            line(&exited.clone().with_kill_failed(true)),
+            Some((End::Exit(0), None)),
+            "a failed kill is the one tree fact worth a line"
+        );
+
+        let timed_out =
+            JobCompletion::timed_out(none(), none()).with_stop(Some(StopCause::Timeout));
+        assert_eq!(line(&timed_out), Some((End::Timeout, None)));
+        let cancelled = JobCompletion::cancelled(none(), none()).with_stop(Some(StopCause::Cancel));
+        assert_eq!(line(&cancelled), Some((End::Cancel, Some("caller"))));
+        let signalled = JobCompletion::completed(None, false, none(), none()).with_signal(Some(9));
+        assert_eq!(line(&signalled), Some((End::Signal(9), Some("external"))));
+        let lost_output = JobCompletion::internal_failed("disk full", none(), none())
+            .with_exit_code(Some(0))
+            .after_terminal(JobStatus::Completed);
+        assert_eq!(line(&lost_output), Some((End::Error, None)));
     }
 
     /// The wiring, not the helpers: a real signalled child must reach the wire
@@ -5051,14 +4879,10 @@ mod tests {
         assert!(error.message.contains("unknown field"), "{error:?}");
     }
 
-    /// A command that returns while its own group is still running did not finish:
-    /// the leftovers are swept at once and the invocation is reported as failed, with
-    /// the command's own status still intact. Previously the caller waited for the
-    /// writer's inherited pipe until the deadline and then got a collection error —
-    /// slow, and wrong about why.
+    /// The durable status carries the same verdict and preserves retained output.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_command_that_returns_leaving_work_running_fails_promptly() {
+    async fn job_get_reports_live_leftovers_with_the_real_exit_code() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
@@ -5091,13 +4915,9 @@ mod tests {
         };
         assert_eq!(status["status"], "completed", "{status}");
         assert_eq!(status["success"], false, "{status}");
+        assert_eq!(status["tree"], "leftovers", "{status}");
         assert_eq!(status["exit_code"], 0, "the command's own status: {status}");
-        assert!(
-            status["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("left processes running")),
-            "{status}"
-        );
+        assert!(status.get("error").is_none(), "{status}");
         assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
         let partial = machine
             .jobs
@@ -5455,11 +5275,7 @@ mod tests {
                     crate::jobs::JobCompletion::completed(
                         Some(0),
                         true,
-                        crate::jobs::StreamSummary {
-                            total_bytes: 6,
-                            stored_bytes: 6,
-                            truncated: false,
-                        },
+                        crate::jobs::StreamSummary::complete(6, 6),
                         crate::jobs::StreamSummary::default(),
                     )
                 },
@@ -6569,16 +6385,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        // The command succeeded and its writer was swept, so the reply is the
-        // command's own result — not a collection failure.
+        // A leftover is neither a spool failure nor an execution timeout.
         let payload: Value = serde_json::from_str(&text).unwrap();
-        // Failed because the command left work running — not because collection
-        // timed out, which is what the old shared deadline produced.
+        assert_ne!(result.is_error, Some(true), "{text}");
         assert_eq!(payload["success"], false, "{text}");
+        assert_eq!(payload["tree"], "leftovers", "{text}");
+        assert_eq!(payload["exit_code"], 0, "{text}");
         assert_eq!(payload["stdout"], "done", "{text}");
-        let error = payload["error"].as_str().unwrap_or_default();
-        assert!(error.contains("left processes running"), "{text}");
-        assert!(!error.contains("collecting command output"), "{text}");
+        assert!(payload.get("error").is_none(), "{text}");
     }
 
     #[cfg(unix)]

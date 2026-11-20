@@ -54,6 +54,12 @@ backup copies and prints their locations instead of deleting them.
 
 The Linux binaries are static musl builds with no distro-specific glibc dependency, so the same artifact runs across NixOS, Debian, and other compatible Linux distributions.
 
+Linux builds embed the std-only shell observer in the same binary. `build.rs`
+uses Cargo’s target, linker and encoded target rustflags (including `--sysroot`);
+all-target Clippy enforces warnings in CI. The observer’s direct `rustc` invocation
+needs a target sysroot containing `std`. For custom standard libraries, supply
+that sysroot explicitly; Cargo’s nightly `-Zbuild-std` switch alone is not a sysroot.
+
 ## Nix / Crane outputs
 
 `flake.nix` declares inputs and delegates output definitions to `nix/default.nix`.

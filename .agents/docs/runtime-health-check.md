@@ -18,7 +18,7 @@ systemctl show dotlink -p Environment --value | tr ' ' '\n' | grep DOTLINK_
 ```
 
 `NRestarts` and `ExecMainStartTimestamp` bound the log window: everything before the last
-start belongs to a different process, and **jobs do not survive a restart**.
+start belongs to a different process, and **job handles do not survive a process restart**.
 
 ## 1. Pull one window per host
 
@@ -236,14 +236,13 @@ Check these explicitly. Each has a known-good value in the baseline.
 | poll failures / restarts | 0 / 0 | any — transport instability |
 | caps at exactly the hold | expected on long builds | caps *plus* duplicate work, or caps on sub-second tools |
 | `notifications/` lines | 0 on the ChatGPT tunnel | non-zero means the client started sending a progress token; heartbeat behaviour changes |
-| `end=` lines | only when there is something to say: `end=` names what ended it, `by=` names who | any line for an ordinary exit; a second line for one job; a missing line for a deadline, cancel or internal error |
-| `by=external` | rare: something else signalled the command; `end=signal` prints the signal name, and `tree=killed` may follow | `by=external` on a job whose result claims `stopped_by`, or a `signal` in a result whose job wrote no line |
-| `"left processes running"` in a shell `error` | the command left its own group running, so dotlink killed that work and failed the invocation while still reporting the command's status | a clean command reporting this, or a `success: true` beside a `tree=killed` line |
+| `end=` lines | an exit with no tree observation or cleanup alarm is silent | a second line for one job; a bare `end=exit code=N`; no line when the shell runner reports a timeout, cancel or internal error |
+| `by=external` | a signal in the waited process's status with no `stopped_by` | `by=external` despite `stopped_by`, or inferred from an exit code alone |
+| `cleanup=kill-failed` | 0 | any — the tree kill failed or could not be confirmed; check for surviving processes |
 | error latency | 0–10 ms | tens of ms in `edit`/`patch` means the planner read files before failing |
 
-A line written while the runtime restarts has no completion to match: the connector
-revokes those jobs before they can publish one, so an `end=abandoned` standing alone
-is expected, not evidence of a lost result.
+`end=abandoned` means an unfinished guard was dropped while armed or with an unresolved kill failure.
+During teardown that line may have no caller-visible result to match.
 
 The `id=` of a line is the durable job handle: when the call returned one
 (`background: true`, or a handoff receipt under a cap) it is the id `job_get` and
@@ -251,17 +250,20 @@ The `id=` of a line is the durable job handle: when the call returned one
 the line's timestamp and the result's `ts` are the same call — and compare `end=`
 with the status the caller actually saw.
 
-**One line per job, when there is one to write.** `end=` says what ended the job and
-`by=` appears only where the actor is a choice: `by=caller`/`by=connector` on a cancel,
-`by=external` on a signal. A deadline, an internal error and `end=abandoned` are dotlink
-by definition and name nobody. A command that ended on its own names no actor, and writes no line unless a
-sweep changed the verdict — so the record only holds events worth reconstructing. A sweep of work the command left running rides on the same line as
-`tree=killed` — or `tree=alive` when the kernel refused, which is the one case that is
-an alarm — and it is also what makes the invocation a failure; an empty group adds
-nothing. Because the line is written once — from the completion, or by the fail-safe
-when there is none — a second line for one job is a bug. A refused signal appears as
-`tree=alive`: the run path records it before disarming, so the alarm never depends on
-the guard surviving.
+`end=exit code=0 tree=leftovers` means the main command exited 0 but left live
+work inside its cleanup boundary: the result has `success: false`, not a tool error.
+`tree=unknown` means the pre-cleanup observation was unavailable; a racing
+deadline or cancel can signal the group before it can be inspected. On Linux, check
+that `/proc` describes the runner’s PID namespace and is not hiding PIDs (`hidepid`). Neither tree
+value means a kill failed. Only `cleanup=kill-failed` means the kill remained
+unconfirmed after its immediate retry. Silence does not establish host-wide containment: an unsandboxed
+Unix child in another group (including Bash job control or GNU `timeout`) is outside both observation and cleanup. A matching session ID does not put it back in scope.
+
+`by=` identifies an attributed cancel (`caller` or `connector`) or an observed signal
+not attributed to dotlink (`external`). In direct Unix and Bubblewrap runs an
+external SIGKILL of the shell gives `signal: "SIGKILL"` and `end=signal SIGKILL by=external`.
+A numeric `exit_code: 137` alone proves no signal. If the sandbox report is
+missing or inconsistent, dotlink keeps the launcher status and reports `tree: "unknown"`.
 
 ## 5. Benign classes — do not chase
 

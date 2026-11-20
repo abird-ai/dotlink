@@ -32,35 +32,26 @@ Both trees must agree afterwards: `main`'s mapping in `src/jobs.rs`
 
 `release/0.17` adds `stopped_by` (`timeout` | `cancel` | `shutdown` | `failed`,
 where `shutdown` means the connector withdrew the work rather than the caller) and
-it is absent when the command decided its own fate, including after a sweep of its
-leftovers — a sweep is a journal line, not a claim — alongside
-`signal`. Combined with `ProcessExit`'s own `Cancelled` / `DeadlineExceeded`
+it is absent when the command decided its own fate. A sweep of its leftovers
+never sets `stopped_by` or changes `signal`. Combined with `ProcessExit`'s own `Cancelled` / `DeadlineExceeded`
 variants on `main`, this is one concept expressed twice; the port should keep a
 single representation, not both. `main`'s `Unknown` case maps onto "dotlink did
 not stop it", which is the same information as an absent `stopped_by`.
 
 ### 3. Stop log line
 
-`release/0.17` emits at most one
-`LOG job id=<id> end=<what> [by=<who>] [tree=<what became of the group>]` line per
-job. It is a lifecycle line, so it survives every verbosity: for it to be evidence,
-absence must mean the command simply ended. `end=` comes from the terminal the runner
-reached (`exit code=N`, `signal SIGKILL`, `timeout`, `cancel`, `shutdown`, `error`,
-`abandoned`), and `by=` names another actor only when there was one (`dotlink`,
-`caller`, `connector`, `external`) — a command's own ending names none. `tree=killed`
-or `tree=alive` rides on the same line when the command left its group running and
-dotlink swept it. One line, because two lines each needing the other to be read is
-how a record stops being evidence.
+Preserve the lane's [lifecycle line](../../../README.md#logging), not a log of
+signal attempts. An ordinary exit without tree facts is silent. `tree=leftovers` records live work at cleanup and clears `success` without changing the exit code or failing the tool. An attributed
+cancel names `caller` or `connector`; a signal in the waited process's status
+with no dotlink stop names `external`. Never infer a signal from exit 128+N.
 
-The port must keep the writer single: the completion writes the line, and the
-fail-safe `Drop` writes `end=abandoned` only when no completion exists. Every path
-that publishes a completion disarms the guard first, carrying an unproven signal onto
-the line as `tree=alive`, so a job is never written twice and a refused kill is still
-recorded.
+The completion writes the line with `cleanup=kill-failed` only if the tree kill
+is still unconfirmed after one immediate retry. Hold the Unix leader waitable through that last group signal; never signal its PGID after reaping. A Windows exit other than the private termination marker rules out dotlink’s kill. Disarm the guard before publishing;
+`Drop` writes `end=abandoned` only when no completion exists.
 
 ### 4. Result fields
 
-`signal` and `stopped_by` are rendered through one helper at every surface that
+`tree`, `signal`, and `stopped_by` are rendered through one helper at every surface that
 can carry them: the ordinary result, `job_get`'s status payload, the
 internal-failure envelope (`streams_omitted` instead of the streams, and only the
 context keys that exist), and a failed native task, which carries the facts in
@@ -82,9 +73,10 @@ a spool failure does not hide the command's own outcome.
 - The lane's behaviour is the reference for shell/job semantics; `main`'s process
   layer is the reference for its own abstractions. Do not keep two mechanisms.
 - No result growth beyond these fields: payload bytes ship on every call.
-- Re-verify with a real kill rather than by reasoning: an inner `kill -9` in a
-  sandbox exits `128+9`, while a kill of the sandbox launcher itself yields no
-  exit code at all. Only the launcher's own status proves a signal.
+- Re-verify in both modes: a shell killed by SIGKILL reports a signal; an explicit
+  `exit 137` never does. A normal launcher exit must corroborate the sandbox report.
+  If a stop interrupts the launcher, preserve the inner status when independently
+  observed; never treat a partial scan as a clean tree.
 
 ## Mapping onto `main`
 

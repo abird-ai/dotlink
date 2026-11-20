@@ -1,10 +1,10 @@
 //! A job's lifecycle line, end to end: one line when something happened, none when the
 //! command simply ended, and the same words at every verbosity.
 //!
-//! `end=` says what ended the job and `by=` names another actor when there was one —
-//! `dotlink` a deadline, `external` a signal from outside the connector. A command that
-//! ended on its own names no actor and writes nothing, so a line always means dotlink
-//! did something to a tree, or somebody else ended the command.
+//! `end=` says what ended the job and `by=` names an actor only where the actor is a
+//! choice — `caller`/`connector` on a cancel, `external` on a signal from outside the
+//! connector; a deadline is dotlink by definition and names nobody. An ordinary exit with no tree observation or
+//! cleanup failure writes nothing.
 //!
 //! Driven against the real binary with a piped stderr, because `LOG` lines are not
 //! captured by the in-process tests. Signals are a Unix concept here; on Windows
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 fn config() -> String {
     json!({
-        "version": 12,
+        "version": 13,
         "transports": {"openai": false, "stdio": true, "http": false,
             "http_bind": "127.0.0.1:3000", "http_ephemeral_url": false,
             "ngrok": false, "ngrok_domain": null, "ngrok_ephemeral_url": false},

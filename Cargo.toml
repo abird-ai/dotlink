@@ -8,6 +8,12 @@ repository = "https://github.com/abird-ai/dotlink"
 homepage = "https://github.com/abird-ai/dotlink"
 publish = false
 
+# Embedded by build.rs on Linux; an example keeps the helper under Cargo fmt/Clippy
+# without installing a second binary.
+[[example]]
+name = "observe-shell"
+path = "support/observe_shell.rs"
+
 [dependencies]
 anyhow = "1"
 argon2 = "0.5"

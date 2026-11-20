@@ -1,45 +1,18 @@
-//! Kill the contained process group/job on timeout, error or cancellation.
-//!
-//! Signalling is by process group id, which the kernel may recycle once the group
-//! is empty: between the sweep and the `kill(-pgid)` another process could in
-//! principle be given that number. The window is the syscall pair on a group this
-//! shell owned a moment earlier, and closing it would need a pidfd per member, so
-//! the record says what the signal found (`tree=killed`/`alive`) rather than
-//! pretending the group cannot have been reaped.
-//! Unsandboxed Unix children can intentionally escape their process group
-//! (setsid); no process-group API can guarantee descendant containment, so the
-//! contract is the group: it is swept when the command returns, and a sandboxed
-//! tree is already gone with its namespace. Work that must outlive the call
-//! belongs in a durable job (`background: true`), where the process is the job
-//! rather than a leftover of one.
+//! Kill the contained process group/job on stop, and sweep it on command exit.
+//! Observe live members *before* cleanup. A delivered signal alone proves nothing
+//! about leftovers: even a group containing only zombies accepts SIGKILL.
 
-use std::io;
+#[cfg(target_os = "linux")]
+mod linux_observation;
+#[cfg(target_os = "linux")]
+mod namespace_report;
+#[cfg(unix)]
+mod unix_wait;
+
+use std::{io, process::ExitStatus};
 use tokio::process::{Child, Command};
 
-/// Why a tree was signalled. This is the log vocabulary: it is wider than what a
-/// result may claim, because a tree is sometimes cleaned up rather than stopped.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum KillReason {
-    /// The command reached its requested `timeout_secs`.
-    Timeout,
-    /// The caller cancelled.
-    Cancel,
-    /// The connector withdrew the work: shutdown, restart, or authority
-    /// replacement.
-    Shutdown,
-    /// Launch, stdin delivery, wait or output capture failed.
-    Failed,
-    /// The command had already ended; the tree behind it was cleaned up.
-    Cleanup,
-    /// The guard was dropped without a caller-requested stop: the fail-safe.
-    Dropped,
-}
-
-/// What a result may claim: dotlink ended the waited command. A separate type
-/// because "we signalled a tree" and "we ended your command" are different
-/// statements, and only the second belongs on the wire. A sweep of leftovers
-/// ends a tree whose command had already decided its own fate, so it is a trace
-/// fact — one `stop` line — and never a claim.
+/// What caused dotlink to stop the command. A post-exit sweep has no such cause.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StopCause {
     Timeout,
@@ -48,40 +21,6 @@ pub(crate) enum StopCause {
     /// `cancel` here would blame a user who did nothing.
     Shutdown,
     Failed,
-}
-
-impl KillReason {
-    /// Test-facing names. The lifecycle line speaks about the job's ending instead:
-    /// `end=` names what ended it, so a reason is no longer a wire word.
-    #[cfg(test)]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Timeout => "timeout",
-            Self::Cancel => "cancel",
-            Self::Shutdown => "shutdown",
-            Self::Failed => "failed",
-            // "cleanup" left the reader asking what was cleaned up. These two
-            // name the target instead: the command had already finished, so
-            // only its leftovers were signalled.
-            Self::Cleanup => "leftovers",
-            Self::Dropped => "fail-safe",
-        }
-    }
-
-    /// The cause this kill records on the result. Only a kill that ends the
-    /// command names one: a sweep of leftovers, and the fail-safe that may or may
-    /// not catch a live command, answer no question a result asks. They are still
-    /// on the record — the `stop` line names them — so attribution lives in the
-    /// journal rather than being smuggled into a field that means "we ended it".
-    fn claim(self) -> Option<StopCause> {
-        match self {
-            Self::Timeout => Some(StopCause::Timeout),
-            Self::Cancel => Some(StopCause::Cancel),
-            Self::Shutdown => Some(StopCause::Shutdown),
-            Self::Failed => Some(StopCause::Failed),
-            Self::Cleanup | Self::Dropped => None,
-        }
-    }
 }
 
 impl StopCause {
@@ -95,13 +34,44 @@ impl StopCause {
     }
 }
 
-/// What the signal actually did. Only a delivered signal is a stop: a group that
-/// is already gone was not stopped by us, and a failed signal left it running.
+/// What the signal call returned. Only a delivered signal is a stop, and even that
+/// proves little: the kernel accepts a signal for a group of zombies, so it shows
+/// neither that work was running nor that it has ended. A group already gone was
+/// not stopped by us, and a failed signal — refused, or on Windows unverifiable —
+/// leaves termination unproven.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StopOutcome {
     Delivered,
     AlreadyGone,
+    #[cfg(windows)]
+    Cleared, // successful job termination, occupancy unknown
     Failed,
+}
+
+/// A post-exit observation, not a claim about what the cleanup signal killed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TreeObservation {
+    #[default]
+    None,
+    Leftovers,
+    Unknown,
+}
+
+impl TreeObservation {
+    pub(crate) fn word(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Leftovers => Some("leftovers"),
+            Self::Unknown => Some("unknown"),
+        }
+    }
+    fn from_live(live: Option<bool>) -> Self {
+        match live {
+            Some(true) => Self::Leftovers,
+            Some(false) => Self::None,
+            None => Self::Unknown,
+        }
+    }
 }
 
 /// How a job ended, as the record names it. A type, so "is this the command's own
@@ -128,36 +98,28 @@ impl End {
         }
     }
 
-    /// The command decided its own fate, so nothing about it is dotlink's to report
-    /// unless a sweep changed the verdict.
+    /// An ordinary exit is silent unless a tree observation or cleanup alarm adds information.
     pub(crate) fn is_own(self) -> bool {
         matches!(self, Self::Exit(_))
     }
 }
 
-/// What became of the tree, as the one word a record uses — or nothing, because a
-/// group already empty had nothing happen to it and a line saying so is noise. One
-/// mapping serves the completion's line and the fail-safe's, so the two cannot
-/// disagree about the same outcome.
-pub(crate) fn tree_word(outcome: StopOutcome) -> Option<&'static str> {
-    match outcome {
-        StopOutcome::Delivered => Some("killed"),
-        StopOutcome::AlreadyGone => None,
-        // The kernel refused: these may still be running, which is the one place
-        // where saying so is an alarm rather than noise.
-        StopOutcome::Failed => Some("alive"),
-    }
+#[cfg(test)]
+#[derive(Default)]
+struct RecordedTrace {
+    attempts: Vec<StopOutcome>,
+    lines: Vec<String>,
 }
 
-/// The stop line is the only proof that dotlink ended a command, so the guard
-/// carries what it needs to report: the shared log, the job it belongs to, and —
-/// in tests — what it reported.
+/// Job-scoped lifecycle journal, shared with the guard's fail-safe.
 #[derive(Clone)]
 pub(crate) struct StopTrace {
     log: crate::logging::LogConfig,
     label: String,
     #[cfg(test)]
-    reports: std::sync::Arc<std::sync::Mutex<Vec<(KillReason, StopOutcome)>>>,
+    recorded: std::sync::Arc<std::sync::Mutex<RecordedTrace>>,
+    #[cfg(test)]
+    pub(crate) refuse_first: usize,
 }
 
 impl StopTrace {
@@ -166,85 +128,89 @@ impl StopTrace {
             log,
             label: label.into(),
             #[cfg(test)]
-            reports: std::sync::Arc::default(),
+            recorded: Default::default(),
+            #[cfg(test)]
+            refuse_first: 0,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn reports(&self) -> Vec<KillReason> {
-        self.reports
-            .lock()
-            .expect("report list")
-            .iter()
-            .map(|(reason, _)| *reason)
-            .collect()
-    }
-
-    #[cfg(test)]
     pub(crate) fn outcomes(&self) -> Vec<StopOutcome> {
-        self.reports
-            .lock()
-            .expect("report list")
-            .iter()
-            .map(|(_, outcome)| *outcome)
-            .collect()
+        self.recorded.lock().unwrap().attempts.clone()
     }
 
-    /// Record one attempt, for tests only. A job's lifecycle line is written once,
-    /// when its ending is known, by whoever knows it: the run path for a completion
-    /// and the fail-safe for a guard dropped before one existed.
     #[cfg(test)]
-    pub(crate) fn stopped(&self, reason: KillReason, outcome: StopOutcome) {
-        self.reports
-            .lock()
-            .expect("report list")
-            .push((reason, outcome));
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.recorded.lock().unwrap().lines.clone()
     }
 
     /// The one line a job gets, written where its ending is known.
-    pub(crate) fn ended(&self, end: &End, by: Option<&str>, tree: Option<&str>) {
-        self.log
-            .notice("job", end_message(&self.label, &end.describe(), by, tree));
+    pub(crate) fn ended(
+        &self,
+        end: &End,
+        by: Option<&str>,
+        observation: TreeObservation,
+        kill_failed: bool,
+    ) {
+        let line = end_message(&self.label, &end.describe(), by, observation, kill_failed);
+        self.log.notice("job", &line);
+        #[cfg(test)]
+        self.recorded.lock().unwrap().lines.push(line);
     }
 
     /// The same line for a guard dropped before a completion existed: dotlink
-    /// abandoned the job and swept whatever was left. This is the only writer that
-    /// runs without a completion, which is why it cannot be a second line for a job
-    /// that already published one — every completion path disarms the guard.
-    pub(crate) fn abandoned(&self, tree: Option<&str>) {
-        self.ended(&End::Abandoned, None, tree);
+    /// abandoned the job and killed its tree. This is the only writer that runs
+    /// without a completion, which is why it cannot be a second line for a job that
+    /// already published one — every completion path disarms the guard.
+    pub(crate) fn abandoned(&self, kill_failed: bool) {
+        self.ended(&End::Abandoned, None, TreeObservation::None, kill_failed);
     }
 }
 
-/// One lifecycle line per job, written only when there is something to say: how it
-/// ended, who ended it when that was not the command itself, and what became of the
-/// process group it left behind. Every field is a word a reader does not have to look
-/// up, and an absent `by=` is not an omission to decode — a line that exists at all
-/// because the command ended on its own says so by naming no other actor.
-pub(crate) fn end_message(label: &str, end: &str, by: Option<&str>, tree: Option<&str>) -> String {
+/// Keep observation separate from an independently failed cleanup attempt.
+pub(crate) fn end_message(
+    label: &str,
+    end: &str,
+    by: Option<&str>,
+    observation: TreeObservation,
+    kill_failed: bool,
+) -> String {
     let mut line = format!("id={label} end={end}");
     if let Some(by) = by {
         line.push_str(&format!(" by={by}"));
     }
-    if let Some(tree) = tree {
-        line.push_str(&format!(" tree={tree}"));
+    if let Some(tree) = observation.word() {
+        line.push_str(" tree=");
+        line.push_str(tree);
+    }
+    if kill_failed {
+        line.push_str(" cleanup=kill-failed");
     }
     line
 }
 
-#[cfg(unix)]
-pub(crate) fn configure(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-    // The shell owns a new group; signals never reach dotlink's own group.
-    command.as_std_mut().process_group(0);
-}
-
-#[cfg(windows)]
-pub(crate) fn configure(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-    // No user code may run until the process belongs to its private job.
-    command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+/// Establish the containment boundary before user code can run.
+pub(crate) fn spawn(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        use tokio::signal::unix::{SignalKind, signal};
+        // Tokio keeps the installed handler after the listener drops. Install it
+        // *before* spawn: inherited SIG_IGN would otherwise auto-reap the leader.
+        drop(signal(SignalKind::child())?);
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, DETACHED_PROCESS};
+        // Noninteractive shell I/O is piped. Never inherit or allocate a console
+        // for the interpreter; job accounting needs no image-name exemptions.
+        command
+            .as_std_mut()
+            .creation_flags(CREATE_SUSPENDED | DETACHED_PROCESS);
+    }
+    command.kill_on_drop(true).spawn()
 }
 
 /// Resume a Windows child only after associating it with its job object.
@@ -297,15 +263,104 @@ fn resume_new_process(pid: u32) -> io::Result<()> {
     ))
 }
 
-pub(crate) struct Guard {
-    active: bool,
-    /// Set when the kernel refused a signal, so the group's fate is unproven. Distinct
-    /// from `active`, which only says the guard has not been disarmed: a fresh guard is
-    /// armed without anything having been refused.
-    refused: bool,
-    /// The outcome of the most recent signal, so a path that cannot sweep can still say
-    /// what its own kill found.
-    last: Option<StopOutcome>,
+#[cfg(windows)]
+const WINDOWS_KILL_CODE: u32 = 0xD071_1A7E; // private termination marker, not a reserved OS code
+
+/// Mutually exclusive evidence: the command's own status or a possible dotlink stop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChildEnd {
+    Exited(ExitStatus),
+    Stopped(Option<StopCause>),
+}
+
+/// What killing the waited child proved. The two facts are separate because
+/// neither alone is portable evidence: a kill can be accepted for a process that
+/// has already exited (Unix zombies), and a kill can be rejected while a status
+/// is still readable (Windows).
+struct ChildStop {
+    /// The child kill was accepted; alone this cannot identify the sender of a terminal SIGKILL.
+    delivered: bool,
+    /// The status the process was finally reaped with, when one was readable.
+    status: Option<std::process::ExitStatus>,
+}
+
+impl ChildStop {
+    async fn kill(child: &mut Child) -> Self {
+        #[cfg(unix)]
+        let delivered = child.start_kill().is_ok();
+        #[cfg(windows)]
+        let delivered = child.raw_handle().is_some_and(|process| {
+            // SAFETY: the child owns this handle through the termination call.
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(process, WINDOWS_KILL_CODE)
+                    != 0
+            }
+        });
+        Self {
+            delivered,
+            status: child.wait().await.ok(),
+        }
+    }
+
+    /// Unix tree and child kills send only SIGKILL. An exit code or any other
+    /// terminal signal wins even if the group (possibly zombies) accepted our kill.
+    /// Both Windows kill paths use the same private marker. No delivery also rules out our kill.
+    fn independent_status(&self, tree_may_have_killed: bool) -> Option<std::process::ExitStatus> {
+        let status = self.status?;
+        #[cfg(unix)]
+        let independent = status.code().is_some()
+            || std::os::unix::process::ExitStatusExt::signal(&status)
+                .is_some_and(|n| n != libc::SIGKILL);
+        #[cfg(windows)]
+        let independent = status
+            .code()
+            .is_some_and(|code| code != WINDOWS_KILL_CODE as i32);
+        (independent || !(tree_may_have_killed || self.delivered)).then_some(status)
+    }
+
+    fn tree_ending(&self, cause: StopCause, outcome: StopOutcome) -> ChildEnd {
+        let delivery = match outcome {
+            StopOutcome::Delivered => true,
+            StopOutcome::AlreadyGone | StopOutcome::Failed => false,
+            // Terminating an empty job also succeeds. Without accounting,
+            // require a matching leader status before attributing the stop.
+            #[cfg(windows)]
+            StopOutcome::Cleared => {
+                self.status.and_then(|s| s.code()) == Some(WINDOWS_KILL_CODE as i32)
+            }
+        };
+        self.ending(delivery.then_some(cause))
+    }
+
+    fn ending(&self, cause: Option<StopCause>) -> ChildEnd {
+        match self.independent_status(cause.is_some()) {
+            Some(status) => ChildEnd::Exited(status),
+            None => ChildEnd::Stopped(cause),
+        }
+    }
+}
+
+/// Where this command's pre-cleanup evidence comes from. Owned by the guard once spawned.
+#[derive(Debug)]
+pub(crate) enum TreeObserver {
+    Direct,
+    #[cfg(target_os = "linux")]
+    Namespace(std::os::unix::net::UnixDatagram),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardState {
+    Armed,
+    Disarmed,
+    /// Both attempts failed. Journal the alarm at completion or on abandonment; don't signal again.
+    KillFailed,
+}
+
+pub(crate) struct Guard<'a> {
+    child: &'a mut Child,
+    observer: TreeObserver,
+    state: GuardState,
+    pub(crate) observation: TreeObservation,
     trace: StopTrace,
     #[cfg(unix)]
     group: libc::pid_t,
@@ -313,179 +368,228 @@ pub(crate) struct Guard {
     job: std::os::windows::io::OwnedHandle,
 }
 
-impl Guard {
-    /// Attach, and remember who to tell if this guard ends up killing the tree.
-    pub(crate) fn attach(child: &Child, trace: StopTrace) -> io::Result<Self> {
+#[cfg(unix)]
+fn attach_target(child: &Child) -> io::Result<libc::pid_t> {
+    child
+        .id()
+        .and_then(|id| libc::pid_t::try_from(id).ok())
+        .ok_or_else(|| io::Error::other("spawned shell has no process group"))
+}
+
+#[cfg(windows)]
+fn attach_target(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+    // SAFETY: null attributes and name create a private unnamed job.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateJobObjectW returned an owned kernel handle.
+    let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job) };
+    let process = child
+        .raw_handle()
+        .ok_or_else(|| io::Error::other("spawned shell has no process handle"))?;
+    // SAFETY: both handles remain alive for the assignment.
+    if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // The only thread is suspended at creation; resume only after
+    // association, so no descendants can be launched outside the job.
+    resume_new_process(
+        child
+            .id()
+            .ok_or_else(|| io::Error::other("missing process ID"))?,
+    )?;
+    Ok(job)
+}
+
+impl<'a> Guard<'a> {
+    /// Either take exclusive reaping authority or stop the uncontained child.
+    pub(crate) async fn attach(
+        child: &'a mut Child,
+        observer: TreeObserver,
+        trace: StopTrace,
+    ) -> Result<Self, (io::Error, ChildEnd)> {
+        let target = match attach_target(child) {
+            Ok(target) => target,
+            Err(error) => {
+                let stop = ChildStop::kill(child).await;
+                return Err((
+                    error,
+                    stop.ending(stop.delivered.then_some(StopCause::Failed)),
+                ));
+            }
+        };
+        Ok(Self {
+            child,
+            observer,
+            trace,
+            state: GuardState::Armed,
+            observation: TreeObservation::None,
+            #[cfg(unix)]
+            group: target,
+            #[cfg(windows)]
+            job: target,
+        })
+    }
+
+    /// The last kill failed or was unverifiable. On Unix even our own child's
+    /// group can return `EPERM` if all remaining members changed credentials.
+    pub(crate) fn kill_failed(&self) -> bool {
+        self.state == GuardState::KillFailed
+    }
+
+    /// Stop before reaping. A status inconsistent with our kill remains the command's own.
+    pub(crate) async fn stop(&mut self, cause: StopCause) -> ChildEnd {
+        #[cfg(target_os = "linux")]
+        let before = match &self.observer {
+            TreeObserver::Namespace(socket) => NamespaceEvidence::Empty.read(socket),
+            TreeObserver::Direct => NamespaceEvidence::Empty,
+        };
+        let outcome = self.signal();
+        let reaped = ChildStop::kill(self.child).await;
+        let ending = reaped.tree_ending(cause, outcome);
+        #[cfg(target_os = "linux")]
+        if let TreeObserver::Namespace(socket) = &self.observer {
+            let after = before.read(socket);
+            if let ChildEnd::Exited(launcher) = ending {
+                let (status, tree) = after.corroborated(launcher);
+                self.observation = tree;
+                return ChildEnd::Exited(status);
+            }
+            // If we interrupted the launcher, it cannot corroborate the report.
+            // A status published *before* our signal is independent even for SIGKILL.
+            // A later non-SIGKILL ending also rules out our kill, but its scan
+            // could have overlapped cleanup and cannot establish the original tree.
+            use std::os::unix::process::ExitStatusExt;
+            if !matches!(after, NamespaceEvidence::Invalid)
+                && let Some((status, tree)) = before.facts().or_else(|| {
+                    let (status, _) = after.facts()?;
+                    (status.signal() != Some(libc::SIGKILL))
+                        .then_some((status, TreeObservation::Unknown))
+                })
+            {
+                self.observation = tree;
+                return ChildEnd::Exited(status);
+            }
+        }
+        if matches!(ending, ChildEnd::Exited(_)) {
+            self.observation = TreeObservation::Unknown;
+        }
+        ending
+    }
+
+    pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         #[cfg(unix)]
         {
-            let group = child
-                .id()
-                .and_then(|id| libc::pid_t::try_from(id).ok())
-                .ok_or_else(|| io::Error::other("spawned shell has no process group"))?;
-            Ok(Self {
-                active: true,
-                refused: false,
-                last: None,
-                trace,
-                group,
-            })
+            unix_wait::wait(self.group).await?;
+            self.collect_waitable()
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::{AsRawHandle, FromRawHandle};
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW,
-            };
-            // SAFETY: null attributes and name create a private unnamed job.
-            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if job.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: CreateJobObjectW returned an owned kernel handle.
-            let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job) };
-            let process = child
-                .raw_handle()
-                .ok_or_else(|| io::Error::other("spawned shell has no process handle"))?;
-            // SAFETY: both handles remain alive for the assignment.
-            if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // The only thread is suspended at creation; resume only after
-            // association, so no descendants can be launched outside the job.
-            resume_new_process(
-                child
-                    .id()
-                    .ok_or_else(|| io::Error::other("missing process ID"))?,
-            )?;
-            Ok(Self {
-                active: true,
-                refused: false,
-                last: None,
-                trace,
-                job,
-            })
+            let status = self.child.wait().await?;
+            let tree = self.sweep(); // the private job handle survives the leader
+            Ok(self.command_exit(status, tree))
         }
     }
 
-    /// Signal the tree and say why. Idempotent: only the first caller reports, and
-    /// the return value is the claim the outcome supports — nothing at all when
-    /// the signal was not delivered, so a later failure cannot relabel an
-    /// already-stopped tree and a failed signal cannot pass for a stop.
-    pub(crate) fn terminate(&mut self, reason: KillReason) -> Option<StopCause> {
-        matches!(self.signal_and_record(reason), StopOutcome::Delivered)
-            .then(|| reason.claim())
-            .flatten()
-    }
-
-    /// What the last signal did, for a path that ends the command without sweeping it.
-    /// A kill made during the deadline race ends no command but does end the tree
-    /// behind it, and without this the record would say nothing happened.
-    pub(crate) fn last_outcome(&self) -> Option<StopOutcome> {
-        self.last
-    }
-
-    /// Whether the last signal is unproven: the kernel refused it and this guard is
-    /// still armed for the retry that no longer exists once the run path disarms it.
-    /// Read it before disarming, so the alarm outlives the guard that holds it.
-    pub(crate) fn may_still_run(&self) -> bool {
-        self.refused
-    }
-
-    /// End the tree behind a command that has already returned, and report what the
-    /// signal found. A sweep claims no cause, because the command's own status is what
-    /// ended it; whether anything was still *running* is the fact a completion reports.
-    pub(crate) fn sweep(&mut self) -> StopOutcome {
-        if !self.active {
-            return StopOutcome::AlreadyGone;
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(unix)]
+        {
+            unix_wait::exited(self.group)?
+                .then(|| self.collect_waitable())
+                .transpose()
         }
-        // Sample before signalling: SIGKILL turns a live member into a zombie, which
-        // erases the very distinction this asks about.
-        let live = self.group_has_live_member();
-        match self.signal_and_record(KillReason::Cleanup) {
-            // A group of zombies takes SIGKILL too, so a delivered signal is not proof
-            // that anything was running. Nothing was, so nothing happened.
-            StopOutcome::Delivered if !live => StopOutcome::AlreadyGone,
-            outcome => outcome,
+        #[cfg(windows)]
+        {
+            Ok(self.child.try_wait()?.map(|status| {
+                let tree = self.sweep();
+                self.command_exit(status, tree)
+            }))
         }
     }
 
-    /// Whether the group holds a process that is not already a zombie.
-    ///
-    /// `kill(-pgid, 0)` only proves the group is non-empty, and a member that has exited
-    /// but not been collected by its parent still occupies it — which is the normal
-    /// state for a moment after any command that leaves a child behind, and how a
-    /// command that left nothing running came to be reported as a failure. Only the
-    /// members' own state answers the question. Linux reads it exactly; elsewhere the
-    /// signal's own outcome stands, which errs toward recording a sweep rather than
-    /// inventing one.
-    #[cfg(target_os = "linux")]
-    fn group_has_live_member(&self) -> bool {
-        // An empty group needs no scan: the fast path for every sandboxed command,
-        // whose tree died with its namespace.
-        // SAFETY: signal 0 performs the error check and delivers nothing.
-        if unsafe { libc::kill(-self.group, 0) } != 0 {
-            return false;
-        }
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return true;
+    #[cfg(unix)]
+    fn collect_waitable(&mut self) -> io::Result<ExitStatus> {
+        // Only this guard may reap. Until the last group signal, the exited
+        // leader still owns its PID; even an otherwise empty PGID cannot be reused.
+        let tree = self.sweep();
+        let status = self
+            .child
+            .try_wait()?
+            .ok_or_else(|| io::Error::other("child exit was not waitable"))?;
+        Ok(self.command_exit(status, tree))
+    }
+
+    fn sweep(&mut self) -> TreeObservation {
+        let tree = match self.observer {
+            TreeObserver::Direct => self.observe_direct_tree(),
+            #[cfg(target_os = "linux")]
+            TreeObserver::Namespace(_) => TreeObservation::Unknown, // evidence travels in the report
         };
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<libc::pid_t>().ok())
-            else {
-                continue;
-            };
-            // `<pid> (<comm>) <state> <ppid> <pgrp> …`, and `comm` may itself contain
-            // spaces and parentheses, so the numeric fields start after the last `)`.
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-                continue;
-            };
-            let Some(fields) = stat.rfind(')').map(|end| &stat[end + 1..]) else {
-                continue;
-            };
-            let mut fields = fields.split_whitespace();
-            let (Some(state), Some(_ppid), Some(pgrp)) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                continue;
-            };
-            if pgrp.parse::<libc::pid_t>().ok() != Some(self.group) {
-                continue;
-            }
-            // `Z` is exited-not-yet-collected, `X` already gone.
-            if state != "Z" && state != "X" {
-                return true;
-            }
-        }
-        false
+        self.signal();
+        tree
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn group_has_live_member(&self) -> bool {
-        true
+    fn command_exit(&mut self, launcher: ExitStatus, direct: TreeObservation) -> ExitStatus {
+        let (status, tree) = match &self.observer {
+            TreeObserver::Direct => (launcher, direct),
+            #[cfg(target_os = "linux")]
+            TreeObserver::Namespace(socket) => {
+                NamespaceEvidence::Empty.read(socket).corroborated(launcher)
+            }
+        };
+        self.observation = tree;
+        status
     }
 
-    /// One attempt, one record. Disarmed guards signal nothing.
-    fn signal_and_record(
-        &mut self,
-        #[cfg_attr(not(test), allow(unused_variables))] reason: KillReason,
-    ) -> StopOutcome {
-        if !self.active {
-            return StopOutcome::AlreadyGone;
+    fn observe_direct_tree(&self) -> TreeObservation {
+        #[cfg(target_os = "linux")]
+        let check = crate::blocking::run(|| linux_observation::has_live_member(Some(self.group)));
+        #[cfg(target_os = "macos")]
+        let check = crate::blocking::run(|| mac_group_has_live_member(self.group));
+        #[cfg(windows)]
+        let check = self.active_job_processes().map(|n| n != 0);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let check: io::Result<bool> = Err(io::ErrorKind::Unsupported.into());
+        TreeObservation::from_live(check.ok())
+    }
+
+    /// Retry an unconfirmed kill once, immediately — never after draining output
+    /// when a Unix process-group number may already have been reused.
+    fn signal(&mut self) -> StopOutcome {
+        match self.state {
+            GuardState::KillFailed => return StopOutcome::Failed,
+            GuardState::Disarmed => return StopOutcome::AlreadyGone,
+            GuardState::Armed => (),
         }
-        let outcome = self.signal_tree();
-        self.last = Some(outcome);
-        self.refused = outcome == StopOutcome::Failed;
-        // A signal that failed leaves the tree running, so stay armed: the
-        // fail-safe drop gets one more attempt.
-        self.active = self.refused;
-        // The job's line is written once, by whoever knows its ending; this is only
-        // the attempt, kept for tests.
-        #[cfg(test)]
-        self.trace.stopped(reason, outcome);
+        let mut outcome = self.attempt_signal();
+        if outcome == StopOutcome::Failed {
+            outcome = self.attempt_signal();
+        }
+        self.state = if outcome == StopOutcome::Failed {
+            GuardState::KillFailed
+        } else {
+            GuardState::Disarmed
+        };
         outcome
+    }
+
+    fn attempt_signal(&self) -> StopOutcome {
+        #[cfg(test)]
+        {
+            let mut record = self.trace.recorded.lock().unwrap();
+            let outcome = if record.attempts.len() < self.trace.refuse_first {
+                StopOutcome::Failed
+            } else {
+                self.signal_tree()
+            };
+            record.attempts.push(outcome);
+            outcome
+        }
+        #[cfg(not(test))]
+        self.signal_tree()
     }
 
     #[cfg(unix)]
@@ -504,14 +608,12 @@ impl Guard {
     }
 
     #[cfg(windows)]
-    fn signal_tree(&self) -> StopOutcome {
+    fn active_job_processes(&self) -> io::Result<u32> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::{
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-            QueryInformationJobObject, TerminateJobObject,
+            QueryInformationJobObject,
         };
-        // An empty job reports success for a termination too, so ask first: a
-        // group that is already gone is not a stop we performed.
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: the job belongs to this invocation and the struct matches the
         // class the call was asked for.
@@ -524,37 +626,156 @@ impl Guard {
                 std::ptr::null_mut(),
             )
         };
-        if queried != 0 && accounting.ActiveProcesses == 0 {
+        if queried == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses)
+        }
+    }
+
+    #[cfg(windows)]
+    fn signal_tree(&self) -> StopOutcome {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        let count = self.active_job_processes();
+        if matches!(count, Ok(0)) {
             return StopOutcome::AlreadyGone;
         }
         // Always terminate, even when the count is unavailable: failing closed
-        // must not leave descendants running. The outcome is unproven then, so
-        // nothing may be claimed for it.
-        let terminated = unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } != 0;
-        match (queried != 0, terminated) {
+        // must not leave descendants running. Cleanup and attribution are separate.
+        let terminated =
+            unsafe { TerminateJobObject(self.job.as_raw_handle(), WINDOWS_KILL_CODE) } != 0;
+        match (count.is_ok(), terminated) {
             // Terminating an empty job succeeds too, so without the count a
             // success proves nothing about whether we were the one who stopped it.
-            (false, _) => StopOutcome::Failed,
+            (false, true) => StopOutcome::Cleared,
             (true, true) => StopOutcome::Delivered,
-            (true, false) => StopOutcome::Failed,
+            (_, false) => StopOutcome::Failed,
         }
     }
 
     pub(crate) fn disarm(&mut self) {
-        self.active = false;
+        self.state = GuardState::Disarmed;
     }
 }
 
-impl Drop for Guard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
+/// Ordered private datagrams: wait status first, then one post-exit tree observation.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum NamespaceEvidence {
+    Empty,
+    Waited(namespace_report::ShellStatus),
+    Complete(namespace_report::ShellStatus, TreeObservation),
+    Invalid,
+}
+
+#[cfg(target_os = "linux")]
+impl NamespaceEvidence {
+    fn read(mut self, socket: &std::os::unix::net::UnixDatagram) -> Self {
+        while matches!(self, Self::Empty | Self::Waited(_)) {
+            // One byte larger than either packet, so truncated datagrams never validate.
+            let mut buf = [0; 3];
+            let bytes = match socket.recv(&mut buf) {
+                Ok(len) => &buf[..len],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => return Self::Invalid,
+            };
+            self = match (self, bytes) {
+                (Self::Empty, packet) => namespace_report::ShellStatus::try_from(packet)
+                    .map_or(Self::Invalid, Self::Waited),
+                (Self::Waited(status), b"L") => Self::Complete(status, TreeObservation::Leftovers),
+                (Self::Waited(status), b"N") => Self::Complete(status, TreeObservation::None),
+                (Self::Waited(status), b"?") => Self::Complete(status, TreeObservation::Unknown),
+                _ => Self::Invalid,
+            };
         }
-        // Reaching here while still armed means a path returned without
-        // disarming. The kill is right; so is saying so, and this is the one
-        // ending no completion can report.
-        let outcome = self.signal_and_record(KillReason::Dropped);
-        self.trace.abandoned(tree_word(outcome));
+        self
+    }
+
+    fn facts(self) -> Option<(ExitStatus, TreeObservation)> {
+        match self {
+            Self::Waited(status) => Some((status.0, TreeObservation::Unknown)),
+            Self::Complete(status, tree) => Some((status.0, tree)),
+            _ => None,
+        }
+    }
+
+    fn corroborated(self, launcher: ExitStatus) -> (ExitStatus, TreeObservation) {
+        if let Self::Complete(status, tree) = self
+            && launcher.code() == Some(i32::from(status.launcher_code()))
+        {
+            (status.0, tree)
+        } else {
+            (launcher, TreeObservation::Unknown)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_group_has_live_member(group: libc::pid_t) -> io::Result<bool> {
+    let mut pids: Vec<libc::pid_t> = vec![0; 32];
+    loop {
+        let bytes = std::mem::size_of_val(&pids[..]);
+        // Apple libsyscall/libproc.c: proc_listpgrppids divides proc_listpids' byte result by sizeof(int).
+        // SAFETY: writable pid array of exactly `bytes` bytes.
+        let used =
+            unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), bytes as i32) };
+        if used <= 0 {
+            // The waitable leader still owns this group. No list is not proof of no leftovers.
+            return Err(io::Error::other("cannot list command process group"));
+        }
+        let listed = &pids[..pids.len().min(used as usize)];
+        for &pid in listed {
+            // The waitable leader is already terminal.
+            if pid <= 0 || pid == group {
+                continue;
+            }
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+            let size = size_of::<libc::proc_bsdinfo>() as i32;
+            // SAFETY: output storage matches the flavor/size requested.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if got != size {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                return Err(err);
+            }
+            // SAFETY: proc_pidinfo returned the entire structure.
+            let info = unsafe { info.assume_init() };
+            if info.pbi_pgid == group as u32 && info.pbi_status != libc::SZOMB {
+                return Ok(true);
+            }
+        }
+        if listed.len() < pids.len() {
+            return Ok(false);
+        }
+        if pids.len() >= 65536 {
+            return Err(io::Error::other("incomplete process group listing"));
+        }
+        pids.resize(pids.len() * 2, 0);
+    }
+}
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        match self.state {
+            GuardState::Armed => {
+                self.signal();
+                self.trace.abandoned(self.kill_failed());
+            }
+            GuardState::KillFailed => self.trace.abandoned(true),
+            GuardState::Disarmed => (),
+        }
     }
 }
 
@@ -562,18 +783,179 @@ impl Drop for Guard {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_report_requires_a_terminal_packet_and_matching_launcher() {
+        use std::os::unix::{net::UnixDatagram, process::ExitStatusExt};
+
+        let code137 = ExitStatus::from_raw(137 << 8);
+        let killed = ExitStatus::from_raw(libc::SIGKILL);
+        for (status, tree, launcher) in [
+            (None, None, code137),
+            (Some(&b"S"[..]), None, code137),
+            (Some(b"S\x09!"), None, code137),
+            (Some(b"S\0"), None, code137),
+            (Some(b"S\x7f"), None, code137),
+            (Some(b"S\x09"), None, code137),
+            (Some(b"S\x09"), Some(&b"X"[..]), code137),
+            (Some(b"S\x09"), Some(b"L!"), code137),
+            (Some(b"E\0"), Some(b"L"), code137),
+            (Some(b"S\x09"), Some(b"L"), killed),
+            (Some(b"S\x09"), Some(b"?"), code137),
+        ] {
+            let (rx, tx) = UnixDatagram::pair().unwrap();
+            rx.set_nonblocking(true).unwrap();
+            for packet in [status, tree].into_iter().flatten() {
+                tx.send(packet).unwrap();
+            }
+            let expected = if tree == Some(b"?") { killed } else { launcher };
+            assert_eq!(
+                NamespaceEvidence::Empty.read(&rx).corroborated(launcher),
+                (expected, TreeObservation::Unknown)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_during_observer_tail_preserves_only_published_evidence() {
+        use std::os::unix::{net::UnixDatagram, process::ExitStatusExt};
+        // A live launcher, but the private observer has already waited on the
+        // command. Exercise either side of the scan without a timing-dependent race.
+        for cause in [StopCause::Timeout, StopCause::Cancel] {
+            for tree in [None, Some(&b"L"[..]), Some(b"N")] {
+                let (recv, send) = UnixDatagram::pair().unwrap();
+                recv.set_nonblocking(true).unwrap();
+                let (mut child, trace) = guarded_sleep();
+                let mut guard = Guard::attach(&mut child, TreeObserver::Namespace(recv), trace)
+                    .await
+                    .unwrap();
+                let packet = if cause == StopCause::Timeout {
+                    b"E\x00"
+                } else {
+                    b"S\x09"
+                };
+                send.send(packet).unwrap();
+                if let Some(packet) = tree {
+                    send.send(packet).unwrap();
+                }
+                assert!(guard.try_wait().unwrap().is_none());
+                let ChildEnd::Exited(status) = guard.stop(cause).await else {
+                    panic!("stopping only the launcher cannot own the shell exit");
+                };
+                if cause == StopCause::Timeout {
+                    assert_eq!(status.code(), Some(0));
+                } else {
+                    assert_eq!(status.signal(), Some(libc::SIGKILL));
+                }
+                assert_eq!(
+                    guard.observation,
+                    match tree {
+                        Some(b"L") => TreeObservation::Leftovers,
+                        Some(b"N") => TreeObservation::None,
+                        _ => TreeObservation::Unknown,
+                    }
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
-    fn guarded_sleep() -> (tokio::process::Child, Guard, StopTrace) {
+    #[test]
+    fn a_racing_stop_cannot_claim_a_different_terminal_signal_or_an_exit_code() {
+        use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+        for raw in [3 << 8, libc::SIGTERM, libc::SIGSEGV, libc::SIGKILL] {
+            let status = ExitStatus::from_raw(raw);
+            let stop = ChildStop {
+                delivered: true,
+                status: Some(status),
+            };
+            let compatible = raw == libc::SIGKILL;
+            let no_delivery = ChildStop {
+                delivered: false,
+                status: Some(status),
+            };
+            assert_eq!(no_delivery.independent_status(false), Some(status));
+            assert_eq!(
+                stop.independent_status(false),
+                (!compatible).then_some(status)
+            );
+            assert_eq!(
+                matches!(
+                    stop.ending(Some(StopCause::Failed)),
+                    ChildEnd::Stopped(Some(StopCause::Failed))
+                ),
+                compatible
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_the_windows_termination_code_is_ambiguous() {
+        use std::os::windows::process::ExitStatusExt;
+        for code in [0, 1, 42, WINDOWS_KILL_CODE, 0xc0000005] {
+            let status = ExitStatus::from_raw(code);
+            let no_delivery = ChildStop {
+                delivered: false,
+                status: Some(status),
+            };
+            assert_eq!(
+                matches!(
+                    no_delivery.tree_ending(StopCause::Timeout, StopOutcome::Cleared),
+                    ChildEnd::Stopped(Some(StopCause::Timeout))
+                ),
+                code == WINDOWS_KILL_CODE
+            );
+            assert_eq!(no_delivery.independent_status(false), Some(status));
+            assert_eq!(
+                no_delivery.independent_status(true),
+                (code != WINDOWS_KILL_CODE).then_some(status)
+            );
+            let stop = ChildStop {
+                delivered: true,
+                status: Some(status),
+            };
+            assert_eq!(
+                stop.independent_status(false),
+                (code != WINDOWS_KILL_CODE).then_some(status)
+            );
+            assert_eq!(
+                matches!(
+                    stop.ending(Some(StopCause::Failed)),
+                    ChildEnd::Stopped(Some(StopCause::Failed))
+                ),
+                code == WINDOWS_KILL_CODE
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_child_only_windows_stop_uses_the_same_private_marker() {
+        let mut command = Command::new("ping.exe");
+        command
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let stop = ChildStop::kill(&mut child).await;
+        assert!(stop.delivered);
+        assert_eq!(stop.status.unwrap().code(), Some(WINDOWS_KILL_CODE as i32));
+        assert!(stop.independent_status(false).is_none());
+    }
+
+    #[cfg(unix)]
+    fn guarded_sleep() -> (Child, StopTrace) {
         let mut command = Command::new("sh");
-        configure(&mut command);
-        command.arg("-c").arg("sleep 5");
-        let child = command.spawn().unwrap();
+        command.arg("-c").arg("exec sleep 5");
+        let child = spawn(&mut command).unwrap();
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(2, false, crate::logging::ColorMode::Never),
             "job-1",
         );
-        let guard = Guard::attach(&child, trace.clone()).unwrap();
-        (child, guard, trace)
+        (child, trace)
     }
 
     /// The headline invariant: a stop reports itself exactly once, and the reason
@@ -581,14 +963,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_stop_reports_once_and_the_fail_safe_names_itself() {
-        let (mut child, mut guard, trace) = guarded_sleep();
-        assert_eq!(
-            guard.terminate(KillReason::Timeout),
-            Some(StopCause::Timeout)
-        );
-        assert_eq!(guard.terminate(KillReason::Cancel), None);
-        assert_eq!(trace.reports(), vec![KillReason::Timeout]);
+        let (mut child, trace) = guarded_sleep();
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
+        let end = guard.stop(StopCause::Timeout).await;
+        assert!(matches!(end, ChildEnd::Stopped(Some(StopCause::Timeout))));
+        assert_eq!(guard.signal(), StopOutcome::AlreadyGone);
         assert_eq!(trace.outcomes(), vec![StopOutcome::Delivered]);
+        drop(guard);
         let _ = child.kill().await;
     }
 
@@ -597,62 +980,102 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_an_armed_guard_reports_the_fail_safe() {
-        let (_child, guard, trace) = guarded_sleep();
+        let (mut child, trace) = guarded_sleep();
+        let guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
         drop(guard);
-        assert_eq!(trace.reports(), vec![KillReason::Dropped]);
+        assert_eq!(trace.lines(), ["id=job-1 end=abandoned"]);
         assert_eq!(trace.outcomes(), vec![StopOutcome::Delivered]);
     }
 
-    /// Two facts, two homes: a kill that ended the command claims a cause on the
-    /// result, a sweep of leftovers is on the journal record only. Neither may
-    /// borrow the other's meaning, which is how one field came to answer two
-    /// questions at once.
-    #[test]
-    fn only_a_command_ending_claims_a_cause() {
-        for (reason, cause) in [
-            (KillReason::Timeout, StopCause::Timeout),
-            (KillReason::Cancel, StopCause::Cancel),
-            (KillReason::Shutdown, StopCause::Shutdown),
-            (KillReason::Failed, StopCause::Failed),
-        ] {
-            assert_eq!(reason.claim(), Some(cause), "{reason:?}");
-        }
-        for reason in [KillReason::Cleanup, KillReason::Dropped] {
-            assert_eq!(
-                reason.claim(),
-                None,
-                "{reason:?} ends a tree, not a command"
-            );
-            // Still on the record, so the kill is never a stranger's.
-            assert!(
-                !reason.as_str().is_empty(),
-                "{reason:?} must still be named"
-            );
-        }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transient_refusal_retries_immediately_but_never_signals_again_on_drop() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 15 & exit 42"]);
+        let mut child = spawn(&mut command).unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        let trace = StopTrace::new(crate::logging::LogConfig::default(), "racing-stop");
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
+        guard.trace.refuse_first = 1;
+        unix_wait::wait(pid).await.unwrap();
+        let ChildEnd::Exited(status) = guard.stop(StopCause::Timeout).await else {
+            panic!("a sweep of the remaining group cannot own the leader's exit");
+        };
+        assert_eq!(status.code(), Some(42));
+        assert_eq!(guard.observation, TreeObservation::Unknown);
+        assert!(!guard.kill_failed());
+        drop(guard);
+        assert_eq!(
+            trace.outcomes(),
+            [StopOutcome::Failed, StopOutcome::Delivered]
+        );
+        assert!(trace.lines().is_empty());
     }
 
-    /// A signal that found nothing has no word: no line, or every sandboxed
-    /// command's sweep would write one saying nothing happened.
-    #[test]
-    fn an_empty_group_has_no_word() {
-        assert_eq!(tree_word(StopOutcome::AlreadyGone), None);
-        assert_eq!(tree_word(StopOutcome::Delivered), Some("killed"));
-        assert_eq!(tree_word(StopOutcome::Failed), Some("alive"));
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandonment_after_two_refusals_reports_the_alarm_without_a_third_kill() {
+        let (mut child, trace) = guarded_sleep();
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
+        guard.trace.refuse_first = 2;
+        assert_eq!(guard.signal(), StopOutcome::Failed);
+        drop(guard);
+        assert_eq!(trace.outcomes(), [StopOutcome::Failed; 2]);
+        assert_eq!(
+            trace.lines(),
+            ["id=job-1 end=abandoned cleanup=kill-failed"]
+        );
+        child.kill().await.unwrap();
+    }
+
+    /// Why a sweep is never evidence: a group whose only member has exited but not
+    /// been collected still takes the signal. The command left nothing running, yet
+    /// the kernel reports delivery — so nothing a caller or operator reads may depend
+    /// on it, and only a refusal survives as a fact.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_zombie_group_takes_the_signal_and_records_nothing() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        let mut child = spawn(&mut command).unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        let trace = StopTrace::new(crate::logging::LogConfig::default(), "zombie");
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
+        unix_wait::wait(pid).await.unwrap();
+        assert!(
+            unix_wait::exited(pid).unwrap(),
+            "exit notification must not reap"
+        );
+        assert!(guard.try_wait().unwrap().unwrap().success());
+        assert_eq!(
+            unix_wait::exited(pid).unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_eq!(guard.observation, TreeObservation::None);
+        assert_eq!(trace.outcomes(), vec![StopOutcome::Delivered]);
+        assert!(!guard.kill_failed(), "delivery to zombies is not a refusal");
+        guard.disarm();
     }
 
     /// The contract a caller is told: a command's process group does not outlive
     /// it. A shell that backgrounds work and returns leaves that work in the
-    /// group, so sweeping the tree after the command returns must reach it — and
-    /// say so on the record, without claiming to have ended the command. A
-    /// `setsid` descendant leaves the group and is out of reach; the contract is
-    /// the group, not the machine.
+    /// group, so sweeping the tree after the command returns must reach it, without
+    /// claiming to have ended the command. A `setsid` descendant leaves the group and
+    /// is out of reach; the contract is the group, not the machine.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_descendant_outliving_the_command_is_ended_and_recorded() {
+    async fn a_descendant_outliving_the_command_is_ended() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("survived");
         let mut command = Command::new("sh");
-        configure(&mut command);
         command
             .arg("-c")
             .arg(format!(
@@ -661,22 +1084,21 @@ mod tests {
             ))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut child = command.spawn().unwrap();
+        let mut child = spawn(&mut command).unwrap();
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(0, false, crate::logging::ColorMode::Never),
             "job-contract",
         );
-        let mut tree = Guard::attach(&child, trace.clone()).unwrap();
+        let mut tree = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
         // The command itself is done; the backgrounded writer is not.
-        let _ = child.wait().await;
-        let claimed = tree.terminate(KillReason::Cleanup);
+        assert!(tree.wait().await.unwrap().success());
+        assert_eq!(tree.observation, TreeObservation::Leftovers);
+        assert!(!tree.kill_failed());
         tree.disarm();
 
-        assert_eq!(
-            claimed, None,
-            "a sweep ends a tree, not the command, so it claims no cause"
-        );
-        assert_eq!(trace.reports(), vec![KillReason::Cleanup]);
+        assert_eq!(trace.outcomes(), [StopOutcome::Delivered]);
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         assert!(
             !marker.exists(),
@@ -686,22 +1108,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_empty_group_is_reported_as_gone_and_claims_nothing() {
+    async fn a_later_stop_never_signals_the_reaped_group() {
         let mut command = Command::new("sh");
-        configure(&mut command);
         command.arg("-c").arg("exit 0");
-        let mut child = command.spawn().unwrap();
+        let mut child = spawn(&mut command).unwrap();
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(1, false, crate::logging::ColorMode::Never),
             "gone",
         );
-        let mut guard = Guard::attach(&child, trace.clone()).unwrap();
-        child.wait().await.unwrap();
-        // A claimable reason on an empty group still claims nothing: the signal
-        // never reached the command, so dotlink did not stop it.
-        assert_eq!(guard.terminate(KillReason::Timeout), None);
-        assert_eq!(trace.reports(), vec![KillReason::Timeout]);
-        assert_eq!(trace.outcomes(), vec![StopOutcome::AlreadyGone]);
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
+        assert!(guard.wait().await.unwrap().success());
+        let swept = trace.outcomes();
+        assert_eq!(guard.signal(), StopOutcome::AlreadyGone);
+        assert_eq!(trace.outcomes(), swept, "no group signal after reaping");
     }
 
     /// A command that finished is disarmed first, so nothing is reported.
@@ -710,45 +1131,60 @@ mod tests {
     async fn a_disarmed_guard_reports_nothing() {
         let mut child = {
             let mut command = Command::new("sh");
-            configure(&mut command);
             command.arg("-c").arg("exit 0");
-            command.spawn().unwrap()
+            spawn(&mut command).unwrap()
         };
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(2, false, crate::logging::ColorMode::Never),
             "job-2",
         );
-        let mut guard = Guard::attach(&child, trace.clone()).unwrap();
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
         guard.disarm();
         drop(guard);
         let _ = child.wait().await;
-        assert!(trace.reports().is_empty(), "{:?}", trace.reports());
+        assert!(trace.outcomes().is_empty(), "{:?}", trace.outcomes());
     }
 
-    /// The whole vocabulary, in one place: how it ended, who ended it, and whether
-    /// dotlink also killed work the command left running. No token here may read as
-    /// "something is still running".
+    /// The whole vocabulary, in one place, as the line is actually written: how it
+    /// ended, who ended it when that was a choice, and the one tree fact worth a line.
+    #[cfg(unix)]
     #[test]
     fn the_end_line_names_how_it_ended_and_who_ended_it() {
+        let line = |end: End, by, kill_failed| {
+            end_message(
+                "3f0c9d1e",
+                &end.describe(),
+                by,
+                TreeObservation::None,
+                kill_failed,
+            )
+        };
         assert_eq!(
-            end_message("3f0c9d1e", "exit code=0", None, None),
+            line(End::Exit(0), None, false),
             "id=3f0c9d1e end=exit code=0"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "signal signal=SIGKILL", Some("external"), None),
-            "id=3f0c9d1e end=signal signal=SIGKILL by=external"
+            line(End::Signal(libc::SIGKILL), Some("external"), false),
+            "id=3f0c9d1e end=signal SIGKILL by=external"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "timeout", Some("dotlink"), None),
-            "id=3f0c9d1e end=timeout by=dotlink"
+            end_message("id", "exit code=0", None, TreeObservation::Leftovers, true),
+            "id=id end=exit code=0 tree=leftovers cleanup=kill-failed"
+        );
+        assert_eq!(line(End::Timeout, None, false), "id=3f0c9d1e end=timeout");
+        assert_eq!(
+            line(End::Cancel, Some("caller"), false),
+            "id=3f0c9d1e end=cancel by=caller"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "exit code=0", None, Some("killed")),
-            "id=3f0c9d1e end=exit code=0 tree=killed"
+            line(End::Exit(0), None, true),
+            "id=3f0c9d1e end=exit code=0 cleanup=kill-failed"
         );
         assert_eq!(
-            end_message("3f0c9d1e", "abandoned", Some("dotlink"), Some("alive")),
-            "id=3f0c9d1e end=abandoned by=dotlink tree=alive"
+            line(End::Abandoned, None, true),
+            "id=3f0c9d1e end=abandoned cleanup=kill-failed"
         );
     }
 
@@ -757,15 +1193,16 @@ mod tests {
     async fn suspended_windows_command_resumes_only_after_job_assignment() {
         use std::process::Stdio;
         let mut command = Command::new("cmd.exe");
-        configure(&mut command);
         command.arg("/C").arg("exit 0").stdout(Stdio::null());
-        let mut child = command.spawn().unwrap();
+        let mut child = spawn(&mut command).unwrap();
         let mut job = Guard::attach(
-            &child,
+            &mut child,
+            TreeObserver::Direct,
             StopTrace::new(crate::logging::LogConfig::default(), "test"),
         )
+        .await
         .unwrap();
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), job.wait())
             .await
             .unwrap()
             .unwrap();
@@ -779,7 +1216,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("marker");
         let mut command = Command::new("sh");
-        configure(&mut command);
         command
             .arg("-c")
             .arg(format!(
@@ -787,15 +1223,16 @@ mod tests {
                 output.display()
             ))
             .kill_on_drop(true);
-        let mut child = command.spawn().unwrap();
+        let mut child = spawn(&mut command).unwrap();
         let mut tree = Guard::attach(
-            &child,
+            &mut child,
+            TreeObserver::Direct,
             StopTrace::new(crate::logging::LogConfig::default(), "test"),
         )
+        .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        let _ = tree.terminate(KillReason::Timeout);
-        let _ = child.wait().await;
+        let _ = tree.stop(StopCause::Timeout).await;
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         assert!(!output.exists(), "killed descendant must not run later");
     }

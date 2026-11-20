@@ -731,6 +731,7 @@ struct DirectoryEntries {
 }
 
 enum DirectorySource {
+    #[cfg(not(target_os = "macos"))]
     Streaming(fs::ReadDir),
     #[cfg(target_os = "macos")]
     Buffered(std::vec::IntoIter<OsString>),
@@ -745,6 +746,7 @@ impl DirectoryEntries {
 
     async fn next_name(&mut self) -> io::Result<Option<OsString>> {
         match &mut self.source {
+            #[cfg(not(target_os = "macos"))]
             DirectorySource::Streaming(reader) => {
                 Ok(reader.next_entry().await?.map(|entry| entry.file_name()))
             }

@@ -291,6 +291,7 @@ pub fn validate_assembled(mounts: &[SandboxMount]) -> Result<()> {
 /// `/tmp/home/.gitconfig`) after the mount layer, so a colliding mount would
 /// either be shadowed or break the bind outright. Environment collides only
 /// when the values differ: setting the same value twice is harmless.
+#[cfg(any(target_os = "linux", test))]
 pub fn reject_host_conflicts(
     mounts: &[SandboxMount],
     host_targets: &[PathBuf],

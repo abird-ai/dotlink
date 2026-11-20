@@ -491,11 +491,7 @@ mod wire_tests {
         let job = machine.jobs.create_for_test(30).unwrap();
         std::fs::write(&job.stdout_path, b"out").unwrap();
         std::fs::write(&job.stderr_path, b"err").unwrap();
-        let stream = |bytes: u64| StreamSummary {
-            total_bytes: bytes,
-            stored_bytes: bytes,
-            truncated: false,
-        };
+        let stream = |bytes: u64| StreamSummary::complete(bytes, bytes);
         machine.jobs.finish(
             &job.id,
             JobCompletion::completed(Some(0), true, stream(3), stream(3)),

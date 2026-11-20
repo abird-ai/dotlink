@@ -199,11 +199,40 @@ pub(crate) enum JobPhase {
     Terminal,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct StreamSummary {
-    pub(crate) total_bytes: u64,
+    /// Counted pipe reads; only an exact total after EOF.
+    read_bytes: u64,
     pub(crate) stored_bytes: u64,
-    pub(crate) truncated: bool,
+    pub(crate) drain_incomplete: bool,
+}
+
+impl StreamSummary {
+    pub(crate) fn complete(read_bytes: u64, stored_bytes: u64) -> Self {
+        Self {
+            read_bytes,
+            stored_bytes,
+            drain_incomplete: false,
+        }
+    }
+
+    /// Called after all writers quiesce; the file holds only the retained prefix.
+    pub(crate) fn incomplete(path: &Path, read_bytes: u64) -> Self {
+        let stored_bytes = stored_len(path, None);
+        Self {
+            read_bytes: read_bytes.max(stored_bytes),
+            stored_bytes,
+            drain_incomplete: true,
+        }
+    }
+
+    pub(crate) fn total(self) -> Option<u64> {
+        (!self.drain_incomplete).then_some(self.read_bytes)
+    }
+
+    pub(crate) fn truncated(self) -> bool {
+        self.read_bytes > self.stored_bytes
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -236,15 +265,13 @@ pub(crate) struct JobCompletion {
     /// signalled the tree and the signal was delivered. Absent means no stop is
     /// provable — the command ended on its own, was never spawned, was stopped
     /// from outside the connector, or the runner died in a way this record cannot
-    /// see. The lifecycle line is the fuller account of the tree — a sweep, a refusal —
-    /// while this field stays the one question a result asks. Read it beside `status`,
-    /// which says how the job ended.
+    /// see. Read it beside `status`, which says how the job ended.
     pub(crate) stopped_by: Option<crate::shell_process::StopCause>,
-    /// What became of the group the command left: `Some(Delivered)` killed it,
-    /// `Some(Failed)` could not and it may still be running, `Some(AlreadyGone)` found
-    /// it empty, and `None` means no sweep ran at all. Set by the one finalizer every
-    /// path uses, so `tree=` on the lifecycle line cannot disagree with it.
-    pub(crate) leftovers: Option<crate::shell_process::StopOutcome>,
+    /// Journal-only: the last tree kill failed or could not be confirmed.
+    /// Cleanup never overrides the command's own exit status.
+    pub(crate) kill_failed: bool,
+    pub(crate) tree: crate::shell_process::TreeObservation,
+    /// Shell-result verdict, not MCP tool status: even exit 0 is unsuccessful with observed live leftovers.
     pub(crate) success: bool,
     pub(crate) error: Option<String>,
     pub(crate) stdout: StreamSummary,
@@ -254,27 +281,19 @@ pub(crate) struct JobCompletion {
 }
 
 impl JobCompletion {
-    /// What the sweep of this command's group found — `None` when no sweep ran. The
-    /// lifecycle line reads it to say `tree=killed`/`tree=alive`; it never changes which
-    /// field a result carries, because the verdict travels in `error`. One setter, so a
-    /// caller cannot leave a sweep unrecorded by reaching for another.
-    pub(crate) fn with_leftovers(
-        mut self,
-        leftovers: Option<crate::shell_process::StopOutcome>,
-    ) -> Self {
-        if let Some(leftovers) = leftovers {
-            self.leftovers = Some(leftovers);
-        }
+    /// Whether a kill of this command's tree failed. The finalizer's setter: the
+    /// journal reads it, a result never does.
+    pub(crate) fn with_kill_failed(mut self, kill_failed: bool) -> Self {
+        self.kill_failed = kill_failed;
         self
     }
 
-    /// The command returned, but the work it started did not: dotlink ended it. The
-    /// command's own status stays exactly as the process reported it — this is not a
-    /// dotlink failure — while `success` says the invocation did not finish. A caller
-    /// that reads `success` must not read "done" here, and `error` is why.
-    pub(crate) fn did_not_finish(mut self, message: impl Into<String>) -> Self {
-        self.success = false;
-        self.error = Some(message.into());
+    /// Only positive evidence of live leftovers clears success. Never rewrite the reaped exit code or signal.
+    pub(crate) fn with_tree(mut self, tree: crate::shell_process::TreeObservation) -> Self {
+        self.tree = tree;
+        if tree == crate::shell_process::TreeObservation::Leftovers {
+            self.success = false;
+        }
         self
     }
 
@@ -290,7 +309,8 @@ impl JobCompletion {
             exit_code,
             signal: None,
             stopped_by: None,
-            leftovers: None,
+            kill_failed: false,
+            tree: Default::default(),
             terminal: None,
             success,
             error: None,
@@ -308,10 +328,11 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
-            leftovers: None,
+            kill_failed: false,
+            tree: Default::default(),
             terminal: None,
             success: false,
-            error: Some("shell job reached its requested timeout".to_owned()),
+            error: Some("command timed out".to_owned()),
             stdout,
             stderr,
             context: None,
@@ -326,7 +347,8 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
-            leftovers: None,
+            kill_failed: false,
+            tree: Default::default(),
             terminal: None,
             success: false,
             error: Some("shell job was cancelled".to_owned()),
@@ -352,7 +374,8 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
-            leftovers: None,
+            kill_failed: false,
+            tree: Default::default(),
             terminal: None,
             success: false,
             error: Some(bounded_job_error(message)),
@@ -375,7 +398,8 @@ impl JobCompletion {
             exit_code: None,
             signal: None,
             stopped_by: None,
-            leftovers: None,
+            kill_failed: false,
+            tree: Default::default(),
             terminal: None,
             success: false,
             error: Some(message.clone()),
@@ -386,9 +410,41 @@ impl JobCompletion {
         }
     }
 
-    /// Attach the signal that ended the waited process. Only the launcher's own
-    /// status can prove it: a signalled *inner* command reaches dotlink as a
-    /// normal exit code (128 + signal) because the sandbox re-encodes it.
+    /// Replace process evidence, not the runner verdict. A capture failure and
+    /// a command with a known exit code are compatible facts.
+    pub(crate) fn with_child_end(self, end: crate::shell_process::ChildEnd) -> Self {
+        use crate::shell_process::ChildEnd;
+        match end {
+            ChildEnd::Exited(status) => {
+                #[cfg(unix)]
+                let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+                #[cfg(not(unix))]
+                let signal = None;
+                self.with_exit_code(status.code())
+                    .with_signal(signal)
+                    .with_stop(None)
+            }
+            ChildEnd::Stopped(cause) => {
+                self.with_exit_code(None).with_signal(None).with_stop(cause)
+            }
+        }
+    }
+
+    /// Output storage failed after the ending was known. Preserve its facts and streams.
+    pub(crate) fn with_output_failure(self, error: String) -> Self {
+        let terminal = self.status;
+        let error = bounded_job_error(error);
+        Self {
+            status: JobStatus::Failed,
+            success: false,
+            error: Some(error.clone()),
+            internal_error: Some(error),
+            ..self
+        }
+        .after_terminal(terminal)
+    }
+
+    /// Attach a signal from a wait status, never inferred from a numeric exit code.
     pub(crate) fn with_signal(mut self, signal: Option<i32>) -> Self {
         self.signal = signal;
         self
@@ -1078,13 +1134,15 @@ struct JobOutputPage<'a> {
     offset: u64,
     next_offset: u64,
     stored_bytes: u64,
-    /// Absent while the job runs, because nothing is final yet.
+    /// Known only after EOF.
     #[serde(skip_serializing_if = "Option::is_none")]
     total_bytes: Option<u64>,
     /// Always rendered: `complete: false` is the answer "read another page".
     complete: bool,
     #[serde(skip_serializing_if = "is_absent_bool")]
     truncated: bool,
+    #[serde(skip_serializing_if = "is_absent_bool")]
+    drain_incomplete: bool,
     #[serde(skip_serializing_if = "is_absent_bool")]
     released: bool,
     encoding: &'static str,
@@ -1468,8 +1526,8 @@ impl JobManager {
                     // exactly when a tree was still armed.
                     JobCompletion::internal_failed(
                         "shell job runner panicked",
-                        incomplete_stream_summary(&panic_stdout),
-                        incomplete_stream_summary(&panic_stderr),
+                        StreamSummary::incomplete(&panic_stdout, 0),
+                        StreamSummary::incomplete(&panic_stderr, 0),
                     )
                 }
             };
@@ -2303,8 +2361,7 @@ impl JobManager {
                         stream,
                         offset,
                         stored_bytes: stored,
-                        total_bytes: summary.map(|value| value.total_bytes),
-                        truncated: summary.is_some_and(|value| value.truncated),
+                        summary,
                         released: true,
                         base64,
                     }
@@ -2321,8 +2378,7 @@ impl JobManager {
                     path: stream_path(entry, stream).to_path_buf(),
                     terminal: entry.status().terminal(),
                     stored,
-                    total: summary.map(|value| value.total_bytes),
-                    truncated: summary.is_some_and(|value| value.truncated),
+                    summary,
                     released: false,
                 },
                 JobReadLease {
@@ -2409,7 +2465,7 @@ impl JobManager {
                 .completion
                 .as_ref()
                 .filter(|completion| completion.internal_error.is_some())
-                .cloned();
+                .map(|completion| (completion.clone(), entry.timeout_secs));
             let snapshot = if matches!(
                 status,
                 JobStatus::Completed | JobStatus::TimedOut | JobStatus::Failed
@@ -2439,10 +2495,9 @@ impl JobManager {
             JobStatus::Running => TaskPayload::Working,
             JobStatus::Cancelled => TaskPayload::Cancelled,
             JobStatus::Completed | JobStatus::TimedOut | JobStatus::Failed => {
-                if let Some(completion) = internal {
-                    let message = completion.internal_error.clone().unwrap_or_default();
+                if let Some((completion, timeout_secs)) = internal {
                     TaskPayload::Failed {
-                        error: failure_error_object(&message, &completion),
+                        error: failure_error_object(&completion, timeout_secs),
                     }
                 } else {
                     let result = crate::blocking::run(|| {
@@ -2464,8 +2519,7 @@ struct OutputSnapshot {
     path: PathBuf,
     terminal: bool,
     stored: u64,
-    total: Option<u64>,
-    truncated: bool,
+    summary: Option<StreamSummary>,
     released: bool,
 }
 
@@ -2559,13 +2613,12 @@ fn external_stop_note(completion: &JobCompletion) -> Option<String> {
 /// a culprit — a crash and a stranger's SIGKILL both land here.
 ///
 /// The predicate is `stopped_by.is_none()`, which is exactly "no kill of ours
-/// ended this command": only a kill that ends the command claims a cause, while a
-/// sweep of leftovers is a stop line in the journal. So a command that somebody
-/// else killed keeps its exit line even when dotlink also swept its tree — the
-/// two records answer different questions and must not be merged.
+/// ended this command": only a kill that ends the command claims a cause, and a
+/// sweep of leftovers claims nothing. So a command that somebody else killed keeps
+/// this ending even when dotlink also swept its tree behind it.
 ///
-/// The result sentence and the exit line both read this, so the journal and the
-/// reply cannot disagree about the same job.
+/// The result sentence and the `by=external` line both read this, so the journal
+/// and the reply cannot disagree about the same job.
 pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
     let signal = completion.signal?;
     completion.stopped_by.is_none().then_some(signal)
@@ -2579,9 +2632,12 @@ pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
 /// Flags whose `false` means "nothing to report". Everything else — `success`,
 /// `sandboxed`, `network`, `complete` — is rendered even when false, because there
 /// its false is the answer a reader came for.
-const FALSE_IS_ABSENT: [&str; 6] = [
+const FALSE_IS_ABSENT: [&str; 9] = [
     "timed_out",
     "truncated",
+    "drain_incomplete",
+    "stdout_drain_incomplete",
+    "stderr_drain_incomplete",
     "stdout_truncated",
     "stderr_truncated",
     "cancelling",
@@ -2618,10 +2674,11 @@ fn omit_absences(payload: &mut Value) {
     }
 }
 
-/// Terminal facts a shell result carries beyond `exit_code`/`success`: the signal
-/// that ended the waited process, and whether dotlink stopped it. Both are omitted
-/// when they do not apply, so ordinary results stay unchanged.
+/// Render the optional `tree`, `signal`, and `stopped_by` evidence on every rich result surface.
 fn with_termination(mut payload: Value, completion: &JobCompletion) -> Value {
+    if let Some(tree) = completion.tree.word() {
+        payload["tree"] = Value::from(tree);
+    }
     if let Some(signal) = completion.signal {
         payload["signal"] = Value::from(signal_token(signal));
     }
@@ -2632,29 +2689,42 @@ fn with_termination(mut payload: Value, completion: &JobCompletion) -> Value {
 }
 
 /// The result a caller sees for a completion whose streams cannot be trusted.
-fn internal_failure_result(completion: &JobCompletion) -> CallToolResult {
+fn internal_failure_result(completion: &JobCompletion, timeout_secs: u64) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(internal_failure_payload(
         completion,
+        timeout_secs,
     ))])
+}
+
+/// Same terminal facts in the tool reply and native Task error data. A spool
+/// failure can follow a deadline, but is not a reason to recommend retrying it.
+fn internal_failure_facts(completion: &JobCompletion, timeout_secs: u64) -> Value {
+    let timed_out = completion.terminal == Some(JobStatus::TimedOut);
+    let mut facts = with_termination(
+        serde_json::json!({
+            "exit_code": completion.exit_code,
+            "timed_out": timed_out,
+            "timeout_secs": timed_out.then_some(timeout_secs),
+            "streams_omitted": true,
+            "next": external_stop_note(completion),
+        }),
+        completion,
+    );
+    omit_absences(&mut facts);
+    facts
 }
 
 /// The envelope for a completion whose streams cannot be trusted — an internal
 /// failure is often the spool itself, so reading it would fail again. It is still
 /// the ordinary envelope, so `job_get` and this surface cannot disagree about the
 /// stop that produced it.
-fn internal_failure_payload(completion: &JobCompletion) -> String {
-    let mut payload = serde_json::json!({
-        "ts": completion.completed_unix,
-        "exit_code": completion.exit_code,
-        "success": false,
-        // An internal failure is never `TimedOut` itself; the terminal it
-        // followed is, and that is the fact to report.
-        "timed_out": completion.terminal == Some(JobStatus::TimedOut),
-        // One key says the streams are unusable; spelling out empty ones would
-        // repeat that three more times on every such failure.
-        "streams_omitted": true,
-        "error": completion.internal_error.as_deref(),
-    });
+fn internal_failure_payload(completion: &JobCompletion, timeout_secs: u64) -> String {
+    let mut payload = internal_failure_facts(completion, timeout_secs);
+    payload["ts"] = Value::from(completion.completed_unix);
+    payload["success"] = Value::from(false);
+    if let Some(error) = completion.internal_error.as_deref() {
+        payload["error"] = Value::from(error);
+    }
     // Context is absent only for completions that never ran, and a null key tells
     // a reader nothing they cannot infer from that.
     if let Some(context) = completion.context.as_ref() {
@@ -2662,18 +2732,13 @@ fn internal_failure_payload(completion: &JobCompletion) -> String {
         payload["sandboxed"] = serde_json::Value::from(context.sandboxed);
         payload["network"] = serde_json::Value::from(context.network);
     }
-    if let Some(note) = external_stop_note(completion) {
-        payload["next"] = serde_json::Value::from(note);
-    }
-    let mut payload = with_termination(payload, completion);
-    omit_absences(&mut payload);
     payload.to_string()
 }
 
 fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let completion = &snapshot.completion;
     if completion.internal_error.is_some() {
-        return Ok(internal_failure_result(completion));
+        return Ok(internal_failure_result(completion, snapshot.timeout_secs));
     }
     let stdout_limit = usize::try_from(completion.stdout.stored_bytes)
         .unwrap_or(usize::MAX)
@@ -2683,10 +2748,10 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         .min(snapshot.result_limit);
     let stdout = read_prefix(&snapshot.stdout_path, stdout_limit)?;
     let stderr = read_prefix(&snapshot.stderr_path, stderr_limit)?;
-    let stdout_truncated =
-        completion.stdout.truncated || completion.stdout.total_bytes > snapshot.result_limit as u64;
-    let stderr_truncated =
-        completion.stderr.truncated || completion.stderr.total_bytes > snapshot.result_limit as u64;
+    let stdout_truncated = completion.stdout.truncated()
+        || completion.stdout.stored_bytes > snapshot.result_limit as u64;
+    let stderr_truncated = completion.stderr.truncated()
+        || completion.stderr.stored_bytes > snapshot.result_limit as u64;
 
     let Some(context) = completion.context.as_ref() else {
         if completion.status != JobStatus::Completed {
@@ -2713,7 +2778,9 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             "stdout": String::from_utf8_lossy(&stdout),
             "stderr": String::from_utf8_lossy(&stderr),
             "stdout_truncated": stdout_truncated,
+            "stdout_drain_incomplete": completion.stdout.drain_incomplete,
             "stderr_truncated": stderr_truncated,
+            "stderr_drain_incomplete": completion.stderr.drain_incomplete,
         });
         omit_absences(&mut payload);
         let text = payload.to_string();
@@ -2721,9 +2788,6 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     };
 
     let timed_out = completion.status == JobStatus::TimedOut;
-    // The sentence says the one thing the number cannot; `timeout_secs` below says the
-    // number, because a caller cannot tell "too slow" from "capped" without it.
-    let error = timed_out.then_some("command timed out; the process tree was killed");
     // A deadline smaller than the ceiling can be raised; one that already equals it
     // cannot, and saying otherwise sends a caller in circles forever.
     let next = (timed_out && snapshot.timeout_secs < snapshot.timeout_ceiling)
@@ -2734,7 +2798,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "ts": completion.completed_unix,
         "exit_code": completion.exit_code,
         "success": completion.success,
-        "timed_out": completion.status == JobStatus::TimedOut,
+        "timed_out": timed_out,
         "timeout_secs": timed_out.then_some(snapshot.timeout_secs),
         "dir": context.dir,
         "sandboxed": context.sandboxed,
@@ -2742,20 +2806,20 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "stdout": String::from_utf8_lossy(&stdout),
         "stderr": String::from_utf8_lossy(&stderr),
         "stdout_truncated": stdout_truncated,
+        "stdout_drain_incomplete": completion.stdout.drain_incomplete,
         "stderr_truncated": stderr_truncated,
-        "error": error.or(completion.error.as_deref()),
+        "stderr_drain_incomplete": completion.stderr.drain_incomplete,
+        "error": completion.error,
         "next": next.or(stop_note.as_deref()),
         }),
         completion,
     );
     omit_absences(&mut payload);
     let text = payload.to_string();
-    // A completed *lifecycle* is not a completed *invocation*: a command that
-    // returned with its own group still running carries an error and no success,
-    // and the caller has to see the call fail. An ordinary non-zero exit carries no
-    // error, so it stays a successful tool call with `success: false`, as before.
-    let finished = completion.status == JobStatus::Completed && completion.error.is_none();
-    Ok(if finished {
+    // The tool call failed only when the job did not complete: a non-zero exit or a
+    // signal is the command's own answer, carried by `success`/`signal`, not a failed
+    // call. Observed leftovers affect `success`, not MCP `isError`.
+    Ok(if completion.status == JobStatus::Completed {
         CallToolResult::success(vec![ContentBlock::text(text)])
     } else {
         CallToolResult::error(vec![ContentBlock::text(text)])
@@ -2777,25 +2841,17 @@ fn error_object(message: &str) -> JsonObject {
 /// A failed task reports the same termination facts as every other surface: the
 /// error object keeps its protocol shape and carries them in `data`, which is the
 /// one place an error may put structured detail.
-fn failure_error_object(message: &str, completion: &JobCompletion) -> JsonObject {
-    let mut error = error_object(message);
-    let mut data = serde_json::Map::new();
-    data.insert("streams_omitted".to_owned(), Value::from(true));
-    if let Some(exit_code) = completion.exit_code {
-        data.insert("exit_code".to_owned(), Value::from(exit_code));
-    }
-    if completion.terminal == Some(JobStatus::TimedOut) {
-        data.insert("timed_out".to_owned(), Value::from(true));
-    }
-    if let Some(signal) = completion.signal {
-        // One representation on every surface: the name. A second numeric field
-        // would let a task error and a tool result disagree about the same job.
-        data.insert("signal".to_owned(), Value::from(signal_token(signal)));
-    }
-    if let Some(cause) = completion.stopped_by {
-        data.insert("stopped_by".to_owned(), Value::from(cause.as_str()));
-    }
-    error.insert("data".to_owned(), Value::Object(data));
+fn failure_error_object(completion: &JobCompletion, timeout_secs: u64) -> JsonObject {
+    let mut error = error_object(
+        completion
+            .internal_error
+            .as_deref()
+            .expect("internal failure"),
+    );
+    error.insert(
+        "data".to_owned(),
+        internal_failure_facts(completion, timeout_secs),
+    );
     error
 }
 
@@ -2848,8 +2904,7 @@ fn fit_output_page(
         stream,
         offset,
         stored_bytes: snapshot.stored,
-        total_bytes: snapshot.total,
-        truncated: snapshot.truncated,
+        summary: snapshot.summary,
         released: snapshot.released,
         base64,
     };
@@ -2945,8 +3000,7 @@ struct OutputPageRender<'a> {
     stream: JobStream,
     offset: u64,
     stored_bytes: u64,
-    total_bytes: Option<u64>,
-    truncated: bool,
+    summary: Option<StreamSummary>,
     released: bool,
     base64: bool,
 }
@@ -2966,9 +3020,10 @@ impl OutputPageRender<'_> {
             offset: self.offset,
             next_offset,
             stored_bytes: self.stored_bytes,
-            total_bytes: self.total_bytes,
+            total_bytes: self.summary.and_then(StreamSummary::total),
             complete,
-            truncated: self.truncated,
+            truncated: self.summary.is_some_and(StreamSummary::truncated),
+            drain_incomplete: self.summary.is_some_and(|s| s.drain_incomplete),
             released: self.released,
             encoding: if self.base64 { "base64" } else { "utf8_lossy" },
             data,
@@ -3023,20 +3078,15 @@ fn render_ack_receipt(entry: &JobEntry) -> String {
 
 /// One stream's status: byte positions that matter, and only the flags that are true.
 /// A stream with nothing stored and nothing released has nothing to say.
-fn stream_status(
-    stored: u64,
-    ack: u64,
-    total: Option<u64>,
-    truncated: bool,
-    released: bool,
-) -> Value {
+fn stream_status(stored: u64, ack: u64, summary: Option<StreamSummary>, released: bool) -> Value {
     // Every field is rendered and the absence rule trims it, so this stays one shape
     // and cannot drift from the payloads around it.
     serde_json::json!({
         "stored_bytes": stored,
         "ack_bytes": ack,
-        "total_bytes": total,
-        "truncated": truncated,
+        "total_bytes": summary.and_then(StreamSummary::total),
+        "truncated": summary.is_some_and(StreamSummary::truncated),
+        "drain_incomplete": summary.is_some_and(|s| s.drain_incomplete),
         "released": released,
     })
 }
@@ -3058,15 +3108,13 @@ fn render_status_locked(entry: &JobEntry) -> Value {
         "stdout": stream_status(
             stdout_stored,
             entry.stdout_consumed,
-            completion.map(|value| value.stdout.total_bytes),
-            completion.is_some_and(|value| value.stdout.truncated),
+            completion.map(|value| value.stdout),
             entry.stdout_released,
         ),
         "stderr": stream_status(
             stderr_stored,
             entry.stderr_consumed,
-            completion.map(|value| value.stderr.total_bytes),
-            completion.is_some_and(|value| value.stderr.truncated),
+            completion.map(|value| value.stderr),
             entry.stderr_released,
         ),
     });
@@ -3556,15 +3604,6 @@ fn create_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn incomplete_stream_summary(path: &Path) -> StreamSummary {
-    let stored = fs::metadata(path).map_or(0, |metadata| metadata.len());
-    StreamSummary {
-        total_bytes: stored,
-        stored_bytes: stored,
-        truncated: true,
-    }
-}
-
 fn stored_len(path: &Path, hint: Option<u64>) -> u64 {
     hint.unwrap_or_else(|| fs::metadata(path).map_or(0, |metadata| metadata.len()))
 }
@@ -3807,6 +3846,9 @@ fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
             JobPhase::Running => {
                 "shell job is running; job_output provides durable paged stdout/stderr"
             }
+            JobPhase::Terminal if entry.status() == JobStatus::Cancelled => {
+                "shell job cancelled; use job_get with job_id=taskId for termination details"
+            }
             JobPhase::Terminal => {
                 "shell job finished; job_output provides durable paged stdout/stderr"
             }
@@ -3888,10 +3930,7 @@ mod tests {
         }
     }
 
-    /// Attribution, stated as a property: a signal is external only when dotlink
-    /// never signalled that tree. A delivered teardown is still our signal, so it
-    /// must never surface as a stranger's SIGKILL — that misreading sent a caller
-    /// hunting for a host process over a kill this process performed.
+    /// A stop attributed to dotlink must not also be described as external.
     #[test]
     fn a_signal_dotlink_delivered_is_never_reported_as_external() {
         // The four causes that end the command: dotlink's signal is the story, so
@@ -3918,10 +3957,7 @@ mod tests {
         assert_eq!(payload["signal"], Value::from("SIGKILL"));
     }
 
-    /// A command that something else killed keeps its own ending even when
-    /// dotlink swept the tree behind it. The sweep is a journal line; the result
-    /// says nothing about it, because nothing about the command's fate was ours —
-    /// and a bare `signal` with no sentence is the one thing that must not happen.
+    /// Sweeping leftovers does not conceal a signal that already ended the command.
     #[test]
     fn a_swept_tree_does_not_hide_the_command_ending() {
         let completion = JobCompletion::failed_with_output(
@@ -3955,6 +3991,36 @@ mod tests {
             let payload = rendered(&completion);
             assert_eq!(payload["stopped_by"], Value::from(text), "{payload}");
             assert!(payload.get("signal").is_none(), "{payload}");
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_result_names_the_deadline_and_only_suggests_an_available_retry() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        for timeout in [3, 10] {
+            let started = manager
+                .spawn(timeout, 10, 4096, None, |_| async {
+                    JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
+                        .with_context(JobResultContext {
+                            dir: ".".to_owned(),
+                            sandboxed: false,
+                            network: false,
+                        })
+                })
+                .unwrap();
+            manager.wait_until(&started.id, None).await.unwrap();
+            let result = manager.tool_result(&started.id, None).unwrap().unwrap();
+            let payload: Value =
+                serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(payload["timeout_secs"], timeout, "{payload}");
+            assert_eq!(payload["error"], "command timed out", "{payload}");
+            assert!(payload.get("stopped_by").is_none(), "{payload}");
+            if timeout < 10 {
+                let next = payload["next"].as_str().unwrap_or_default();
+                assert!(next.contains("larger timeout_secs"), "{payload}");
+            } else {
+                assert!(payload.get("next").is_none(), "{payload}");
+            }
         }
     }
 
@@ -3995,7 +4061,7 @@ mod tests {
             StreamSummary::default(),
         )
         .with_stop(Some(crate::shell_process::StopCause::Failed));
-        let result = internal_failure_result(&completion);
+        let result = internal_failure_result(&completion, 30);
         let text = serde_json::to_value(&result).unwrap();
         assert_eq!(
             text["isError"],
@@ -4020,10 +4086,11 @@ mod tests {
         .with_signal(Some(11))
         .with_stop(Some(crate::shell_process::StopCause::Failed))
         .after_terminal(JobStatus::TimedOut);
-        let error = failure_error_object("failed spooling stderr: disk full", &completion);
+        let error = failure_error_object(&completion, 17);
         let data = error.get("data").expect("error carries structured detail");
         assert_eq!(data["exit_code"], Value::from(3), "{data}");
         assert_eq!(data["timed_out"], Value::from(true), "{data}");
+        assert_eq!(data["timeout_secs"], 17, "{data}");
         assert_eq!(data["signal"], Value::from("SIGSEGV"), "{data}");
         assert!(
             data.get("signal_name").is_none(),
@@ -4031,6 +4098,72 @@ mod tests {
         );
         assert_eq!(data["stopped_by"], Value::from("failed"), "{data}");
         assert_eq!(data["streams_omitted"], Value::from(true), "{data}");
+    }
+
+    #[test]
+    fn internal_failure_explains_an_external_signal_on_both_result_surfaces() {
+        let completion = JobCompletion::internal_failed(
+            "disk full",
+            StreamSummary::default(),
+            StreamSummary::default(),
+        )
+        .with_signal(Some(9));
+        let payload: Value =
+            serde_json::from_str(&internal_failure_payload(&completion, 10)).unwrap();
+        let data = &failure_error_object(&completion, 10)["data"];
+        assert_eq!(data["signal"], "SIGKILL");
+        assert!(data["next"].as_str().unwrap().contains("SIGKILL"));
+        assert_eq!(data["next"], payload["next"]);
+    }
+
+    #[test]
+    fn cancelled_native_task_points_to_its_durable_stop_facts() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        manager.expose_native_task(&job.id, None).unwrap().unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_stop(Some(crate::shell_process::StopCause::Cancel)),
+        );
+        let task = manager.detailed_task(&job.id).unwrap();
+        assert!(matches!(task.payload, TaskPayload::Cancelled));
+        assert!(task.task.status_message.unwrap().contains("job_get"));
+        let job: Value =
+            serde_json::from_str(&manager.status(&task.task.task_id).unwrap()).unwrap();
+        assert_eq!(job["stopped_by"], "cancel");
+    }
+
+    #[test]
+    fn cut_stream_has_no_exact_total_even_on_its_last_page() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        for read in [3, 6] {
+            let job = manager.create_for_test(30).unwrap();
+            fs::write(&job.stdout_path, b"abc").unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary::incomplete(&job.stdout_path, read),
+                    StreamSummary::default(),
+                ),
+            );
+            let status: Value = serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+            let page: Value = serde_json::from_str(
+                &manager
+                    .output_page(&job.id, JobStream::Stdout, OutputPageRequest::tail(4))
+                    .unwrap(),
+            )
+            .unwrap();
+            for stream in [&status["stdout"], &page] {
+                assert_eq!(stream["stored_bytes"], 3);
+                assert!(stream.get("total_bytes").is_none());
+                assert_eq!(stream["drain_incomplete"], true);
+                assert_eq!(stream.get("truncated").is_some(), read > 3);
+            }
+            assert_eq!(page["complete"], true, "no more retained bytes to page");
+        }
     }
 
     /// The absence rule is one rule: a field that only says "no" disappears, at any
@@ -4077,7 +4210,9 @@ mod tests {
             StreamSummary::default(),
         )
         .with_stop(Some(crate::shell_process::StopCause::Failed));
-        let payload: Value = serde_json::from_str(&internal_failure_payload(&completion)).unwrap();
+        let payload: Value =
+            serde_json::from_str(&internal_failure_payload(&completion, 17)).unwrap();
+        assert!(payload.get("timeout_secs").is_none(), "{payload}");
         assert_eq!(payload["stopped_by"], Value::from("failed"), "{payload}");
         assert_eq!(payload["streams_omitted"], Value::from(true), "{payload}");
         assert!(payload.get("signal").is_none(), "{payload}");
@@ -4100,7 +4235,13 @@ mod tests {
         )
         .with_stop(None)
         .after_terminal(JobStatus::TimedOut);
-        let payload: Value = serde_json::from_str(&internal_failure_payload(&timed_out)).unwrap();
+        let payload: Value =
+            serde_json::from_str(&internal_failure_payload(&timed_out, 17)).unwrap();
+        assert_eq!(payload["timeout_secs"], 17, "{payload}");
+        assert!(
+            payload.get("next").is_none(),
+            "a storage failure isn't retry advice: {payload}"
+        );
         assert_eq!(payload["timed_out"], Value::from(true), "{payload}");
         assert!(payload.get("stopped_by").is_none(), "{payload}");
 
@@ -4113,7 +4254,8 @@ mod tests {
         )
         .with_signal(Some(9))
         .after_terminal(JobStatus::Completed);
-        let payload: Value = serde_json::from_str(&internal_failure_payload(&signalled)).unwrap();
+        let payload: Value =
+            serde_json::from_str(&internal_failure_payload(&signalled, 17)).unwrap();
         assert_eq!(payload["signal"], Value::from("SIGKILL"), "{payload}");
         assert!(
             payload["next"]
@@ -4310,13 +4452,7 @@ mod tests {
         assert_eq!(payload["stopped_by"], Value::from("timeout"), "{payload}");
         assert!(payload.get("signal").is_none(), "{payload}");
         // The deadline keeps its own explanation instead of the signal note.
-        assert!(
-            payload["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("requested timeout"),
-            "{payload}"
-        );
+        assert_eq!(payload["error"], "command timed out", "{payload}");
         // `status` already says the deadline, so the boolean is not repeated.
         assert_eq!(payload["status"], Value::from("timed_out"), "{payload}");
         assert!(payload.get("timed_out").is_none(), "{payload}");
@@ -4605,16 +4741,8 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: text.len() as u64,
-                    stored_bytes: text.len() as u64,
-                    truncated: false,
-                },
-                StreamSummary {
-                    total_bytes: 0,
-                    stored_bytes: 0,
-                    truncated: false,
-                },
+                StreamSummary::complete(text.len() as u64, text.len() as u64),
+                StreamSummary::complete(0, 0),
             ),
         );
 
@@ -4694,16 +4822,8 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: stdout_text.len() as u64,
-                    stored_bytes: stdout_text.len() as u64,
-                    truncated: false,
-                },
-                StreamSummary {
-                    total_bytes: stderr_text.len() as u64,
-                    stored_bytes: stderr_text.len() as u64,
-                    truncated: false,
-                },
+                StreamSummary::complete(stdout_text.len() as u64, stdout_text.len() as u64),
+                StreamSummary::complete(stderr_text.len() as u64, stderr_text.len() as u64),
             ),
         );
 
@@ -4738,16 +4858,8 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 0,
-                    stored_bytes: 0,
-                    truncated: false,
-                },
-                StreamSummary {
-                    total_bytes: 0,
-                    stored_bytes: 0,
-                    truncated: false,
-                },
+                StreamSummary::complete(0, 0),
+                StreamSummary::complete(0, 0),
             ),
         );
         let empty_status: Value = serde_json::from_str(
@@ -4811,16 +4923,8 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 5,
-                    stored_bytes: 5,
-                    truncated: false,
-                },
-                StreamSummary {
-                    total_bytes: 3,
-                    stored_bytes: 3,
-                    truncated: false,
-                },
+                StreamSummary::complete(5, 5),
+                StreamSummary::complete(3, 3),
             ),
         );
         let first = manager
@@ -4884,11 +4988,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 5,
-                    stored_bytes: 5,
-                    truncated: false,
-                },
+                StreamSummary::complete(5, 5),
                 StreamSummary::default(),
             ),
         );
@@ -4915,16 +5015,8 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 5,
-                    stored_bytes: 5,
-                    truncated: false,
-                },
-                StreamSummary {
-                    total_bytes: 3,
-                    stored_bytes: 3,
-                    truncated: false,
-                },
+                StreamSummary::complete(5, 5),
+                StreamSummary::complete(3, 3),
             ),
         );
         let status: serde_json::Value =
@@ -4978,11 +5070,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 6,
-                    stored_bytes: 6,
-                    truncated: false,
-                },
+                StreamSummary::complete(6, 6),
                 StreamSummary::default(),
             ),
         );
@@ -5033,11 +5121,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: text.len() as u64,
-                    stored_bytes: text.len() as u64,
-                    truncated: false,
-                },
+                StreamSummary::complete(text.len() as u64, text.len() as u64),
                 StreamSummary::default(),
             ),
         );
@@ -5089,11 +5173,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 5,
-                    stored_bytes: 5,
-                    truncated: false,
-                },
+                StreamSummary::complete(5, 5),
                 StreamSummary::default(),
             ),
         );
@@ -5178,8 +5258,10 @@ mod tests {
                 stream: JobStream::Stdout,
                 offset: 0,
                 stored_bytes: sample.len() as u64,
-                total_bytes: Some(sample.len() as u64),
-                truncated: false,
+                summary: Some(StreamSummary::complete(
+                    sample.len() as u64,
+                    sample.len() as u64,
+                )),
                 released: false,
                 base64: false,
             };
@@ -5204,11 +5286,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: data.len() as u64,
-                    stored_bytes: data.len() as u64,
-                    truncated: false,
-                },
+                StreamSummary::complete(data.len() as u64, data.len() as u64),
                 StreamSummary::default(),
             ),
         );
@@ -5247,11 +5325,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 6,
-                    stored_bytes: 6,
-                    truncated: false,
-                },
+                StreamSummary::complete(6, 6),
                 StreamSummary::default(),
             ),
         );
@@ -5287,11 +5361,7 @@ mod tests {
                 JobCompletion::completed(
                     Some(0),
                     true,
-                    StreamSummary {
-                        total_bytes: 1,
-                        stored_bytes: 1,
-                        truncated: false,
-                    },
+                    StreamSummary::complete(1, 1),
                     StreamSummary::default(),
                 ),
             );
@@ -5386,11 +5456,7 @@ mod tests {
                 JobCompletion::completed(
                     Some(0),
                     true,
-                    StreamSummary {
-                        total_bytes: 1,
-                        stored_bytes: 1,
-                        truncated: false,
-                    },
+                    StreamSummary::complete(1, 1),
                     StreamSummary::default(),
                 ),
             );
@@ -5473,11 +5539,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 1,
-                    stored_bytes: 1,
-                    truncated: false,
-                },
+                StreamSummary::complete(1, 1),
                 StreamSummary::default(),
             ),
         );
@@ -5685,11 +5747,7 @@ mod tests {
                     JobCompletion::completed(
                         Some(0),
                         true,
-                        StreamSummary {
-                            total_bytes: 12,
-                            stored_bytes: 12,
-                            truncated: false,
-                        },
+                        StreamSummary::complete(12, 12),
                         StreamSummary::default(),
                     )
                     .with_context(JobResultContext {
@@ -6246,11 +6304,7 @@ mod tests {
                 JobCompletion::completed(
                     Some(0),
                     true,
-                    StreamSummary {
-                        total_bytes: 1,
-                        stored_bytes: 1,
-                        truncated: false,
-                    },
+                    StreamSummary::complete(1, 1),
                     StreamSummary::default(),
                 ),
             );
@@ -6515,11 +6569,7 @@ mod tests {
                 JobCompletion::completed(
                     Some(0),
                     true,
-                    StreamSummary {
-                        total_bytes: 1,
-                        stored_bytes: 1,
-                        truncated: false,
-                    },
+                    StreamSummary::complete(1, 1),
                     StreamSummary::default(),
                 ),
             );
@@ -6576,11 +6626,7 @@ mod tests {
                 JobCompletion::completed(
                     Some(0),
                     true,
-                    StreamSummary {
-                        total_bytes: 1,
-                        stored_bytes: 1,
-                        truncated: false,
-                    },
+                    StreamSummary::complete(1, 1),
                     StreamSummary::default(),
                 ),
             );
@@ -6876,11 +6922,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 5,
-                    stored_bytes: 5,
-                    truncated: false,
-                },
+                StreamSummary::complete(5, 5),
                 StreamSummary::default(),
             ),
         );
@@ -6910,11 +6952,7 @@ mod tests {
                     JobCompletion::completed(
                         Some(0),
                         true,
-                        StreamSummary {
-                            total_bytes: 5,
-                            stored_bytes: 5,
-                            truncated: false,
-                        },
+                        StreamSummary::complete(5, 5),
                         StreamSummary::default(),
                     )
                 },
@@ -6976,11 +7014,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 6,
-                    stored_bytes: 6,
-                    truncated: false,
-                },
+                StreamSummary::complete(6, 6),
                 StreamSummary::default(),
             ),
         );
@@ -7030,11 +7064,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 8,
-                    stored_bytes: 8,
-                    truncated: false,
-                },
+                StreamSummary::complete(8, 8),
                 StreamSummary::default(),
             ),
         );
@@ -7163,11 +7193,7 @@ mod tests {
             JobCompletion::completed(
                 Some(0),
                 true,
-                StreamSummary {
-                    total_bytes: 1,
-                    stored_bytes: 1,
-                    truncated: false,
-                },
+                StreamSummary::complete(1, 1),
                 StreamSummary::default(),
             ),
         );

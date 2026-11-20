@@ -423,29 +423,54 @@ including `-q` — so `-q` is not silence:
 ~~~text
 [01:07:12.031] LOG  job        id=<job id> end=timeout
 [01:07:13.117] LOG  job        id=<job id> end=signal SIGKILL by=external
-[01:07:13.884] LOG  job        id=<job id> end=exit code=0 tree=killed
+[01:07:13.884] LOG  job        id=<job id> end=cancel by=caller
 ~~~
 
-They cover startup, restart, verbosity changes, and how a shell job ended. A job
-writes a line only when there is something to say, so a command that simply ended —
-successful or not — writes nothing, and the record stays short enough to read. Every
-word on the line can be read without a legend: `end=` says what ended it (`exit code=N`,
-`signal SIGKILL`, `timeout`, `cancel`, `error`, or `abandoned` when dotlink dropped
-the job without a result). `by=` appears only where the actor is a choice: `caller`
-or `connector` on a cancel, and `external` on a signal. A deadline, an internal error
-and the fail-safe are dotlink by definition and name nobody, and a command that ended
-on its own names no actor at all. `external` claims only the absence of our signal,
-never a culprit: a crash and a stranger's `kill -9` read the same there, and the signal
-name is what separates them.
+They cover startup, restart, verbosity changes, and shell job endings. A job writes at
+most one line: `LOG job id=… end=… [by=…] [tree=…] [cleanup=kill-failed]`. `end=` reports an exit
+code, signal, timeout, cancel, error, or `abandoned` if the runner was dropped while
+still guarding the job. `by=caller` or `by=connector` identifies an attributed cancel;
+`by=external` means dotlink observed a signal it did not send, not that it knows who did.
 
-When the command left processes running — it returned, or was killed, with its group
-still live — dotlink kills them and the same line says `tree=killed` (`tree=alive` when the kernel refused,
-which is a real alarm). That is a verdict, not housekeeping: the invocation did not
-finish, so the result is a failure — `success: false`, the tool result marked as an
-error, and `error` naming the work — while the command's own exit status is still
-reported, because that fact did not change. A command that leaves work running should
-`wait` for it, which is what makes `server & wait` the idiom for a process that must
-outlive the call.
+In direct Unix and Bubblewrap runs, a shell killed by `SIGKILL` reports
+`signal: "SIGKILL"` and logs `end=signal SIGKILL by=external` when dotlink did
+not stop it. A shell that runs `exit 137` reports only the numeric exit, not a
+signal. If the sandbox observer cannot deliver a matching report, dotlink keeps
+the launcher's wait status and reports `tree: "unknown"`; it never guesses a signal.
+If a stop interrupts Bubblewrap *after* the observer reports the shell's exit,
+the result keeps that exit. An unfinished tree scan stays unknown.
+
+Bubblewrap tears down the PID namespace when the command exits. In direct mode
+dotlink attempts to kill the remaining Unix process group or Windows job object;
+a Unix descendant in another process group is **neither observed nor killed**, even
+if it stays in the same session. Bash job control and GNU `timeout` can create such
+groups. Use `timeout_secs` for a deadline; use the Linux sandbox when descendants
+must not outlive the call. Bash runs scripts as a non-login shell, so explicit
+`exit` does not run logout hooks. Direct execution inherits the host Bash
+environment (including `BASH_ENV` and exported functions); the sandbox starts
+with only its configured environment.
+If other processes are still live when the main command exits, the result includes
+`"tree":"leftovers"` and `"success":false`. The exit code is still the main command's,
+not a made-up failure code, and this is not an MCP tool error. For example:
+
+| Bash command | Result | Lifecycle line |
+| --- | --- | --- |
+| `sleep 6 & echo ok` | `exit_code: 0`, `success: false`, `tree: "leftovers"` | `end=exit code=0 tree=leftovers` |
+| `sleep 6 & wait` | `exit_code: 0`, `success: true`, no `tree` | none |
+
+The command already ran: inspect its output before retrying. Only observed live
+work counts, not zombies or an accepted kill signal. `tree: "unknown"` means dotlink
+could not observe the tree *before* cleanup, including when a deadline or cancel
+raced the command's exit. On Linux this also covers a `/proc` view from another PID
+namespace, or a filtered view that could hide live processes. It does not change the verdict. If a tree kill fails,
+dotlink retries once immediately; only an unresolved failure logs `cleanup=kill-failed`.
+To keep a server running as a job, wait inside the command and request `background: true`.
+
+If an output collector did not reach EOF, the shell result marks that stream
+`stdout_drain_incomplete` or `stderr_drain_incomplete`. Its `job_get` and
+`job_output` records show `drain_incomplete: true` and omit `total_bytes`.
+Truncation means **known omitted bytes**, not an open pipe. On a page,
+`complete: true` means the end of the *stored prefix*, not proof of pipe EOF.
 
 TOOL logs include bounded command previews plus complete path labels, methods, status, and latency; file contents, binary payloads, Runtime keys, and raw request bodies are not intentionally logged. Interactive `V` removes the command-preview cap while TOOL logging is active, so use it only when command text is safe to retain.
 
@@ -708,13 +733,13 @@ Use `dotlink oauth clients -p <profile>` to inspect approved DCR clients, then `
 Usually not. dotlink is local and answers every tool call; a stuck conversation is normally the hosted client ending its own turn.
 
 - ChatGPT decides how long one turn may run and can abort it or drop the reply — the UI then looks frozen or stops updating, and dotlink cannot extend that budget.
-- dotlink asks the model to stop at a coherent boundary after about 35 minutes of one turn (measured from the `ts` stamp on shell and job results) and hand back with what is done and what remains. A long turn is exactly what makes a client show "still thinking" while dotlink is answering fine.
-- Blocking calls report `notifications/progress`, and long `bash`/`powershell` runs continue behind a job handle instead of being cut to the transport deadline.
+- With the OpenAI tunnel active, dotlink asks the model to use the turn's first shell or job `ts` as its anchor and hand back at a coherent boundary after about 35 minutes. This is advice for the turn, not a timer that cancels it. Separately, the shared runtime caps each command at the lower of `max_shell_timeout_secs` and 2100 s (35 min), even for stdio/HTTP clients on that runtime. Without the tunnel, the profile ceiling applies and there is no turn advice.
+- Blocking calls send `notifications/progress` when the client supplies a progress token. A shell call that outlasts the response window hands back a job handle; this does not reset its execution deadline.
 
 Those measures reduce it; they do not remove it. When it happens:
 
 1. Stop the turn and refresh the ChatGPT page (or reopen the conversation).
-2. Ask it to continue. `job_list` finds a run that was still in flight, and `job_get` / `job_output` return its status, tail or full output — the work was not lost, and it is not re-executed: a repeated tunnel request replays the original response until its retention window expires.
+2. Ask it to continue. Use `job_list` to find a retained job, then `job_get` / `job_output` for its status and captured output. Check before starting the command again: a new call is not a replay.
 
 ## NixOS service
 
@@ -775,7 +800,8 @@ checks. Each check is independently selectable, for example
 `nix build .#checks.x86_64-linux.markdownlint`. `nix fmt` formats Nix files with
 Alejandra. Markdown linting includes `.agents/` documentation; its configuration
 allows soft-wrapped prose and repeated headings in separate changelog sections.
-CI runs these checks before building release artifacts.
+Linux CI also compares the direct and Bubblewrap shell results outside the Nix
+build sandbox. To run that check locally, see [AGENTS.md](AGENTS.md#validation-before-commit).
 
 Build the complete reproducible release bundle from an x86_64 Linux host:
 

@@ -9,6 +9,8 @@ mod hardware;
 mod host_services;
 mod jobs;
 mod limits;
+#[cfg(target_os = "linux")]
+mod linux_procfs;
 mod logging;
 mod mcp;
 mod mounts;
@@ -2118,6 +2120,7 @@ fn print_tools(descriptions: Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::mounts::SandboxMount;
 
     fn parse(args: &[&str], defaults: PermissionConfig) -> (Args, Policy) {

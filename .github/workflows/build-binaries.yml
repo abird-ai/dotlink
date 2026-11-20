@@ -50,6 +50,15 @@ jobs:
           path: artifacts/
           if-no-files-found: error
 
+  linux-shell-parity:
+    name: Compare direct and Bubblewrap shell results
+    # Run outside the Nix build sandbox on a runner with unprivileged user namespaces.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix develop -c env DOTLINK_TEST_BWRAP=1 cargo test --locked --all-features --test shell_lifetime
+
   native-platform-tests:
     name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -62,6 +71,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
+          components: clippy
+      - name: Check macOS-specific code
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Run native platform tests
         run: cargo test --locked --all-features
       - name: Validate PowerShell installer syntax
@@ -81,7 +94,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, native-platform-tests]
+    needs: [build, linux-shell-parity, native-platform-tests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

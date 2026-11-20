@@ -8,66 +8,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Breaking
 
-- `signal` is the signal's name, not its number: `{"signal":"SIGKILL"}` rather than
-  `{"signal":9}`, and the failed-native-task error no longer carries a separate
-  `signal_name`. A structured client that parses the number must read the name, or
-  both surfaces would disagree about the same job.
-- `stopped_by` no longer carries `teardown`: it answers one question — did dotlink end
-  this command — so a sweep of a finished command's leftovers claims nothing.
-- Results omit what only says "no": nulls, flags that are false because nothing
-  happened, empty streams, and a `truncated`/`released` that is not true. A client that
-  expects a key to exist for every result must treat absence as the negative case.
-- The journal writes one lifecycle line per job and only when something happened:
-  `LOG job id=… end=… [by=…] [tree=…]`. A command that ends on its own writes nothing,
-  `end=shutdown` is gone (a withdrawn job is `end=cancel by=connector`), and `by=`
-  appears only where the actor is a choice. Anything grepping for `stop id=` or
-  `exit id=` must read `end=` instead.
+- Bash now runs non-login scripts in both modes: `shopt -q login_shell` is false
+  and explicit `exit` does not run logout hooks. Both modes already passed
+  `--noprofile`; explicitly source any profile your command requires.
+- Direct shell runs now sweep the Unix process group or Windows job object when the
+  command returns; Bubblewrap already tears down its PID namespace. Do not rely on
+  background children surviving. Wait inside a durable job (`server & wait` with
+  `background: true`). A Unix descendant that leaves the group can still survive.
+  In both modes, observed live leftovers now give `tree: "leftovers"` and
+  `success: false` even after exit 0. The result preserves the command's `exit_code`/`signal`.
+  Leftovers alone no longer set MCP `isError: true`; check `tree`, not `isError`. Zombies and already-waited children do not count.
+- `signal` is now a string, e.g. `{"signal":"SIGKILL"}` rather than `{"signal":9}`
+  (unknown signals use the number as text). Failed native tasks no longer carry a
+  separate `signal_name`.
+- An unfinished shell drain no longer implies truncation. Look for
+  `stdout_drain_incomplete` / `stderr_drain_incomplete` on shell results or
+  `drain_incomplete` in job stream metadata. Exact `total_bytes` requires EOF.
+- Shell and job payloads omit nulls, empty stream text, and false event flags such
+  as `timed_out`, `truncated` and `released`. Clients must tolerate absent keys;
+  meaningful false values such as `success: false` and `complete: false` remain.
+- `LOG job id=… end=… [by=…] [tree=…] [cleanup=kill-failed]` replaces the `stop id=` and `exit id=`
+  lines, with at most one line per job. An attributed cancel names `caller` or
+  `connector`. An external SIGKILL of the shell now gives `signal: "SIGKILL"` and
+  `end=signal SIGKILL by=external` in both direct Unix and Bubblewrap runs.
+  An explicit `exit 137` is still an exit code. An ordinary exit is silent unless
+  there is a tree observation or cleanup failure.
 
 ### Changed
 
-- The sweep asks the group, not the kernel. `kill(-pgid, SIGKILL)` succeeds against a
-  group of zombies, so a command that left nothing running was being reported as a
-  failed invocation — deterministically, for anything that backgrounds a short-lived
-  child (`true & exec sleep 0.05` failed 5 times out of 5). The sweep now samples the
-  members' state before signalling, so "left processes running" means one was alive.
-  With that, the contract finally holds on every surface: a command that leaves work
-  running fails the call, and one that leaves nothing running does not.
-- Output collection gives each stream its own window. One window for both let a writer
-  holding one pipe open discard the other stream's spool error, reporting a storage
-  failure as a truncated success.
-- A timeout states its deadline and only advises a larger one when a larger one exists:
-  `timeout_secs` is on the payload, and `next` is omitted once the deadline equals the
-  ceiling. Before, a capped call said "retry with a larger timeout_secs" with no number
-  and no way to know the ceiling had been reached — a model could loop forever.
-- A kill made during the deadline race is recorded. When the command exited just as the
-  deadline fired, its own status cleared the stop while the signal had ended the tree
-  behind it, so the line said nothing happened.
-- The PowerShell tool no longer carries Unix advice: no process groups, no `setsid`
-  escape, and `Wait-Process` instead of `server & wait`.
-- `end=` is a type, not a string, so "is this the command's own ending" is a match the
-  compiler checks rather than a prefix comparison.
-- "Hosted" is gone from the runtime: the fact it named is `capped` — the active
-  transports hand a shell call back instead of waiting, so the runtime bounds one
-  command by a turn and gives the caller the turn advice. Naming it after the property
-  rather than after the OpenAI tunnel means a transport that starts bounding its
-  window joins automatically, and the docs stop implying a deployment identity the
-  code never tested for.
+- The 35-minute turn advice now appears only in server instructions on a runtime with
+  a bounded sync hold (currently the OpenAI tunnel). The first shell/job `ts` anchors
+  the advisory; it does not start a turn timer. On that runtime the advertised and
+  enforced per-command `timeout_secs` ceiling is `min(max_shell_timeout_secs, 2100)`,
+  including for co-hosted stdio/HTTP. Without the tunnel the profile ceiling stands
+  (default 3600 s). Profiles do not need migration: startup warns when it caps a
+  non-default value. The response window still limits only how long the caller waits.
+- A timed-out shell result now gives the deadline as `timeout_secs` and advises a
+  larger one only below the effective ceiling.
+- The PowerShell tool recommends `Wait-Process` for work that should stay in the job;
+  the process-group caveat and `server & wait` example apply only to Unix. A direct
+  run cannot observe or kill work in other groups (including job-control groups).
 
 ### Fixed
 
-- A drain that closes with a writer still holding the pipe is not an internal failure.
-  The command had ended and its output was in the spool, so the reply is that prefix
-  marked truncated; before, it claimed the *execution* deadline had elapsed and hid the
-  output the command had produced.
-- A failure behind an already-finished command reports the sweep that already happened,
-  through one `finish()` finalizer that every path uses, so a recorded sweep cannot
-  become an unrecorded one.
-- A refused signal is carried as `tree=alive` before the guard is disarmed, on every
-  terminal and on the paths that fail before a run starts.
-- An internal failure that loses a command's output is itself the recorded ending:
-  `end=error`, not the command's exit code.
-- One lifetime line per published job: the fail-safe speaks only for a job that never
-  published a result.
+- A writer holding a pipe open after command exit no longer holds the reply until the
+  execution deadline. After a bounded drain, dotlink returns the retained prefix
+  with an incomplete-drain flag; it does not promise to terminate an escaped writer.
+- Stdout and stderr are collected independently against the same drain deadline. A cut
+  stream cannot hide the other's spool error, and collectors quiesce before readback.
+- An exit code or a signal other than SIGKILL wins over a racing Unix stop
+  attempt. On Windows, any exit code other than dotlink’s private termination marker
+  likewise rules out its kill. A completed command is not relabelled as a timeout.
+- Unix cleanup holds the exited group leader until the last group signal, preventing
+  PGID reuse during the sweep. A mismatched or filtered Linux process list is not
+  proof that no live work remains. Stacked `/proc` mounts (including `--allow-rw=/`)
+  use the visible mount’s options, so a clean exit need not log `tree=unknown`.
+- Windows starts PowerShell with redirected streams and no automatic console.
+- A failed tree kill is retried once immediately. If it remains unconfirmed,
+  the job's single journal line includes `cleanup=kill-failed`, independent of `tree`.
+- A runner failure keeps the command’s independently observed exit code or signal
+  without claiming dotlink stopped it or turning the failure into success.
+- If output capture fails after the command exits, the journal records `end=error`
+  rather than treating the reaped exit code as the job's ending.
 
 ## [0.17.5] - 2026-11-19
 

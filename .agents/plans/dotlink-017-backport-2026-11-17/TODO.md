@@ -9,14 +9,14 @@ Design: [README.md](README.md).
 - [ ] `aw-tools`: `ProcessExit::Signal(i32)`, fed from `ExitStatus::signal()`
 - [ ] `main`: map a signalled, unsuccessful completion to `Signal(n)` instead of `Signal`
 - [ ] Reconcile `stopped_by` with `ProcessExit::{Cancelled,DeadlineExceeded,Unknown}` — one representation
-- [ ] Keep the `LOG job stop id=<id> reason=<reason> outcome=<...>` line on the real signal path, including `Drop`
-- [ ] Keep the single renderer for `signal` / `stopped_by` across sync, handoff and `job_get`
+- [ ] Keep the single lifecycle line, including failed cleanup and fail-safe `Drop` (see design §3)
+- [ ] Share `signal` / `stopped_by` rendering across result surfaces; handoff carries only a handle
 - [ ] Port the 0.17.0 tool surface (`background: true`) and 0.17.1–0.17.3 fixes
 - [ ] Port `.agents/docs/runtime-health-check.md` and the idle bands
 
 ## Tests
 
-- [ ] Signalled launcher reports the signal number; a crash and a kill differ
-- [ ] dotlink stops report a reason and never a signal
-- [ ] An externally killed job reports `signal` with no stop cause
-- [ ] Stop line appears for a connector stop and is absent for an external kill
+- [ ] Render the shell's observed signal by name; distinguish a signal from an explicit exit 137
+- [ ] Report `stopped_by` only for an attributed stop; observed leftovers clear `success`, not `exit_code`
+- [ ] A signal in the wait status without a stop cause gets `by=external`; never infer one from an exit code
+- [ ] An ordinary exit is silent except for a tree observation or cleanup alarm; a finalized job never logs `end=abandoned`

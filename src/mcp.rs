@@ -616,7 +616,10 @@ pub struct ToolSpec {
     pub request_replay: bool,
     /// Pure reads that may overlap each other without an operation gate. Read
     /// only on platforms that still serialize mutation.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, windows)),
+        expect(dead_code, reason = "shared tool metadata; only Windows gates reads")
+    )]
     pub concurrent_read: bool,
 }
 
@@ -748,6 +751,7 @@ fn contains_parent_component(path: &Path) -> bool {
         .any(|component| component == Component::ParentDir)
 }
 
+#[cfg(target_os = "linux")]
 fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
@@ -1158,6 +1162,7 @@ impl AccessPolicy {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn sandbox_mounts(&self) -> Vec<(PathBuf, bool)> {
         if self.unrestricted_fs {
             return vec![(PathBuf::from("/"), true)];
