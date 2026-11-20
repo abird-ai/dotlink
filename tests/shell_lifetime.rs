@@ -414,11 +414,15 @@ $p.Arguments = '-NoLogo -NoProfile -NonInteractive -Command "Start-Sleep -Second
 $p.UseShellExecute = $false
 $p.CreateNoWindow = $true
 $null = [System.Diagnostics.Process]::Start($p);"#;
+    // `[Console]::Out` needs a console, and a detached process deliberately has
+    // none. Write to the redirected standard-output handle, which is what the
+    // product guarantees to capture.
+    let write_ok = r#"$o = [Console]::OpenStandardOutput(); $b = [Text.Encoding]::UTF8.GetBytes('ok'); $o.Write($b, 0, $b.Length); $o.Flush()"#;
     for prefix in ["", child] {
         let dir = tempfile::tempdir().unwrap();
         let call = one_call_with(
             dir.path(),
-            &format!("{prefix} [Console]::Out.Write('ok'); exit 0"),
+            &format!("{prefix} {write_ok}; exit 0"),
             Mode::Direct,
             |binary| {
                 binary.creation_flags(DETACHED_PROCESS);
