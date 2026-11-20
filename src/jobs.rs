@@ -3910,7 +3910,7 @@ mod tests {
         .with_signal(Some(9));
         let payload = rendered(&completion);
         assert_eq!(payload["exit_code"], Value::Null);
-        assert_eq!(payload["signal"], Value::from("SIGKILL"));
+        assert_eq!(payload["signal"], signal_token(9));
         assert!(payload.get("stopped_by").is_none(), "{payload}");
     }
 
@@ -3946,7 +3946,7 @@ mod tests {
             assert_eq!(external_stop_note(&completion), None, "{cause:?}");
             let payload = rendered(&completion);
             assert_eq!(payload["stopped_by"], Value::from(cause.as_str()));
-            assert_eq!(payload["signal"], Value::from("SIGKILL"));
+            assert_eq!(payload["signal"], signal_token(9));
         }
         // The one ending that is genuinely not ours keeps both surfaces.
         let external = signalled_completion();
@@ -3954,7 +3954,7 @@ mod tests {
         assert!(external_stop_note(&external).is_some());
         let payload = rendered(&external);
         assert!(payload.get("stopped_by").is_none(), "{payload}");
-        assert_eq!(payload["signal"], Value::from("SIGKILL"));
+        assert_eq!(payload["signal"], signal_token(9));
     }
 
     /// Sweeping leftovers does not conceal a signal that already ended the command.
@@ -3968,9 +3968,9 @@ mod tests {
         .with_signal(Some(9));
         assert_eq!(external_signal(&completion), Some(9));
         let note = external_stop_note(&completion).expect("the command's signal needs a story");
-        assert!(note.contains("SIGKILL"), "{note}");
+        assert!(note.contains(&signal_token(9)), "{note}");
         let payload = rendered(&completion);
-        assert_eq!(payload["signal"], Value::from("SIGKILL"));
+        assert_eq!(payload["signal"], signal_token(9));
         assert!(
             payload.get("stopped_by").is_none(),
             "a sweep claims nothing: {payload}"
@@ -4091,7 +4091,7 @@ mod tests {
         assert_eq!(data["exit_code"], Value::from(3), "{data}");
         assert_eq!(data["timed_out"], Value::from(true), "{data}");
         assert_eq!(data["timeout_secs"], 17, "{data}");
-        assert_eq!(data["signal"], Value::from("SIGSEGV"), "{data}");
+        assert_eq!(data["signal"], signal_token(11), "{data}");
         assert!(
             data.get("signal_name").is_none(),
             "one representation, or surfaces disagree: {data}"
@@ -4111,8 +4111,8 @@ mod tests {
         let payload: Value =
             serde_json::from_str(&internal_failure_payload(&completion, 10)).unwrap();
         let data = &failure_error_object(&completion, 10)["data"];
-        assert_eq!(data["signal"], "SIGKILL");
-        assert!(data["next"].as_str().unwrap().contains("SIGKILL"));
+        assert_eq!(data["signal"], signal_token(9));
+        assert!(data["next"].as_str().unwrap().contains(&signal_token(9)));
         assert_eq!(data["next"], payload["next"]);
     }
 
@@ -4256,7 +4256,7 @@ mod tests {
         .after_terminal(JobStatus::Completed);
         let payload: Value =
             serde_json::from_str(&internal_failure_payload(&signalled, 17)).unwrap();
-        assert_eq!(payload["signal"], Value::from("SIGKILL"), "{payload}");
+        assert_eq!(payload["signal"], signal_token(9), "{payload}");
         assert!(
             payload["next"]
                 .as_str()
@@ -4324,8 +4324,13 @@ mod tests {
     fn a_signal_token_never_opens_a_field_of_its_own() {
         // The token is one word with no spaces: the lifecycle line and the result share
         // it, and a number would be a second representation to keep in step.
-        #[cfg(unix)]
-        assert_eq!(signal_token(9), "SIGKILL");
+        let (kill, segv) = if cfg!(unix) {
+            ("SIGKILL", "SIGSEGV")
+        } else {
+            ("9", "11")
+        };
+        assert_eq!(signal_token(9), kill);
+        assert_eq!(signal_token(11), segv);
         assert_eq!(signal_token(42), "42", "an unknown number stays a number");
         for signal in [1, 9, 11, 15, 42] {
             let token = signal_token(signal);
@@ -4353,8 +4358,8 @@ mod tests {
             )
             .with_signal(Some(11)),
         );
-        assert_eq!(killed["signal"], Value::from("SIGKILL"));
-        assert_eq!(crashed["signal"], Value::from("SIGSEGV"));
+        assert_eq!(killed["signal"], signal_token(9));
+        assert_eq!(crashed["signal"], signal_token(11));
     }
 
     #[test]
@@ -4431,7 +4436,7 @@ mod tests {
             .with_signal(Some(9)),
         );
         let payload: Value = serde_json::from_str(&manager.status(&signalled.id).unwrap()).unwrap();
-        assert_eq!(payload["signal"], Value::from("SIGKILL"), "{payload}");
+        assert_eq!(payload["signal"], signal_token(9), "{payload}");
         assert!(payload.get("stopped_by").is_none(), "{payload}");
         // The poller sees the same sentence the synchronous result carried.
         assert!(
