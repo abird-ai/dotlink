@@ -539,6 +539,22 @@ enum OAuthCommand {
         #[arg(short = 'p', long, default_value = "default", value_name = "NAME")]
         profile: String,
     },
+    /// Trust one approved OAuth client to issue AW Remote Start leases.
+    TrustAwBridge {
+        /// Client ID shown by `dotlink oauth clients`.
+        client_id: String,
+        /// Profile name; use "default" for the unnamed default profile.
+        #[arg(short = 'p', long, default_value = "default", value_name = "NAME")]
+        profile: String,
+    },
+    /// Revoke AW Remote Start issuer trust without revoking ordinary MCP OAuth.
+    UntrustAwBridge {
+        /// Client ID shown by `dotlink oauth clients`.
+        client_id: String,
+        /// Profile name; use "default" for the unnamed default profile.
+        #[arg(short = 'p', long, default_value = "default", value_name = "NAME")]
+        profile: String,
+    },
     /// Revoke every persisted OAuth refresh grant for a profile.
     RevokeAll {
         /// Profile name; use "default" for the unnamed default profile.
@@ -1224,6 +1240,29 @@ async fn run_command(command: &Command, color: bool) -> Result<()> {
                     );
                 } else {
                     bail!("OAuth client {client_id:?} was not found");
+                }
+            }
+            OAuthCommand::TrustAwBridge { profile, client_id } => {
+                let status =
+                    oauth::set_remote_start_trust(oauth_profile_target(profile), client_id, true)?;
+                println!(
+                    "OAuth client {client_id:?} is trusted as an AW bridge (epoch {}).",
+                    status.epoch
+                );
+                if !status.changed {
+                    println!("Trust was already current; the epoch was not changed.");
+                }
+            }
+            OAuthCommand::UntrustAwBridge { profile, client_id } => {
+                let status =
+                    oauth::set_remote_start_trust(oauth_profile_target(profile), client_id, false)?;
+                if status.epoch == 0 {
+                    println!("OAuth client {client_id:?} was already untrusted as an AW bridge.");
+                } else {
+                    println!(
+                        "OAuth client {client_id:?} is no longer trusted as an AW bridge (epoch {}).",
+                        status.epoch
+                    );
                 }
             }
             OAuthCommand::RevokeAll { profile } => {

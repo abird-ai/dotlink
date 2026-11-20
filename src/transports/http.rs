@@ -937,18 +937,25 @@ async fn stop_server_tasks_with_budget(
 }
 
 async fn remote_start_lease(machine: LocalMachine, request: Request<Body>) -> Response {
-    if request
+    let Some(client) = request
         .extensions()
         .get::<crate::remote_start::AuthenticatedMcpClient>()
-        .is_none()
-    {
+        .cloned()
+    else {
         return (
             StatusCode::UNAUTHORIZED,
             "remote Start lease requires authenticated MCP client",
         )
             .into_response();
+    };
+    if client.remote_start_trust_epoch().is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            "authenticated MCP client is not trusted as an AW Remote Start bridge",
+        )
+            .into_response();
     }
-    match machine.remote_start_lease() {
+    match machine.remote_start_lease(&client) {
         Ok(lease) => (StatusCode::OK, Json(lease)).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1246,19 +1253,32 @@ mod tests {
         request
             .extensions_mut()
             .insert(crate::remote_start::AuthenticatedMcpClient::new("aw-client").unwrap());
+        let forbidden = remote_start_lease(machine.clone(), request).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let mut request = Request::builder()
+            .uri("/mcp/remote-start-lease")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(
+            crate::remote_start::AuthenticatedMcpClient::with_remote_start_trust("aw-client", 11)
+                .unwrap(),
+        );
         let response = remote_start_lease(machine, request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
             .unwrap();
-        let lease: aw_tools::remote_start::RemoteRuntimeLease =
+        let lease: aw_tools::remote_start::RemoteStartLease =
             serde_json::from_slice(&body).unwrap();
-        assert_eq!(lease.target_host, "l5");
-        assert_eq!(lease.target_profile, "work");
-        assert_ne!(lease.generation, [0; 32]);
-        assert!(lease.expires_at_unix_ms > lease.issued_at_unix_ms);
+        assert_eq!(lease.target.target_host, "l5");
+        assert_eq!(lease.target.target_profile, "work");
+        assert_ne!(lease.target.generation, [0; 32]);
+        assert_eq!(lease.issuer.client_id, "aw-client");
+        assert_eq!(lease.issuer.trust_epoch, 11);
+        assert!(lease.target.expires_at_unix_ms > lease.target.issued_at_unix_ms);
         assert!(
-            lease.expires_at_unix_ms - lease.issued_at_unix_ms
+            lease.target.expires_at_unix_ms - lease.target.issued_at_unix_ms
                 <= crate::remote_start::REMOTE_START_LEASE_MILLIS
         );
     }
@@ -1277,7 +1297,10 @@ mod tests {
         std::fs::write(root.join("a.txt"), "a").unwrap();
         let machine = crate::mcp::test_machine(root.clone());
         machine.bind_remote_target_for_test("l5", "default");
-        let lease = machine.remote_start_lease().unwrap();
+        let identity =
+            crate::remote_start::AuthenticatedMcpClient::with_remote_start_trust("aw-client", 1)
+                .unwrap();
+        let lease = machine.remote_start_lease(&identity).unwrap();
         let arguments = serde_json::json!({"from":"a.txt","to":"b.txt"});
         let authorization = RemoteStartAuthorization::new(
             RemoteStartIntent {
@@ -1293,7 +1316,7 @@ mod tests {
                 arguments_sha256: crate::remote_start::arguments_sha256(&arguments),
                 original_request_sha256: [3; 32],
                 session_action: RemoteSessionAction::Submit,
-                target: lease,
+                target: lease.target.clone(),
             },
             RemoteStartProvenance {
                 actor: "actor".into(),
@@ -1305,6 +1328,7 @@ mod tests {
                     resource_scope: "root".into(),
                     grant_sha256: [4; 32],
                 },
+                issuer: Some(lease.issuer.clone()),
                 policy_revision_sha256: [5; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),
@@ -1366,7 +1390,6 @@ mod tests {
         assert!(root.join("a.txt").exists());
         assert!(!root.join("b.txt").exists());
 
-        let identity = crate::remote_start::AuthenticatedMcpClient::new("aw-client").unwrap();
         let authenticated = base.layer(middleware::from_fn(
             move |mut request: Request<Body>, next: Next| {
                 let identity = identity.clone();

@@ -1999,10 +1999,13 @@ impl LocalMachine {
         &self.config.log
     }
 
-    pub(crate) fn remote_start_lease(&self) -> Result<aw_tools::remote_start::RemoteRuntimeLease> {
+    pub(crate) fn remote_start_lease(
+        &self,
+        client: &crate::remote_start::AuthenticatedMcpClient,
+    ) -> Result<aw_tools::remote_start::RemoteStartLease> {
         self.jobs
             .remote_target()?
-            .lease(self.jobs.runtime_generation_fingerprint())
+            .lease(self.jobs.runtime_generation_fingerprint(), client)
     }
 
     #[cfg(test)]
@@ -2532,8 +2535,7 @@ fn tool_call_log_outcome(
 
 #[tool_handler(
     router = self.policy_tool_router(),
-    name = "dotlink",
-    instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
+    name = "dotlink"
 )]
 impl rmcp::ServerHandler for LocalMachine {
     async fn list_tools(

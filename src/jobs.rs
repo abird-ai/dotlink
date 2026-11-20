@@ -174,7 +174,6 @@ pub(crate) struct JobResultContext {
     pub(crate) dir: String,
     pub(crate) sandboxed: bool,
     pub(crate) network: bool,
-    pub(crate) timeout_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -591,6 +590,12 @@ pub(crate) enum ProcessInput {
     Eof,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProcessInputAuthority {
+    pub(crate) tool: SharedNodeTool,
+    pub(crate) shell_guard_generation: Option<[u8; 32]>,
+}
+
 pub(crate) struct ProcessInputRequest {
     pub(crate) input: ProcessInput,
     pub(crate) response: oneshot::Sender<std::result::Result<(), String>>,
@@ -648,6 +653,10 @@ struct JobEntry {
     delivered_through: HashMap<(usize, JobOutputStream), u64>,
     /// RAII owner of the canonical shared lifecycle projection.
     shared_job: Option<SharedJobLease>,
+    /// A local caller disappeared before shared admission was installed.
+    /// Publication is deferred until the canonical shared owner exists; a
+    /// half-owned Job is never visible through jobs_*.
+    publish_when_shared: bool,
     /// Serializes only sequence allocation + canonical shared lifecycle
     /// transitions for this Job. Effects, output I/O and unrelated Jobs remain
     /// fully concurrent.
@@ -1146,6 +1155,22 @@ struct JobFinisher {
     inner: Weak<JobManagerInner>,
 }
 
+fn process_input_coordinate(entry: &JobEntry, node: Option<usize>) -> JobResult<usize> {
+    match (entry.shared_graph_authoritative, node) {
+        (false, None) => Ok(1),
+        (false, Some(_)) => Err(JobError::Unknown(
+            "Process Job ref cannot contain a Graph node".into(),
+        )),
+        (true, Some(node)) if node > 0 => Ok(node),
+        (true, None) => Err(JobError::Unknown(
+            "Graph jobs_send requires an exact interactive node ref".into(),
+        )),
+        (true, Some(_)) => Err(JobError::Unknown(
+            "Graph node coordinate must be positive".into(),
+        )),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct JobHandle {
     pub(crate) id: String,
@@ -1301,40 +1326,59 @@ impl JobHandle {
             )
             .map_err(|error| anyhow!("shared Graph admission failed: {error:?}"))?;
         let mut state = inner.state.lock().expect("job manager lock");
-        let Some(entry) = state.jobs.get_mut(&self.id) else {
-            drop(state);
-            let _ = inner.shared_jobs.discard_unstarted(&self.id);
-            bail!("job disappeared during shared Graph admission");
+        let (publish_when_shared, exposure_sequence_missing) = {
+            let Some(entry) = state.jobs.get(&self.id) else {
+                drop(state);
+                let _ = inner.shared_jobs.discard_unstarted(&self.id);
+                bail!("job disappeared during shared Graph admission");
+            };
+            if entry.completion.is_some() || entry.shared_job.is_some() {
+                drop(state);
+                let _ = inner.shared_jobs.discard_unstarted(&self.id);
+                bail!("job is no longer eligible for shared Graph admission");
+            }
+            if entry.disposition.exposed() {
+                drop(state);
+                let _ = inner.shared_jobs.discard_unstarted(&self.id);
+                bail!("Job became public before canonical shared ownership was installed");
+            }
+            (entry.publish_when_shared, entry.exposure_sequence.is_none())
         };
-        if entry.completion.is_some() || entry.shared_job.is_some() {
+        if publish_when_shared
+            && exposure_sequence_missing
+            && state.next_exposure_sequence == u64::MAX
+        {
             drop(state);
             let _ = inner.shared_jobs.discard_unstarted(&self.id);
-            bail!("job is no longer eligible for shared Graph admission");
+            bail!("job exposure sequence exhausted before shared publication");
         }
-        // A local response can be abandoned or handed off before this async
-        // runner reaches shared Graph admission. In that ordering the local
-        // wire disposition is already durable while the shared Job did not yet
-        // exist, so the earlier exposure attempt necessarily observed NotFound.
-        // Reconcile visibility here, still before claim/process launch, so the
-        // canonical JobManager never trails an already-committed host surface.
-        if entry.disposition.exposed()
+        if publish_when_shared
             && let Err(error) = reconcile_prelaunch_shared_exposure(
                 &inner.shared_jobs,
                 &self.id,
-                "shared Graph could not reconcile pre-admission exposure before launch",
+                "shared Job could not publish abandoned local execution before launch",
             )
         {
             drop(state);
             return Err(error);
         }
+        let entry = state
+            .jobs
+            .get_mut(&self.id)
+            .expect("Job remains present during shared admission");
         entry.shell_guard_generation = shell_guard_generation;
         entry.shared_graph_authoritative = authoritative;
         entry.shared_job = Some(SharedJobLease {
             manager: inner.shared_jobs.clone(),
             id: self.id.clone(),
         });
+        entry.publish_when_shared = false;
         entry.updated_at = chrono::Utc::now().to_rfc3339();
         entry.notify.notify_waiters();
+        if publish_when_shared {
+            commit_exposure(&mut state, &self.id, JobDisposition::Compatibility)
+                .map_err(|error| anyhow!("cannot commit abandoned Job publication: {error:?}"))?;
+        }
         Ok(())
     }
 
@@ -1931,6 +1975,12 @@ pub(crate) enum JobWait {
     Pending,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SharedOwnerWait {
+    Owned,
+    TerminalBeforeAdmission,
+}
+
 #[derive(Debug)]
 pub(crate) enum JobError {
     Unknown(String),
@@ -2063,6 +2113,56 @@ impl JobFinisher {
         }
         finish_inner(&inner, id, completion);
     }
+}
+
+fn exact_largest_fitting_projection(
+    upper_exclusive: usize,
+    project: &mut impl FnMut(usize) -> JobResult<String>,
+    fits: &impl Fn(&str) -> bool,
+) -> JobResult<Option<String>> {
+    for limit in (1..upper_exclusive).rev() {
+        let candidate = project(limit)?;
+        if fits(&candidate) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// Return the richest already-proven projection below `upper_exclusive`.
+/// ASCII projections grow monotonically with a prepended raw byte and use a
+/// logarithmic search; any observed non-ASCII projection falls back to the
+/// bounded exact search because lossy UTF-8 boundaries can shrink on growth.
+fn largest_fitting_projection(
+    upper_exclusive: usize,
+    ascii_monotone: bool,
+    mut project: impl FnMut(usize) -> JobResult<String>,
+    fits: impl Fn(&str) -> bool,
+) -> JobResult<Option<String>> {
+    if upper_exclusive <= 1 {
+        return Ok(None);
+    }
+    if !ascii_monotone {
+        return exact_largest_fitting_projection(upper_exclusive, &mut project, &fits);
+    }
+
+    let mut low = 1usize;
+    let mut high = upper_exclusive - 1;
+    let mut best = None;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = project(middle)?;
+        if !candidate.is_ascii() {
+            return exact_largest_fitting_projection(upper_exclusive, &mut project, &fits);
+        }
+        if fits(&candidate) {
+            best = Some(candidate);
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(best)
 }
 
 impl JobManager {
@@ -2309,6 +2409,7 @@ impl JobManager {
                 process_inputs: HashMap::new(),
                 delivered_through: HashMap::new(),
                 shared_job: None,
+                publish_when_shared: false,
                 shared_transition_gate: shared_transition_gate.clone(),
                 shared_graph_authoritative: false,
                 retention_anchor: None,
@@ -2449,6 +2550,7 @@ impl JobManager {
                 process_inputs: HashMap::new(),
                 delivered_through: HashMap::new(),
                 shared_job: None,
+                publish_when_shared: false,
                 shared_transition_gate: shared_transition_gate.clone(),
                 shared_graph_authoritative: false,
                 retention_anchor: None,
@@ -2608,6 +2710,9 @@ impl JobManager {
                     RemoteStartDecision::Existing(receipt.clone())
                 }
             });
+        }
+        if !start.new_claim_authorized() {
+            bail!("remote Start issuer is not currently trusted for new effects");
         }
         if state.remote_starts.len() >= MAX_REQUEST_REPLAYS {
             bail!(
@@ -3195,13 +3300,13 @@ impl JobManager {
             .then(|| (shared.manager.clone(), coordinate)))
     }
 
-    pub(crate) fn standalone_process_tail(
+    pub(crate) fn standalone_process_tail_fitted(
         &self,
         id: &str,
         node: Option<usize>,
         requested: Option<usize>,
         status: String,
-        response_ceiling: usize,
+        fits: impl Fn(&str) -> bool,
     ) -> JobResult<String> {
         let tail = requested.unwrap_or(DOTLINK_JOB_PROFILE.get_tail_default);
         if tail > DOTLINK_JOB_PROFILE.get_tail_max {
@@ -3265,32 +3370,17 @@ impl JobManager {
             Ok(rendered)
         };
         let full = project(tail, false)?;
-        if serialized_tool_result_len(&full).is_ok_and(|size| size <= response_ceiling) {
+        if fits(&full) {
             return Ok(full);
         }
         let budget_marker = format!("{status}\ntail=budget");
-        if match serialized_tool_result_len(&budget_marker) {
-            Ok(size) => size > response_ceiling,
-            Err(_) => true,
-        } {
+        if !fits(&budget_marker) {
             return Ok(status);
         }
-        let mut low = 0usize;
-        let mut high = tail;
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            let candidate = project(middle, middle < tail)?;
-            if serialized_tool_result_len(&candidate).is_ok_and(|size| size <= response_ceiling) {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        if low == 0 {
-            Ok(budget_marker)
-        } else {
-            project(low, low < tail)
-        }
+        Ok(
+            largest_fitting_projection(tail, full.is_ascii(), |limit| project(limit, true), fits)?
+                .unwrap_or(budget_marker),
+        )
     }
 
     pub(crate) fn standalone_list_fitted(
@@ -3366,69 +3456,6 @@ impl JobManager {
         })
     }
 
-    pub(crate) fn standalone_process_tool(
-        &self,
-        id: &str,
-        node: Option<usize>,
-    ) -> JobResult<SharedNodeTool> {
-        sweep_expired(&self.inner);
-        let state = self.inner.state.lock().expect("job manager lock");
-        let entry = state
-            .available(id)
-            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        let coordinate = match (entry.shared_graph_authoritative, node) {
-            (false, None) => 1,
-            (false, Some(_)) => {
-                return Err(JobError::Unknown(
-                    "Process Job ref cannot contain a Graph node".into(),
-                ));
-            }
-            (true, Some(node)) if node > 0 => node,
-            (true, None) => {
-                return Err(JobError::Unknown(
-                    "Graph Process input requires an exact node ref".into(),
-                ));
-            }
-            (true, Some(_)) => {
-                return Err(JobError::Unknown(
-                    "Graph node coordinate must be positive".into(),
-                ));
-            }
-        };
-        let shared = entry.shared_job.as_ref().ok_or_else(|| {
-            JobError::Unknown(
-                "Process stdin is not interactive, not ready, closed, or already settled".into(),
-            )
-        })?;
-        let graph = shared
-            .manager
-            .graph(id)
-            .map_err(|error| JobError::Unknown(format!("Process graph unavailable: {error:?}")))?;
-        let tool = graph
-            .steps()
-            .get(coordinate.saturating_sub(1))
-            .map(|step| step.tool)
-            .ok_or_else(|| JobError::Unknown(format!("unknown Graph node {coordinate}")))?;
-        if !tool.is_shell() {
-            return Err(JobError::Unknown(
-                "jobs_send target is not an interactive Process node".into(),
-            ));
-        }
-        Ok(tool)
-    }
-
-    pub(crate) fn standalone_shell_guard_generation(
-        &self,
-        id: &str,
-    ) -> JobResult<Option<[u8; 32]>> {
-        sweep_expired(&self.inner);
-        let state = self.inner.state.lock().expect("job manager lock");
-        let entry = state
-            .available(id)
-            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        Ok(entry.shell_guard_generation)
-    }
-
     #[cfg(test)]
     pub(crate) fn process_input_ready_for_test(&self, id: &str, node: Option<usize>) -> bool {
         let state = self.inner.state.lock().expect("job manager lock");
@@ -3456,12 +3483,13 @@ impl JobManager {
         entry.notify.notify_waiters();
     }
 
-    pub(crate) async fn standalone_send_process_input(
+    pub(crate) async fn standalone_send_process_input_checked(
         &self,
         id: &str,
         node: Option<usize>,
         expected_revision: Option<u64>,
         input: ProcessInput,
+        verify_authority: impl FnOnce(ProcessInputAuthority) -> JobResult<()>,
     ) -> JobResult<u64> {
         const MAX_INPUT_BYTES: usize = 64 * 1024;
         if let ProcessInput::Text(bytes) = &input
@@ -3471,7 +3499,8 @@ impl JobManager {
                 "jobs_send text exceeds {MAX_INPUT_BYTES} bytes"
             )));
         }
-        let (sender, revision, shared_owned) = {
+
+        let (sender, transition_gate) = {
             sweep_expired(&self.inner);
             let state = self.inner.state.lock().expect("job manager lock");
             let entry = state
@@ -3480,31 +3509,13 @@ impl JobManager {
             if entry.status().terminal() {
                 return Err(JobError::Unknown(format!("job {id} is already terminal")));
             }
-            let coordinate = match (entry.shared_graph_authoritative, node) {
-                (false, None) => 1,
-                (false, Some(_)) => {
-                    return Err(JobError::Unknown(
-                        "Process Job ref cannot contain a Graph node".into(),
-                    ));
-                }
-                (true, Some(node)) if node > 0 => node,
-                (true, None) => {
-                    return Err(JobError::Unknown(
-                        "Graph jobs_send requires an exact interactive node ref".into(),
-                    ));
-                }
-                (true, Some(_)) => {
-                    return Err(JobError::Unknown(
-                        "Graph node coordinate must be positive".into(),
-                    ));
-                }
-            };
-            let (revision, _) = self.standalone_status_locked(entry, node)?;
-            if expected_revision.is_some_and(|expected| expected != revision) {
-                return Err(JobError::Unknown(format!(
-                    "stale Job revision: expected {expected_revision:?}, current {revision}"
-                )));
+            if entry.shared_job.is_none() {
+                return Err(JobError::Unknown(
+                    "Process Job is not yet under canonical shared ownership; stdin was not accepted"
+                        .into(),
+                ));
             }
+            let coordinate = process_input_coordinate(entry, node)?;
             let sender = entry
                 .process_inputs
                 .get(&coordinate)
@@ -3515,31 +3526,93 @@ impl JobManager {
                             .into(),
                     )
                 })?;
-            (sender, revision, entry.shared_job.is_some())
+            (sender, entry.shared_transition_gate.clone())
         };
-        let effect_revision = if shared_owned {
-            self.inner
+
+        // Wait for bounded channel capacity before entering the owner transition.
+        // Dropping this permit is effect-free; no revision has been reserved yet.
+        let permit = sender.reserve_owned().await.map_err(|_| {
+            JobError::Unknown(
+                "Process stdin owner disappeared before acceptance; no input was accepted".into(),
+            )
+        })?;
+
+        let effect_revision = {
+            let _transition = transition_gate
+                .lock()
+                .map_err(|_| JobError::Internal(anyhow!("shared Job transition gate poisoned")))?;
+            let (coordinate, shell_guard_generation, shared_manager) = {
+                let state = self.inner.state.lock().expect("job manager lock");
+                let entry = state
+                    .available(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+                if entry.status().terminal() {
+                    return Err(JobError::Unknown(format!("job {id} is already terminal")));
+                }
+                let shared = entry.shared_job.as_ref().ok_or_else(|| {
+                    JobError::Unknown(
+                        "Process Job lost canonical shared ownership before stdin acceptance"
+                            .into(),
+                    )
+                })?;
+                let coordinate = process_input_coordinate(entry, node)?;
+                if !entry.process_inputs.contains_key(&coordinate) {
+                    return Err(JobError::Unknown(
+                        "Process stdin closed before input acceptance".into(),
+                    ));
+                }
+                (
+                    coordinate,
+                    entry.shell_guard_generation,
+                    shared.manager.clone(),
+                )
+            };
+            let graph = shared_manager.graph(id).map_err(|error| {
+                JobError::Unknown(format!("Process graph unavailable: {error:?}"))
+            })?;
+            let tool = graph
+                .steps()
+                .get(coordinate.saturating_sub(1))
+                .map(|step| step.tool)
+                .ok_or_else(|| JobError::Unknown(format!("unknown Graph node {coordinate}")))?;
+            if !tool.is_shell() {
+                return Err(JobError::Unknown(
+                    "jobs_send target is not an interactive Process node".into(),
+                ));
+            }
+            verify_authority(ProcessInputAuthority {
+                tool,
+                shell_guard_generation,
+            })?;
+
+            let before = self
+                .inner
+                .shared_jobs
+                .runtime_snapshot(id)
+                .map_err(|error| {
+                    JobError::Internal(anyhow!(
+                        "cannot inspect shared Job before stdin acceptance: {error:?}"
+                    ))
+                })?;
+            if expected_revision.is_some_and(|expected| expected != before.sequence) {
+                return Err(JobError::Unknown(format!(
+                    "stale Job revision: expected {expected_revision:?}, current {}",
+                    before.sequence
+                )));
+            }
+            let revision = self
+                .inner
                 .shared_jobs
                 .compare_and_bump_revision(id, expected_revision)
                 .map_err(|error| {
                     JobError::Unknown(format!(
                         "stale Job revision or unavailable stdin target: {error:?}"
                     ))
-                })?
-        } else {
-            revision.saturating_add(1)
-        };
-        let (response, received) = oneshot::channel();
-        sender
-            .send(ProcessInputRequest { input, response })
-            .await
-            .map_err(|_| {
-                JobError::Unknown(
-                    "Process stdin owner disappeared before delivery; inspect before retry".into(),
-                )
-            })?;
-        match received.await {
-            Ok(Ok(())) => {
+                })?;
+
+            let (response, received) = oneshot::channel();
+            let _sender = permit.send(ProcessInputRequest { input, response });
+            {
                 let mut state = self.inner.state.lock().expect("job manager lock");
                 let entry = state
                     .available_mut(id)
@@ -3547,16 +3620,19 @@ impl JobManager {
                 entry.public_revision = entry.public_revision.saturating_add(1);
                 entry.updated_at = chrono::Utc::now().to_rfc3339();
                 entry.notify.notify_waiters();
-                Ok(if shared_owned {
-                    effect_revision
-                } else {
-                    entry.public_revision.max(effect_revision)
-                })
             }
-            Ok(Err(message)) => Err(JobError::Unknown(message)),
-            Err(_) => Err(JobError::Unknown(
-                "Process stdin outcome is unknown; do not retry blindly".into(),
-            )),
+            (revision, received)
+        };
+
+        let (revision, received) = effect_revision;
+        match received.await {
+            Ok(Ok(())) => Ok(revision),
+            Ok(Err(message)) => Err(JobError::Unknown(format!(
+                "Process stdin was accepted at rev {revision}, but write completion failed: {message}; inspect the Job and do not resend blindly"
+            ))),
+            Err(_) => Err(JobError::Unknown(format!(
+                "Process stdin was accepted at rev {revision}, but write outcome is unknown; inspect the Job and do not resend"
+            ))),
         }
     }
 
@@ -3649,23 +3725,10 @@ impl JobManager {
         };
 
         if !shared_owned {
-            let (current, _) = self.standalone_status(id, None)?;
-            if expected_revision.is_some_and(|expected| expected != current) {
-                return Err(JobError::Unknown(format!(
-                    "stale Job revision: expected {expected_revision:?}, current {current}"
-                )));
-            }
-            let changed = {
-                let state = self.inner.state.lock().expect("job manager lock");
-                !state
-                    .available(id)
-                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
-                    .status()
-                    .terminal()
-            };
-            self.cancel(id)?;
-            let (revision, _) = self.standalone_status(id, None)?;
-            return Ok((changed, revision));
+            return Err(JobError::Unknown(
+                "Job is not yet under canonical shared ownership; cancellation was not applied"
+                    .to_owned(),
+            ));
         }
 
         let _transition = transition_gate
@@ -3879,6 +3942,13 @@ impl JobManager {
         };
         match disposition {
             JobDisposition::Pending => {
+                #[cfg(not(test))]
+                if !shared_owned {
+                    return Err(JobError::Unknown(
+                        "Job is still being admitted; public exposure requires canonical shared ownership"
+                            .to_owned(),
+                    ));
+                }
                 reserve_exposure_slot(&mut state, id)?;
                 self.reserve_shared_exposure(id, shared_owned)?;
                 self.expose_shared_job(id, shared_owned)?;
@@ -3960,6 +4030,12 @@ impl JobManager {
             )
         };
         if disposition == JobDisposition::Pending {
+            if !shared_owned {
+                return Err(JobError::Unknown(
+                    "Job is still being admitted; public handoff requires canonical shared ownership"
+                        .to_owned(),
+                ));
+            }
             let native = native_tasks
                 && !budget.is_some_and(|budget| {
                     !crate::mcp::shell_result_fits_budget(result_limit, budget)
@@ -4006,6 +4082,32 @@ impl JobManager {
         match state.available(id) {
             Some(entry) if entry.disposition.native_task() => Ok(()),
             _ => Err(JobError::Unknown(format!("unknown task {id}"))),
+        }
+    }
+
+    /// Wait until canonical shared ownership is installed, or until a
+    /// pre-admission failure becomes terminal. Public Job handoff is forbidden
+    /// before this boundary: exposed => shared-owned is a runtime invariant.
+    pub(crate) async fn wait_until_shared_owner_or_terminal(
+        &self,
+        id: &str,
+    ) -> JobResult<SharedOwnerWait> {
+        loop {
+            let notify = {
+                let state = self.inner.state.lock().expect("job manager lock");
+                let entry = state
+                    .jobs
+                    .get(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+                if entry.shared_job.is_some() {
+                    return Ok(SharedOwnerWait::Owned);
+                }
+                if entry.status().terminal() {
+                    return Ok(SharedOwnerWait::TerminalBeforeAdmission);
+                }
+                entry.notify.clone().notified_owned()
+            };
+            notify.await;
         }
     }
 
@@ -5456,7 +5558,7 @@ pub(crate) fn product_stopped_by(completion: &JobCompletion) -> Option<&'static 
     })
 }
 
-pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
+pub(crate) fn outside_command_exit_signal(completion: &JobCompletion) -> Option<i32> {
     let signal = completion.signal()?;
     completion
         .stop_record
@@ -5478,7 +5580,7 @@ pub(crate) fn signal_token(signal: i32) -> String {
 }
 
 fn external_stop_note(completion: &JobCompletion) -> Option<String> {
-    let signal = external_signal(completion)?;
+    let signal = outside_command_exit_signal(completion)?;
     Some(format!(
         "terminated by {} from outside dotlink; check what signalled it before retrying",
         signal_label(signal)
@@ -5519,7 +5621,7 @@ pub(crate) fn process_lifecycle_message(id: &str, completion: &JobCompletion) ->
         };
         return Some(format!("stop id={id} reason={reason} outcome={outcome}"));
     }
-    external_signal(completion)
+    outside_command_exit_signal(completion)
         .map(|signal| format!("exit id={id} signal={} from=outside", signal_token(signal)))
 }
 
@@ -5668,6 +5770,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
                 "stderr": String::from_utf8_lossy(&stderr),
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
+                "output_complete": completion.output_complete,
             }),
             completion,
         )
@@ -5699,6 +5802,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "stderr": String::from_utf8_lossy(&stderr),
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
+        "output_complete": completion.output_complete,
         "error": error.as_deref().or(completion.error.as_deref()),
     });
     if completion.status == JobStatus::Unknown {
@@ -6273,10 +6377,13 @@ fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
         entry.retention = RetentionClass::TransportOnly;
     } else if entry.request_key.is_none() && entry.response_attempts == 0 {
         // Local transports have no durable request identity to replay. Make an
-        // abandoned execution discoverable through jobs_list instead of hiding a
-        // side effect behind an irrecoverable lost response. The local retained
-        // slot was reserved at admission, so shared exposure capacity is not an
-        // independent admission decision here.
+        // abandoned execution discoverable, but never publish a half-owned Job:
+        // if shared admission has not happened yet, record publication intent
+        // and let that owner publish atomically before process claim/launch.
+        if entry.shared_job.is_none() {
+            entry.publish_when_shared = true;
+            return;
+        }
         if let Some(shared) = entry.shared_job.as_ref() {
             let reserved = match shared.manager.reserve_exposed(&entry.id) {
                 Ok(()) => true,
@@ -7512,12 +7619,25 @@ mod tests {
         SerializedResultBytes::new(bytes).expect("test serialized result budget")
     }
 
+    fn process_tail_with_ceiling(
+        manager: &JobManager,
+        id: &str,
+        node: Option<usize>,
+        requested: Option<usize>,
+        status: String,
+        response_ceiling: usize,
+    ) -> JobResult<String> {
+        manager.standalone_process_tail_fitted(id, node, requested, status, |candidate| {
+            serialized_tool_result_len(candidate).is_ok_and(|size| size <= response_ceiling)
+        })
+    }
+
     #[test]
     fn process_projection_keeps_physical_exit_stop_evidence_and_product_context_orthogonal() {
         let stream = StreamSummary::default();
         let external =
             JobCompletion::completed_with_exit(SharedProcessExit::Signal(9), false, stream, stream);
-        assert_eq!(external_signal(&external), Some(9));
+        assert_eq!(outside_command_exit_signal(&external), Some(9));
         assert_eq!(product_stopped_by(&external), None);
         assert_eq!(
             process_lifecycle_message("j:1", &external).as_deref(),
@@ -7530,7 +7650,7 @@ mod tests {
                 SharedProcessStopReason::Timeout,
             )),
         );
-        assert_eq!(external_signal(&timeout), None);
+        assert_eq!(outside_command_exit_signal(&timeout), None);
         assert_eq!(product_stopped_by(&timeout), Some("timeout"));
         assert_eq!(
             process_lifecycle_message("j:2", &timeout).as_deref(),
@@ -7543,7 +7663,7 @@ mod tests {
                 SharedProcessStopReason::Timeout,
             )),
         );
-        assert_eq!(external_signal(&unresolved), None);
+        assert_eq!(outside_command_exit_signal(&unresolved), None);
         assert_eq!(product_stopped_by(&unresolved), None);
         assert_eq!(
             process_lifecycle_message("j:3", &unresolved).as_deref(),
@@ -7596,7 +7716,7 @@ mod tests {
                 )
                 .with_cancel_origin(origin);
             assert_eq!(product_stopped_by(&cancelled), Some(stopped_by));
-            assert_eq!(external_signal(&cancelled), None);
+            assert_eq!(outside_command_exit_signal(&cancelled), None);
             let expected = format!("stop id=j:5 reason={line_reason} outcome=delivered");
             assert_eq!(
                 process_lifecycle_message("j:5", &cancelled).as_deref(),
@@ -7801,6 +7921,41 @@ mod tests {
             .find(|row| row["job_id"] == job.id)
             .unwrap();
         assert_eq!(row["status"], "skip");
+    }
+
+    #[test]
+    fn incomplete_output_is_orthogonal_to_known_process_outcome() {
+        for (exit, expected) in [
+            (SharedProcessExit::Code(0), SharedPrimary::Ok),
+            (SharedProcessExit::Code(7), SharedPrimary::Fail),
+            (SharedProcessExit::Signal(9), SharedPrimary::Fail),
+            (SharedProcessExit::Unknown, SharedPrimary::Unknown),
+        ] {
+            let terminal = SharedProcessTerminal {
+                exit,
+                stop: None,
+                output: SharedProcessOutputMeta {
+                    complete: false,
+                    ..Default::default()
+                },
+            };
+            let status = terminal.status();
+            assert_eq!(status.primary, expected);
+            assert!(status.incomplete);
+            assert!(!status.more);
+        }
+
+        let stopped = SharedProcessTerminal {
+            exit: SharedProcessExit::Code(0),
+            stop: Some(SharedProcessStopReason::Cancelled),
+            output: SharedProcessOutputMeta {
+                complete: false,
+                ..Default::default()
+            },
+        };
+        let status = stopped.status();
+        assert_eq!(status.primary, SharedPrimary::Fail);
+        assert!(status.incomplete);
     }
 
     #[test]
@@ -8968,7 +9123,6 @@ mod tests {
                         dir: ".".to_owned(),
                         sandboxed: true,
                         network: false,
-                        timeout_secs: 30,
                     })
                 },
             )
@@ -9243,7 +9397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exposure_committed_before_shared_admission_is_reconciled_before_launch() {
+    async fn abandoned_response_defers_publication_until_shared_admission_before_launch() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let release = Arc::new(Notify::new());
         let claimed = Arc::new(Notify::new());
@@ -9260,9 +9414,9 @@ mod tests {
                     async move {
                         runner_release.notified().await;
                         let writers = claim_shared_shell_writers(&runner_manager, &job);
-                        // The local compatibility representation was committed
-                        // before this shared admission. The shared Job must be
-                        // visible before any process/effect can be marked live.
+                        // Local publication was deferred while no canonical owner
+                        // existed. Shared admission must publish both projections
+                        // before any process/effect can be marked live.
                         assert!(runner_manager.inner.shared_jobs.get(&job.id).is_ok());
                         runner_claimed.notify_one();
                         job.mark_launched().unwrap();
@@ -9282,9 +9436,14 @@ mod tests {
         drop(started);
         {
             let state = manager.inner.state.lock().unwrap();
-            assert_eq!(state.jobs[&id].disposition, JobDisposition::Compatibility);
-            assert!(state.jobs[&id].shared_job.is_none());
+            let entry = &state.jobs[&id];
+            assert_eq!(entry.disposition, JobDisposition::Pending);
+            assert!(entry.shared_job.is_none());
+            assert!(entry.publish_when_shared);
+            assert!(entry.exposure_sequence.is_none());
         }
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
+        assert!(listed["jobs"].as_array().unwrap().is_empty());
         assert!(matches!(
             manager.inner.shared_jobs.runtime_snapshot(&id),
             Err(aw_tools::filesystem::job_manager::Error::NotFound)
@@ -9294,6 +9453,14 @@ mod tests {
             .await
             .expect("shared admission must reconcile exposure");
         assert_eq!(manager.inner.shared_jobs.get(&id).unwrap().id, id);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&id];
+            assert_eq!(entry.disposition, JobDisposition::Compatibility);
+            assert!(entry.shared_job.is_some());
+            assert!(!entry.publish_when_shared);
+            assert!(entry.exposure_sequence.is_some());
+        }
         assert!(matches!(
             manager
                 .wait_until(&id, Some(TokioInstant::now() + Duration::from_secs(2)))
@@ -9305,39 +9472,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_local_response_becomes_recoverable_compatibility_job() {
-        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
-        let started = manager
-            .spawn(
-                30,
-                crate::limits::DEFAULT_TRANSFER_BYTES,
-                None,
-                |_job| async { std::future::pending::<JobCompletion>().await },
-            )
-            .unwrap();
-        let id = started.id.clone();
-        drop(started);
-        {
-            let state = manager.inner.state.lock().unwrap();
-            let entry = &state.jobs[&id];
-            assert_eq!(entry.disposition, JobDisposition::Compatibility);
-            assert_eq!(entry.retention, RetentionClass::Ordinary);
-            assert!(entry.retention_anchor.is_some());
-        }
-        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
-        assert_eq!(listed["jobs"][0]["job_id"], id);
-        manager.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn first_committed_response_disposition_wins_concurrent_redelivery_races() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let exposed_runner = manager.clone();
         let exposed = manager
             .spawn(
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("exposure-wins".to_owned()),
-                |_job| async {
+                move |job| async move {
+                    let writers = claim_shared_shell_writers(&exposed_runner, &job);
+                    job.mark_launched().unwrap();
+                    writers.stdout.finish().unwrap();
+                    writers.stderr.finish().unwrap();
                     JobCompletion::completed(
                         Some(0),
                         true,
@@ -9366,12 +9513,17 @@ mod tests {
             Some(JobHandoff::Compatibility(_))
         ));
 
+        let synchronous_runner = manager.clone();
         let synchronous = manager
             .spawn(
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("sync-wins".to_owned()),
-                |_job| async {
+                move |job| async move {
+                    let writers = claim_shared_shell_writers(&synchronous_runner, &job);
+                    job.mark_launched().unwrap();
+                    writers.stdout.finish().unwrap();
+                    writers.stderr.finish().unwrap();
                     JobCompletion::completed(
                         Some(0),
                         true,
@@ -9400,12 +9552,17 @@ mod tests {
     #[tokio::test]
     async fn delivered_exposed_request_gets_a_fresh_user_visible_retention_window() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let runner_manager = manager.clone();
         let started = manager
             .spawn(
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("delayed-receipt".to_owned()),
-                |_job| async {
+                move |job| async move {
+                    let writers = claim_shared_shell_writers(&runner_manager, &job);
+                    job.mark_launched().unwrap();
+                    writers.stdout.finish().unwrap();
+                    writers.stderr.finish().unwrap();
                     JobCompletion::completed(
                         Some(0),
                         true,
@@ -9460,12 +9617,17 @@ mod tests {
     #[tokio::test]
     async fn replayed_native_task_advertises_retention_from_the_delivery_attempt() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let runner_manager = manager.clone();
         let started = manager
             .spawn(
                 30,
                 crate::limits::DEFAULT_TRANSFER_BYTES,
                 Some("delayed-task".to_owned()),
-                |_job| async {
+                move |job| async move {
+                    let writers = claim_shared_shell_writers(&runner_manager, &job);
+                    job.mark_launched().unwrap();
+                    writers.stdout.finish().unwrap();
+                    writers.stderr.finish().unwrap();
                     JobCompletion::completed(
                         Some(0),
                         true,
@@ -11053,9 +11215,8 @@ mod tests {
         assert_eq!(writers.stderr.append(&stderr).unwrap(), stderr.len());
 
         let (_, running) = manager.standalone_status(&job.id, None).unwrap();
-        let tail = manager
-            .standalone_process_tail(&job.id, None, None, running, 16 * 1024)
-            .unwrap();
+        let tail =
+            process_tail_with_ceiling(&manager, &job.id, None, None, running, 16 * 1024).unwrap();
         assert!(tail.contains("stdout [288..700]"), "{tail}");
         assert!(tail.contains("stderr [0..100]"), "{tail}");
         assert_eq!(tail.matches('X').count(), 412, "{tail}");
@@ -11068,11 +11229,84 @@ mod tests {
         );
 
         let (_, running) = manager.standalone_status(&job.id, None).unwrap();
-        let capped = manager
-            .standalone_process_tail(&job.id, None, Some(1024), running, 520)
-            .unwrap();
+        let capped =
+            process_tail_with_ceiling(&manager, &job.id, None, Some(1024), running.clone(), 520)
+                .unwrap();
         assert!(serialized_tool_result_len(&capped).unwrap() <= 520);
         assert!(capped.contains("tail=capped") || capped.contains("tail=budget"));
+
+        let decorated_len = |candidate: &str| {
+            let result = aw_mcp_protocol::decorate_and_fit_complete_result(
+                crate::mcp::shared_receipt_profile(),
+                OperationId::JobsGet,
+                CallToolResult::success(vec![ContentBlock::text(candidate.to_owned())]),
+                Some(1_794_737_000),
+                SerializedResultBytes::new(usize::MAX).expect("unbounded test result budget"),
+            )
+            .unwrap();
+            aw_mcp_protocol::serialized_result_len(&result).unwrap()
+        };
+        let (ceiling, bare) = (256..=1024)
+            .find_map(|ceiling| {
+                let bare = process_tail_with_ceiling(
+                    &manager,
+                    &job.id,
+                    None,
+                    Some(1024),
+                    running.clone(),
+                    ceiling,
+                )
+                .unwrap();
+                (serialized_tool_result_len(&bare).unwrap() <= ceiling
+                    && decorated_len(&bare) > ceiling)
+                    .then_some((ceiling, bare))
+            })
+            .expect("tight envelope exposes the pre-D6 bare-tail fitting gap");
+        let fitted = manager
+            .standalone_process_tail_fitted(&job.id, None, Some(1024), running, |candidate| {
+                decorated_len(candidate) <= ceiling
+            })
+            .unwrap();
+        assert_ne!(fitted, bare);
+        assert!(decorated_len(&fitted) <= ceiling);
+
+        // A suffix beginning at a continuation byte can be one serialized byte
+        // larger than the next raw limit, where the omitted lead byte rejoins
+        // it into a valid UTF-8 character. The exact non-ASCII fallback must
+        // not let binary-search monotonicity assumptions miss that larger fit.
+        let unicode = manager.create_for_test(30).unwrap();
+        let unicode_writers = claim_shared_shell_writers(&manager, &unicode);
+        unicode.mark_launched().unwrap();
+        manager.expose_compatibility(&unicode.id).unwrap();
+        let mut bytes = vec![b'Z'; 1024];
+        bytes[511] = 0xc2;
+        bytes[512] = 0x80;
+        bytes[513..].fill(b'A');
+        assert_eq!(unicode_writers.stdout.append(&bytes).unwrap(), bytes.len());
+        let (_, unicode_status) = manager.standalone_status(&unicode.id, None).unwrap();
+        let mut expected = process_tail_with_ceiling(
+            &manager,
+            &unicode.id,
+            None,
+            Some(513),
+            unicode_status.clone(),
+            16 * 1024,
+        )
+        .unwrap();
+        expected.push_str("\ntail=capped");
+        let unicode_ceiling = decorated_len(&expected);
+        let exact = manager
+            .standalone_process_tail_fitted(
+                &unicode.id,
+                None,
+                Some(1024),
+                unicode_status,
+                |candidate| decorated_len(candidate) <= unicode_ceiling,
+            )
+            .unwrap();
+        assert_eq!(exact, expected);
+        unicode_writers.stdout.finish().unwrap();
+        unicode_writers.stderr.finish().unwrap();
 
         writers.stdout.finish().unwrap();
         writers.stderr.finish().unwrap();
@@ -11083,15 +11317,27 @@ mod tests {
             JobCompletion::completed(Some(0), true, stdout_summary, stderr_summary),
         );
         let (_, terminal) = manager.standalone_status(&job.id, None).unwrap();
-        let tail = manager
-            .standalone_process_tail(&job.id, None, Some(1024), terminal.clone(), 16 * 1024)
-            .unwrap();
+        let tail = process_tail_with_ceiling(
+            &manager,
+            &job.id,
+            None,
+            Some(1024),
+            terminal.clone(),
+            16 * 1024,
+        )
+        .unwrap();
         assert!(tail.contains("stdout [0..700] eof"), "{tail}");
         assert!(tail.contains("stderr [0..100] eof"), "{tail}");
         assert_eq!(
-            manager
-                .standalone_process_tail(&job.id, None, Some(0), terminal.clone(), 16 * 1024)
-                .unwrap(),
+            process_tail_with_ceiling(
+                &manager,
+                &job.id,
+                None,
+                Some(0),
+                terminal.clone(),
+                16 * 1024,
+            )
+            .unwrap(),
             terminal,
             "tail=0 disables output"
         );
@@ -11161,6 +11407,26 @@ mod tests {
                 .is_err(),
             "failed response preflight cannot mint delivered proof"
         );
+
+        for ceiling in 1..=1024 {
+            if let Ok(page) = manager.output_node_page(&job.id, request(0, ceiling, false)) {
+                let decorated = aw_mcp_protocol::decorate_and_fit_complete_result(
+                    crate::mcp::shared_receipt_profile(),
+                    OperationId::JobsRead,
+                    CallToolResult::success(vec![ContentBlock::text(page.clone())]),
+                    Some(1_794_737_000),
+                    serialized(ceiling),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("D5 page fit at ceiling {ceiling} but D6 decoration failed: {error}")
+                });
+                assert_eq!(
+                    decorated.content[0].as_text().unwrap().text,
+                    page,
+                    "D5 must not credit text that D6 later changes at ceiling {ceiling}"
+                );
+            }
+        }
 
         let rendered = manager
             .output_node_page(&job.id, request(0, 1024, false))
@@ -11880,6 +12146,24 @@ mod tests {
 
         manager.expose_compatibility(&job.id).unwrap();
         assert_eq!(manager.inner.shared_jobs.get(&job.id).unwrap().id, job.id);
+    }
+
+    #[test]
+    fn revision_fenced_public_cancel_requires_canonical_shared_owner() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        manager.expose_compatibility(&job.id).unwrap();
+        assert!(!job.cancel.is_cancelled());
+
+        let error = manager
+            .standalone_cancel_checked(&job.id, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical shared ownership"), "{error}");
+        assert!(
+            !job.cancel.is_cancelled(),
+            "failed shared-owner verification must not signal the runner"
+        );
     }
 
     #[test]

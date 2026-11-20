@@ -1093,6 +1093,10 @@ mod tests {
                     resource_scope: "root".into(),
                     grant_sha256: [4; 32],
                 },
+                issuer: Some(aw_tools::remote_start::RemoteStartIssuer {
+                    client_id: "aw-client".into(),
+                    trust_epoch: 1,
+                }),
                 policy_revision_sha256: [5; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),
@@ -1108,6 +1112,7 @@ mod tests {
             authorization,
             crate::remote_start::ValidationContext {
                 client_id: "aw-client",
+                remote_start_trust_epoch: Some(1),
                 target: &target,
                 generation,
                 now_unix_ms: now,

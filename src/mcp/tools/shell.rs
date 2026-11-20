@@ -47,8 +47,8 @@ use crate::mcp::{
 use crate::{
     jobs::{
         JobCompletion, JobDisposition, JobHandle, JobHandoff, JobResultContext, JobStatus, JobWait,
-        ProcessInput, ProcessInputRequest, RemoteStartDecision, RemoteStartReceipt,
-        SharedShellWriters, SpoolWriterGuard, StreamSummary,
+        ProcessInput, ProcessInputAuthority, ProcessInputRequest, RemoteStartDecision,
+        RemoteStartReceipt, SharedOwnerWait, SharedShellWriters, SpoolWriterGuard, StreamSummary,
     },
     mcp::RuntimeConfig,
 };
@@ -149,8 +149,10 @@ impl ShellCallArgs {
     }
 }
 
-/// Salvage window for partial output after a killed child.
-const TIMEOUT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+/// Bounded output-quiescence window after the waited command has settled.
+/// This is independent from the command execution deadline: managed descendants
+/// are stopped first, then already-produced pipe data gets this short drain grace.
+const POST_STOP_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_SHELL_OUTPUT_BYTES: usize = 256 * 1024;
 
 fn shell_timeout_description(max_secs: u64) -> String {
@@ -1688,16 +1690,11 @@ impl ShellRuntime {
         )
     }
 
-    pub(crate) fn job_result_context(
-        &self,
-        working_dir: &Path,
-        timeout_secs: u64,
-    ) -> JobResultContext {
+    pub(crate) fn job_result_context(&self, working_dir: &Path) -> JobResultContext {
         JobResultContext {
             dir: self.config.access.relative_display(working_dir),
             sandboxed: self.config.sandbox_shell,
             network: self.config.allow_network,
-            timeout_secs,
         }
     }
 
@@ -2184,26 +2181,36 @@ impl LocalMachine {
         revision: Option<u64>,
         input: crate::jobs::ProcessInput,
     ) -> crate::jobs::JobResult<u64> {
-        if !self.has_tool_for_policy("jobs_send") {
-            return Err(crate::jobs::JobError::Unknown(
-                "jobs_send is no longer granted by current policy".into(),
-            ));
-        }
-        let tool = self.jobs.standalone_process_tool(id, node)?;
-        if !self.has_tool_for_policy(tool.name()) {
-            return Err(crate::jobs::JobError::Unknown(format!(
-                "Process interpreter {} is no longer granted",
-                tool.name()
-            )));
-        }
-        let expected_guard = self.jobs.standalone_shell_guard_generation(id)?;
-        if !self.shell_guard_generation_is_current(expected_guard) {
-            return Err(crate::jobs::JobError::Unknown(
-                "Process launcher/sandbox authority changed; live stdin is revoked".into(),
-            ));
-        }
         self.jobs
-            .standalone_send_process_input(id, node, revision, input)
+            .standalone_send_process_input_checked(
+                id,
+                node,
+                revision,
+                input,
+                |authority: ProcessInputAuthority| {
+                    if !self.has_tool_for_policy("jobs_send") {
+                        return Err(crate::jobs::JobError::Unknown(
+                            "jobs_send is no longer granted by current policy; stdin was not accepted"
+                                .into(),
+                        ));
+                    }
+                    if !self.has_tool_for_policy(authority.tool.name()) {
+                        return Err(crate::jobs::JobError::Unknown(format!(
+                            "Process interpreter {} is no longer granted; stdin was not accepted",
+                            authority.tool.name()
+                        )));
+                    }
+                    if !self
+                        .shell_guard_generation_is_current(authority.shell_guard_generation)
+                    {
+                        return Err(crate::jobs::JobError::Unknown(
+                            "Process launcher/sandbox authority changed; stdin was not accepted"
+                                .into(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
             .await
     }
 
@@ -2212,6 +2219,44 @@ impl LocalMachine {
         request_key: &str,
     ) -> Option<crate::jobs::RequestDeliveryState> {
         self.jobs.request_delivery_state(request_key)
+    }
+
+    fn pre_admission_terminal_result(
+        &self,
+        id: &str,
+        result_budget: Option<usize>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .jobs
+            .tool_result(id, result_budget)
+            .map_err(crate::jobs::JobError::into_mcp)?
+            .unwrap_or_else(|| {
+                tool_error(
+                    "shell failed before canonical Job admission; no managed process was exposed and the complete failure receipt exceeds this response budget",
+                )
+            });
+        self.jobs
+            .mark_synchronous_result(id)
+            .map_err(crate::jobs::JobError::into_mcp)?;
+        Ok(result)
+    }
+
+    async fn await_shared_shell_owner(
+        &self,
+        id: &str,
+        result_budget: Option<usize>,
+    ) -> Result<Option<CallToolResult>, McpError> {
+        match self
+            .jobs
+            .wait_until_shared_owner_or_terminal(id)
+            .await
+            .map_err(crate::jobs::JobError::into_mcp)?
+        {
+            SharedOwnerWait::Owned => Ok(None),
+            SharedOwnerWait::TerminalBeforeAdmission => self
+                .pre_admission_terminal_result(id, result_budget)
+                .map(Some),
+        }
     }
 
     fn handoff_shell_job(
@@ -2313,21 +2358,30 @@ impl LocalMachine {
                     return Err(McpError::internal_error(error.to_string(), None));
                 }
             };
-        if let Err(error) = self.jobs.expose_compatibility(&started.id) {
-            guard.mark_unknown();
-            return Err(crate::jobs::JobError::into_mcp(error));
-        }
-        let status = match self.jobs.standalone_status(&started.id, None) {
-            Ok((_, status)) => status,
+        let mut result = match self.await_shared_shell_owner(&started.id, None).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                if let Err(error) = self.jobs.expose_compatibility(&started.id) {
+                    guard.mark_unknown();
+                    return Err(crate::jobs::JobError::into_mcp(error));
+                }
+                let status = match self.jobs.standalone_status(&started.id, None) {
+                    Ok((_, status)) => status,
+                    Err(error) => {
+                        guard.mark_unknown();
+                        return Err(error.into_mcp());
+                    }
+                };
+                ok_text(status)
+            }
             Err(error) => {
                 guard.mark_unknown();
-                return Err(error.into_mcp());
+                return Err(error);
             }
         };
         let operation = aw_tools::OperationId::from_model_name(name).ok_or_else(|| {
             McpError::internal_error("shell operation metadata unavailable", None)
         })?;
-        let mut result = ok_text(status);
         if let Err(error) = self.stamp_cached_mcp_receipt(operation, &mut result) {
             let fallback = tool_error(format!(
                 "remote Start shell effect completed but its timestamp receipt could not be finalized: {error}; inspect the Job before retrying"
@@ -2389,6 +2443,12 @@ impl LocalMachine {
         }
 
         if background {
+            if let Some(result) = self
+                .await_shared_shell_owner(&started.id, result_budget)
+                .await?
+            {
+                return Ok(Some(CallToolResponse::Complete(result)));
+            }
             let _ = self
                 .jobs
                 .expose_compatibility(&started.id)
@@ -2441,12 +2501,25 @@ impl LocalMachine {
                 // transport response. Expose the same terminal execution for
                 // compact status + paged stdout/stderr rather than failing after
                 // side effects have already happened.
+                if let Some(result) = self
+                    .await_shared_shell_owner(&started.id, result_budget)
+                    .await?
+                {
+                    return Ok(Some(CallToolResponse::Complete(result)));
+                }
                 self.handoff_shell_job(&started.id, native_tasks, result_budget)
                     .map(Some)
             }
-            JobWait::Pending => self
-                .handoff_shell_job(&started.id, native_tasks, result_budget)
-                .map(Some),
+            JobWait::Pending => {
+                if let Some(result) = self
+                    .await_shared_shell_owner(&started.id, result_budget)
+                    .await?
+                {
+                    return Ok(Some(CallToolResponse::Complete(result)));
+                }
+                self.handoff_shell_job(&started.id, native_tasks, result_budget)
+                    .map(Some)
+            }
         }
     }
 
@@ -2564,7 +2637,6 @@ impl LocalMachine {
                         dir: runtime.config.access.relative_display(&working_dir),
                         sandboxed: runtime.config.sandbox_shell,
                         network: runtime.config.allow_network,
-                        timeout_secs,
                     };
                     let completion = LocalMachine::run_shell_job(ShellJobRun {
                         command,
@@ -2897,13 +2969,21 @@ impl LocalMachine {
 
         let (process_exit, mut stop_record, cancel_origin, terminal, terminal_error) = match outcome
         {
-            WaitOutcome::Child(Ok(status)) => (
-                Self::process_exit(status),
-                None,
-                None,
-                JobStatus::Completed,
-                None,
-            ),
+            WaitOutcome::Child(Ok(status)) => {
+                let process_exit = Self::process_exit(status);
+                // The waited command owns the managed process-group/Job-Object
+                // lifetime. Once it exits, surviving managed descendants are
+                // housekeeping only: terminate them immediately without claiming
+                // that dotlink stopped the already-reaped command itself.
+                let cleanup = Self::stop_tree(&mut process_tree, &mut stop_tracker, None);
+                (
+                    process_exit,
+                    Some(cleanup),
+                    None,
+                    JobStatus::Completed,
+                    None,
+                )
+            }
             WaitOutcome::Child(Err(error)) => {
                 let stop = Self::stop_tree(
                     &mut process_tree,
@@ -2966,11 +3046,7 @@ impl LocalMachine {
             task.abort();
         }
 
-        let collect_deadline = if terminal == JobStatus::Completed {
-            deadline
-        } else {
-            Instant::now() + TIMEOUT_OUTPUT_GRACE
-        };
+        let collect_deadline = Instant::now() + POST_STOP_OUTPUT_GRACE;
         let collected = timeout_at(collect_deadline, async {
             let stdout = (&mut stdout_task).await;
             let stderr = (&mut stderr_task).await;
@@ -3099,34 +3175,6 @@ impl LocalMachine {
                     true,
                 )
             }
-            Err(_) if terminal == JobStatus::Completed => {
-                stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
-                Self::cleanup_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    &mut stop_record,
-                    SharedProcessStopReason::RuntimeError,
-                    true,
-                );
-                return JobCompletion::internal_failed(
-                    format!(
-                        "collecting command output timed out after {} seconds",
-                        result_context.timeout_secs
-                    ),
-                    job.shared_node_stream_summary(
-                        coordinate,
-                        crate::jobs::JobStream::Stdout,
-                        true,
-                    ),
-                    job.shared_node_stream_summary(
-                        coordinate,
-                        crate::jobs::JobStream::Stderr,
-                        true,
-                    ),
-                )
-                .with_process_facts(process_exit, stop_record)
-                .with_context(result_context);
-            }
             Err(_) => {
                 stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
                 (
@@ -3147,9 +3195,10 @@ impl LocalMachine {
 
         let completion = match terminal {
             JobStatus::Completed => {
-                // A normal exit may intentionally launch independent background
-                // work. Keep containment armed until all inherited output has
-                // been collected successfully, matching synchronous shell.
+                // Managed descendants were already stopped immediately after the
+                // waited command exited. Disarm only after the bounded pipe drain;
+                // a setsid-style escape may still keep an inherited FD open, in
+                // which case output_complete below is false without changing exit.
                 process_tree.disarm();
                 JobCompletion::completed_with_exit(
                     process_exit,
@@ -3157,6 +3206,7 @@ impl LocalMachine {
                     stdout,
                     stderr,
                 )
+                .with_process_facts(process_exit, stop_record)
                 .with_context(result_context)
             }
             JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)
@@ -4610,6 +4660,10 @@ mod tests {
                     resource_scope: "root".into(),
                     grant_sha256: [4; 32],
                 },
+                issuer: Some(aw_tools::remote_start::RemoteStartIssuer {
+                    client_id: "aw-client".into(),
+                    trust_epoch: 1,
+                }),
                 policy_revision_sha256: [5; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),
@@ -4625,6 +4679,7 @@ mod tests {
             authorization,
             crate::remote_start::ValidationContext {
                 client_id: "aw-client",
+                remote_start_trust_epoch: Some(1),
                 target: &target,
                 generation,
                 now_unix_ms: now,
@@ -4733,6 +4788,10 @@ mod tests {
                     resource_scope: reference.clone(),
                     grant_sha256: [8; 32],
                 },
+                issuer: Some(aw_tools::remote_start::RemoteStartIssuer {
+                    client_id: "aw-client".into(),
+                    trust_epoch: 1,
+                }),
                 policy_revision_sha256: [9; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),
@@ -4748,6 +4807,7 @@ mod tests {
             authorization,
             crate::remote_start::ValidationContext {
                 client_id: "aw-client",
+                remote_start_trust_epoch: Some(1),
                 target: &target,
                 generation,
                 now_unix_ms: now,
@@ -5216,7 +5276,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[cfg(unix)]
     #[tokio::test]
     async fn interactive_process_stdin_advances_revision_and_revocation_fences_before_bytes() {
         let Some(bash) = resolve_executable("bash") else {
@@ -5240,6 +5299,14 @@ mod tests {
                 true,
             )
             .unwrap();
+        assert_eq!(
+            machine
+                .jobs
+                .wait_until_shared_owner_or_terminal(&started.id)
+                .await
+                .unwrap(),
+            SharedOwnerWait::Owned
+        );
         machine.jobs.expose_compatibility(&started.id).unwrap();
 
         let (before, after) = {
@@ -5294,8 +5361,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            revoked.to_string().contains("live stdin is revoked"),
+            revoked.to_string().contains("stdin was not accepted"),
             "{revoked}"
+        );
+        assert_eq!(
+            machine.jobs.standalone_status(&started.id, None).unwrap().0,
+            revoked_rev,
+            "authority rejection must not reserve a Job revision"
         );
 
         machine
@@ -5340,57 +5412,78 @@ mod tests {
         assert!(!data.contains("blocked"), "{data}");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn jobs_read_wait_wakes_on_retained_bytes_without_polling_gap() {
-        let Some(bash) = resolve_executable("bash") else {
-            return;
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let machine = direct_shell_machine(root, bash, 16 * 1024);
-        let started = machine
-            .start_shell_job(
-                ShellArgs {
-                    command: "sleep 0.08; printf delayed".into(),
-                    dir: ".".into(),
-                    stdin: None,
-                    timeout_secs: Some(3),
-                    max_output_bytes: Some(4096),
-                    writes: None,
-                },
+        let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        assert!(manager.bind_policy([9; 32]));
+        let job = manager.create_for_test(30).unwrap();
+        let result_limit = crate::limits::DEFAULT_TRANSFER_BYTES;
+        let writers = job
+            .claim_prepared_shell(
                 aw_tools::filesystem::batch::NodeTool::Bash,
+                serde_json::json!({
+                    "command":"synthetic-output-wait",
+                    "dir":".",
+                    "stdin":null,
+                    "timeout_secs":30,
+                    "max_output_bytes":result_limit
+                }),
                 None,
-                false,
+                result_limit,
+                crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM,
             )
             .unwrap();
-        machine.jobs.expose_compatibility(&started.id).unwrap();
-        let started_wait = Instant::now();
-        let page: Value = serde_json::from_str(
-            &machine
-                .jobs
-                .output_node_page_wait(
-                    &started.id,
-                    crate::jobs::OutputPageRequest {
-                        node: None,
-                        stream: Some(crate::jobs::JobOutputStream::Stdout),
-                        offset: 0,
-                        requested_bytes: raw(4096),
-                        response_ceiling: serialized(16 * 1024),
-                        base64: false,
-                    },
-                    1_000,
-                )
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(started_wait.elapsed() >= Duration::from_millis(40));
+        job.mark_launched().unwrap();
+        manager.expose_compatibility(&job.id).unwrap();
+
+        let jobs = manager.clone();
+        let id = job.id.clone();
+        let waiter = tokio::spawn(async move {
+            jobs.output_node_page_wait(
+                &id,
+                crate::jobs::OutputPageRequest {
+                    node: None,
+                    stream: Some(crate::jobs::JobOutputStream::Stdout),
+                    offset: 0,
+                    requested_bytes: raw(4096),
+                    response_ceiling: serialized(16 * 1024),
+                    base64: false,
+                },
+                1_000,
+            )
+            .await
+            .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "jobs_read must remain pending while no retained bytes or EOF exist"
+        );
+
+        assert_eq!(writers.stdout.append(b"delayed").unwrap(), 7);
+        job.notify_output_changed();
+        let rendered = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("jobs_read woke after retained output")
+            .unwrap();
+        let page: Value = serde_json::from_str(&rendered).unwrap();
         assert!(page["data"].as_str().unwrap().contains("delayed"), "{page}");
+
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                job.shared_stream_summary(crate::jobs::JobStream::Stdout, false),
+                job.shared_stream_summary(crate::jobs::JobStream::Stderr, false),
+            ),
+        );
     }
 
     #[tokio::test]
-    async fn background_job_keeps_containment_until_inherited_pipes_finish() {
+    async fn waited_shell_exit_immediately_ends_managed_background_descendants() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
@@ -5415,6 +5508,7 @@ mod tests {
             .unwrap()
             .id;
 
+        let started_wait = Instant::now();
         let status = loop {
             let status: Value = serde_json::from_str(&machine.jobs.status(&id).unwrap()).unwrap();
             if status["status"] != "working" {
@@ -5422,13 +5516,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_eq!(status["status"], "unknown", "{status}");
-        assert_eq!(status["observed_status"], "failed", "{status}");
+        assert_eq!(status["status"], "completed", "{status}");
+        assert_eq!(status["success"], true, "{status}");
+        assert!(status["error"].is_null(), "{status}");
         assert!(
-            status["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("collecting command output timed out")),
-            "{status}"
+            started_wait.elapsed() < Duration::from_millis(900),
+            "managed descendants must not hold completion to the 1s execution deadline"
         );
         assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
         let partial = machine
@@ -5446,7 +5539,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(
             !marker.exists(),
-            "descendant holding inherited pipes must remain contained through output collection"
+            "managed descendant must be terminated when the waited shell exits"
         );
         machine.jobs.shutdown().await.unwrap();
     }
@@ -6721,7 +6814,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn shell_timeout_includes_output_collection_from_descendants() {
+    async fn successful_shell_does_not_wait_for_background_pipe_to_command_deadline() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
@@ -6776,9 +6869,8 @@ mod tests {
         let result = machine
             .execute_shell(
                 ShellArgs {
-                    // The background process inherits the captured pipes after
-                    // Bash exits, so output collection must share the same
-                    // absolute deadline as the command itself.
+                    // The background process inherits captured pipes, but it is
+                    // still inside the managed group and therefore ends with Bash.
                     command: "sleep 2 & printf done".to_owned(),
                     dir: ".".to_owned(),
                     stdin: None,
@@ -6792,11 +6884,72 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(started.elapsed() < Duration::from_millis(1800));
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "managed background writer must not hold the result to the command deadline"
+        );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(
-            serialized.contains("collecting command output timed out after 1 seconds"),
+            serialized.contains("done"),
             "unexpected shell result: {serialized}"
+        );
+        assert!(
+            !serialized.contains("collecting command output timed out"),
+            "successful top-level exit must not become a collection failure: {serialized}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn setsid_escaped_writer_keeps_exit_factual_and_marks_output_incomplete() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let Some(setsid) = resolve_executable("setsid") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ready = root.join("escaped-ready");
+        let machine = direct_shell_machine(root, bash, 4096);
+        let started = Instant::now();
+        let result = machine
+            .execute_shell(
+                ShellArgs {
+                    command: format!(
+                        r#"'{}' sh -c "touch '{}'; sleep 1" & while [ ! -e '{}' ]; do sleep 0.01; done; printf done"#,
+                        setsid.display(),
+                        ready.display(),
+                        ready.display()
+                    ),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(2),
+                    max_output_bytes: Some(4096),
+                    writes: None,
+                },
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "escaped writer must be bounded by post-exit drain grace, not execution deadline"
+        );
+        let text = &result.content[0].as_text().unwrap().text;
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["exit_code"], 0, "{payload}");
+        assert_eq!(payload["success"], true, "{payload}");
+        assert_eq!(payload["output_complete"], false, "{payload}");
+        assert!(
+            payload["stdout"].as_str().unwrap().contains("done"),
+            "{payload}"
+        );
+        assert!(
+            !text.contains("collecting command output timed out"),
+            "escaped inherited FD must not rewrite the command result: {text}"
         );
     }
 

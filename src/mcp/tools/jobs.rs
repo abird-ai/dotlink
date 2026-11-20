@@ -165,7 +165,7 @@ fn bounded_control_success(
     }
     let meta = result.meta;
     let mut error = tool_error(format!(
-        "{reference} Job Control effect already applied, but its receipt exceeds the response budget; inspect with jobs_get before retrying"
+        "{reference} Job Control effect already applied, but its receipt exceeds the response budget; inspect with jobs_get and do not repeat the control"
     ));
     error.meta = meta;
     error
@@ -256,14 +256,16 @@ fn complete_remote_start_result(
     };
     if let Err(error) = machine.stamp_cached_mcp_receipt(operation, &mut canonical) {
         let fallback = tool_error(format!(
-            "remote Start effect completed but its timestamp receipt could not be finalized: {error}; inspect the Job before retrying"
+            "remote Start effect already crossed its owner boundary, but its timestamp receipt could not be finalized: {error}; inspect the Job and do not repeat the effect"
         ));
         return match guard.mark_ready(RemoteStartReceipt::JobMcp {
             reference: reference.clone(),
             result: fallback.clone(),
         }) {
             Ok(()) => fallback,
-            Err(cache_error) => tool_error(cache_error),
+            Err(cache_error) => tool_error(format!(
+                "remote Start effect already crossed its owner boundary, but its replay receipt could not be committed: {cache_error}; inspect the Job and do not repeat the effect"
+            )),
         };
     }
     match guard.mark_ready(RemoteStartReceipt::JobMcp {
@@ -271,7 +273,9 @@ fn complete_remote_start_result(
         result: canonical.clone(),
     }) {
         Ok(()) => project(canonical),
-        Err(error) => tool_error(error),
+        Err(error) => tool_error(format!(
+            "remote Start effect already crossed its owner boundary, but its replay receipt could not be committed: {error}; inspect the Job and do not repeat the effect"
+        )),
     }
 }
 
@@ -764,10 +768,20 @@ impl LocalMachine {
             .min(self.config.max_output_bytes);
         match self.jobs.standalone_get(id, node, args.rev, wait_ms).await {
             Ok(status) => {
-                match self
-                    .jobs
-                    .standalone_process_tail(id, node, args.tail, status, result_budget)
-                {
+                match self.jobs.standalone_process_tail_fitted(
+                    id,
+                    node,
+                    args.tail,
+                    status,
+                    |candidate| {
+                        result_fits(
+                            self,
+                            aw_tools::OperationId::JobsGet,
+                            &ok_text(candidate.to_owned()),
+                            Some(result_budget),
+                        )
+                    },
+                ) {
                     Ok(status) => bounded_job_status(self, status, Some(result_budget)),
                     Err(error) => tool_error(error),
                 }
@@ -1218,7 +1232,7 @@ impl LocalMachine {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         let result = tool_error(format!(
-                            "cannot render typed Job cancellation receipt: {error:?}"
+                            "Job cancellation was already accepted, but its typed receipt could not be rendered: {error:?}; inspect with jobs_get and do not repeat cancellation"
                         ));
                         return complete_remote_start_result(
                             self,
@@ -1302,6 +1316,68 @@ mod tests {
         SerializedResultBytes::new(bytes).expect("test serialized result budget")
     }
 
+    fn running_shared_process(
+        manager: &crate::jobs::JobManager,
+    ) -> (crate::jobs::JobHandle, crate::jobs::SharedShellWriters) {
+        if manager.policy_fingerprint().is_err() {
+            assert!(manager.bind_policy([9; 32]));
+        }
+        let job = manager.create_for_test(30).unwrap();
+        let result_limit = crate::limits::DEFAULT_TRANSFER_BYTES;
+        let writers = job
+            .claim_prepared_shell(
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                serde_json::json!({
+                    "command":"synthetic-job-control",
+                    "dir":".",
+                    "stdin":null,
+                    "timeout_secs":30,
+                    "max_output_bytes":result_limit
+                }),
+                None,
+                result_limit,
+                crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM,
+            )
+            .unwrap();
+        job.mark_launched().unwrap();
+        manager.expose_compatibility(&job.id).unwrap();
+        (job, writers)
+    }
+
+    fn settle_shared_process(
+        manager: &crate::jobs::JobManager,
+        job: &crate::jobs::JobHandle,
+        writers: &crate::jobs::SharedShellWriters,
+    ) {
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        manager.finish(
+            &job.id,
+            crate::jobs::JobCompletion::completed(
+                Some(0),
+                true,
+                job.shared_stream_summary(crate::jobs::JobStream::Stdout, false),
+                job.shared_stream_summary(crate::jobs::JobStream::Stderr, false),
+            ),
+        );
+    }
+
+    fn process_tail_with_ceiling(
+        machine: &LocalMachine,
+        id: &str,
+        node: Option<usize>,
+        requested: Option<usize>,
+        status: String,
+        response_ceiling: usize,
+    ) -> crate::jobs::JobResult<String> {
+        machine
+            .jobs
+            .standalone_process_tail_fitted(id, node, requested, status, |candidate| {
+                crate::mcp::serialized_json_len(&ok_text(candidate.to_owned()))
+                    .is_some_and(|size| size <= response_ceiling)
+            })
+    }
+
     fn test_toolset(max_output_bytes: usize) -> aw_tools::toolset::Toolset {
         crate::mcp::tools::shared_native::toolset(
             aw_tools::filesystem::schema::SchemaCaps::default(),
@@ -1357,43 +1433,18 @@ mod tests {
         assert_eq!(limit["maximum"], DOTLINK_JOB_PROFILE.list_page_max);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn finite_get_waits_for_process_settlement_even_with_stale_revision() {
-        use aw_tools::filesystem::batch::NodeTool;
+        let manager = crate::jobs::JobManager::new(std::time::Duration::from_secs(60)).unwrap();
+        let (job, writers) = running_shared_process(&manager);
+        assert_eq!(writers.stdout.append(b"early").unwrap(), 5);
+        job.notify_output_changed();
+        let (rev, _) = manager.standalone_status(&job.id, None).unwrap();
 
-        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
-            return;
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let machine = crate::mcp::tools::test_support::test_machine_with_shell(
-            tmp.path().canonicalize().unwrap(),
-            bash,
-        );
-        let started = machine
-            .start_shell_job(
-                crate::mcp::tools::shell::ShellArgs {
-                    command: "printf early; sleep 0.55; printf late".into(),
-                    dir: ".".into(),
-                    stdin: None,
-                    timeout_secs: Some(5),
-                    max_output_bytes: Some(1024),
-                    writes: None,
-                },
-                NodeTool::Bash,
-                None,
-                false,
-            )
-            .unwrap();
-        machine.jobs.expose_compatibility(&started.id).unwrap();
-        let (rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
-
-        // Older implementation treats this stale revision as permission to
-        // return immediately. New contract: settle-or-deadline, regardless of
-        // revision changes, early stdout or shell launch progress.
-        let pending = machine
-            .jobs
-            .standalone_get(&started.id, None, Some(rev.saturating_sub(1)), 40)
+        // A stale observed revision is never permission to return before the
+        // requested settle-or-deadline condition.
+        let pending = manager
+            .standalone_get(&job.id, None, Some(rev.saturating_sub(1)), 40)
             .await
             .unwrap();
         assert!(
@@ -1401,22 +1452,37 @@ mod tests {
             "{pending}"
         );
 
-        let terminal = machine
-            .jobs
-            .standalone_get(&started.id, None, Some(rev.saturating_sub(1)), 1500)
+        let waiting_manager = manager.clone();
+        let waiting_id = job.id.clone();
+        let terminal_wait = tokio::spawn(async move {
+            waiting_manager
+                .standalone_get(&waiting_id, None, Some(rev.saturating_sub(1)), 1_500)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !terminal_wait.is_finished(),
+            "jobs_get must remain pending until settlement even when revision is stale"
+        );
+
+        assert_eq!(writers.stdout.append(b"late").unwrap(), 4);
+        job.notify_output_changed();
+        settle_shared_process(&manager, &job, &writers);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), terminal_wait)
             .await
+            .expect("jobs_get woke after process settlement")
             .unwrap();
         assert!(terminal.contains(" settled "), "{terminal}");
         assert_eq!(
-            machine
-                .jobs
-                .standalone_get(&started.id, None, None, 1500,)
+            manager
+                .standalone_get(&job.id, None, None, 1_500)
                 .await
                 .unwrap(),
             terminal,
             "terminal get must not wait again"
         );
-        machine.jobs.shutdown().await.unwrap();
+        manager.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]
@@ -1448,10 +1514,9 @@ mod tests {
             .await
             .unwrap();
         assert!(first.contains(" settled "), "{first}");
-        let first_tail = machine
-            .jobs
-            .standalone_process_tail(&started.id, Some(1), None, first.clone(), 4096)
-            .unwrap();
+        let first_tail =
+            process_tail_with_ceiling(&machine, &started.id, Some(1), None, first.clone(), 4096)
+                .unwrap();
         assert!(first_tail.contains("stdout [0..5] eof"), "{first_tail}");
         assert!(first_tail.contains("first"), "{first_tail}");
         assert!(
@@ -1476,17 +1541,13 @@ mod tests {
             "root must not be settled while sibling remains active: {root}"
         );
         assert_eq!(
-            machine
-                .jobs
-                .standalone_process_tail(&started.id, None, None, root.clone(), 4096,)
+            process_tail_with_ceiling(&machine, &started.id, None, None, root.clone(), 4096)
                 .unwrap(),
             root,
             "Graph roots do not synthesize Process tails"
         );
         assert!(
-            machine
-                .jobs
-                .standalone_process_tail(&started.id, None, Some(1), root.clone(), 4096,)
+            process_tail_with_ceiling(&machine, &started.id, None, Some(1), root.clone(), 4096,)
                 .is_err(),
             "explicit Graph-root tail must fail rather than guess a node"
         );
@@ -1574,35 +1635,10 @@ mod tests {
         machine.jobs.shutdown().await.unwrap();
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn finite_read_waits_for_new_bytes_and_eof_not_shell_revision() {
-        use aw_tools::filesystem::batch::NodeTool;
-
-        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
-            return;
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let machine = crate::mcp::tools::test_support::test_machine_with_shell(
-            temp.path().canonicalize().unwrap(),
-            bash,
-        );
-        let started = machine
-            .start_shell_job(
-                crate::mcp::tools::shell::ShellArgs {
-                    command: "sleep 0.18; printf first; sleep 0.65; printf second".into(),
-                    dir: ".".into(),
-                    stdin: None,
-                    timeout_secs: Some(5),
-                    max_output_bytes: Some(1024),
-                    writes: None,
-                },
-                NodeTool::Bash,
-                None,
-                false,
-            )
-            .unwrap();
-        machine.jobs.expose_compatibility(&started.id).unwrap();
+        let manager = crate::jobs::JobManager::new(std::time::Duration::from_secs(60)).unwrap();
+        let (job, writers) = running_shared_process(&manager);
         let request = |offset: u64| crate::jobs::OutputPageRequest {
             node: None,
             stream: Some(crate::jobs::JobOutputStream::Stdout),
@@ -1611,22 +1647,32 @@ mod tests {
             response_ceiling: serialized(4096),
             base64: false,
         };
-        let page = machine
-            .jobs
-            .output_node_page_wait(&started.id, request(0), 1500)
+
+        let first_manager = manager.clone();
+        let first_id = job.id.clone();
+        let first_wait = tokio::spawn(async move {
+            first_manager
+                .output_node_page_wait(&first_id, request(0), 1_500)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!first_wait.is_finished());
+        assert_eq!(writers.stdout.append(b"first").unwrap(), 5);
+        job.notify_output_changed();
+        let page = tokio::time::timeout(std::time::Duration::from_secs(2), first_wait)
             .await
+            .expect("jobs_read woke for first retained bytes")
             .unwrap();
         let first: serde_json::Value = serde_json::from_str(&page).unwrap();
         assert_eq!(first["data"], "first", "{first}");
         assert_eq!(first["next_offset"], 5);
-        assert_eq!(first["complete"], false, "first bytes precede process EOF");
+        assert_eq!(first["complete"], false, "first bytes precede writer EOF");
 
-        // A status revision can change (launch/other progress) without
-        // making bytes at offset 5 available. The short deadline returns
-        // an empty running page; it does not consume the Process timeout.
-        let short = machine
-            .jobs
-            .output_node_page_wait(&started.id, request(5), 35)
+        // Job/status revisions are irrelevant to byte availability. With no
+        // new bytes and no EOF, the read waits until its own short deadline.
+        let short = manager
+            .output_node_page_wait(&job.id, request(5), 35)
             .await
             .unwrap();
         let short: serde_json::Value = serde_json::from_str(&short).unwrap();
@@ -1634,19 +1680,41 @@ mod tests {
         assert_eq!(short["next_offset"], 5);
         assert_eq!(short["complete"], false);
 
-        let page = machine
-            .jobs
-            .output_node_page_wait(&started.id, request(5), 1500)
+        let second_manager = manager.clone();
+        let second_id = job.id.clone();
+        let second_wait = tokio::spawn(async move {
+            second_manager
+                .output_node_page_wait(&second_id, request(5), 1_500)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!second_wait.is_finished());
+        assert_eq!(writers.stdout.append(b"second").unwrap(), 6);
+        job.notify_output_changed();
+        let page = tokio::time::timeout(std::time::Duration::from_secs(2), second_wait)
             .await
+            .expect("jobs_read woke for second retained bytes")
             .unwrap();
         let second: serde_json::Value = serde_json::from_str(&page).unwrap();
         assert_eq!(second["data"], "second", "{second}");
         assert_eq!(second["next_offset"], 11);
 
-        let eof = machine
-            .jobs
-            .output_node_page_wait(&started.id, request(11), 1500)
+        let eof_manager = manager.clone();
+        let eof_id = job.id.clone();
+        let eof_wait = tokio::spawn(async move {
+            eof_manager
+                .output_node_page_wait(&eof_id, request(11), 1_500)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!eof_wait.is_finished());
+        writers.stdout.finish().unwrap();
+        job.notify_output_changed();
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(2), eof_wait)
             .await
+            .expect("jobs_read woke for writer EOF")
             .unwrap();
         let eof: serde_json::Value = serde_json::from_str(&eof).unwrap();
         assert_eq!(eof["data"], "", "{eof}");
@@ -1655,12 +1723,24 @@ mod tests {
             eof["complete"], true,
             "writer EOF is the stream completion gate"
         );
+
         // The status projection retains the shared owner ACK watermark.
         let status: serde_json::Value =
-            serde_json::from_str(&machine.jobs.status(&started.id).unwrap()).unwrap();
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
         assert_eq!(status["stdout"]["acknowledged_bytes"], 0);
         assert_eq!(status["stdout"]["released"], false);
-        machine.jobs.shutdown().await.unwrap();
+
+        writers.stderr.finish().unwrap();
+        manager.finish(
+            &job.id,
+            crate::jobs::JobCompletion::completed(
+                Some(0),
+                true,
+                job.shared_stream_summary(crate::jobs::JobStream::Stdout, false),
+                job.shared_stream_summary(crate::jobs::JobStream::Stderr, false),
+            ),
+        );
+        manager.shutdown().await.unwrap();
     }
 
     #[test]
@@ -2053,6 +2133,10 @@ mod tests {
                     resource_scope: "root".into(),
                     grant_sha256: [4; 32],
                 },
+                issuer: Some(aw_tools::remote_start::RemoteStartIssuer {
+                    client_id: "aw-client".into(),
+                    trust_epoch: 1,
+                }),
                 policy_revision_sha256: [5; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),
@@ -2068,6 +2152,7 @@ mod tests {
             authorization,
             crate::remote_start::ValidationContext {
                 client_id: "aw-client",
+                remote_start_trust_epoch: Some(1),
                 target: &target,
                 generation,
                 now_unix_ms: now,
@@ -2201,42 +2286,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn remote_cancel_replay_precedes_revision_recheck() {
-        use aw_tools::{
-            filesystem::batch::NodeTool,
-            remote_start::{
-                REMOTE_START_VERSION, RemoteRuntimeLease, RemoteSessionAction,
-                RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance,
-                RemoteStartSource,
-            },
+        use aw_tools::remote_start::{
+            REMOTE_START_VERSION, RemoteRuntimeLease, RemoteSessionAction,
+            RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance, RemoteStartSource,
         };
 
-        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
-            return;
-        };
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let machine = crate::mcp::tools::test_support::test_machine_with_shell(root, bash);
-        let started = machine
-            .start_shell_job(
-                crate::mcp::tools::shell::ShellArgs {
-                    command: "sleep 30".into(),
-                    dir: ".".into(),
-                    stdin: None,
-                    timeout_secs: Some(30),
-                    max_output_bytes: Some(1024),
-                    writes: None,
-                },
-                NodeTool::Bash,
-                None,
-                false,
-            )
-            .unwrap();
-        machine.jobs.expose_compatibility(&started.id).unwrap();
-        let (initial_rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
-        let reference = format!("j:{}", started.id);
+        let machine =
+            crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
+        let (job, writers) = running_shared_process(&machine.jobs);
+        let (initial_rev, _) = machine.jobs.standalone_status(&job.id, None).unwrap();
+        let reference = format!("j:{}", job.id);
         let raw = serde_json::json!({"ref":reference,"rev":initial_rev});
         let generation = machine.jobs.runtime_generation_fingerprint();
         let now = crate::remote_start::now_unix_ms().unwrap();
@@ -2248,7 +2310,7 @@ mod tests {
                 call_id: "cancel".into(),
                 effect_attempt_id: "cancel".into(),
                 operation: aw_tools::OperationId::JobsCancel.semantic_name().into(),
-                canonical_ref: format!("/d:d/i:i/p:p/a:0/j:{}", started.id),
+                canonical_ref: format!("/d:d/i:i/p:p/a:0/j:{}", job.id),
                 arguments_sha256: crate::remote_start::arguments_sha256(&raw),
                 original_request_sha256: [3; 32],
                 session_action: RemoteSessionAction::Control,
@@ -2270,6 +2332,10 @@ mod tests {
                     resource_scope: "root".into(),
                     grant_sha256: [4; 32],
                 },
+                issuer: Some(aw_tools::remote_start::RemoteStartIssuer {
+                    client_id: "aw-client".into(),
+                    trust_epoch: 1,
+                }),
                 policy_revision_sha256: [5; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),
@@ -2285,6 +2351,7 @@ mod tests {
             authorization,
             crate::remote_start::ValidationContext {
                 client_id: "aw-client",
+                remote_start_trust_epoch: Some(1),
                 target: &target,
                 generation,
                 now_unix_ms: now,
@@ -2312,7 +2379,7 @@ mod tests {
         );
         let first_ts = crate::mcp::stored_receipt_ts(&narrow_first)
             .expect("narrow first cancel response preserves cached receipt timestamp");
-        let (after_rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        let (after_rev, _) = machine.jobs.standalone_status(&job.id, None).unwrap();
         assert_ne!(
             after_rev, initial_rev,
             "first cancellation must advance revision so replay exercises stale-current-state ordering"
@@ -2343,7 +2410,7 @@ mod tests {
         let narrow = machine
             .jobs_cancel_impl(
                 JobsCancelArgs {
-                    reference: format!("j:{}", started.id),
+                    reference: format!("j:{}", job.id),
                     rev: Some(initial_rev),
                 },
                 Some(start.clone()),
@@ -2358,7 +2425,7 @@ mod tests {
         let still_original = machine
             .jobs_cancel_impl(
                 JobsCancelArgs {
-                    reference: format!("j:{}", started.id),
+                    reference: format!("j:{}", job.id),
                     rev: Some(initial_rev),
                 },
                 Some(start),
@@ -2369,7 +2436,19 @@ mod tests {
             still_original, replay,
             "narrow replay must not replace the canonical cached Control result"
         );
-        machine.jobs.wait_until(&started.id, None).await.unwrap();
+
+        // This fixture has no OS runner; terminalize it only for cleanup.
+        // Do not invent a physical signal for the synthetic cancellation.
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        machine.jobs.finish(
+            &job.id,
+            crate::jobs::JobCompletion::cancelled(
+                job.shared_stream_summary(crate::jobs::JobStream::Stdout, false),
+                job.shared_stream_summary(crate::jobs::JobStream::Stderr, false),
+            ),
+        );
+        machine.jobs.wait_until(&job.id, None).await.unwrap();
     }
 
     #[test]

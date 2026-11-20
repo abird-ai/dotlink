@@ -46,16 +46,16 @@ url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 # Exact reviewed shared-runtime revision. Dotlink must remain standalone: no sibling path dependency.
-aw-tools = { git = "https://github.com/abird-ai/aw", rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59", default-features = false, features = ["conformance", "durable"] }
-aw-platform = { git = "https://github.com/abird-ai/aw", rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59", default-features = false }
-aw-mcp-protocol = { git = "https://github.com/abird-ai/aw", rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59", default-features = false }
+aw-tools = { git = "https://github.com/abird-ai/aw", rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b", default-features = false, features = ["conformance", "durable"] }
+aw-platform = { git = "https://github.com/abird-ai/aw", rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b", default-features = false }
+aw-mcp-protocol = { git = "https://github.com/abird-ai/aw", rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-aw-tools-fs-unix = { git = "https://github.com/abird-ai/aw", rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59" }
+aw-tools-fs-unix = { git = "https://github.com/abird-ai/aw", rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b" }
 
 [target.'cfg(windows)'.dependencies]
-aw-tools-fs-win = { git = "https://github.com/abird-ai/aw", rev = "1a5d0f65208e4a05b737c804a55a3aaad3e2fa59" }
+aw-tools-fs-win = { git = "https://github.com/abird-ai/aw", rev = "b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b" }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
 
 [dev-dependencies]

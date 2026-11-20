@@ -1,10 +1,12 @@
 //! Authenticated AW -> dotlink remote-Start bridge primitives.
 //!
 //! A RemoteStartAuthorization is source-fencing evidence, not a dotlink grant.
-//! It is accepted only from an OAuth-authenticated HTTP client, is bound to the
-//! exact live runtime generation and immutable host/profile identity, and is
-//! rechecked against the actual semantic operation/arguments before the existing
-//! JobManager owner may claim it.
+//! It is accepted only from the same OAuth-authenticated client named by the
+//! target-authenticated issuer. A genuinely new claim additionally requires that
+//! client's current explicit AW-bridge trust epoch; exact committed replay is
+//! resolved before that mutable trust check. Target generation, immutable
+//! host/profile identity and exact semantic operation/arguments remain bound to
+//! the authorization before the existing JobManager owner may claim it.
 
 use std::{
     sync::Arc,
@@ -17,7 +19,7 @@ use aw_tools::{
     execution_ref::{ExecutionRef, ExecutionSegment},
     remote_start::{
         MAX_REMOTE_START_LEASE_MILLIS, RemoteRuntimeLease, RemoteSessionAction,
-        RemoteStartAuthorization,
+        RemoteStartAuthorization, RemoteStartIssuer, RemoteStartLease,
     },
 };
 use rmcp::{
@@ -35,6 +37,7 @@ pub(crate) const REMOTE_START_LEASE_MILLIS: u64 = 30_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthenticatedMcpClient {
     client_id: Arc<str>,
+    remote_start_trust_epoch: Option<u64>,
 }
 
 impl AuthenticatedMcpClient {
@@ -44,11 +47,44 @@ impl AuthenticatedMcpClient {
         {
             bail!("invalid authenticated MCP client identity");
         }
-        Ok(Self { client_id })
+        Ok(Self {
+            client_id,
+            remote_start_trust_epoch: None,
+        })
+    }
+
+    pub(crate) fn with_remote_start_trust(
+        client_id: impl Into<Arc<str>>,
+        trust_epoch: u64,
+    ) -> Result<Self> {
+        if trust_epoch == 0 {
+            bail!("invalid remote Start trust epoch");
+        }
+        let mut client = Self::new(client_id)?;
+        client.remote_start_trust_epoch = Some(trust_epoch);
+        Ok(client)
     }
 
     pub(crate) fn id(&self) -> &str {
         self.client_id.as_ref()
+    }
+
+    pub(crate) fn remote_start_trust_epoch(&self) -> Option<u64> {
+        self.remote_start_trust_epoch
+    }
+
+    fn issuer(&self) -> Result<RemoteStartIssuer> {
+        let trust_epoch = self
+            .remote_start_trust_epoch
+            .ok_or_else(|| anyhow!("authenticated MCP client is not trusted as an AW bridge"))?;
+        let issuer = RemoteStartIssuer {
+            client_id: self.id().to_owned(),
+            trust_epoch,
+        };
+        issuer
+            .validate()
+            .map_err(|_| anyhow!("invalid remote Start issuer identity"))?;
+        Ok(issuer)
     }
 }
 
@@ -78,7 +114,11 @@ impl BridgeTarget {
         self.profile.as_ref()
     }
 
-    pub(crate) fn lease(&self, generation: [u8; 32]) -> Result<RemoteRuntimeLease> {
+    pub(crate) fn lease(
+        &self,
+        generation: [u8; 32],
+        client: &AuthenticatedMcpClient,
+    ) -> Result<RemoteStartLease> {
         if generation == [0; 32] {
             bail!("remote bridge runtime generation is unavailable");
         }
@@ -86,16 +126,23 @@ impl BridgeTarget {
         let expires_at_unix_ms = issued_at_unix_ms
             .checked_add(REMOTE_START_LEASE_MILLIS.min(MAX_REMOTE_START_LEASE_MILLIS))
             .ok_or_else(|| anyhow!("remote Start lease timestamp overflow"))?;
-        let lease = RemoteRuntimeLease {
+        let target = RemoteRuntimeLease {
             target_host: self.host().to_owned(),
             target_profile: self.profile().to_owned(),
             generation,
             issued_at_unix_ms,
             expires_at_unix_ms,
         };
-        lease
+        target
             .validate()
             .map_err(|_| anyhow!("invalid remote Start runtime lease"))?;
+        let lease = RemoteStartLease {
+            target,
+            issuer: client.issuer()?,
+        };
+        lease
+            .validate()
+            .map_err(|_| anyhow!("invalid remote Start lease"))?;
         Ok(lease)
     }
 }
@@ -119,6 +166,7 @@ impl StartClass {
 pub(crate) struct ValidatedRemoteStart {
     authorization: RemoteStartAuthorization,
     semantic_hash: [u8; 32],
+    new_claim_authorized: bool,
 }
 
 impl ValidatedRemoteStart {
@@ -143,6 +191,10 @@ impl ValidatedRemoteStart {
 
     pub(crate) fn replay_key(&self) -> String {
         format!("aw-start:{:x}", Sha256::digest(self.claim_key()))
+    }
+
+    pub(crate) fn new_claim_authorized(&self) -> bool {
+        self.new_claim_authorized
     }
 }
 
@@ -220,6 +272,7 @@ fn finite_suffix(reference: &str) -> Result<(String, Option<usize>)> {
 
 pub(crate) struct ValidationContext<'a> {
     pub(crate) client_id: &'a str,
+    pub(crate) remote_start_trust_epoch: Option<u64>,
     pub(crate) target: &'a BridgeTarget,
     pub(crate) generation: [u8; 32],
     pub(crate) now_unix_ms: u64,
@@ -233,7 +286,10 @@ pub(crate) fn validate_authorization(
     authorization: RemoteStartAuthorization,
     request: ValidationContext<'_>,
 ) -> Result<ValidatedRemoteStart> {
-    let client = AuthenticatedMcpClient::new(request.client_id)?;
+    let client = match request.remote_start_trust_epoch {
+        Some(epoch) => AuthenticatedMcpClient::with_remote_start_trust(request.client_id, epoch)?,
+        None => AuthenticatedMcpClient::new(request.client_id)?,
+    };
     authorization
         .validate_for_target(
             request.target.host(),
@@ -249,6 +305,15 @@ pub(crate) fn validate_authorization(
     {
         bail!("remote Start differs from the exact semantic request");
     }
+
+    let issuer =
+        authorization.provenance.issuer.as_ref().ok_or_else(|| {
+            anyhow!("remote Start is missing target-authenticated issuer identity")
+        })?;
+    if issuer.client_id != client.id() {
+        bail!("remote Start issuer differs from authenticated MCP client");
+    }
+    let new_claim_authorized = client.remote_start_trust_epoch() == Some(issuer.trust_epoch);
 
     if let Some(reference) = request.control_ref {
         let (requested_job, requested_node) = finite_suffix(reference)?;
@@ -267,6 +332,7 @@ pub(crate) fn validate_authorization(
     Ok(ValidatedRemoteStart {
         authorization,
         semantic_hash,
+        new_claim_authorized,
     })
 }
 
@@ -287,6 +353,7 @@ pub(crate) fn validate_request(
         authorization,
         ValidationContext {
             client_id: client.id(),
+            remote_start_trust_epoch: client.remote_start_trust_epoch(),
             target,
             generation,
             now_unix_ms: now_unix_ms()?,
@@ -302,7 +369,9 @@ pub(crate) fn validate_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aw_tools::remote_start::{RemoteStartIntent, RemoteStartProvenance, RemoteStartSource};
+    use aw_tools::remote_start::{
+        RemoteStartIntent, RemoteStartIssuer, RemoteStartProvenance, RemoteStartSource,
+    };
 
     fn auth(arguments: &Value, generation: [u8; 32]) -> RemoteStartAuthorization {
         RemoteStartAuthorization::new(
@@ -335,6 +404,10 @@ mod tests {
                     resource_scope: "root".into(),
                     grant_sha256: [5; 32],
                 },
+                issuer: Some(RemoteStartIssuer {
+                    client_id: "client-a".into(),
+                    trust_epoch: 7,
+                }),
                 policy_revision_sha256: [6; 32],
                 policy_admission_id: "policy".into(),
                 session_id: "session".into(),
@@ -367,10 +440,12 @@ mod tests {
         let first = ValidatedRemoteStart {
             semantic_hash: semantic_hash(&authorization, "client-a", OperationId::Bash, &arguments),
             authorization: authorization.clone(),
+            new_claim_authorized: true,
         };
         let second = ValidatedRemoteStart {
             semantic_hash: semantic_hash(&authorization, "client-b", OperationId::Bash, &arguments),
             authorization,
+            new_claim_authorized: true,
         };
         assert_eq!(first.claim_key(), second.claim_key());
         assert_eq!(first.replay_key(), second.replay_key());
@@ -399,6 +474,7 @@ mod tests {
             authorization.clone(),
             ValidationContext {
                 client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
                 target: &target,
                 generation,
                 now_unix_ms: 150,
@@ -415,6 +491,7 @@ mod tests {
                 authorization.clone(),
                 ValidationContext {
                     client_id: "client-a",
+                    remote_start_trust_epoch: Some(7),
                     target: &target,
                     generation: [8; 32],
                     now_unix_ms: 150,
@@ -431,6 +508,7 @@ mod tests {
                 authorization.clone(),
                 ValidationContext {
                     client_id: "client-a",
+                    remote_start_trust_epoch: Some(7),
                     target: &target,
                     generation,
                     now_unix_ms: 201,
@@ -447,6 +525,7 @@ mod tests {
                 authorization.clone(),
                 ValidationContext {
                     client_id: "client-a",
+                    remote_start_trust_epoch: Some(7),
                     target: &target,
                     generation,
                     now_unix_ms: 150,
@@ -464,6 +543,7 @@ mod tests {
                 authorization,
                 ValidationContext {
                     client_id: "client-a",
+                    remote_start_trust_epoch: Some(7),
                     target: &target,
                     generation,
                     now_unix_ms: 150,
@@ -495,6 +575,7 @@ mod tests {
             authorization,
             ValidationContext {
                 client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
                 target: &target,
                 generation,
                 now_unix_ms: now,
@@ -538,6 +619,107 @@ mod tests {
     }
 
     #[test]
+    fn revoked_issuer_blocks_fresh_claim_but_exact_replay_survives() {
+        let arguments = serde_json::json!({"command":"true"});
+        let generation = [9; 32];
+        let now = now_unix_ms().unwrap();
+        let mut authorization = auth(&arguments, generation);
+        authorization.intent.target.issued_at_unix_ms = now;
+        authorization.intent.target.expires_at_unix_ms = now + 5_000;
+        authorization = RemoteStartAuthorization::new(
+            authorization.intent.clone(),
+            authorization.provenance.clone(),
+        )
+        .unwrap();
+        let target = BridgeTarget::new("l5", "default").unwrap();
+        let trusted = validate_authorization(
+            authorization.clone(),
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(trusted.new_claim_authorized());
+
+        let manager = crate::jobs::JobManager::with_spool_limit(
+            std::time::Duration::from_secs(60),
+            crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+        )
+        .unwrap();
+        let guard = match manager.claim_remote_start(&trusted).unwrap() {
+            crate::jobs::RemoteStartDecision::New(guard) => guard,
+            _ => panic!("trusted issuer must create the first claim"),
+        };
+        let receipt = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "j:abc process settled rev=2 outcome=ok",
+        )]);
+        guard
+            .mark_ready(crate::jobs::RemoteStartReceipt::Mcp(receipt.clone()))
+            .unwrap();
+
+        let revoked_replay = validate_authorization(
+            authorization,
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: None,
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(!revoked_replay.new_claim_authorized());
+        assert!(matches!(
+            manager.claim_remote_start(&revoked_replay).unwrap(),
+            crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::Mcp(
+                ref replay
+            )) if *replay == receipt
+        ));
+
+        let mut fresh_intent = revoked_replay.authorization.intent.clone();
+        fresh_intent.effect_attempt_id = "fresh-after-revoke".into();
+        fresh_intent.call_id = "fresh-after-revoke".into();
+        let fresh_authorization = RemoteStartAuthorization::new(
+            fresh_intent,
+            revoked_replay.authorization.provenance.clone(),
+        )
+        .unwrap();
+        let fresh = validate_authorization(
+            fresh_authorization,
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: None,
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(!fresh.new_claim_authorized());
+        let error = match manager.claim_remote_start(&fresh) {
+            Ok(_) => panic!("revoked issuer unexpectedly created a fresh Start claim"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("issuer is not currently trusted"), "{error}");
+    }
+
+    #[test]
     fn old_generation_authorization_is_rejected_after_runtime_restart() {
         let arguments = serde_json::json!({"command":"true"});
         let first = crate::jobs::JobManager::with_spool_limit(
@@ -569,6 +751,7 @@ mod tests {
                 authorization,
                 ValidationContext {
                     client_id: "client-a",
+                    remote_start_trust_epoch: Some(7),
                     target: &target,
                     generation: second_generation,
                     now_unix_ms: now,

@@ -162,6 +162,13 @@ struct RegisteredClient {
     issued_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RemoteStartTrust {
+    epoch: u64,
+    enabled: bool,
+}
+
 #[derive(Clone, Debug)]
 struct PendingClient {
     client: RegisteredClient,
@@ -185,6 +192,8 @@ struct PersistentState {
     owner_password_generations: BTreeMap<String, String>,
     #[serde(default)]
     clients: BTreeMap<String, RegisteredClient>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    remote_start_trust: BTreeMap<String, RemoteStartTrust>,
     #[serde(default)]
     refresh_tokens: BTreeMap<String, RefreshGrant>,
 }
@@ -196,6 +205,7 @@ impl Default for PersistentState {
             owner_password_hash: None,
             owner_password_generations: BTreeMap::new(),
             clients: BTreeMap::new(),
+            remote_start_trust: BTreeMap::new(),
             refresh_tokens: BTreeMap::new(),
         }
     }
@@ -607,6 +617,14 @@ enum ClientIndexLookup {
     Uncertain,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteStartTrustLookup {
+    Trusted(u64),
+    Untrusted,
+    StableUnavailable,
+    Uncertain,
+}
+
 #[derive(Default)]
 struct StateIndex {
     version: Option<StateVersion>,
@@ -614,6 +632,7 @@ struct StateIndex {
     valid: bool,
     refresh_expirations: BTreeMap<String, i64>,
     clients: BTreeMap<String, RegisteredClient>,
+    remote_start_trust: BTreeMap<String, RemoteStartTrust>,
 }
 
 impl StateIndex {
@@ -655,12 +674,14 @@ impl StateIndex {
                     .map(|(hash, grant)| (hash, grant.expires_at))
                     .collect();
                 self.clients = state.clients;
+                self.remote_start_trust = state.remote_start_trust;
                 self.valid = true;
                 StateIndexAvailability::Ready
             }
             Err(error) => {
                 self.refresh_expirations.clear();
                 self.clients.clear();
+                self.remote_start_trust.clear();
                 self.valid = false;
                 tracing::warn!(error = ?error, "cannot load OAuth state index");
                 StateIndexAvailability::StableUnavailable
@@ -694,6 +715,22 @@ impl StateIndex {
                 .unwrap_or(ClientIndexLookup::Absent),
             StateIndexAvailability::StableUnavailable => ClientIndexLookup::StableUnavailable,
             StateIndexAvailability::Uncertain => ClientIndexLookup::Uncertain,
+        }
+    }
+
+    fn remote_start_trust(&mut self, path: &Path, client_id: &str) -> RemoteStartTrustLookup {
+        match self.refresh(path) {
+            StateIndexAvailability::Ready if !self.clients.contains_key(client_id) => {
+                RemoteStartTrustLookup::Untrusted
+            }
+            StateIndexAvailability::Ready => match self.remote_start_trust.get(client_id) {
+                Some(trust) if trust.enabled && trust.epoch != 0 => {
+                    RemoteStartTrustLookup::Trusted(trust.epoch)
+                }
+                _ => RemoteStartTrustLookup::Untrusted,
+            },
+            StateIndexAvailability::StableUnavailable => RemoteStartTrustLookup::StableUnavailable,
+            StateIndexAvailability::Uncertain => RemoteStartTrustLookup::Uncertain,
         }
     }
 }
@@ -1253,6 +1290,36 @@ impl Runtime {
             .map(|pending| client_metadata(&pending.client)))
     }
 
+    fn remote_start_trust_epoch(&self, client_id: &str) -> Result<Option<u64>> {
+        let indexed = crate::blocking::run(|| match self.inner.state_index.try_lock() {
+            Ok(mut index) => index.remote_start_trust(&self.inner.state_path, client_id),
+            Err(std::sync::TryLockError::WouldBlock) => RemoteStartTrustLookup::Uncertain,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                self.inner.state_index.clear_poison();
+                let mut index = error.into_inner();
+                *index = StateIndex::default();
+                index.remote_start_trust(&self.inner.state_path, client_id)
+            }
+        });
+        match indexed {
+            RemoteStartTrustLookup::Trusted(epoch) => Ok(Some(epoch)),
+            RemoteStartTrustLookup::Untrusted => Ok(None),
+            RemoteStartTrustLookup::StableUnavailable => bail!("OAuth state is unavailable"),
+            RemoteStartTrustLookup::Uncertain => crate::blocking::run(|| {
+                read_state(&self.inner.state_path).map(|state| {
+                    if !state.clients.contains_key(client_id) {
+                        return None;
+                    }
+                    state
+                        .remote_start_trust
+                        .get(client_id)
+                        .filter(|trust| trust.enabled && trust.epoch != 0)
+                        .map(|trust| trust.epoch)
+                })
+            }),
+        }
+    }
+
     fn insert_dcr_client(
         &self,
         requester: RequesterId,
@@ -1795,7 +1862,22 @@ impl Server {
             .access_identity(raw, &self.issuer, &self.resource)
         {
             Ok(Some(client_id)) => {
-                let identity = match crate::remote_start::AuthenticatedMcpClient::new(client_id) {
+                let trust_epoch = match self.runtime.remote_start_trust_epoch(&client_id) {
+                    Ok(epoch) => epoch,
+                    Err(error) => {
+                        tracing::warn!(?error, %client_id, "remote Start trust state unavailable; MCP authentication remains valid but issuer authority is disabled");
+                        None
+                    }
+                };
+                let identity = match trust_epoch {
+                    Some(epoch) => {
+                        crate::remote_start::AuthenticatedMcpClient::with_remote_start_trust(
+                            client_id, epoch,
+                        )
+                    }
+                    None => crate::remote_start::AuthenticatedMcpClient::new(client_id),
+                };
+                let identity = match identity {
                     Ok(identity) => identity,
                     Err(_) => return self.unauthorized(true),
                 };
@@ -2014,8 +2096,13 @@ pub fn status(profile: Option<&str>) -> Result<String> {
     let selection = crate::setup::profile_owner_selection(profile)?;
     let selected = selection.revision();
     let owner = active_owner_hash(&state, selected).is_some();
+    let trusted_bridges = state
+        .remote_start_trust
+        .values()
+        .filter(|trust| trust.enabled && trust.epoch != 0)
+        .count();
     Ok(format!(
-        "OAuth state: {}\nOwner credential: {}\nDCR clients: {}\nRefresh grants: {}\n",
+        "OAuth state: {}\nOwner credential: {}\nDCR clients: {}\nTrusted AW bridges: {}\nRefresh grants: {}\n",
         path.display(),
         if owner {
             "configured"
@@ -2023,38 +2110,123 @@ pub fn status(profile: Option<&str>) -> Result<String> {
             "not configured"
         },
         state.clients.len(),
+        trusted_bridges,
         state.refresh_tokens.len()
     ))
 }
 
-fn client_terminal_line(client: &RegisteredClient) -> String {
+fn client_terminal_line(client: &RegisteredClient, trust: Option<RemoteStartTrust>) -> String {
     let client_name = client
         .client_name
         .as_deref()
         .map(sanitize_client_name)
         .unwrap_or_else(|| "[unnamed]".to_owned());
+    let bridge = match trust {
+        Some(trust) if trust.enabled && trust.epoch != 0 => {
+            format!("aw-bridge=trusted(epoch={})", trust.epoch)
+        }
+        _ => "aw-bridge=untrusted".to_owned(),
+    };
     format!(
-        "{}\t{}\t{} redirect URI(s)",
+        "{}\t{}\t{} redirect URI(s)\t{}",
         client.client_id,
         client_name,
-        client.redirect_uris.len()
+        client.redirect_uris.len(),
+        bridge,
     )
 }
 
 pub fn clients(profile: Option<&str>) -> Result<Vec<String>> {
     let state = read_state(&state_path(profile)?)?;
-    Ok(state.clients.values().map(client_terminal_line).collect())
+    Ok(state
+        .clients
+        .values()
+        .map(|client| {
+            client_terminal_line(
+                client,
+                state.remote_start_trust.get(&client.client_id).copied(),
+            )
+        })
+        .collect())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteStartTrustStatus {
+    pub enabled: bool,
+    pub epoch: u64,
+    pub changed: bool,
+}
+
+fn update_remote_start_trust(
+    state: &mut PersistentState,
+    client_id: &str,
+    enabled: bool,
+) -> Result<RemoteStartTrustStatus> {
+    if !state.clients.contains_key(client_id) {
+        bail!("OAuth client {client_id:?} was not found");
+    }
+    match state.remote_start_trust.get_mut(client_id) {
+        None if !enabled => Ok(RemoteStartTrustStatus {
+            enabled: false,
+            epoch: 0,
+            changed: false,
+        }),
+        None => {
+            state.remote_start_trust.insert(
+                client_id.to_owned(),
+                RemoteStartTrust {
+                    epoch: 1,
+                    enabled: true,
+                },
+            );
+            Ok(RemoteStartTrustStatus {
+                enabled: true,
+                epoch: 1,
+                changed: true,
+            })
+        }
+        Some(current) if current.enabled == enabled => Ok(RemoteStartTrustStatus {
+            enabled: current.enabled,
+            epoch: current.epoch,
+            changed: false,
+        }),
+        Some(current) => {
+            current.epoch = current
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("remote Start trust epoch exhausted"))?;
+            current.enabled = enabled;
+            Ok(RemoteStartTrustStatus {
+                enabled,
+                epoch: current.epoch,
+                changed: true,
+            })
+        }
+    }
+}
+
+pub fn set_remote_start_trust(
+    profile: Option<&str>,
+    client_id: &str,
+    enabled: bool,
+) -> Result<RemoteStartTrustStatus> {
+    let path = state_path(profile)?;
+    let (_, status) = update_state(&path, |state| {
+        update_remote_start_trust(state, client_id, enabled)
+    })?;
+    Ok(status)
 }
 
 pub fn revoke_client(profile: Option<&str>, client_id: &str) -> Result<bool> {
     let path = state_path(profile)?;
     let (_, changed) = update_state(&path, |state| {
         let removed_client = state.clients.remove(client_id).is_some();
+        let removed_trust = state.remote_start_trust.remove(client_id).is_some();
         let before = state.refresh_tokens.len();
         state
             .refresh_tokens
             .retain(|_, grant| grant.client_id != client_id);
-        Ok(removed_client || before != state.refresh_tokens.len())
+        Ok(removed_client || removed_trust || before != state.refresh_tokens.len())
     })?;
     Ok(changed)
 }
@@ -3289,6 +3461,14 @@ fn read_state(path: &Path) -> Result<PersistentState> {
             path.display()
         );
     }
+    if state.remote_start_trust.len() > state.clients.len()
+        || state
+            .remote_start_trust
+            .iter()
+            .any(|(client_id, trust)| trust.epoch == 0 || !state.clients.contains_key(client_id))
+    {
+        bail!("invalid Remote Start trust state in {}", path.display());
+    }
     Ok(state)
 }
 
@@ -4348,11 +4528,12 @@ mod tests {
         assert_eq!(persisted.client_name.as_deref(), Some(hostile));
         let metadata_name = client_metadata(&persisted).client_name.unwrap();
         assert_eq!(metadata_name, sanitized);
-        let terminal = client_terminal_line(&persisted);
+        let terminal = client_terminal_line(&persisted, None);
         assert!(terminal.contains("雪 café <owner>"));
         assert!(terminal.contains('\u{fffd}'));
+        assert!(terminal.contains("aw-bridge=untrusted"));
         let terminal_fields = terminal.split('\t').collect::<Vec<_>>();
-        assert_eq!(terminal_fields.len(), 3);
+        assert_eq!(terminal_fields.len(), 4);
         assert!(!terminal_fields[1].chars().any(is_unsafe_client_name_char));
     }
 
@@ -4835,6 +5016,170 @@ mod tests {
             }),
         };
         (runtime, temp)
+    }
+
+    fn test_registered_client(client_id: &str) -> RegisteredClient {
+        RegisteredClient {
+            client_id: client_id.to_owned(),
+            client_name: Some("AW bridge test".into()),
+            redirect_uris: vec!["https://client.example/callback".into()],
+            grant_types: vec!["authorization_code".into()],
+            response_types: vec!["code".into()],
+            token_endpoint_auth_method: "none".into(),
+            issued_at: now(),
+        }
+    }
+
+    #[test]
+    fn remote_start_trust_epoch_is_monotonic_idempotent_and_observed_live() {
+        let (runtime, _temp) = test_runtime("long-enough-owner-password");
+        let client_id = "dcr_aw_bridge";
+        update_state(&runtime.inner.state_path, |state| {
+            state
+                .clients
+                .insert(client_id.into(), test_registered_client(client_id));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(runtime.remote_start_trust_epoch(client_id).unwrap(), None);
+
+        let (_, first) = update_state(&runtime.inner.state_path, |state| {
+            update_remote_start_trust(state, client_id, true)
+        })
+        .unwrap();
+        assert_eq!(
+            first,
+            RemoteStartTrustStatus {
+                enabled: true,
+                epoch: 1,
+                changed: true,
+            }
+        );
+        assert_eq!(
+            runtime.remote_start_trust_epoch(client_id).unwrap(),
+            Some(1)
+        );
+
+        let (_, unchanged) = update_state(&runtime.inner.state_path, |state| {
+            update_remote_start_trust(state, client_id, true)
+        })
+        .unwrap();
+        assert_eq!(unchanged.epoch, 1);
+        assert!(!unchanged.changed);
+
+        let (_, revoked) = update_state(&runtime.inner.state_path, |state| {
+            update_remote_start_trust(state, client_id, false)
+        })
+        .unwrap();
+        assert_eq!(revoked.epoch, 2);
+        assert!(revoked.changed);
+        assert_eq!(runtime.remote_start_trust_epoch(client_id).unwrap(), None);
+
+        let (_, retrusted) = update_state(&runtime.inner.state_path, |state| {
+            update_remote_start_trust(state, client_id, true)
+        })
+        .unwrap();
+        assert_eq!(retrusted.epoch, 3);
+        assert!(retrusted.changed);
+        assert_eq!(
+            runtime.remote_start_trust_epoch(client_id).unwrap(),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_survives_live_remote_start_trust_revocation() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt as _;
+
+        async fn identity_probe(request: Request<Body>) -> Response {
+            let identity = request
+                .extensions()
+                .get::<crate::remote_start::AuthenticatedMcpClient>()
+                .expect("bearer middleware attaches authenticated identity");
+            public_json(json!({
+                "client_id": identity.id(),
+                "remote_start_trust_epoch": identity.remote_start_trust_epoch(),
+            }))
+        }
+
+        let (runtime, _temp) = test_runtime("long-enough-owner-password");
+        let server = Server::new(
+            runtime.clone(),
+            Url::parse("https://mcp.example.com").unwrap(),
+            "/mcp",
+        )
+        .unwrap();
+        let client_id = "dcr_aw_bridge";
+        update_state(&runtime.inner.state_path, |state| {
+            state
+                .clients
+                .insert(client_id.into(), test_registered_client(client_id));
+            update_remote_start_trust(state, client_id, true)?;
+            Ok(())
+        })
+        .unwrap();
+        let (access, _) = runtime
+            .issue_access_and_refresh(
+                client_id,
+                server.issuer(),
+                server.resource(),
+                SCOPE_MCP,
+                false,
+            )
+            .unwrap();
+
+        let app = Router::new()
+            .route("/", get(identity_probe))
+            .layer(middleware::from_fn({
+                let server = server.clone();
+                move |request: Request<Body>, next: Next| {
+                    let server = server.clone();
+                    async move { server.require_bearer(request, next).await }
+                }
+            }));
+        let request = || {
+            Request::builder()
+                .uri("/")
+                .header(AUTHORIZATION, format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let trusted = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(trusted.status(), StatusCode::OK);
+        let trusted = axum::body::to_bytes(trusted.into_body(), 4096)
+            .await
+            .unwrap();
+        let trusted: Value = serde_json::from_slice(&trusted).unwrap();
+        assert_eq!(trusted["client_id"], client_id);
+        assert_eq!(trusted["remote_start_trust_epoch"], 1);
+
+        update_state(&runtime.inner.state_path, |state| {
+            update_remote_start_trust(state, client_id, false)?;
+            Ok(())
+        })
+        .unwrap();
+        let revoked = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let revoked = axum::body::to_bytes(revoked.into_body(), 4096)
+            .await
+            .unwrap();
+        let revoked: Value = serde_json::from_slice(&revoked).unwrap();
+        assert_eq!(revoked["remote_start_trust_epoch"], Value::Null);
+
+        update_state(&runtime.inner.state_path, |state| {
+            update_remote_start_trust(state, client_id, true)?;
+            Ok(())
+        })
+        .unwrap();
+        let retrusted = app.oneshot(request()).await.unwrap();
+        assert_eq!(retrusted.status(), StatusCode::OK);
+        let retrusted = axum::body::to_bytes(retrusted.into_body(), 4096)
+            .await
+            .unwrap();
+        let retrusted: Value = serde_json::from_slice(&retrusted).unwrap();
+        assert_eq!(retrusted["remote_start_trust_epoch"], 3);
     }
 
     #[test]

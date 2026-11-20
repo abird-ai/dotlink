@@ -623,9 +623,7 @@ async fn execute_shell(
             "fail shell timeout is unschedulable",
         );
     };
-    let context = runtime
-        .shell
-        .job_result_context(&working_dir, node.timeout_secs);
+    let context = runtime.shell.job_result_context(&working_dir);
     let completion = LocalMachine::run_shell_job(ShellJobRun {
         command,
         log: runtime.shell.log_config(),
@@ -1656,16 +1654,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn bash() -> PathBuf {
+    fn bash() -> Option<PathBuf> {
         std::env::var_os("AW_BASH")
             .map(PathBuf::from)
-            .or_else(|| {
-                ["/bin/bash", "/usr/bin/bash"]
-                    .iter()
-                    .map(PathBuf::from)
-                    .find(|path| path.is_file())
-            })
-            .expect("Graph shell tests require bash")
+            .filter(|path| path.is_file())
+            .or_else(|| crate::mcp::tools::shell::resolve_executable("bash"))
     }
 
     #[cfg(unix)]
@@ -1674,7 +1667,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         fs::write(root.join("x.txt"), "old").unwrap();
-        let machine = test_support::test_machine_with_shell(root.clone(), bash());
+        let Some(bash) = bash() else {
+            return;
+        };
+        let machine = test_support::test_machine_with_shell(root.clone(), bash);
         let prepared = prepare(
             &machine,
             vec![
@@ -1703,7 +1699,10 @@ mod tests {
     async fn graph_cancel_stops_shell_before_late_side_effect() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let machine = test_support::test_machine_with_shell(root.clone(), bash());
+        let Some(bash) = bash() else {
+            return;
+        };
+        let machine = test_support::test_machine_with_shell(root.clone(), bash);
         let prepared = prepare(
             &machine,
             vec![json!(["bash", {

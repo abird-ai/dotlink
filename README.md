@@ -448,6 +448,8 @@ oauth, default-allow, shell, network
 OAUTH MANAGEMENT
 dotlink oauth status [-p <NAME>]
 dotlink oauth clients [-p <NAME>]
+dotlink oauth trust-aw-bridge [-p <NAME>] <CLIENT_ID>
+dotlink oauth untrust-aw-bridge [-p <NAME>] <CLIENT_ID>
 dotlink oauth revoke [-p <NAME>] <CLIENT_ID>
 dotlink oauth revoke-all [-p <NAME>]
 
@@ -662,11 +664,13 @@ Yes. Claude.ai and other remote MCP clients can use the HTTP/ngrok transport; lo
 
 Profiles live under `~/.config/abird/dotlink/` (or the equivalent XDG config directory). OpenAI Runtime API keys are stored separately from JSONC profiles and are never shown back in plaintext during setup.
 
-OAuth state lives separately under `$XDG_STATE_HOME/abird/dotlink/` (normally `~/.local/state/abird/dotlink/`). dotlink stores only the Argon2id owner-password hash, approved DCR client metadata, and SHA-256 hashes of refresh tokens there; plaintext owner passwords, access tokens, and authorization codes are not persisted.
+OAuth state lives separately under `$XDG_STATE_HOME/abird/dotlink/` (normally `~/.local/state/abird/dotlink/`). dotlink stores only the Argon2id owner-password hash, approved DCR client metadata, per-client AW-bridge trust epochs, and SHA-256 hashes of refresh tokens there; plaintext owner passwords, access tokens, and authorization codes are not persisted.
 
 ### How do I revoke a remote OAuth client?
 
 Use `dotlink oauth clients -p <profile>` to inspect approved DCR clients, then `dotlink oauth revoke -p <profile> <client-id>`. `dotlink oauth revoke-all -p <profile>` revokes all persisted refresh grants. Restart dotlink or press `Ctrl+R` if you also want all currently issued short-lived access tokens invalidated immediately.
+
+AW Remote Start issuance is a separate, narrower capability than ordinary MCP OAuth. Approve the exact DCR client first, then run `dotlink oauth trust-aw-bridge -p <profile> <client-id>`. `untrust-aw-bridge` revokes only new Remote Start issuance while ordinary MCP OAuth continues to work. Trust changes advance a monotonic epoch, so a revoked and later re-trusted client cannot reuse an older lease; exact already-committed Remote Start replay remains factual and does not become a new effect.
 
 ### ChatGPT seems stuck mid-task. Is that dotlink?
 
