@@ -6,11 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Fixed
-
-- macOS no longer logs `cleanup=kill-failed` for an exited shell whose process
-  group has no live members. Unconfirmed cleanup still raises the alarm.
-
 ## [0.17.6] - 2026-11-21
 
 ### Breaking
@@ -58,6 +53,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- macOS no longer logs `cleanup=kill-failed` for an exited shell whose process
+  group has no live members. Darwin refuses a group signal with `EPERM` when the
+  only remaining member is the unreaped leader; that is cleanup with nothing to
+  do, not a refused kill. Unconfirmed cleanup still raises the alarm.
 - A writer holding a pipe open after command exit no longer holds the reply until the
   execution deadline. After a bounded drain, dotlink returns the retained prefix
   with an incomplete-drain flag; it does not promise to terminate an escaped writer.
