@@ -405,8 +405,6 @@ fn stacked_proc_under_root_rw_preserves_the_tree_verdict() {
 #[cfg(windows)]
 #[test]
 fn detached_powershell_counts_real_job_members_not_a_console_host() {
-    use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
     // A quiet, bounded child: its lifetime does not depend on an inherited pipe.
     let child = r#"$p = New-Object System.Diagnostics.ProcessStartInfo
 $p.FileName = (Get-Process -Id $PID).Path
@@ -414,9 +412,10 @@ $p.Arguments = '-NoLogo -NoProfile -NonInteractive -Command "Start-Sleep -Second
 $p.UseShellExecute = $false
 $p.CreateNoWindow = $true
 $null = [System.Diagnostics.Process]::Start($p);"#;
-    // `[Console]::Out` needs a console, and a detached process deliberately has
-    // none, so the liveness signal is a file rather than captured stdout: this test
-    // is about job accounting, not console capture.
+    // The product detaches the interpreter itself; detaching dotlink as well only
+    // changes how the harness reaches it. `[Console]::Out` needs a console the
+    // detached child does not have, so prove liveness with a file: this test is
+    // about job accounting, not console capture.
     for prefix in ["", child] {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
@@ -427,9 +426,7 @@ $null = [System.Diagnostics.Process]::Start($p);"#;
                 marker = marker.display()
             ),
             Mode::Direct,
-            |binary| {
-                binary.creation_flags(DETACHED_PROCESS);
-            },
+            |_| (),
         );
         assert!(!call.is_error);
         assert_eq!(call.payload["exit_code"], 0);
