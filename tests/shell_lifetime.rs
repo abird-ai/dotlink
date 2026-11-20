@@ -415,14 +415,17 @@ $p.UseShellExecute = $false
 $p.CreateNoWindow = $true
 $null = [System.Diagnostics.Process]::Start($p);"#;
     // `[Console]::Out` needs a console, and a detached process deliberately has
-    // none. Write to the redirected standard-output handle, which is what the
-    // product guarantees to capture.
-    let write_ok = r#"$o = [Console]::OpenStandardOutput(); $b = [Text.Encoding]::UTF8.GetBytes('ok'); $o.Write($b, 0, $b.Length); $o.Flush()"#;
+    // none, so the liveness signal is a file rather than captured stdout: this test
+    // is about job accounting, not console capture.
     for prefix in ["", child] {
         let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
         let call = one_call_with(
             dir.path(),
-            &format!("{prefix} {write_ok}; exit 0"),
+            &format!(
+                "{prefix} Set-Content -LiteralPath '{marker}' -Value ran; exit 0",
+                marker = marker.display()
+            ),
             Mode::Direct,
             |binary| {
                 binary.creation_flags(DETACHED_PROCESS);
@@ -430,7 +433,11 @@ $null = [System.Diagnostics.Process]::Start($p);"#;
         );
         assert!(!call.is_error);
         assert_eq!(call.payload["exit_code"], 0);
-        assert_eq!(call.payload["stdout"], "ok");
+        assert!(
+            marker.exists(),
+            "the command must have run: {}",
+            call.payload
+        );
         assert_eq!(call.payload["success"], prefix.is_empty());
         if prefix.is_empty() {
             assert!(call.payload.get("tree").is_none());
