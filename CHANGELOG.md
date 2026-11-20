@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-11-21
+
 ### Breaking
 
 - Bash now runs non-login scripts in both modes: `shopt -q login_shell` is false
@@ -877,7 +879,8 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.4...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.6...HEAD
+[0.17.6]: https://github.com/abird-ai/dotlink/compare/v0.17.5...v0.17.6
 [0.17.5]: https://github.com/abird-ai/dotlink/compare/v0.17.4...v0.17.5
 [0.17.4]: https://github.com/abird-ai/dotlink/compare/v0.17.3...v0.17.4
 [0.17.3]: https://github.com/abird-ai/dotlink/compare/v0.17.2...v0.17.3
