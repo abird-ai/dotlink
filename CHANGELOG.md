@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.8] - 2026-11-21
+
 ### Changed
 
 - A capped runtime (currently the OpenAI tunnel) now caps a command at **1500 s**
