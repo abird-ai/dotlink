@@ -1741,11 +1741,13 @@ impl LocalMachine {
         args: MachineConfig,
         job_root: &Path,
     ) -> Result<PreparedMachine> {
-        let max_shell_timeout_secs = checked_limit(
+        let configured_shell_timeout_secs = checked_limit(
             "max_shell_timeout_secs",
             args.max_shell_timeout_secs,
             MIN_SHELL_TIMEOUT_SECS,
         )?;
+        let max_shell_timeout_secs =
+            tools::shared_native::effective_shell_timeout_ceiling(configured_shell_timeout_secs);
         let max_output_bytes = checked_byte_limit("max_output_bytes", args.max_output_bytes)?;
         let max_read_bytes = checked_byte_limit("max_read_bytes", args.max_read_bytes)?;
         let max_write_bytes = checked_byte_limit("max_write_bytes", args.max_write_bytes)?;

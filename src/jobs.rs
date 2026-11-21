@@ -43,8 +43,8 @@ use aw_tools::filesystem::{
         Snapshot as SharedSnapshot, StartRequest as SharedStartRequest, plan_graph,
     },
     runner::{
-        ProcessExit as SharedProcessExit, ProcessOutputMeta as SharedProcessOutputMeta,
-        ProcessTerminal as SharedProcessTerminal,
+        Occupancy as SharedProcessOccupancy, ProcessExit as SharedProcessExit,
+        ProcessOutputMeta as SharedProcessOutputMeta, ProcessTerminal as SharedProcessTerminal,
     },
     status::Primary as SharedPrimary,
 };
@@ -179,10 +179,9 @@ pub(crate) struct JobResultContext {
 #[derive(Clone, Debug)]
 pub(crate) struct JobCompletion {
     pub(crate) status: JobStatus,
-    /// Physical process exit, independent from product/Job lifecycle status.
-    pub(crate) process_exit: SharedProcessExit,
-    /// Final factual logical stop record, when a process stop sequence occurred.
-    pub(crate) stop_record: Option<SharedProcessStopRecord>,
+    /// Canonical cross-host Process terminal fact. Product/Job status and wire fields
+    /// are projections; spawn failures have no ProcessTerminal because no Process existed.
+    pub(crate) process_terminal: Option<SharedProcessTerminal>,
     /// Product-only provenance for a shared `Cancelled` reason.
     pub(crate) cancel_origin: Option<CancelOrigin>,
     pub(crate) success: bool,
@@ -212,8 +211,7 @@ impl JobCompletion {
     ) -> Self {
         Self {
             status,
-            process_exit: SharedProcessExit::Unknown,
-            stop_record: None,
+            process_terminal: None,
             cancel_origin: None,
             success,
             error,
@@ -252,7 +250,19 @@ impl JobCompletion {
         stderr: StreamSummary,
     ) -> Self {
         let mut completion = Self::base(JobStatus::Completed, success, None, stdout, stderr);
-        completion.process_exit = process_exit;
+        completion.process_terminal = Some(SharedProcessTerminal {
+            exit: process_exit,
+            stop: None,
+            occupancy: SharedProcessOccupancy::Unknown,
+            output: SharedProcessOutputMeta {
+                stdout_bytes: completion.stdout.total_bytes,
+                stderr_bytes: completion.stderr.total_bytes,
+                stdout_truncated: completion.stdout.truncated,
+                stderr_truncated: completion.stderr.truncated,
+                stdout_complete: true,
+                stderr_complete: true,
+            },
+        });
         completion
     }
 
@@ -337,23 +347,37 @@ impl JobCompletion {
         self
     }
 
-    pub(crate) fn with_incomplete_output(mut self) -> Self {
-        self.output_complete = false;
-        self
-    }
-
+    #[cfg(test)]
     pub(crate) fn with_observed_status(mut self, status: JobStatus) -> Self {
         self.observed_status = Some(status);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_process_facts(
         mut self,
         process_exit: SharedProcessExit,
         stop_record: Option<SharedProcessStopRecord>,
     ) -> Self {
-        self.process_exit = process_exit;
-        self.stop_record = stop_record;
+        self.process_terminal = Some(SharedProcessTerminal {
+            exit: process_exit,
+            stop: stop_record,
+            occupancy: SharedProcessOccupancy::Unknown,
+            output: SharedProcessOutputMeta {
+                stdout_bytes: self.stdout.total_bytes,
+                stderr_bytes: self.stderr.total_bytes,
+                stdout_truncated: self.stdout.truncated,
+                stderr_truncated: self.stderr.truncated,
+                stdout_complete: self.output_complete,
+                stderr_complete: self.output_complete,
+            },
+        });
+        self
+    }
+
+    pub(crate) fn with_process_terminal(mut self, terminal: SharedProcessTerminal) -> Self {
+        self.output_complete = terminal.output.complete();
+        self.process_terminal = Some(terminal);
         self
     }
 
@@ -363,22 +387,43 @@ impl JobCompletion {
     }
 
     pub(crate) const fn exit_code(&self) -> Option<i32> {
-        match self.process_exit {
-            SharedProcessExit::Code(code) => Some(code),
-            SharedProcessExit::Signal(_) | SharedProcessExit::Unknown => None,
+        match self.process_terminal {
+            Some(SharedProcessTerminal {
+                exit: SharedProcessExit::Code(code),
+                ..
+            }) => Some(code),
+            _ => None,
         }
     }
 
     pub(crate) const fn signal(&self) -> Option<i32> {
-        match self.process_exit {
-            SharedProcessExit::Signal(signal) => Some(signal),
-            SharedProcessExit::Code(_) | SharedProcessExit::Unknown => None,
+        match self.process_terminal {
+            Some(SharedProcessTerminal {
+                exit: SharedProcessExit::Signal(signal),
+                ..
+            }) => Some(signal),
+            _ => None,
         }
     }
 
-    pub(crate) const fn terminal_stop_reason(&self) -> Option<SharedProcessStopReason> {
-        match self.stop_record {
-            Some(record) => record.terminal_reason(),
+    pub(crate) const fn stop_record(&self) -> Option<SharedProcessStopRecord> {
+        match self.process_terminal {
+            Some(SharedProcessTerminal { stop, .. }) => stop,
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn process_exit(&self) -> SharedProcessExit {
+        match self.process_terminal {
+            Some(SharedProcessTerminal { exit, .. }) => exit,
+            None => SharedProcessExit::Unknown,
+        }
+    }
+
+    pub(crate) const fn process_occupancy(&self) -> Option<SharedProcessOccupancy> {
+        match self.process_terminal {
+            Some(SharedProcessTerminal { occupancy, .. }) => Some(occupancy),
             None => None,
         }
     }
@@ -646,7 +691,7 @@ struct JobEntry {
     /// None for unsandboxed/non-Linux commands and pre-execution failures.
     shell_guard_generation: Option<[u8; 32]>,
     /// Runner-owned live stdin command channels keyed by exact Process/Graph
-    /// coordinate. The ChildStdin itself never leaves the runner.
+    /// coordinate. ChildStdin itself never leaves the shared aw-process owner.
     process_inputs: HashMap<usize, mpsc::Sender<ProcessInputRequest>>,
     /// Legacy/test-only delivery fence for Jobs without a shared output owner.
     /// Shared Jobs keep exact delivery proof in aw-tools.
@@ -1864,6 +1909,7 @@ impl JobHandle {
         self.drain_writers.seal();
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_spool_writers_idle(&self) {
         self.drain_writers.wait_idle().await;
     }
@@ -5547,7 +5593,7 @@ fn tool_result_output(entry: &JobEntry) -> ToolResultOutput {
 }
 
 pub(crate) fn product_stopped_by(completion: &JobCompletion) -> Option<&'static str> {
-    let reason = completion.stop_record?.terminal_reason()?;
+    let reason = completion.stop_record()?.terminal_reason()?;
     Some(match reason {
         SharedProcessStopReason::Timeout => "timeout",
         SharedProcessStopReason::RuntimeError => "failed",
@@ -5563,7 +5609,7 @@ pub(crate) fn product_stopped_by(completion: &JobCompletion) -> Option<&'static 
 pub(crate) fn outside_command_exit_signal(completion: &JobCompletion) -> Option<i32> {
     let signal = completion.signal()?;
     completion
-        .stop_record
+        .stop_record()
         .is_none_or(|record| record.reason.is_none())
         .then_some(signal)
 }
@@ -5599,11 +5645,20 @@ fn with_termination(
     if let Some(stopped_by) = product_stopped_by(completion) {
         payload["stopped_by"] = serde_json::Value::from(stopped_by);
     }
+    match completion.process_occupancy() {
+        None | Some(SharedProcessOccupancy::Empty) => {}
+        Some(SharedProcessOccupancy::Live) => {
+            payload["tree"] = serde_json::Value::from("leftovers");
+        }
+        Some(SharedProcessOccupancy::Unknown) => {
+            payload["tree"] = serde_json::Value::from("unknown");
+        }
+    }
     payload
 }
 
 pub(crate) fn process_lifecycle_message(id: &str, completion: &JobCompletion) -> Option<String> {
-    if let Some(record) = completion.stop_record
+    if let Some(record) = completion.stop_record()
         && let Some(reason) = record.reason
     {
         let reason = match reason {
@@ -6514,18 +6569,21 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
 }
 
 pub(crate) fn shared_process_terminal(completion: &JobCompletion) -> SharedProcessTerminal {
-    let output = SharedProcessOutputMeta {
-        stdout_bytes: completion.stdout.total_bytes,
-        stderr_bytes: completion.stderr.total_bytes,
-        stdout_truncated: completion.stdout.truncated,
-        stderr_truncated: completion.stderr.truncated,
-        complete: completion.output_complete,
-    };
-    SharedProcessTerminal {
-        exit: completion.process_exit,
-        stop: completion.terminal_stop_reason(),
-        output,
-    }
+    completion
+        .process_terminal
+        .unwrap_or(SharedProcessTerminal {
+            exit: SharedProcessExit::Unknown,
+            stop: None,
+            occupancy: SharedProcessOccupancy::Unknown,
+            output: SharedProcessOutputMeta {
+                stdout_bytes: completion.stdout.total_bytes,
+                stderr_bytes: completion.stderr.total_bytes,
+                stdout_truncated: completion.stdout.truncated,
+                stderr_truncated: completion.stderr.truncated,
+                stdout_complete: completion.output_complete,
+                stderr_complete: completion.output_complete,
+            },
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7782,8 +7840,8 @@ mod tests {
         );
         assert_eq!(completion.status, JobStatus::Unknown);
         assert!(!completion.success);
-        assert_eq!(completion.process_exit, SharedProcessExit::Unknown);
-        assert_eq!(completion.stop_record, None);
+        assert_eq!(completion.process_exit(), SharedProcessExit::Unknown);
+        assert_eq!(completion.stop_record(), None);
         assert!(completion.internal_error.is_none());
         assert_eq!(completion.stdout.stored_bytes, 7);
         assert_eq!(
@@ -7809,7 +7867,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&skipped);
         assert_eq!(completion.status, JobStatus::Failed);
         assert!(!completion.success);
-        assert_eq!(completion.stop_record, None);
+        assert_eq!(completion.stop_record(), None);
 
         let cancelled = SharedSnapshot {
             id: "cancelled".into(),
@@ -7819,7 +7877,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&cancelled);
         assert_eq!(completion.status, JobStatus::Cancelled);
         assert!(!completion.success);
-        assert_eq!(completion.stop_record, None);
+        assert_eq!(completion.stop_record(), None);
 
         let cancelled_unknown = SharedSnapshot {
             id: "cancelled-unknown".into(),
@@ -7829,7 +7887,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&cancelled_unknown);
         assert_eq!(completion.status, JobStatus::Unknown);
         assert!(!completion.success);
-        assert_eq!(completion.stop_record, None);
+        assert_eq!(completion.stop_record(), None);
 
         let journal_unknown = SharedSnapshot {
             id: "journal-unknown".into(),
@@ -7840,7 +7898,7 @@ mod tests {
         let completion = JobCompletion::from_shared_graph(&journal_unknown);
         assert_eq!(completion.status, JobStatus::Unknown);
         assert!(!completion.success);
-        assert_eq!(completion.stop_record, None);
+        assert_eq!(completion.stop_record(), None);
     }
 
     #[test]
@@ -7936,8 +7994,10 @@ mod tests {
             let terminal = SharedProcessTerminal {
                 exit,
                 stop: None,
+                occupancy: SharedProcessOccupancy::Unknown,
                 output: SharedProcessOutputMeta {
-                    complete: false,
+                    stdout_complete: false,
+                    stderr_complete: false,
                     ..Default::default()
                 },
             };
@@ -7949,9 +8009,13 @@ mod tests {
 
         let stopped = SharedProcessTerminal {
             exit: SharedProcessExit::Code(0),
-            stop: Some(SharedProcessStopReason::Cancelled),
+            stop: Some(SharedProcessStopRecord::stopped(
+                SharedProcessStopReason::Cancelled,
+            )),
+            occupancy: SharedProcessOccupancy::Unknown,
             output: SharedProcessOutputMeta {
-                complete: false,
+                stdout_complete: false,
+                stderr_complete: false,
                 ..Default::default()
             },
         };
@@ -7961,7 +8025,7 @@ mod tests {
     }
 
     #[test]
-    fn unproven_cancel_or_timeout_maps_to_shared_unknown() {
+    fn unproven_cancel_or_timeout_preserves_reason_as_fail_incomplete() {
         for (completion, reason) in [
             (
                 JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default()),
@@ -7978,8 +8042,12 @@ mod tests {
             );
             let terminal = shared_process_terminal(&completion);
             assert_eq!(terminal.exit, SharedProcessExit::Unknown);
-            assert_eq!(terminal.stop, None);
-            assert_eq!(terminal.status().primary, SharedPrimary::Unknown);
+            assert_eq!(
+                terminal.stop,
+                Some(SharedProcessStopRecord::unknown(reason))
+            );
+            assert_eq!(terminal.status().primary, SharedPrimary::Fail);
+            assert!(terminal.status().incomplete);
         }
     }
 

@@ -12,10 +12,12 @@ use std::{
 use anyhow::{Context, Result};
 use aw_tools::{
     execution_stop::{
-        StopEvidence as SharedStopEvidence, StopReason as SharedProcessStopReason,
-        StopRecord as SharedProcessStopRecord, StopTracker as SharedStopTracker,
+        StopReason as SharedProcessStopReason, StopRecord as SharedProcessStopRecord,
     },
-    filesystem::runner::ProcessExit as SharedProcessExit,
+    filesystem::runner::{
+        Occupancy as SharedProcessOccupancy, ProcessExit as SharedProcessExit,
+        ProcessOutputMeta as SharedProcessOutputMeta, ProcessTerminal as SharedProcessTerminal,
+    },
 };
 use rmcp::{
     ErrorData as McpError,
@@ -30,11 +32,13 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt},
     process::Command,
-    time::{Instant, sleep_until, timeout_at},
+    time::Instant,
 };
-use tokio_util::{sync::CancellationToken as DrainStop, task::AbortOnDropHandle};
+#[cfg(test)]
+use tokio_util::sync::CancellationToken as DrainStop;
+use tokio_util::task::AbortOnDropHandle;
 
 use super::{
     LocalMachine, RequestProgress, await_with_request_progress, dot, ok_text, resolve_capped,
@@ -46,7 +50,7 @@ use crate::mcp::{
 };
 use crate::{
     jobs::{
-        JobCompletion, JobDisposition, JobHandle, JobHandoff, JobResultContext, JobStatus, JobWait,
+        JobCompletion, JobDisposition, JobHandle, JobHandoff, JobResultContext, JobWait,
         ProcessInput, ProcessInputAuthority, ProcessInputRequest, RemoteStartDecision,
         RemoteStartReceipt, SharedOwnerWait, SharedShellWriters, SpoolWriterGuard, StreamSummary,
     },
@@ -149,10 +153,6 @@ impl ShellCallArgs {
     }
 }
 
-/// Bounded output-quiescence window after the waited command has settled.
-/// This is independent from the command execution deadline: managed descendants
-/// are stopped first, then already-produced pipe data gets this short drain grace.
-const POST_STOP_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const DEFAULT_SHELL_OUTPUT_BYTES: usize = 256 * 1024;
 
 fn shell_timeout_description(max_secs: u64) -> String {
@@ -204,114 +204,115 @@ pub(crate) fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usiz
     tool
 }
 
-/// Drain a long-running job stream directly into its private spool file. The
-/// stored prefix is bounded independently of response paging, while the pipe is
-/// always fully drained so a noisy child can never deadlock on a full pipe.
+#[cfg(test)]
 async fn stop_and_quiesce_spool_tasks(job: &JobHandle, stop: &DrainStop) {
-    // Seal registration first, then wake both drain loops. Dropping a read future
-    // because the process tree was intentionally stopped is not a spool I/O
-    // failure: the retained prefix remains trustworthy but incomplete.
     job.seal_spool_writers();
     stop.cancel();
     job.wait_spool_writers_idle().await;
 }
 
-struct SharedDrainWriter {
+/// Product-owned retained-output adapter for the shared Process runtime.
+/// Pipe reads, bounded batching and drain deadlines live in `aw-process`; this
+/// edge owns only the existing Job output writer, notification and drain lease.
+struct SharedProcessOutputSink {
     writer: aw_tools::filesystem::job_manager::OutputWriter,
     _lifetime: SpoolWriterGuard,
+    job: JobHandle,
     finished: bool,
 }
 
-impl SharedDrainWriter {
+impl SharedProcessOutputSink {
     fn new(
         writer: aw_tools::filesystem::job_manager::OutputWriter,
         lifetime: SpoolWriterGuard,
+        job: JobHandle,
     ) -> Self {
         Self {
             writer,
             _lifetime: lifetime,
+            job,
             finished: false,
         }
     }
 
-    fn fail(&mut self) {
-        let _ = self.writer.mark_failed();
+    fn changed(&self) {
+        self.job.notify_output_changed();
+    }
+}
+
+impl aw_process::OutputSink for SharedProcessOutputSink {
+    fn discard_if_full(&mut self, seen: u64) -> Result<bool, aw_process::SinkError> {
+        let discarded = self
+            .writer
+            .discard_if_full(seen)
+            .map_err(|_| aw_process::SinkError)?;
+        if discarded {
+            self.changed();
+        }
+        Ok(discarded)
     }
 
-    fn finish(&mut self) -> std::io::Result<()> {
-        let result = self.writer.finish().map_err(|error| {
-            std::io::Error::other(format!("shared output finish failed: {error:?}"))
-        });
+    fn append(&mut self, bytes: &[u8]) -> Result<usize, aw_process::SinkError> {
+        let written = self
+            .writer
+            .append(bytes)
+            .map_err(|_| aw_process::SinkError)?;
+        self.changed();
+        Ok(written)
+    }
+
+    fn observe_after_failure(&mut self, seen: u64) -> Result<(), aw_process::SinkError> {
+        self.writer
+            .observe_after_failure(seen)
+            .map_err(|_| aw_process::SinkError)?;
+        self.changed();
+        Ok(())
+    }
+
+    fn mark_failed(&mut self) {
+        let _ = self.writer.mark_failed();
+        self.changed();
+    }
+
+    fn finish(&mut self) -> Result<(), aw_process::SinkError> {
+        let result = self.writer.finish().map_err(|_| aw_process::SinkError);
         self.finished = true;
+        self.changed();
         result
     }
 }
 
-impl Drop for SharedDrainWriter {
+impl Drop for SharedProcessOutputSink {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.writer.mark_failed();
+            // Dropping before pipe ownership begins (for example a definite
+            // spawn failure) is not an output-write failure. The shared
+            // Process runtime calls mark_failed explicitly for real sink/read
+            // failures before finishing the writer.
             let _ = self.writer.finish();
             self.finished = true;
+            self.changed();
         }
     }
 }
 
-async fn spool_shared_job_output<R>(
-    mut reader: R,
-    writer: aw_tools::filesystem::job_manager::OutputWriter,
-    writer_guard: SpoolWriterGuard,
-    job: JobHandle,
-    stop: DrainStop,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut sink = SharedDrainWriter::new(writer, writer_guard);
-    let mut buffer = [0_u8; 16 * 1024];
-    let mut failed: Option<std::io::Error> = None;
-    loop {
-        let read = tokio::select! {
-            biased;
-            _ = stop.cancelled() => {
-                let finish = sink.finish();
-                if let Some(error) = failed {
-                    return Err(error);
-                }
-                return finish;
-            }
-            read = reader.read(&mut buffer) => match read {
-                Ok(read) => read,
-                Err(error) => {
-                    sink.fail();
-                    let _ = sink.finish();
-                    return Err(error);
-                }
-            }
-        };
-        if read == 0 {
+async fn forward_process_input(
+    mut receiver: tokio::sync::mpsc::Receiver<ProcessInputRequest>,
+    input: aw_process::ProcessInput,
+) {
+    while let Some(request) = receiver.recv().await {
+        let eof = matches!(request.input, ProcessInput::Eof);
+        let result = match request.input {
+            ProcessInput::Text(bytes) => input.write(bytes).await,
+            ProcessInput::Eof => input.close().await,
+        }
+        .map_err(|error| error.to_string());
+        let failed = result.is_err();
+        let _ = request.response.send(result);
+        if failed || eof {
             break;
         }
-        if failed.is_some() {
-            let observed = u64::try_from(read).unwrap_or(u64::MAX);
-            let _ = sink.writer.observe_after_failure(observed);
-            continue;
-        }
-        if let Err(error) = crate::blocking::run(|| sink.writer.append(&buffer[..read])) {
-            sink.fail();
-            failed = Some(std::io::Error::other(format!(
-                "shared output append failed: {error:?}"
-            )));
-        } else {
-            job.notify_output_changed();
-        }
     }
-    let finish = sink.finish();
-    job.notify_output_changed();
-    if let Some(error) = failed {
-        return Err(error);
-    }
-    finish
 }
 
 #[cfg(test)]
@@ -1961,7 +1962,7 @@ impl ShellRuntime {
             .arg(shell.path())
             .arg("--noprofile")
             .arg("--norc")
-            .arg("-lc")
+            .arg("-c")
             .arg(script);
 
         if !mount_fds.is_empty() {
@@ -2623,16 +2624,7 @@ impl LocalMachine {
                             );
                         }
                     };
-                    crate::shell_process::configure(&mut command);
-                    crate::credentials::hide_from_child(&mut command)
-                        .stdin(if args.stdin.is_some() || interactive {
-                            Stdio::piped()
-                        } else {
-                            Stdio::null()
-                        })
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .kill_on_drop(true);
+                    crate::credentials::hide_from_child(&mut command);
                     let result_context = JobResultContext {
                         dir: runtime.config.access.relative_display(&working_dir),
                         sandboxed: runtime.config.sandbox_shell,
@@ -2658,54 +2650,99 @@ impl LocalMachine {
         })
     }
 
-    fn process_exit(status: std::process::ExitStatus) -> SharedProcessExit {
-        if let Some(code) = status.code() {
-            SharedProcessExit::Code(code)
-        } else if let Some(signal) = aw_platform::exit_signal(&status) {
-            SharedProcessExit::Signal(signal)
-        } else {
-            SharedProcessExit::Unknown
+    fn process_stream_summaries(
+        job: &JobHandle,
+        coordinate: usize,
+        force_truncated: bool,
+    ) -> (StreamSummary, StreamSummary) {
+        (
+            job.shared_node_stream_summary(
+                coordinate,
+                crate::jobs::JobStream::Stdout,
+                force_truncated,
+            ),
+            job.shared_node_stream_summary(
+                coordinate,
+                crate::jobs::JobStream::Stderr,
+                force_truncated,
+            ),
+        )
+    }
+
+    fn uncertain_process_terminal(
+        stdout: StreamSummary,
+        stderr: StreamSummary,
+        reason: SharedProcessStopReason,
+    ) -> SharedProcessTerminal {
+        SharedProcessTerminal {
+            exit: SharedProcessExit::Unknown,
+            stop: Some(SharedProcessStopRecord::unknown(reason)),
+            occupancy: SharedProcessOccupancy::Unknown,
+            output: SharedProcessOutputMeta {
+                stdout_bytes: stdout.total_bytes,
+                stderr_bytes: stderr.total_bytes,
+                stdout_truncated: stdout.truncated,
+                stderr_truncated: stderr.truncated,
+                stdout_complete: false,
+                stderr_complete: false,
+            },
         }
     }
 
-    fn stop_evidence(result: std::io::Result<bool>) -> SharedStopEvidence {
-        match result {
-            Ok(true) => SharedStopEvidence::Stopped,
-            Ok(false) => SharedStopEvidence::NoTarget,
-            Err(_) => SharedStopEvidence::Unknown,
+    async fn stop_or_wait_process(
+        mut process: aw_process::Process,
+        reason: SharedProcessStopReason,
+        deadline: Instant,
+    ) -> aw_process::ProcessResult {
+        match process.stop_with(reason).await {
+            Ok(result) => result,
+            Err(_) => {
+                process
+                    .wait(
+                        std::future::pending::<()>(),
+                        deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .await
+            }
         }
     }
 
-    fn stop_tree(
-        tree: &mut aw_platform::ManagedProcessGuard,
-        tracker: &mut SharedStopTracker,
-        reason: Option<SharedProcessStopReason>,
-    ) -> SharedProcessStopRecord {
-        tracker.record(reason, Self::stop_evidence(tree.terminate()))
-    }
-
-    fn merge_stop_record(
-        current: &mut Option<SharedProcessStopRecord>,
-        record: SharedProcessStopRecord,
-    ) {
-        if current.is_none() || record.reason.is_some() {
-            *current = Some(record);
-        }
-    }
-
-    fn cleanup_tree(
-        tree: &mut aw_platform::ManagedProcessGuard,
-        tracker: &mut SharedStopTracker,
-        current: &mut Option<SharedProcessStopRecord>,
-        reason_if_live: SharedProcessStopReason,
-        command_exited: bool,
-    ) {
-        // Once the waited command has exited, descendant/output cleanup is
-        // housekeeping only. If a prior stop attempt was Unknown, StopTracker
-        // still carries its original semantic reason into this retry.
-        let reason = (current.is_none() && !command_exited).then_some(reason_if_live);
-        let record = Self::stop_tree(tree, tracker, reason);
-        Self::merge_stop_record(current, record);
+    fn completion_from_terminal(
+        terminal: SharedProcessTerminal,
+        stdout: StreamSummary,
+        stderr: StreamSummary,
+        runtime_error: Option<String>,
+        cancel_origin: crate::jobs::CancelOrigin,
+        result_context: JobResultContext,
+    ) -> JobCompletion {
+        let reason = terminal.stop.and_then(|record| record.reason);
+        let success = terminal.exit == SharedProcessExit::Code(0)
+            && terminal.occupancy != SharedProcessOccupancy::Live;
+        let completion = match reason {
+            Some(SharedProcessStopReason::Timeout) => JobCompletion::timed_out(stdout, stderr),
+            Some(SharedProcessStopReason::Cancelled) => {
+                JobCompletion::cancelled(stdout, stderr).with_cancel_origin(cancel_origin)
+            }
+            Some(SharedProcessStopReason::RuntimeError) => JobCompletion::failed_with_output(
+                runtime_error.unwrap_or_else(|| "shell process runtime failed".to_owned()),
+                stdout,
+                stderr,
+            ),
+            None => match terminal.exit {
+                SharedProcessExit::Unknown => JobCompletion::unknown_with_output(
+                    runtime_error.unwrap_or_else(|| {
+                        "shell terminal outcome is uncertain; inspect effects before retrying"
+                            .to_owned()
+                    }),
+                    stdout,
+                    stderr,
+                ),
+                exit => JobCompletion::completed_with_exit(exit, success, stdout, stderr),
+            },
+        };
+        completion
+            .with_process_terminal(terminal)
+            .with_context(result_context)
     }
 
     pub(crate) async fn run_shell_job(run: ShellJobRun) -> JobCompletion {
@@ -2718,7 +2755,7 @@ impl LocalMachine {
 
     async fn run_shell_job_inner(run: ShellJobRun) -> JobCompletion {
         let ShellJobRun {
-            mut command,
+            command,
             log: _,
             stdin_text,
             interactive,
@@ -2729,6 +2766,7 @@ impl LocalMachine {
             shared_writers,
             result_context,
         } = run;
+
         if job.cancel.is_cancelled() {
             job.settle_node_unlaunched(coordinate);
             return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
@@ -2739,7 +2777,25 @@ impl LocalMachine {
             return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
                 .with_context(result_context);
         }
+
+        // Reserve exactly the two product drain leases before the Start
+        // checkpoint. Once reserved, seal registration: no later output writer
+        // may appear after the external effect begins.
+        let Some([stdout_guard, stderr_guard]) = job.begin_spool_writers() else {
+            let _ = shared_writers.stdout.finish();
+            let _ = shared_writers.stderr.finish();
+            job.settle_node_unlaunched(coordinate);
+            return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_cancel_origin(crate::jobs::CancelOrigin::Connector)
+                .with_context(result_context);
+        };
+        job.seal_spool_writers();
+
         if let Err(error) = job.mark_node_launched(coordinate) {
+            let _ = shared_writers.stdout.finish();
+            let _ = shared_writers.stderr.finish();
+            drop(stdout_guard);
+            drop(stderr_guard);
             return JobCompletion::internal_failed(
                 format!("shared shell start checkpoint failed before process launch: {error}"),
                 StreamSummary::default(),
@@ -2747,511 +2803,182 @@ impl LocalMachine {
             )
             .with_context(result_context);
         }
-        if job.cancel.is_cancelled() {
-            let _ = shared_writers.stdout.finish();
-            let _ = shared_writers.stderr.finish();
-            return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
-                .with_context(result_context);
-        }
-        if Instant::now() >= deadline {
-            let _ = shared_writers.stdout.finish();
-            let _ = shared_writers.stderr.finish();
-            return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
-                .with_context(result_context);
-        }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = shared_writers.stdout.finish();
-                let _ = shared_writers.stderr.finish();
+
+        let stdout_sink =
+            SharedProcessOutputSink::new(shared_writers.stdout, stdout_guard, job.clone());
+        let stderr_sink =
+            SharedProcessOutputSink::new(shared_writers.stderr, stderr_guard, job.clone());
+        let stdin_open = stdin_text.is_some() || interactive;
+        let mut process = match aw_process::Process::spawn(
+            command,
+            aw_process::SpawnOptions {
+                stdin_open,
+                stdout: Some(Box::new(stdout_sink)),
+                stderr: Some(Box::new(stderr_sink)),
+                event_sink: None,
+            },
+        ) {
+            Ok(process) => process,
+            Err(aw_process::Error::Io(error)) => {
                 return JobCompletion::spawn_failed(error.to_string()).with_context(result_context);
             }
-        };
-        let mut process_tree = match crate::shell_process::attach(&child) {
-            Ok(group) => group,
             Err(error) => {
-                let process_exit = Self::terminate_child(&mut child).await;
-                return JobCompletion::failed(format!("could not contain command tree: {error}"))
-                    .with_process_facts(
-                        process_exit,
-                        Some(SharedProcessStopRecord::unknown(
-                            SharedProcessStopReason::RuntimeError,
-                        )),
-                    )
-                    .with_context(result_context);
-            }
-        };
-        let mut stop_tracker = SharedStopTracker::default();
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let stop = Self::stop_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    Some(SharedProcessStopReason::RuntimeError),
-                );
-                let process_exit = Self::terminate_child(&mut child).await;
-                return JobCompletion::failed("failed to capture child stdout")
-                    .with_process_facts(process_exit, Some(stop))
-                    .with_context(result_context);
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                let stop = Self::stop_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    Some(SharedProcessStopReason::RuntimeError),
-                );
-                let process_exit = Self::terminate_child(&mut child).await;
-                return JobCompletion::failed("failed to capture child stderr")
-                    .with_process_facts(process_exit, Some(stop))
-                    .with_context(result_context);
-            }
-        };
-        let Some([stdout_writer, stderr_writer]) = job.begin_spool_writers() else {
-            // Only connector teardown seals writer registration. A caller cancel
-            // sets the token but leaves the drain account open.
-            let stop = Self::stop_tree(
-                &mut process_tree,
-                &mut stop_tracker,
-                Some(SharedProcessStopReason::Cancelled),
-            );
-            let process_exit = Self::terminate_child(&mut child).await;
-            return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
-                .with_process_facts(process_exit, Some(stop))
-                .with_cancel_origin(crate::jobs::CancelOrigin::Connector)
-                .with_incomplete_output()
-                .with_context(result_context);
-        };
-        let drain_stop = DrainStop::new();
-        let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_shared_job_output(
-            stdout,
-            shared_writers.stdout,
-            stdout_writer,
-            job.clone(),
-            drain_stop.clone(),
-        )));
-        let mut stderr_task = AbortOnDropHandle::new(tokio::spawn(spool_shared_job_output(
-            stderr,
-            shared_writers.stderr,
-            stderr_writer,
-            job.clone(),
-            drain_stop.clone(),
-        )));
-
-        let mut stdin_task = if stdin_text.is_some() || interactive {
-            let Some(stdin) = child.stdin.take() else {
-                let stop = Self::stop_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    Some(SharedProcessStopReason::RuntimeError),
-                );
-                let process_exit = Self::terminate_child(&mut child).await;
-                stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
-                return JobCompletion::failed("failed to capture child stdin")
-                    .with_process_facts(process_exit, Some(stop))
-                    .with_context(result_context);
-            };
-            if interactive {
-                let (sender, mut receiver) = tokio::sync::mpsc::channel::<ProcessInputRequest>(16);
-                if let Err(error) = job.install_process_input(coordinate, sender) {
-                    let stop = Self::stop_tree(
-                        &mut process_tree,
-                        &mut stop_tracker,
-                        Some(SharedProcessStopReason::RuntimeError),
-                    );
-                    let process_exit = Self::terminate_child(&mut child).await;
-                    stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
-                    return JobCompletion::failed(format!(
-                        "failed to retain interactive stdin custody: {error}"
-                    ))
-                    .with_process_facts(process_exit, Some(stop))
-                    .with_context(result_context);
-                }
-                Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                    let mut stdin = Some(stdin);
-                    if let Some(initial) = stdin_text
-                        && let Some(writer) = stdin.as_mut()
-                    {
-                        match writer.write_all(initial.as_bytes()).await {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                                stdin.take();
-                                return Ok::<(), String>(());
-                            }
-                            Err(error) => {
-                                return Err(format!("failed writing initial stdin: {error}"));
-                            }
-                        }
-                    }
-                    while let Some(request) = receiver.recv().await {
-                        let result = match request.input {
-                            ProcessInput::Text(bytes) => match stdin.as_mut() {
-                                Some(writer) => writer
-                                    .write_all(&bytes)
-                                    .await
-                                    .map_err(|error| format!("failed writing stdin: {error}")),
-                                None => Err("Process stdin is already closed".to_owned()),
-                            },
-                            ProcessInput::Eof => {
-                                stdin.take();
-                                Ok(())
-                            }
-                        };
-                        let eof = stdin.is_none();
-                        let _ = request.response.send(result.clone());
-                        if result.is_err() || eof {
-                            break;
-                        }
-                    }
-                    Ok::<(), String>(())
-                })))
-            } else {
-                Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                    let mut stdin = stdin;
-                    let Some(initial) = stdin_text else {
-                        return Ok::<(), String>(());
-                    };
-                    match stdin.write_all(initial.as_bytes()).await {
-                        Ok(()) => Ok(()),
-                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                        Err(error) => Err(format!("failed writing stdin: {error}")),
-                    }
-                })))
-            }
-        } else {
-            None
-        };
-
-        enum WaitOutcome {
-            Child(std::result::Result<std::process::ExitStatus, std::io::Error>),
-            Timeout,
-            Cancelled(crate::jobs::CancelOrigin),
-            StdinFailure(String),
-        }
-        let outcome = {
-            let wait = child.wait();
-            tokio::pin!(wait);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = job.cancel.cancelled() => {
-                        break WaitOutcome::Cancelled(job.cancel.origin());
-                    },
-                    _ = sleep_until(deadline) => break WaitOutcome::Timeout,
-                    result = &mut wait => break WaitOutcome::Child(result),
-                    result = async {
-                        match stdin_task.as_mut() {
-                            Some(task) => task.await,
-                            None => std::future::pending().await,
-                        }
-                    }, if stdin_task.is_some() => {
-                        match result {
-                            Ok(Ok(())) => {
-                                stdin_task.take();
-                                job.retire_process_input(coordinate);
-                            }
-                            Ok(Err(error)) => {
-                                job.retire_process_input(coordinate);
-                                break WaitOutcome::StdinFailure(error);
-                            }
-                            Err(_) => {
-                                job.retire_process_input(coordinate);
-                                break WaitOutcome::StdinFailure("stdin writer task failed".to_owned());
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        let (process_exit, mut stop_record, cancel_origin, terminal, terminal_error) = match outcome
-        {
-            WaitOutcome::Child(Ok(status)) => {
-                let process_exit = Self::process_exit(status);
-                // The waited command owns the managed process-group/Job-Object
-                // lifetime. Once it exits, surviving managed descendants are
-                // housekeeping only: terminate them immediately without claiming
-                // that dotlink stopped the already-reaped command itself.
-                let cleanup = Self::stop_tree(&mut process_tree, &mut stop_tracker, None);
-                (
-                    process_exit,
-                    Some(cleanup),
-                    None,
-                    JobStatus::Completed,
-                    None,
-                )
-            }
-            WaitOutcome::Child(Err(error)) => {
-                let stop = Self::stop_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    Some(SharedProcessStopReason::RuntimeError),
-                );
-                (
-                    Self::terminate_child(&mut child).await,
-                    Some(stop),
-                    None,
-                    JobStatus::Failed,
-                    Some(error.to_string()),
-                )
-            }
-            WaitOutcome::Timeout => {
-                let stop = Self::stop_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    Some(SharedProcessStopReason::Timeout),
-                );
-                (
-                    Self::terminate_child(&mut child).await,
-                    Some(stop),
-                    None,
-                    JobStatus::TimedOut,
-                    None,
-                )
-            }
-            WaitOutcome::Cancelled(cancel_origin) => {
-                let stop = Self::stop_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    Some(SharedProcessStopReason::Cancelled),
-                );
-                (
-                    Self::terminate_child(&mut child).await,
-                    Some(stop),
-                    Some(cancel_origin),
-                    JobStatus::Cancelled,
-                    None,
-                )
-            }
-            WaitOutcome::StdinFailure(message) => {
-                let stop = Self::stop_tree(
-                    &mut process_tree,
-                    &mut stop_tracker,
-                    Some(SharedProcessStopReason::RuntimeError),
-                );
-                (
-                    Self::terminate_child(&mut child).await,
-                    Some(stop),
-                    None,
-                    JobStatus::Failed,
-                    Some(message),
-                )
-            }
-        };
-        job.retire_process_input(coordinate);
-        if let Some(task) = stdin_task.take() {
-            task.abort();
-        }
-
-        let collect_deadline = Instant::now() + POST_STOP_OUTPUT_GRACE;
-        let collected = timeout_at(collect_deadline, async {
-            let stdout = (&mut stdout_task).await;
-            let stderr = (&mut stderr_task).await;
-            (stdout, stderr)
-        })
-        .await;
-        let (stdout, stderr, output_complete) = match collected {
-            Ok((stdout_result, stderr_result)) => {
-                match stdout_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        Self::cleanup_tree(
-                            &mut process_tree,
-                            &mut stop_tracker,
-                            &mut stop_record,
-                            SharedProcessStopReason::RuntimeError,
-                            terminal == JobStatus::Completed,
-                        );
-                        return JobCompletion::internal_failed(
-                            format!("failed spooling stdout: {error}"),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stdout,
-                                true,
-                            ),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stderr,
-                                true,
-                            ),
-                        )
-                        .with_process_facts(process_exit, stop_record)
-                        .with_observed_status(terminal)
-                        .with_context(result_context);
-                    }
-                    Err(error) => {
-                        Self::cleanup_tree(
-                            &mut process_tree,
-                            &mut stop_tracker,
-                            &mut stop_record,
-                            SharedProcessStopReason::RuntimeError,
-                            terminal == JobStatus::Completed,
-                        );
-                        return JobCompletion::internal_failed(
-                            format!("stdout spool task failed: {error}"),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stdout,
-                                true,
-                            ),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stderr,
-                                true,
-                            ),
-                        )
-                        .with_process_facts(process_exit, stop_record)
-                        .with_observed_status(terminal)
-                        .with_context(result_context);
-                    }
-                }
-                match stderr_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        Self::cleanup_tree(
-                            &mut process_tree,
-                            &mut stop_tracker,
-                            &mut stop_record,
-                            SharedProcessStopReason::RuntimeError,
-                            terminal == JobStatus::Completed,
-                        );
-                        return JobCompletion::internal_failed(
-                            format!("failed spooling stderr: {error}"),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stdout,
-                                true,
-                            ),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stderr,
-                                true,
-                            ),
-                        )
-                        .with_process_facts(process_exit, stop_record)
-                        .with_observed_status(terminal)
-                        .with_context(result_context);
-                    }
-                    Err(error) => {
-                        Self::cleanup_tree(
-                            &mut process_tree,
-                            &mut stop_tracker,
-                            &mut stop_record,
-                            SharedProcessStopReason::RuntimeError,
-                            terminal == JobStatus::Completed,
-                        );
-                        return JobCompletion::internal_failed(
-                            format!("stderr spool task failed: {error}"),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stdout,
-                                true,
-                            ),
-                            job.shared_node_stream_summary(
-                                coordinate,
-                                crate::jobs::JobStream::Stderr,
-                                true,
-                            ),
-                        )
-                        .with_process_facts(process_exit, stop_record)
-                        .with_observed_status(terminal)
-                        .with_context(result_context);
-                    }
-                }
-                (
-                    job.shared_node_stream_summary(
-                        coordinate,
-                        crate::jobs::JobStream::Stdout,
-                        false,
-                    ),
-                    job.shared_node_stream_summary(
-                        coordinate,
-                        crate::jobs::JobStream::Stderr,
-                        false,
-                    ),
-                    true,
-                )
-            }
-            Err(_) => {
-                stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
-                (
-                    job.shared_node_stream_summary(
-                        coordinate,
-                        crate::jobs::JobStream::Stdout,
-                        true,
-                    ),
-                    job.shared_node_stream_summary(
-                        coordinate,
-                        crate::jobs::JobStream::Stderr,
-                        true,
-                    ),
-                    false,
-                )
-            }
-        };
-
-        let completion = match terminal {
-            JobStatus::Completed => {
-                // A proven Stopped/NoTarget cleanup already disarms the shared guard.
-                // Do not force-disarm here: Unknown must remain armed so Drop gets the
-                // final fail-safe containment attempt. A setsid-style escape may still
-                // keep an inherited FD open; that only affects output completeness.
-                JobCompletion::completed_with_exit(
-                    process_exit,
-                    process_exit == SharedProcessExit::Code(0),
+                let (stdout, stderr) = Self::process_stream_summaries(&job, coordinate, true);
+                let terminal = Self::uncertain_process_terminal(
                     stdout,
                     stderr,
-                )
-                .with_process_facts(process_exit, stop_record)
-                .with_context(result_context)
-            }
-            JobStatus::TimedOut => JobCompletion::timed_out(stdout, stderr)
-                .with_process_facts(process_exit, stop_record)
-                .with_context(result_context),
-            JobStatus::Cancelled => {
-                let completion = JobCompletion::cancelled(stdout, stderr)
-                    .with_process_facts(process_exit, stop_record)
+                    SharedProcessStopReason::RuntimeError,
+                );
+                return JobCompletion::unknown_with_output(error.to_string(), stdout, stderr)
+                    .with_process_terminal(terminal)
                     .with_context(result_context);
-                match cancel_origin {
-                    Some(origin) => completion.with_cancel_origin(origin),
-                    None => completion,
+            }
+        };
+
+        let mut stdin_usable = process.stdin_open();
+        if let Some(initial) = stdin_text.as_deref() {
+            enum InitialWrite {
+                Complete(aw_process::Result<()>),
+                Cancelled,
+                Timeout,
+            }
+            let mut initial_error = None;
+            for chunk in initial.as_bytes().chunks(aw_process::MAX_STDIN_WRITE) {
+                let outcome = {
+                    let write = process.write(chunk);
+                    tokio::pin!(write);
+                    tokio::select! {
+                        biased;
+                        _ = job.cancel.cancelled() => InitialWrite::Cancelled,
+                        _ = tokio::time::sleep_until(deadline) => InitialWrite::Timeout,
+                        result = &mut write => InitialWrite::Complete(result),
+                    }
+                };
+                match outcome {
+                    InitialWrite::Complete(Ok(())) => {}
+                    InitialWrite::Complete(Err(aw_process::Error::Io(error)))
+                        if error.kind() == std::io::ErrorKind::BrokenPipe =>
+                    {
+                        // The command may intentionally close stdin after
+                        // consuming only a prefix; preserve its eventual exit.
+                        process.close_stdin();
+                        stdin_usable = false;
+                        break;
+                    }
+                    InitialWrite::Complete(Err(error)) => {
+                        initial_error = Some(error);
+                        break;
+                    }
+                    InitialWrite::Cancelled => {
+                        let result = Self::stop_or_wait_process(
+                            process,
+                            SharedProcessStopReason::Cancelled,
+                            deadline,
+                        )
+                        .await;
+                        let (stdout, stderr) =
+                            Self::process_stream_summaries(&job, coordinate, false);
+                        return Self::completion_from_terminal(
+                            result.terminal,
+                            stdout,
+                            stderr,
+                            None,
+                            job.cancel.origin(),
+                            result_context,
+                        );
+                    }
+                    InitialWrite::Timeout => {
+                        let result = Self::stop_or_wait_process(
+                            process,
+                            SharedProcessStopReason::Timeout,
+                            deadline,
+                        )
+                        .await;
+                        let (stdout, stderr) =
+                            Self::process_stream_summaries(&job, coordinate, false);
+                        return Self::completion_from_terminal(
+                            result.terminal,
+                            stdout,
+                            stderr,
+                            None,
+                            job.cancel.origin(),
+                            result_context,
+                        );
+                    }
                 }
             }
-            JobStatus::Failed => JobCompletion::failed_with_output(
-                terminal_error.unwrap_or_else(|| "shell job failed".to_owned()),
-                stdout,
-                stderr,
-            )
-            .with_process_facts(process_exit, stop_record)
-            .with_context(result_context),
-            JobStatus::Unknown => JobCompletion::unknown_with_output(
-                terminal_error.unwrap_or_else(|| {
-                    "shell terminal outcome is uncertain; inspect effects before retrying"
-                        .to_owned()
-                }),
-                stdout,
-                stderr,
-            )
-            .with_process_facts(process_exit, stop_record)
-            .with_context(result_context),
-            JobStatus::Working => unreachable!(),
-        };
-        if output_complete {
-            completion
-        } else {
-            completion.with_incomplete_output()
+            if let Some(error) = initial_error {
+                let detail = format!("failed writing initial stdin: {error}");
+                let result = Self::stop_or_wait_process(
+                    process,
+                    SharedProcessStopReason::RuntimeError,
+                    deadline,
+                )
+                .await;
+                let (stdout, stderr) = Self::process_stream_summaries(&job, coordinate, false);
+                return Self::completion_from_terminal(
+                    result.terminal,
+                    stdout,
+                    stderr,
+                    Some(detail),
+                    job.cancel.origin(),
+                    result_context,
+                );
+            }
+            if !interactive {
+                process.close_stdin();
+                stdin_usable = false;
+            }
         }
-    }
 
-    async fn terminate_child(child: &mut tokio::process::Child) -> SharedProcessExit {
-        let _ = child.start_kill();
-        match child.wait().await {
-            Ok(status) => Self::process_exit(status),
-            Err(_) => SharedProcessExit::Unknown,
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let mut input_bridge = None;
+        let result = if interactive && stdin_usable {
+            let (process_input, process_receiver) = aw_process::process_input_channel();
+            let (sender, receiver) = tokio::sync::mpsc::channel::<ProcessInputRequest>(16);
+            if let Err(error) = job.install_process_input(coordinate, sender) {
+                let detail = format!("failed to retain interactive stdin custody: {error}");
+                let result = Self::stop_or_wait_process(
+                    process,
+                    SharedProcessStopReason::RuntimeError,
+                    deadline,
+                )
+                .await;
+                let (stdout, stderr) = Self::process_stream_summaries(&job, coordinate, false);
+                return Self::completion_from_terminal(
+                    result.terminal,
+                    stdout,
+                    stderr,
+                    Some(detail),
+                    job.cancel.origin(),
+                    result_context,
+                );
+            }
+            input_bridge = Some(AbortOnDropHandle::new(tokio::spawn(forward_process_input(
+                receiver,
+                process_input,
+            ))));
+            process
+                .wait_interactive(job.cancel.cancelled(), remaining, process_receiver)
+                .await
+        } else {
+            process.wait(job.cancel.cancelled(), remaining).await
+        };
+
+        job.retire_process_input(coordinate);
+        if let Some(bridge) = input_bridge.as_mut() {
+            bridge.abort();
         }
+
+        let (stdout, stderr) = Self::process_stream_summaries(&job, coordinate, false);
+        Self::completion_from_terminal(
+            result.terminal,
+            stdout,
+            stderr,
+            None,
+            job.cancel.origin(),
+            result_context,
+        )
     }
 }
 
@@ -3352,7 +3079,7 @@ fn direct_shell_command(
         command
             .arg("--noprofile")
             .arg("--norc")
-            .arg("-lc")
+            .arg("-c")
             .arg(script);
     }
     command.current_dir(working_dir);
@@ -3432,22 +3159,6 @@ impl LocalMachine {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn platform_stop_result_maps_to_shared_evidence_without_collapsing_absence() {
-        assert_eq!(
-            LocalMachine::stop_evidence(Ok(true)),
-            SharedStopEvidence::Stopped
-        );
-        assert_eq!(
-            LocalMachine::stop_evidence(Ok(false)),
-            SharedStopEvidence::NoTarget
-        );
-        assert_eq!(
-            LocalMachine::stop_evidence(Err(std::io::Error::other("unknown"))),
-            SharedStopEvidence::Unknown
-        );
-    }
-
     use super::*;
     use tokio::sync::RwLock;
 
@@ -5516,7 +5227,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         assert_eq!(status["status"], "completed", "{status}");
-        assert_eq!(status["success"], true, "{status}");
+        assert_eq!(status["exit_code"], 0, "{status}");
+        assert_eq!(status["success"], false, "{status}");
+        assert_eq!(status["tree"], "leftovers", "{status}");
         assert!(status["error"].is_null(), "{status}");
         assert!(
             started_wait.elapsed() < Duration::from_millis(900),

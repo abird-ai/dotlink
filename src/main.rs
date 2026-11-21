@@ -19,7 +19,6 @@ mod requester;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod secure_fs;
 mod setup;
-mod shell_process;
 mod shutdown;
 mod supervisor;
 mod transports;

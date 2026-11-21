@@ -79,13 +79,36 @@ pub(crate) fn caps(max_read: usize, max_write: usize) -> Result<SchemaCaps, &'st
     .validate()
 }
 
-/// Dotlink-selected shared catalog profile. D6 enables receipt timestamps and
-/// checkpoint guidance only for typed Process/Batch/Jobs projections; no
-/// free-form MCP result text is parsed to recover receipt state.
+/// Dotlink-owned runtime profile. The conversational horizon is product policy,
+/// not AW Process semantics. `None` keeps an embedding's configured Process
+/// deadline and omits checkpoint guidance; the current dotlink runtime is the
+/// bounded conversational profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeProfile {
+    pub(crate) checkpoint_minutes: Option<u16>,
+    pub(crate) hard_shell_timeout_secs: Option<u64>,
+}
+
+pub(crate) const fn runtime_profile() -> RuntimeProfile {
+    RuntimeProfile {
+        checkpoint_minutes: Some(30),
+        hard_shell_timeout_secs: Some(35 * 60),
+    }
+}
+
+pub(crate) fn effective_shell_timeout_ceiling(configured_secs: u64) -> u64 {
+    runtime_profile()
+        .hard_shell_timeout_secs
+        .map_or(configured_secs, |hard| configured_secs.min(hard))
+}
+
+/// Dotlink-selected shared catalog profile. Receipt timestamps and checkpoint
+/// guidance apply only to typed Process/Batch/Jobs projections; no free-form
+/// MCP result text is parsed to recover receipt state.
 pub(crate) fn receipt_profile() -> ReceiptProfile {
     ReceiptProfile {
         unix_ts: true,
-        checkpoint_minutes: Some(30),
+        checkpoint_minutes: runtime_profile().checkpoint_minutes,
         scope: ReceiptScope::none()
             .with_category(ReceiptCategory::Process)
             .with_category(ReceiptCategory::Batch)
@@ -858,6 +881,14 @@ mod tests {
         .unwrap();
         let limits = direct_limits(&machine, request_limits, &parsed, None).unwrap();
         assert_eq!(limits.binary_file_bytes, 1024);
+    }
+
+    #[test]
+    fn conversational_runtime_profile_owns_checkpoint_and_hard_shell_horizon() {
+        assert_eq!(runtime_profile().checkpoint_minutes, Some(30));
+        assert_eq!(runtime_profile().hard_shell_timeout_secs, Some(35 * 60));
+        assert_eq!(effective_shell_timeout_ceiling(600), 600);
+        assert_eq!(effective_shell_timeout_ceiling(3_600), 35 * 60);
     }
 
     #[test]

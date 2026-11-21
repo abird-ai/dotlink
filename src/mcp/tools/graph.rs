@@ -2,7 +2,7 @@
 //! deterministic scheduling, status and retained output; dotlink owns policy,
 //! process custody, transport exposure and replay.
 
-use std::{panic::AssertUnwindSafe, path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{panic::AssertUnwindSafe, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow, bail};
 #[cfg(windows)]
@@ -602,16 +602,7 @@ async fn execute_shell(
             "fail shell authority changed after Graph preflight",
         );
     }
-    crate::shell_process::configure(&mut command);
-    crate::credentials::hide_from_child(&mut command)
-        .stdin(if node.args.stdin.is_some() || node.interactive {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    crate::credentials::hide_from_child(&mut command);
     let Some(deadline) = Instant::now().checked_add(Duration::from_secs(node.timeout_secs)) else {
         finish_if_present(&manager, &id, coordinate, OutputStream::Stdout);
         finish_if_present(&manager, &id, coordinate, OutputStream::Stderr);
