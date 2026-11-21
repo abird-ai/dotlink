@@ -19,6 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   hands back before the horizon. The per-command cap is that same number, so the
   reserve always belongs to reporting. Uncapped runtimes keep the profile ceiling
   (default 3600 s) and carry no turn advice.
+- `job_get` states a live job's own deadline once it is close: inside a fifth of
+  `timeout_secs` (at most five minutes) `next` leads with `ends in 4 min at
+  timeout_secs=1500; report from what is retained`, then the usual follow-up. A
+  finished or cancelling job has no deadline left to predict, and no other job tool
+  repeats it.
 
 ## [0.17.7] - 2026-11-21
 

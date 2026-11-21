@@ -3080,13 +3080,19 @@ fn stream_status(stored: u64, ack: u64, summary: Option<StreamSummary>, released
 
 fn render_status_locked(entry: &JobEntry) -> Value {
     let completion = entry.completion.as_ref();
+    let elapsed_ms = entry
+        .created
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let live = completion.is_none() && !entry.cancel.is_cancelled();
     let stdout_stored = retained_bytes(entry, JobStream::Stdout);
     let stderr_stored = retained_bytes(entry, JobStream::Stderr);
     let mut payload = serde_json::json!({
         "ts": crate::mcp::now_unix(),
         "job_id": entry.id,
         "status": entry.status(),
-        "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        "elapsed_ms": elapsed_ms,
         "timeout_secs": entry.timeout_secs,
         "cancelling": entry.cancel.is_cancelled(),
         "exit_code": completion.and_then(|value| value.exit_code),
@@ -3124,11 +3130,45 @@ fn render_status_locked(entry: &JobEntry) -> Value {
             payload["timed_out"] = Value::from(true);
         }
     }
-    if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_get")) {
+    let next = match (
+        deadline_note(entry.timeout_secs, elapsed_ms, live),
+        job_follow_up(JobFollowUp::of(entry), Some("job_get")),
+    ) {
+        (Some(deadline), Some(next)) => Some(format!("{deadline}; {next}")),
+        (deadline, next) => deadline.or(next),
+    };
+    if let Some(next) = next {
         payload["next"] = serde_json::Value::String(next);
     }
     omit_absences(&mut payload);
     payload
+}
+
+/// A live command's own deadline, stated once it is close.
+///
+/// Nothing else in the payload predicts the *kind* of ending that is coming: the
+/// caller has to subtract `elapsed_ms` from `timeout_secs` to notice that the next
+/// poll will be a kill with a partial result. This is not a turn clock — dotlink
+/// has no anchor for a turn — only the cap this execution was given, which is the
+/// one budget it can see run out. A fifth of the budget, at most five minutes:
+/// long enough to finish the step in hand and report it, short enough that an
+/// ordinary command is not announced from its first poll.
+fn deadline_note(cap_secs: u64, elapsed_ms: u64, live: bool) -> Option<String> {
+    if !live || cap_secs <= 1 {
+        return None;
+    }
+    let remaining = cap_secs.saturating_sub(elapsed_ms / 1000);
+    if remaining > deadline_margin(cap_secs) {
+        return None;
+    }
+    Some(format!(
+        "ends in {} at timeout_secs={cap_secs}; report from what is retained",
+        crate::mcp::human_duration(remaining.max(1))
+    ))
+}
+
+fn deadline_margin(cap_secs: u64) -> u64 {
+    (cap_secs / 5).min(300)
 }
 
 /// The last `lines` lines of one spool stream, best effort. Only a bounded
@@ -4009,6 +4049,49 @@ mod tests {
                 assert!(payload.get("next").is_none(), "{payload}");
             }
         }
+    }
+
+    /// A live command near its own cap says so: nothing else in the payload predicts
+    /// that the next poll is a kill with a partial result, and `elapsed_ms` against
+    /// `timeout_secs` is arithmetic the caller should not have to do.
+    #[test]
+    fn a_live_job_states_its_deadline_only_near_it() {
+        assert!(
+            deadline_note(1_500, 1_100_000, true).is_none(),
+            "7 minutes of budget left is quiet"
+        );
+        let near = deadline_note(1_500, 1_260_000, true).expect("4 minutes left warns");
+        assert_eq!(
+            near, "ends in 4 min at timeout_secs=1500; report from what is retained",
+            "{near}"
+        );
+        // A finished or cancelling job has no deadline left to predict.
+        assert!(deadline_note(1_500, 1_490_000, false).is_none());
+        // A short cap warns near its end, not from its first poll.
+        assert!(deadline_note(30, 0, true).is_none());
+        assert!(deadline_note(30, 26_000, true).is_some());
+        // A one-second cap has no room to act in.
+        assert!(deadline_note(1, 5_000, true).is_none());
+        assert_eq!(deadline_margin(1_500), 300);
+        assert_eq!(deadline_margin(60), 12);
+    }
+
+    /// The wiring, from the surface a caller really reads: a fresh live job keeps the
+    /// ordinary follow-up and gains no deadline clause.
+    #[tokio::test]
+    async fn a_fresh_job_keeps_the_ordinary_follow_up() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(300, 10, 4096, None, |_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                JobCompletion::failed("never reached")
+            })
+            .unwrap();
+        let payload: Value = serde_json::from_str(&manager.status(&started.id).unwrap()).unwrap();
+        let next = payload["next"].as_str().unwrap_or_default();
+        assert!(next.contains("job_cancel"), "{payload}");
+        assert!(!next.contains("ends in"), "{payload}");
+        manager.wait_until(&started.id, None).await.ok();
     }
 
     /// The surface a caller really reaches: `tool_result`, not the payload helper.

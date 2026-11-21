@@ -11,7 +11,7 @@ pub(crate) use tools::shell::ShellArgs;
 pub(crate) use tools::test_support::test_machine;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use tools::test_support::trusted_bubblewrap_available;
-pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS, now_unix};
+pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS, human_duration, now_unix};
 
 use std::{
     collections::BTreeSet,
