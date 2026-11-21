@@ -4023,7 +4023,7 @@ mod tests {
         )
         .await;
         assert_eq!(completed.status, JobStatus::Completed);
-        assert!(completed.success);
+        assert!(completed.success, "{completed:?}");
         assert_eq!(completed.exit_code, Some(0));
         assert_eq!(completed.stopped_by, None);
         assert_eq!(

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows no longer reports every direct command as `tree: "leftovers"` with
+  `success: false`. The no-window console introduced in 0.17.7 (which PowerShell
+  needs to run at all) puts its console host in the job, and job accounting clears
+  the exited leader a moment after the wait returns, so the sweep saw live members
+  on a command that left nothing behind. Observations now settle while a member
+  remains instead of deciding on the first query: a clean exit answers immediately,
+  a real leftover keeps the count up for the whole window.
+
 ## [0.17.8] - 2026-11-21
 
 ### Changed

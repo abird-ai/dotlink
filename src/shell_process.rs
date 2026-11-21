@@ -558,7 +558,7 @@ impl<'a> Guard<'a> {
         #[cfg(target_os = "macos")]
         let check = crate::blocking::run(|| mac_group_has_live_member(self.group));
         #[cfg(windows)]
-        let check = self.active_job_processes().map(|n| n != 0);
+        let check = crate::blocking::run(|| self.settled_job_processes().map(|n| n != 0));
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let check: io::Result<bool> = Err(io::ErrorKind::Unsupported.into());
         TreeObservation::from_live(check.ok())
@@ -622,6 +622,31 @@ impl<'a> Guard<'a> {
             }
             _ => StopOutcome::Failed,
         }
+    }
+
+    #[cfg(windows)]
+    /// Live members, once the infrastructure that outlives the leader has left.
+    ///
+    /// A no-window console (which PowerShell needs to run at all) puts its console host
+    /// in the job, and the accounting clears the exited leader a moment after the wait
+    /// returns. Both would otherwise read as leftovers on a command that left nothing
+    /// behind — every Windows command would report `tree: "leftovers"`. Infrastructure
+    /// releases as soon as the last console handle closes, so poll while a member
+    /// remains instead of teaching this layer process names: a real leftover keeps the
+    /// count up for the whole window, and a clean exit answers on the first query.
+    #[cfg(windows)]
+    fn settled_job_processes(&self) -> io::Result<u32> {
+        use std::time::{Duration, Instant};
+        // Long enough for a console host and job accounting to settle under load.
+        const SETTLE: Duration = Duration::from_secs(2);
+        const POLL: Duration = Duration::from_millis(10);
+        let mut count = self.active_job_processes()?;
+        let deadline = Instant::now() + SETTLE;
+        while count != 0 && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+            count = self.active_job_processes()?;
+        }
+        Ok(count)
     }
 
     #[cfg(windows)]
