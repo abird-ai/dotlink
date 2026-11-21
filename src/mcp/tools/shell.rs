@@ -3886,8 +3886,8 @@ mod tests {
         assert!(tunnel.contains("`ts`"), "{tunnel}");
         assert!(tunnel.contains("kills it"), "{tunnel}");
         // `ts` is a fact of the result; the turn horizon is an advisory the
-        // server instructions own, with the "stop at a coherent boundary" rule
-        // that makes it actionable. A description carries no bare number.
+        // server instructions own, with the "work towards a coherent checkpoint"
+        // rule that makes it actionable. A description carries no bare number.
         assert!(!tunnel.contains("turn clock"), "{tunnel}");
         assert!(
             !tunnel.contains(&crate::limits::TURN_CHECKPOINT_MINUTES.to_string()),
@@ -3959,7 +3959,14 @@ mod tests {
     #[test]
     fn the_turn_horizon_bounds_the_hosted_surface_only() {
         let horizon = crate::limits::CAPPED_SHELL_TIMEOUT_SECS;
-        assert_eq!(horizon, crate::limits::TURN_CHECKPOINT_MINUTES * 60);
+        // The cap is the horizon minus the hand-back reserve, not the horizon itself.
+        assert_eq!(
+            horizon,
+            (crate::limits::TURN_CHECKPOINT_MINUTES
+                - crate::limits::TURN_CHECKPOINT_RESERVE_MINUTES)
+                * 60
+        );
+        assert!(horizon < crate::limits::TURN_CHECKPOINT_MINUTES * 60);
         assert_eq!(crate::limits::shell_timeout_ceiling(3_600, true), horizon);
         assert_eq!(crate::limits::shell_timeout_ceiling(3_600, false), 3_600);
         // A profile already under the horizon is untouched on either surface.

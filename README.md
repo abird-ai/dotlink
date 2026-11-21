@@ -734,7 +734,7 @@ Use `dotlink oauth clients -p <profile>` to inspect approved DCR clients, then `
 Usually not. dotlink is local and answers every tool call; a stuck conversation is normally the hosted client ending its own turn.
 
 - ChatGPT decides how long one turn may run and can abort it or drop the reply — the UI then looks frozen or stops updating, and dotlink cannot extend that budget.
-- With the OpenAI tunnel active, dotlink asks the model to use the turn's first shell or job `ts` as its anchor and hand back at a coherent boundary after about 35 minutes. This is advice for the turn, not a timer that cancels it. Separately, the shared runtime caps each command at the lower of `max_shell_timeout_secs` and 2100 s (35 min), even for stdio/HTTP clients on that runtime. Without the tunnel, the profile ceiling applies and there is no turn advice.
+- With the OpenAI tunnel active, dotlink asks the model to use the turn's first shell or job `ts` as its anchor, keep a turn to about 35 minutes, and from minute 25 work only towards a coherent checkpoint and hand back. This is advice for the turn, not a timer that cancels it. Separately, the shared runtime caps each command at the lower of `max_shell_timeout_secs` and 1500 s (25 min: the 35-minute horizon minus 10 minutes kept for reporting), even for stdio/HTTP clients on that runtime. Without the tunnel, the profile ceiling applies and there is no turn advice.
 - Blocking calls send `notifications/progress` when the client supplies a progress token. A shell call that outlasts the response window hands back a job handle; this does not reset its execution deadline.
 
 Those measures reduce it; they do not remove it. When it happens:

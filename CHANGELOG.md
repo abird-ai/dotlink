@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- A capped runtime (currently the OpenAI tunnel) now caps a command at **1500 s**
+  instead of 2100 s: the 35-minute turn horizon minus a 10-minute hand-back
+  reserve, so one call can no longer consume the turn whose reply has to carry
+  its result. `TURN_CHECKPOINT_RESERVE_MINUTES` states the reserve and
+  `CAPPED_SHELL_TIMEOUT_SECS` derives from both numbers, asserted at compile time.
+- Server instructions now name the checkpoint: from minute 25 (35 − 10) a turn
+  works only towards a coherent checkpoint — no new work, land or park what is in
+  hand, leave the tree reportable — then states what is done and what remains and
+  hands back before the horizon. The per-command cap is that same number, so the
+  reserve always belongs to reporting. Uncapped runtimes keep the profile ceiling
+  (default 3600 s) and carry no turn advice.
+
 ## [0.17.7] - 2026-11-21
 
 ### Fixed

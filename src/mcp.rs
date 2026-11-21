@@ -2807,8 +2807,12 @@ pub(crate) fn server_instructions(capped: bool) -> String {
         // The one place the horizon is stated, with the rule that makes it
         // actionable. A tool description hands back `ts` as a fact instead.
         text.push_str(&format!(
-            " Shell and job results carry `ts` (UTC epoch seconds): take the first `ts` of the current turn as your anchor and keep one user turn to about {} minutes. When you reach it, stop at the next coherent boundary, state what is done and what remains, and hand back instead of starting another step. No single command may run longer than that horizon. File-tool results are paged and carry no clock, so read the anchor from the shell or job result around them.",
-            crate::limits::TURN_CHECKPOINT_MINUTES
+            " Shell and job results carry `ts` (UTC epoch seconds): take the first `ts` of the current turn as your anchor and keep one user turn to about {horizon} minutes. From {checkpoint} minutes — {reserve} before that horizon — work only towards a coherent checkpoint: open no new work, land or park what is in hand, and leave the tree and notes reportable. Reach the checkpoint before the horizon, state what is done and what remains, and hand back instead of starting another step. No single command may run longer than {cap} seconds, because the last {reserve} minutes belong to reporting it: one call can never consume the turn its result must arrive in. File-tool results are paged and carry no clock, so read the anchor from the shell or job result around them.",
+            horizon = crate::limits::TURN_CHECKPOINT_MINUTES,
+            checkpoint = crate::limits::TURN_CHECKPOINT_MINUTES
+                - crate::limits::TURN_CHECKPOINT_RESERVE_MINUTES,
+            reserve = crate::limits::TURN_CHECKPOINT_RESERVE_MINUTES,
+            cap = crate::limits::CAPPED_SHELL_TIMEOUT_SECS,
         ));
     }
     text
@@ -2974,7 +2978,22 @@ mod tests {
             "{instructions}"
         );
         // A horizon without an action is a number nobody can act on.
-        assert!(instructions.contains("coherent boundary"), "{instructions}");
+        assert!(
+            instructions.contains("coherent checkpoint"),
+            "{instructions}"
+        );
+        // The action starts one reserve before the horizon, and the per-command cap is
+        // the same number: the last minutes of a turn are for reporting, not running.
+        let checkpoint =
+            crate::limits::TURN_CHECKPOINT_MINUTES - crate::limits::TURN_CHECKPOINT_RESERVE_MINUTES;
+        assert!(
+            instructions.contains(&format!("From {checkpoint} minutes")),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains(&crate::limits::CAPPED_SHELL_TIMEOUT_SECS.to_string()),
+            "{instructions}"
+        );
         // It is a checkpoint over results, not a cap on execution: the horizon
         // never arrives as the execution deadline, which stays the caller's.
         assert!(instructions.contains("`ts`"), "{instructions}");

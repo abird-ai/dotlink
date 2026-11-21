@@ -46,13 +46,31 @@ pub(crate) const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(DEFAULT_JOB_WA
 /// it stamps `ts` and the caller keeps its own clock.
 pub(crate) const TURN_CHECKPOINT_MINUTES: u64 = 35;
 
-/// The longest command a capped runtime may run: one turn.
+/// Part of the horizon held back so the hand-back can still happen.
 ///
-/// Its own constant on purpose — the checkpoint advisory above is model-facing text,
-/// and re-tuning prompt wording must never move an execution limit or the
-/// job-authority fingerprint. That the two agree is asserted, so a deliberate change
-/// to either is a visible decision rather than a side effect.
-pub(crate) const CAPPED_SHELL_TIMEOUT_SECS: u64 = 35 * 60;
+/// A horizon is only actionable if time remains to act on it: stop the work, say
+/// what is done and what remains, and get that into a reply. A command allowed to
+/// run the whole horizon leaves nothing for that, and the turn ends with its result
+/// unread — exactly what a 35-minute call inside a 35-minute turn does.
+pub(crate) const TURN_CHECKPOINT_RESERVE_MINUTES: u64 = 10;
+
+/// The longest command a capped runtime may run: the horizon minus that reserve.
+///
+/// Derived rather than chosen, so a single call can never consume the turn it has to
+/// report into: one number says how long a turn may take, and the per-command cap is
+/// that number with the hand-back margin removed. Re-tuning the horizon moves both
+/// together, and the assertions below keep that movement deliberate.
+pub(crate) const CAPPED_SHELL_TIMEOUT_SECS: u64 =
+    (TURN_CHECKPOINT_MINUTES - TURN_CHECKPOINT_RESERVE_MINUTES) * 60;
+
+const _: () = assert!(
+    TURN_CHECKPOINT_RESERVE_MINUTES > 0
+        && TURN_CHECKPOINT_RESERVE_MINUTES < TURN_CHECKPOINT_MINUTES
+);
+const _: () = assert!(
+    CAPPED_SHELL_TIMEOUT_SECS + TURN_CHECKPOINT_RESERVE_MINUTES * 60
+        == TURN_CHECKPOINT_MINUTES * 60
+);
 
 /// The deadline this runtime offers.
 ///
@@ -60,7 +78,9 @@ pub(crate) const CAPPED_SHELL_TIMEOUT_SECS: u64 = 35 * 60;
 /// the runtime hands a shell call back instead of waiting for it, which is exactly
 /// `sync_hold.is_some()`. A caller that is handed a handle mid-work is in a loop it
 /// must give back from, so one turn is the right horizon and a deadline past one
-/// turn would promise an execution nothing gets to see.
+/// turn would promise an execution nothing gets to see. The deadline stops short of
+/// the horizon by the hand-back reserve for the same reason: the caller has to report
+/// the execution, so it cannot be spending the whole turn waiting on it.
 ///
 /// One machine serves every transport on the socket and a tool schema is advertised
 /// once, so the tightest active transport decides: a stdio caller sharing a tunneled
@@ -144,12 +164,19 @@ pub(crate) const MAX_JOB_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 mod tests {
     use super::*;
 
-    /// Two numbers that must move together, and a test that says so out loud: a
-    /// deadline longer than the advertised turn horizon promises work no turn can
-    /// report, and a shorter one caps execution for no stated reason.
+    /// The cap is one advertised turn with the hand-back margin removed. Equal to the
+    /// horizon (as it was until 0.17.8) a command could run the whole turn and leave
+    /// the caller no time to report it, which is how a 35-minute call ends a turn.
     #[test]
-    fn the_capped_deadline_is_one_advertised_turn_horizon() {
-        assert_eq!(CAPPED_SHELL_TIMEOUT_SECS, TURN_CHECKPOINT_MINUTES * 60);
+    fn the_capped_deadline_leaves_the_hand_back_margin() {
+        assert_eq!(
+            CAPPED_SHELL_TIMEOUT_SECS,
+            (TURN_CHECKPOINT_MINUTES - TURN_CHECKPOINT_RESERVE_MINUTES) * 60
+        );
+        assert_eq!(
+            CAPPED_SHELL_TIMEOUT_SECS + TURN_CHECKPOINT_RESERVE_MINUTES * 60,
+            TURN_CHECKPOINT_MINUTES * 60
+        );
     }
 
     #[test]
