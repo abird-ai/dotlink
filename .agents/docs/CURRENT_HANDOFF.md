@@ -1,26 +1,56 @@
-# CURRENT HANDOFF — dotlink unified Jobs + Agent runtime
+# CURRENT HANDOFF — dotlink unified runtime + DL-200 design
 
-Canonical cross-repo comprehensive handoff:
-`../../../aw/.agents/docs/AW-DOTLINK-FULL-COMPREHENSIVE-HANDOFF-2026-11-20.md`.
+Canonical comprehensive handoff:
+`../../../aw/.agents/docs/AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md`.
 
 Copy-ready next-agent entrypoint:
-`../../../aw/.agents/docs/AW-DOTLINK-NEXT-AGENT-2026-11-20.md`.
+`../../../aw/.agents/docs/AW-DL200-R6-NEXT-AGENT-2026-11-21.md`.
 
-The 2026-11-19 017 handoff is historical and is embedded in the canonical
-2026-11-20 document. Its older current-state/next-action claims are superseded.
+Active DL-200 design:
+`../../../aw/.agents/plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md`.
+
+The previous AW+dotlink 2026-11-20 comprehensive handoff and the 2026-11-19 017
+handoff remain historical chronology referenced by the new canonical R6 handoff.
+
+**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R6 was
+explicitly approved on 2026-11-21 after final live-owner review and is authoritative.
+AW seal/docs are checkpointed at `7c3800c`; AW Phase-0A Process plus Phase-0B owner
+hardening source is checkpointed at `c7cc948`. Dotlink Remote Start/replay hardening is
+checkpointed at `89ff3fb`; the real R6 shared-Process/`aw-process` cutover is still pending.
+The existing dotlink AW Git pin remains `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`
+until a separately authorized AW publication/repin. Frozen 017 mounts/config-v13 remain
+deferred. Commit/push/tag/release/deploy remain separately gated.
 
 Prepared: 2026-11-20
 Owner: @pvl
 Machine: **L5 implementation/source authority**
 Repo: `/home/pvl/spaces/abird/src/dotlink`
 
-> Canonical cross-repo design authority remains AW
-> `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`.
+> Runtime/source authority remains live AW/dotlink source and tests. Current local source
+> checkpoints are AW `c7cc948` and dotlink `89ff3fb`; dotlink still consumes published AW
+> `b8a46a94...` until the explicit repin step.
+> DL-200 design authority is the sealed, implementation-promoted AW spec linked above;
+`IMPLEMENTATION.md` owns the active Phase-0 checkpoint order. Historical
+unsealed/design-only labels below describe earlier checkpoints, not current state.
 > Source/tests/executed evidence outrank prose.
 >
 > Later operational convergence with the 0.17.1 release branch is tracked in
 > [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
 > It preserves this unified-runtime implementation and is not a release/tag.
+
+## LIVE pre-R6-implementation checkpoint — 2026-11-21
+
+- dotlink source checkpoint: `89ff3fb` — `Harden Remote Start replay admission`;
+- exact retained Remote Start replay now resolves before mutable lease/runtime-generation/
+  issuer-trust admission for a genuinely new effect;
+- fresh expired/stale/untrusted claims fail, while retained exact factual receipts remain
+  replayable under the existing JobManager owner;
+- focused Remote Start/replay suite: **16/16** green;
+- locked all-target/all-feature `cargo check`: green;
+- rustfmt and `git diff --check`: green;
+- one test compilation was externally SIGKILLed by L5 and passed cleanly on the warmed rerun;
+- this is Phase-0B/replay hardening only. The R6 `aw-process` consumer cutover, Occupancy
+  projection, non-login Bash convergence and 30/35-minute runtime-horizon work remain next.
 
 ## LIVE published AW repin + process/control/Remote Start trust checkpoint — 2026-11-20
 
