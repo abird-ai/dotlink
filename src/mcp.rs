@@ -7,6 +7,7 @@
 mod shared_fs;
 mod tools;
 pub(crate) use aw_tools::mutation::{MAX_EDIT_FILES, MAX_EDIT_OPS};
+pub(crate) use tools::human_duration;
 #[cfg(test)]
 pub(crate) use tools::shared_native::receipt_profile as shared_receipt_profile;
 #[cfg(test)]
@@ -87,6 +88,9 @@ pub struct MachineConfig {
     /// transports sharing this runtime. None means every active transport is
     /// effectively unbounded for task results.
     pub task_result_budget: Option<usize>,
+    /// Longest synchronous hold imposed by the active transport set. None means
+    /// the runtime has no bounded conversational hand-back surface.
+    pub sync_hold: Option<std::time::Duration>,
     pub job_retention_secs: u64,
     pub job_spool_bytes: u64,
     pub protected_paths: Vec<PathBuf>,
@@ -190,6 +194,7 @@ struct RuntimeConfig {
     max_write_bytes: usize,
     shared_caps: aw_tools::filesystem::schema::SchemaCaps,
     task_result_budget: Option<usize>,
+    surface_policy: crate::limits::RuntimeSurfacePolicy,
     protected_paths: Vec<PathBuf>,
 }
 
@@ -1746,8 +1751,9 @@ impl LocalMachine {
             args.max_shell_timeout_secs,
             MIN_SHELL_TIMEOUT_SECS,
         )?;
+        let surface_policy = crate::limits::RuntimeSurfacePolicy::from_sync_hold(args.sync_hold);
         let max_shell_timeout_secs =
-            tools::shared_native::effective_shell_timeout_ceiling(configured_shell_timeout_secs);
+            surface_policy.shell_timeout_ceiling(configured_shell_timeout_secs);
         let max_output_bytes = checked_byte_limit("max_output_bytes", args.max_output_bytes)?;
         let max_read_bytes = checked_byte_limit("max_read_bytes", args.max_read_bytes)?;
         let max_write_bytes = checked_byte_limit("max_write_bytes", args.max_write_bytes)?;
@@ -1909,6 +1915,7 @@ impl LocalMachine {
             max_write_bytes,
             shared_caps,
             task_result_budget: args.task_result_budget,
+            surface_policy,
             protected_paths,
         };
         let shared_fs = shared_fs::prepare(&config.access, &config.protected_paths)?;
@@ -1951,6 +1958,7 @@ impl LocalMachine {
         if expected_policy == [0; 32] || !jobs.bind_policy(expected_policy) {
             bail!("internal error: prepared execution authority differs from Job session");
         }
+        jobs.set_turn_advice(prepared.config.surface_policy.capped());
         let operation_gate = jobs.operation_gate();
         Ok(Self {
             config: prepared.config,
@@ -2520,6 +2528,30 @@ impl LocalMachine {
     }
 }
 
+fn server_instructions(
+    surface: crate::limits::RuntimeSurfacePolicy,
+    shared: Option<&str>,
+) -> String {
+    let mut text = String::from(
+        "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline.",
+    );
+    if let Some(shared) = shared {
+        text.push(' ');
+        text.push_str(shared);
+    }
+    if surface.capped() {
+        let checkpoint =
+            crate::limits::TURN_HORIZON_MINUTES - crate::limits::TURN_HANDBACK_RESERVE_MINUTES;
+        text.push_str(&format!(
+            " Shell and job results carry `ts` (UTC Unix seconds): take the first `ts` of the current turn as its anchor and keep one user turn to about {horizon} minutes. From {checkpoint} minutes, work only toward a coherent checkpoint: open no new work, land or park what is in hand, leave the tree and notes reportable, state what is done and what remains, and hand back before the horizon. No single command may run longer than {cap} seconds because the last {reserve} minutes belong to reporting its result.",
+            horizon = crate::limits::TURN_HORIZON_MINUTES,
+            reserve = crate::limits::TURN_HANDBACK_RESERVE_MINUTES,
+            cap = crate::limits::CAPPED_SHELL_TIMEOUT_SECS,
+        ));
+    }
+    text
+}
+
 fn tool_call_log_outcome(
     result: &std::result::Result<CallToolResponse, McpError>,
 ) -> LogOutcome<'static> {
@@ -2573,11 +2605,9 @@ impl rmcp::ServerHandler for LocalMachine {
     }
 
     fn get_info(&self) -> ServerConfig {
-        let base_instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline.";
-        let instructions = self.shared_toolset().model_instructions().map_or_else(
-            || base_instructions.to_owned(),
-            |extra| format!("{base_instructions} {extra}"),
-        );
+        let toolset = self.shared_toolset();
+        let shared = toolset.model_instructions();
+        let instructions = server_instructions(self.config.surface_policy, shared.as_deref());
         ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -3024,6 +3054,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -3078,6 +3109,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -3128,6 +3160,7 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+                sync_hold: None,
                 job_retention_secs: 60,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3177,6 +3210,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3229,6 +3263,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3295,6 +3330,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3355,6 +3391,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3988,15 +4025,29 @@ mod tests {
     }
 
     #[test]
-    fn server_instructions_include_shared_thirty_minute_checkpoint_guidance_once() {
+    fn server_instructions_add_turn_policy_only_on_a_handback_surface() {
         let temp = tempfile::tempdir().unwrap();
         let machine =
             crate::mcp::tools::test_support::test_machine(temp.path().canonicalize().unwrap());
-        let info = <LocalMachine as rmcp::ServerHandler>::get_info(&machine);
-        let instructions = info.instructions.as_deref().expect("instructions");
-        assert!(instructions.contains("30 minutes"));
-        assert!(instructions.contains("ts=UTC Unix seconds"));
-        assert_eq!(instructions.matches("30 minutes").count(), 1);
+        let local = <LocalMachine as rmcp::ServerHandler>::get_info(&machine)
+            .instructions
+            .expect("instructions");
+        assert!(!local.contains("35 minutes"));
+        assert!(!local.contains("first `ts`"));
+        assert!(!local.contains("1500 seconds"));
+
+        let capped = server_instructions(
+            crate::limits::RuntimeSurfacePolicy::from_sync_hold(Some(
+                crate::limits::OPENAI_TUNNEL_SYNC_HOLD,
+            )),
+            Some("ts=UTC Unix seconds"),
+        );
+        assert!(capped.contains("`ts` (UTC Unix seconds)"));
+        assert!(capped.contains("35 minutes"));
+        assert!(capped.contains("From 25 minutes"));
+        assert!(capped.contains("1500 seconds"));
+        assert!(capped.contains("last 10 minutes"));
+        assert_eq!(capped.matches("35 minutes").count(), 1);
     }
 
     /// Both HTTP entry points must use the ceiling derived from the profile, not
@@ -4217,6 +4268,7 @@ mod tests {
             max_write_bytes: 4096,
             shared_caps: tools::shared_native::caps(4096, 4096).unwrap(),
             task_result_budget: None,
+            surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
             protected_paths: Vec::new(),
         };
         let secure_fs = crate::secure_fs::SecureFs::new(
@@ -4280,6 +4332,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -4438,6 +4491,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -4573,6 +4627,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,

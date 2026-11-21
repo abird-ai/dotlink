@@ -1,41 +1,56 @@
-# CURRENT HANDOFF — dotlink unified runtime + DL-200 design
+# CURRENT HANDOFF — dotlink unified runtime + DL-200 R6
 
-Canonical comprehensive handoff:
+Canonical comprehensive handoff (**read this first after AGENTS.md**):
 `../../../aw/.agents/docs/AW-DL200-R6-FULL-COMPREHENSIVE-HANDOFF-2026-11-21.md`.
 
-Copy-ready next-agent entrypoint:
+Copy-ready next-agent prompt:
 `../../../aw/.agents/docs/AW-DL200-R6-NEXT-AGENT-2026-11-21.md`.
 
-Active DL-200 design:
+Normative R6 design:
 `../../../aw/.agents/plans/dl200-unified-jobs-agent-events-2026-11-20/SPEC.md`.
 
-The previous AW+dotlink 2026-11-20 comprehensive handoff and the 2026-11-19 017
-handoff remain historical chronology referenced by the new canonical R6 handoff.
+## Current authoritative snapshot — 2026-11-21
 
-**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 CROSS-REPO PROCESS CUTOVER COMPLETE IN SOURCE.** R6 was explicitly approved on 2026-11-21 and is authoritative.
-AW shared runtime is published through `7c1670821b15082821a0b9621cd1caccbe62f144`; AW main
-is `59d67babaa846fa9b60e39a27170ac9d148e3b6f`, whose only later delta is the focused
-bounded-drain regression test. Dotlink source checkpoint `16475e4` consumes `aw-process`
-directly and pins all eight direct/transitive AW Git packages to `7c16708...`. The old
-parallel shell Process owner is deleted. Frozen 017 mounts/config-v13 remain deferred.
-No tag/release/deploy is implied by this checkpoint.
+**R6 + the shared Process/release-correction amendment are SEALED and published. Phase 0B is
+complete. Dotlink is repinned to the published corrective AW revision and the ordinary pinned
+consumer gate is green. The user explicitly deferred real-Bubblewrap worker-retirement and
+Windows-native qualification, so those remain external follow-up evidence and no longer block
+starting Phase 1.**
 
-Prepared: 2026-11-20
-Owner: @pvl
-Machine: **L5 implementation/source authority**
-Repo: `/home/pvl/spaces/abird/src/dotlink`
+Current refs:
 
-> Runtime/source authority remains live AW/dotlink source and tests. Current published AW
-> main is `59d67ba...`; dotlink runtime dependency pin is `7c16708...`; current dotlink source
-> checkpoint is `16475e4` before this handoff-sync commit.
-> DL-200 design authority is the sealed, implementation-promoted AW spec linked above;
-`IMPLEMENTATION.md` owns the active Phase-0 checkpoint order. Historical
-unsealed/design-only labels below describe earlier checkpoints, not current state.
-> Source/tests/executed evidence outrank prose.
->
-> Later operational convergence with the 0.17.1 release branch is tracked in
-> [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
-> It preserves this unified-runtime implementation and is not a release/tag.
+```text
+AW published  20a63a4d4547cc20b2a154787823125b82f5e385
+dotlink base before this publication cut fb1b7b97891d45e84d2a729f3eeb1a7cfe0eaa94
+release/0.17  576d0a1a3fe0a5522a02d51f1d0598c3ddc160c2 = v0.17.9
+dotlink AW pin 20a63a4d4547cc20b2a154787823125b82f5e385
+```
+
+The dotlink source now consumes the published async controlled `aw-process` API directly from the
+Git pin; there is no local path override. All six direct AW manifest revisions and all AW lockfile
+source hashes were repinned atomically. Ordinary `cargo check --locked --all-targets --all-features`
+is green against that published revision. **Do not revert the consumer to the old API.**
+
+Dotlink product policy is complete: one RuntimeSurfacePolicy, 35m turn / 10m hand-back / 25m
+command cap, actual Running-deadline `jobs_get.next`, `checkpoint_minutes=None`, and no duplicate
+Job/Process owner. Phase-0B target replay is complete: full Remote Start receipts compact after TTL
+to payload-free authorization-id tombstones, Unknown stays a tombstone, lookup remains O(1), expiry
+compaction is FIFO/amortized, and tombstones do not consume the 4,096 active/full receipt budget.
+
+Pinned publication qualification: shell **86/86**, Graph **13/13**, real queued Spawn-Lane
+cancellation, pre-spawn-timeout/no-Process mapping and canonical spawn-refusal settlement are green;
+strict all-target/all-feature Clippy, fmt and diff-check are green. The read-only release reference
+was revalidated exact and clean at v0.17.9. Real Bubblewrap worker-retirement and Windows-native
+qualification are explicitly deferred, not claimed green.
+
+Next implementation work is Phase 1: StoreScope / StoreId + StorePos and Agent
+migration-history-disclosure foundation in the canonical AW IMPLEMENTATION plan. Use dotlink---l5
+only. 017 sandbox/mount/config-v13 remains frozen/read-only. No tag/release/deploy is implied by
+this source publication.
+
+> The dated sections below are preserved implementation chronology. If their older status wording
+> conflicts with this snapshot or the canonical AW handoff, live source + the canonical handoff +
+> sealed SPEC win.
 
 ## LIVE R6 shared-Process cross-repo checkpoint — 2026-11-21
 
@@ -76,18 +91,160 @@ Grouped evidence without fixture expansion:
 - rustfmt and `git diff --check` green;
 - static ownership audit: no production `ManagedProcessGuard`, `shell_process::`, local Child
   owner, stop-tree/terminate-child or login-shell residue;
-- shell grouped executable run after the initial cut reached **133 passed / 1 failed**; the
-  single failure was the inherited-FD partial sink-batch loss described above;
-- that exact failure boundary is now covered at its actual shared owner: `aw-process` **3/3**,
-  including `reader_stop_flushes_partial_sink_batch_before_incomplete`, with strict Clippy green;
-- L5 repeatedly SIGKILLs the final dotlink test/binary during dotlink codegen/link after pin
-  changes, before any test executes. This is an explicit executable-qualification environment
-  gap, not a Rust diagnostic; do not split the suite into fixture fragments to work around it.
+- `aw-process` **3/3**, including `reader_stop_flushes_partial_sink_batch_before_incomplete`,
+  with strict Clippy green at the shared owner;
+- final warmed L5 executable qualification is green: shell filter **134/134** plus child-env
+  **1/1**; Process filter **18/18** plus its two process-related integration tests; Remote
+  Start/replay **16/16**;
+- the grouped shell gate includes timeout/cancel, inherited/background pipes, escaped-`setsid`
+  uncertainty, interactive stdin revision fencing and Graph cancellation. Those green reruns remain
+  valid for unchanged semantics, but earlier cold codegen/link SIGKILLs are no longer attributed
+  to an external host after the v0.17.7 parent-thread discovery.
 
-Phase-0 Process architecture is now converged in source. Before declaring final Phase-0
-acceptance/release qualification, rerun the grouped shell/Process/Remote-Start executable gate
-on a host where dotlink test linking is not externally killed. **Do not start Phase 1 in this
-handoff.**
+### v0.17.7 Process correction + v0.17.9 convergence reference
+
+The last audited release checkpoint is exact **v0.17.9 (`576d0a1`)**. Its committed
+`81ef891..v0.17.9` diff SHA-256 is `1aa632e35d9c…`, exactly matching the staged candidate already
+audited. At the actual main-port step, re-diff the then-current read-only release branch from this
+exact tag before editing. Classify deltas by owner instead of blind
+cherry-picking: shared Process/Job factual semantics => AW first; dotlink transport/product policy
+or projection => dotlink main over AW facts; frozen sandbox/config => defer unless explicitly
+promoted; reuse relevant tests/docs.
+
+Its v0.17.7 base contains `64e3bd8`, fixing the long-standing Linux SIGKILL mechanism: Bubblewrap `--die-with-parent` uses thread-scoped `PR_SET_PDEATHSIG`, so a
+launcher forked on a retireable Tokio worker can die when that worker exits while dotlink itself
+remains healthy. The release also requires non-reaping `waitid` confirmation before cleanup,
+keeps stop attribution independent from an already-published/incompatible exit, preserves the
+first cancel requester, and uses `CREATE_NO_WINDOW` instead of `DETACHED_PROCESS` for windowless
+PowerShell.
+
+Main must **not** resurrect release-branch `src/shell_process.rs` or cherry-pick its Linux spawn
+helper as a second Process runtime. The applicable semantics are now ported into the AW R6 design:
+The AW amendment is now **sealed** as one private logical Linux Spawn Facility, not one thread per
+Process: O(1) fixed/add-only process-lifetime Spawn Lanes (**N=1 initially**) accept bounded async
+spawn handoffs, while O(n) `Process: Send`/Job futures remain freely movable across Tokio workers.
+Only spawn + exact `DirectScope` attachment runs on a lane; complete custody returns as private RAII
+`Spawned { Child, DirectScope, pid }`. Lanes never retire/shrink, a request panic poisons future
+launch admission without exiting the anchor thread, and N>1 is internal benchmark-driven only.
+`aw-platform` owns strict child-terminal facts and Windows launch flags; dotlink remains a thin
+consumer and keeps only caller/connector attribution and product/log projection. The frozen 017
+Sandbox/mount design and future AW PID-1 backend remain separate.
+
+v0.17.8/v0.17.9's **purely dotlink-facing bounded-turn refinement is now implemented locally on
+main against the existing published AW pin**. It remains a dotlink projection over shared Job facts,
+not another Process/Jobs owner:
+
+- 35-minute turn horizon with a 10-minute hand-back/report reserve;
+- bounded new-command ceiling = 25 minutes / 1500 s, further narrowed by operator shell policy;
+- one current-surface capability (`sync_hold.is_some()`) determines whether the runtime is bounded;
+- near the Job's own deadline (`min(timeout/5, 5m)`), only live/non-cancelling `job_get` prepends a
+  checkpoint/drive-to-completion note; list/read/ack/cancel and terminal/unknown states stay quiet;
+- one tiny dotlink-local `RuntimeSurfacePolicy` derives the execution ceiling, server instructions,
+  startup warning and Job advisory; 25/35/10 has one source of truth;
+- effective ceiling/transport constraint is new-effect execution authority; current advisory is a
+  rebindable projection and never rewrites an existing Job's admitted timeout;
+- canonical lifecycle/output/revision facts continue to come from AW `JobManager`; dotlink keeps
+  only narrow timing projection. `created` is Job-age/`elapsed_ms`; the absolute
+  `execution_deadline` is established exactly at the canonical Running/Start checkpoint. Queue,
+  preparation and output admission do not consume `timeout_secs`; `jobs_get` counts down from
+  `execution_deadline - now`, never `timeout_secs - elapsed_ms`;
+- AW typed receipts provide `ts`, but dotlink should set `checkpoint_minutes=None` so generic AW
+  checkpoint prose cannot conflict with the exact 25/35/10 product policy;
+- if direct shared-jobs rendering blocks this later, factor only a narrow typed factual projection
+  seam—never rendered-text parsing, a generic renderer/plugin API, AW turn-clock semantics or a
+  duplicate dotlink Job state machine.
+
+The audited `81ef891` plus v0.17.9 refinement is **not dotlink-only**: `CREATE_NO_WINDOW` may
+leave transient console/job infrastructure counted after the main process exits, so immediate
+Windows Job accounting can falsely say `tree=leftovers`. Port this to shared AW:
+`aw-platform-win` exposes the cheap synchronous exact active-member query; `aw-process` performs
+bounded async settling after the main terminal fact. Zero => Empty, query error => Unknown,
+nonzero throughout the full uninterrupted <=2s/~10ms reference window => Live. Cancellation or
+execution deadline interrupts grace and sweeps immediately, yielding Unknown unless Empty was
+already proven; never special-case conhost/image names and never block a Tokio worker for the
+settle window. Dotlink main then projects the shared Occupancy into compatibility `tree`/`success`.
+
+v0.17.9 (`576d0a1`) also belongs partly in shared AW Spawn Facility admission. When a
+runner enters Running it establishes one absolute execution deadline before spawn admission. The
+stable lane rechecks cancellation and expiry immediately before fork using a private linearizable
+launch gate. Stale-before-`Launching` => no child and no ProcessTerminal/StopRecord/kill claim;
+once `Launching` wins, any real child follows normal RAII/Process settlement. Spawn-Lane queueing
+consumes that same deadline; pre-Running product queue age does not.
+
+**Current shared-source status:** AW has implemented the sealed Process/release correction
+locally/uncommitted on L5, including stable Spawn Facility, strict owned-child waitid, causal
+stop-vs-exit reconciliation, one absolute execution deadline across spawn+wait, v0.17.9 pre-fork
+stale cancellation/expiry rejection, and the Windows no-window/private-marker + interruptible
+occupancy-settle source path. Dotlink's sole shared Process consumer is now **also adapted locally**:
+it awaits async `Process::spawn`, passes the canonical Running deadline + cloned level-triggered Job
+cancellation via `SpawnControl`, and maps `CancelledBeforeSpawn`/`TimedOutBeforeSpawn` to factual
+no-Process product outcomes with no ProcessTerminal. The old host `spawn_failed` bit is generalized
+to `process_not_started`; no parallel runtime owner was restored. Dotlink remains pinned to the old
+published AW revision until publication/repin is explicitly authorized.
+
+**Dotlink-local v0.17.9 product-policy checkpoint:** source compiles against the current pin; Jobs
+121/121, shared-native 15/15, Graph 13/13, focused shell queue/timeout/schema tests and the three
+bounded-turn/deadline tests are green; full test graph type-checks; strict all-target/all-feature
+Clippy, fmt and diff-check are green. AW receipts provide factual `ts` with
+`checkpoint_minutes=None`; local-only surfaces stay uncapped/quiet; hand-back surfaces derive the
+25m command cap / 35m turn / 10m report reserve and rebind `jobs_get.next` without changing retained
+Job timeout truth.
+
+**Phase-0B compact replay/lifetime checkpoint is complete locally.** Remote Start full receipts now
+compact after ordinary retention to a payload-free `Compacted` tombstone instead of deleting the
+AW authorization-id claim; Unknown already remains a tombstone. The HashMap keeps O(1) replay
+lookup, a FIFO makes full-receipt expiry amortized rather than scanning lifetime tombstones, and
+payload-free tombstones do not consume the 4,096 active/full receipt budget. Exact semantic hash
+collision remains enforced after compaction. Current disclosure still gates projection: shell/
+filesystem may return only a generic compacted acknowledgement under current source/tool authority;
+Job/Graph controls whose exact Job ref has expired return the opaque withheld acknowledgement.
+Consolidated `remote_start` tests 16/16, strict all-target/all-feature Clippy, test-graph check, fmt
+and diff-check are green. AW's paired policy-admission tombstone/lifetime qualification is recorded
+in the canonical AW handoff.
+
+**Local Process-consumer qualification:** validation against the dirty local AW checkout used a
+strictly temporary path substitution and restored Cargo.toml/Cargo.lock byte-for-byte. Full shell is
+**86/86**, Graph **13/13**, the real process-global Spawn-Lane queued-cancellation test proves the
+cancelled command never execs and has no ProcessTerminal, pre-spawn timeout projection is green,
+canonical spawn-refusal settlement is green, full test-graph check is green, and strict
+all-target/all-feature Clippy/fmt/diff are green. The initial long lane test briefly interfered with
+two unrelated parallel timing tests; shortening it to 250 ms removed the interference without
+weakening those tests, which remain green under their original <900 ms assertions.
+
+Real Bubblewrap smoke was explicitly attempted with `DOTLINK_TEST_BWRAP=1` and reached the installed
+`bwrap`, but L5's outer tool sandbox rejects mounting `/proc` (`Operation not permitted`). Record
+that gate as unavailable on this host, not pass/fail. L5 also lacks a Windows Rust target, so
+Windows-native remains unproven.
+
+**Next implementation sequence after publication authorization:** publish/repin the fixed AW runtime;
+re-diff release/0.17 from exact v0.17.9; rerun this already-green consumer gate under the exact Git
+pin; run real Bubblewrap worker-retirement on a host that permits its mounts and Windows-native
+qualification. After that review, Phase 1 is next.
+
+## LIVE Phase-0B Remote Start replay-disclosure checkpoint — uncommitted, 2026-11-21
+
+The replay owner still resolves exact Ready/Unknown facts before fresh-effect lease/generation/
+issuer checks. Payload projection is now separately current-authorized: a revoked issuer keeps the
+replay fact but loses protected content; lease expiry/runtime-generation drift alone do not hide a
+factual receipt. Cached native filesystem effects re-run only canonical **authority preflight**
+against current prepared capabilities (request parse/access paths/final-symlink resolution +
+`preflight_mutation`) with no read/lock/stage/commit. Shell replay requires current shell policy.
+Cached `jobs_ack/send/cancel` requires current tool policy plus the exact retained Job/node still
+being available. Withholding returns one generic non-retryable success acknowledgement and never
+reclaims the effect identity.
+
+This composes with AW's current Session View + ToolBinding/Actor-Envelope source gate; AW never
+pretends its local filesystem/Job owner proves a dotlink resource. No new protocol, replay ledger,
+resource service or generic Tool hook. Focused grouped evidence: Remote Start/replay **16/16**;
+strict all-target/all-feature Clippy green; fmt/diff clean.
+
+AW's subsequent uncommitted Phase-0B participant Provider/payer slice is also closed: fresh
+admission uses one full-identity `ProviderAccounts::select_exact`; Alice keeps durable
+Session/delegation custody while Bob keeps his own provider/payer/model/tool identity, including
+paid policy delegation. Dotlink source is unchanged by that slice. After the focused v0.17.7
+shared Process publication/repin, the Phase-0B replay/disclosure/provider/tombstone/lifetime work
+and the dotlink Process-consumer source cut are already locally closed. The remaining pre-Phase-1
+work is publication/repin plus real-Bubblewrap and Windows-native platform qualification.
 
 ## Historical pre-R6-implementation checkpoint — 2026-11-21
 

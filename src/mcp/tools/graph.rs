@@ -2,7 +2,7 @@
 //! deterministic scheduling, status and retained output; dotlink owns policy,
 //! process custody, transport exposure and replay.
 
-use std::{panic::AssertUnwindSafe, path::Path, sync::Arc, time::Duration};
+use std::{panic::AssertUnwindSafe, path::Path, sync::Arc};
 
 use anyhow::{Result, anyhow, bail};
 #[cfg(windows)]
@@ -22,7 +22,7 @@ use futures_util::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use rmcp::schemars;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{sync::oneshot, time::Instant};
+use tokio::sync::oneshot;
 
 use super::{
     LocalMachine, dot, resolve_capped, shared_native,
@@ -355,7 +355,9 @@ fn settle_unlaunched(job: &JobHandle, coordinate: usize, claimed_sequence: u64) 
             .settle_unlaunched(
                 &job.id,
                 coordinate,
-                claimed_sequence,
+                NodeState::Claimed {
+                    sequence: claimed_sequence,
+                },
                 next_sequence(manager, &job.id)?,
                 |_, sequence| {
                     if sequence == claimed_sequence {
@@ -603,24 +605,13 @@ async fn execute_shell(
         );
     }
     crate::credentials::hide_from_child(&mut command);
-    let Some(deadline) = Instant::now().checked_add(Duration::from_secs(node.timeout_secs)) else {
-        finish_if_present(&manager, &id, coordinate, OutputStream::Stdout);
-        finish_if_present(&manager, &id, coordinate, OutputStream::Stderr);
-        return settle_prelaunch_failure(
-            &manager,
-            &job,
-            coordinate,
-            claimed_sequence,
-            "fail shell timeout is unschedulable",
-        );
-    };
     let context = runtime.shell.job_result_context(&working_dir);
     let completion = LocalMachine::run_shell_job(ShellJobRun {
         command,
         log: runtime.shell.log_config(),
         stdin_text: node.args.stdin,
         interactive: node.interactive,
-        deadline,
+        timeout_secs: node.timeout_secs,
         job: job.clone(),
         lifecycle_id: format!("{}/n:{coordinate}", job.id),
         coordinate,
@@ -628,14 +619,18 @@ async fn execute_shell(
         result_context: context,
     })
     .await;
-    let terminal =
-        (!completion.spawn_failed).then(|| crate::jobs::shared_process_terminal(&completion));
+    let terminal = (!completion.process_not_started)
+        .then(|| crate::jobs::shared_process_terminal(&completion));
     let (compact, status) = match terminal {
         Some(terminal) => (terminal.compact_result(), terminal.status()),
         None => (
-            "fail launch=spawn_failed".to_owned(),
+            format!("{} process=not_started", completion.status.as_str()),
             Status {
-                primary: Primary::Fail,
+                primary: if completion.status == crate::jobs::JobStatus::Unknown {
+                    Primary::Unknown
+                } else {
+                    Primary::Fail
+                },
                 more: false,
                 incomplete: false,
             },
@@ -812,7 +807,7 @@ fn settle_abort_inner(manager: &SharedJobManager, id: &str) -> Result<()> {
                         .settle_unlaunched(
                             id,
                             coordinate,
-                            sequence,
+                            NodeState::Claimed { sequence },
                             next_sequence(manager, id)?,
                             |_, observed| {
                                 if observed == sequence {
@@ -1227,7 +1222,7 @@ mod tests {
             .settle_unlaunched(
                 "shell-prelaunch-fail",
                 1,
-                claimed,
+                NodeState::Claimed { sequence: claimed },
                 next_sequence(&manager, "shell-prelaunch-fail").unwrap(),
                 |_, observed| {
                     if observed == claimed {
@@ -1325,7 +1320,7 @@ mod tests {
             .settle_unlaunched(
                 "cancel-before-effect",
                 1,
-                claimed,
+                NodeState::Claimed { sequence: claimed },
                 next_sequence(&manager, "cancel-before-effect").unwrap(),
                 |_, observed| {
                     if observed == claimed {
@@ -1706,7 +1701,7 @@ mod tests {
         let started = start(&machine, prepared, None, None, true).await.unwrap();
         machine.jobs.cancel(&started.id).unwrap();
         machine.jobs.wait_until(&started.id, None).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(650)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
         assert!(!root.join("late.txt").exists());
         let snapshot = machine.jobs.shared_snapshot(&started.id).unwrap();
         assert_eq!(snapshot.lifecycle, Lifecycle::Terminal);

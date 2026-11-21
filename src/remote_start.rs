@@ -23,7 +23,7 @@ use aw_tools::{
     },
 };
 use rmcp::{
-    model::RequestMetaObject,
+    model::{CallToolResult, ContentBlock, RequestMetaObject},
     service::{RequestContext, RoleServer},
 };
 use serde_json::Value;
@@ -33,6 +33,18 @@ pub(crate) use aw_tools::remote_start::arguments_sha256;
 
 pub(crate) const REMOTE_START_META_KEY: &str = "io.abird.aw/remoteStart";
 pub(crate) const REMOTE_START_LEASE_MILLIS: u64 = 30_000;
+
+pub(crate) fn withheld_replay_result() -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(
+        "prior remote Start is already consumed; protected replay content is unavailable under current authority; do not retry",
+    )])
+}
+
+pub(crate) fn compacted_replay_result() -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(
+        "prior remote Start is already consumed; original replay detail has expired; do not retry",
+    )])
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthenticatedMcpClient {
@@ -167,6 +179,7 @@ pub(crate) struct ValidatedRemoteStart {
     authorization: RemoteStartAuthorization,
     semantic_hash: [u8; 32],
     new_claim_denial: Option<NewClaimDenial>,
+    issuer_current: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +230,12 @@ impl ValidatedRemoteStart {
 
     pub(crate) fn new_claim_denial(&self) -> Option<&'static str> {
         self.new_claim_denial.map(NewClaimDenial::message)
+    }
+
+    /// Payload disclosure requires the authenticated issuer to remain trusted.
+    /// Lease expiry/runtime-generation drift blocks only new effects, not replay.
+    pub(crate) fn replay_source_current(&self) -> bool {
+        self.issuer_current
     }
 }
 
@@ -336,13 +355,14 @@ pub(crate) fn validate_authorization(
         bail!("remote Start issuer differs from authenticated MCP client");
     }
     let target = &authorization.intent.target;
+    let issuer_current = client.remote_start_trust_epoch() == Some(issuer.trust_epoch);
     let new_claim_denial = if target.generation != request.generation {
         Some(NewClaimDenial::RuntimeGenerationChanged)
     } else if request.now_unix_ms < target.issued_at_unix_ms
         || request.now_unix_ms >= target.expires_at_unix_ms
     {
         Some(NewClaimDenial::LeaseNotCurrent)
-    } else if client.remote_start_trust_epoch() != Some(issuer.trust_epoch) {
+    } else if !issuer_current {
         Some(NewClaimDenial::IssuerNotTrusted)
     } else {
         None
@@ -366,6 +386,7 @@ pub(crate) fn validate_authorization(
         authorization,
         semantic_hash,
         new_claim_denial,
+        issuer_current,
     })
 }
 
@@ -474,11 +495,13 @@ mod tests {
             semantic_hash: semantic_hash(&authorization, "client-a", OperationId::Bash, &arguments),
             authorization: authorization.clone(),
             new_claim_denial: None,
+            issuer_current: true,
         };
         let second = ValidatedRemoteStart {
             semantic_hash: semantic_hash(&authorization, "client-b", OperationId::Bash, &arguments),
             authorization,
             new_claim_denial: None,
+            issuer_current: true,
         };
         assert_eq!(first.claim_key(), second.claim_key());
         assert_eq!(first.replay_key(), second.replay_key());
@@ -654,9 +677,21 @@ mod tests {
             )) if result.content[0].as_text().is_some_and(|text| text.text == "j:abc process running rev=1")
         ));
 
+        manager.set_limits(
+            std::time::Duration::ZERO,
+            crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+        );
+        assert!(matches!(
+            manager.claim_remote_start(&validated).unwrap(),
+            crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::Compacted)
+        ));
+
         let mut changed = validated.clone();
         changed.semantic_hash[0] ^= 1;
-        assert!(manager.claim_remote_start(&changed).is_err());
+        assert!(
+            manager.claim_remote_start(&changed).is_err(),
+            "compaction must retain semantic collision proof rather than reopen the effect slot"
+        );
     }
 
     #[test]
@@ -707,7 +742,7 @@ mod tests {
             .unwrap();
 
         let revoked_replay = validate_authorization(
-            authorization,
+            authorization.clone(),
             ValidationContext {
                 client_id: "client-a",
                 remote_start_trust_epoch: None,
@@ -722,12 +757,39 @@ mod tests {
         )
         .unwrap();
         assert!(!revoked_replay.new_claim_authorized());
+        assert!(
+            !revoked_replay.replay_source_current(),
+            "revoked issuer keeps replay identity factual but loses protected payload disclosure"
+        );
         assert!(matches!(
             manager.claim_remote_start(&revoked_replay).unwrap(),
             crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::Mcp(
                 ref replay
             )) if *replay == receipt
         ));
+        let expired_and_revoked = validate_authorization(
+            authorization,
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: None,
+                target: &target,
+                generation,
+                now_unix_ms: revoked_replay
+                    .authorization
+                    .intent
+                    .target
+                    .expires_at_unix_ms,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !expired_and_revoked.replay_source_current(),
+            "lease expiry must not hide simultaneous issuer revocation from disclosure"
+        );
 
         let mut fresh_intent = revoked_replay.authorization.intent.clone();
         fresh_intent.effect_attempt_id = "fresh-after-revoke".into();

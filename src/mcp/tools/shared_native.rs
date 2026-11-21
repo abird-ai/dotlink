@@ -4,8 +4,11 @@
 use aw_tools::{
     filesystem::{
         access::Action,
+        backend::{
+            ExplicitPathBackend, MutationAccess, MutationExtent, MutationPath, SecuredFilesystem,
+        },
         direct::{self, Body},
-        request,
+        request::{self, PathAccess, RequestKind},
         schema::{SchemaCaps, Tool as CoreTool},
     },
     media::MediaKind,
@@ -79,36 +82,12 @@ pub(crate) fn caps(max_read: usize, max_write: usize) -> Result<SchemaCaps, &'st
     .validate()
 }
 
-/// Dotlink-owned runtime profile. The conversational horizon is product policy,
-/// not AW Process semantics. `None` keeps an embedding's configured Process
-/// deadline and omits checkpoint guidance; the current dotlink runtime is the
-/// bounded conversational profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeProfile {
-    pub(crate) checkpoint_minutes: Option<u16>,
-    pub(crate) hard_shell_timeout_secs: Option<u64>,
-}
-
-pub(crate) const fn runtime_profile() -> RuntimeProfile {
-    RuntimeProfile {
-        checkpoint_minutes: Some(30),
-        hard_shell_timeout_secs: Some(35 * 60),
-    }
-}
-
-pub(crate) fn effective_shell_timeout_ceiling(configured_secs: u64) -> u64 {
-    runtime_profile()
-        .hard_shell_timeout_secs
-        .map_or(configured_secs, |hard| configured_secs.min(hard))
-}
-
-/// Dotlink-selected shared catalog profile. Receipt timestamps and checkpoint
-/// guidance apply only to typed Process/Batch/Jobs projections; no free-form
-/// MCP result text is parsed to recover receipt state.
+/// Dotlink-selected shared catalog profile. AW provides factual receipt time;
+/// exact bounded-turn/checkpoint policy remains one dotlink surface projection.
 pub(crate) fn receipt_profile() -> ReceiptProfile {
     ReceiptProfile {
         unix_ts: true,
-        checkpoint_minutes: runtime_profile().checkpoint_minutes,
+        checkpoint_minutes: None,
         scope: ReceiptScope::none()
             .with_category(ReceiptCategory::Process)
             .with_category(ReceiptCategory::Batch)
@@ -635,6 +614,69 @@ fn execute_projected(
     }
 }
 
+fn replay_filesystem_disclosed(
+    machine: &LocalMachine,
+    name: &str,
+    arguments: &Value,
+    start: &crate::remote_start::ValidatedRemoteStart,
+) -> bool {
+    if !start.replay_source_current() || !machine.has_tool_for_policy(name) {
+        return false;
+    }
+    let Some(tool) = core_tool(name) else {
+        return false;
+    };
+    if tool.action() == Action::Read {
+        return false;
+    }
+    let Ok(request_limits) = semantic_request_limits(machine) else {
+        return false;
+    };
+    let Ok(request) = request::parse(tool, arguments, request_limits) else {
+        return false;
+    };
+    let Ok(backend) = machine.shared_fs.backend_for_request(&request) else {
+        return false;
+    };
+    let extent = match request.kind() {
+        RequestKind::Copy(_) | RequestKind::Move(_) => MutationExtent::Subtree,
+        RequestKind::Remove(args) if args.recursive => MutationExtent::Subtree,
+        _ => MutationExtent::Exact,
+    };
+    let Ok(paths) = request.access_paths() else {
+        return false;
+    };
+    let mut resolved = Vec::with_capacity(paths.len());
+    for path in paths {
+        let model = if path.follow_final {
+            match path.access {
+                PathAccess::Read => backend.resolve_content_path(&path.path, false),
+                PathAccess::Write => backend.resolve_content_path(&path.path, true),
+                PathAccess::ReadWrite => backend.resolve_content_path(&path.path, false),
+            }
+        } else {
+            Ok(path.path)
+        };
+        let Ok(model) = model else {
+            return false;
+        };
+        resolved.push((model, path.access));
+    }
+    let preflight = resolved
+        .iter()
+        .map(|(path, access)| MutationPath {
+            path,
+            access: match access {
+                PathAccess::Read => MutationAccess::Read,
+                PathAccess::Write => MutationAccess::Write,
+                PathAccess::ReadWrite => MutationAccess::ReadWrite,
+            },
+            extent,
+        })
+        .collect::<Vec<_>>();
+    backend.preflight_mutation(&preflight).is_ok()
+}
+
 fn enforce_result_budget(
     result: CallToolResult,
     result_budget: Option<usize>,
@@ -690,7 +732,24 @@ fn execute_with_remote_start(
         | crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::JobMcp {
             result,
             ..
-        }) => return Ok(result),
+        }) => {
+            return Ok(
+                if replay_filesystem_disclosed(machine, name, &arguments, &start) {
+                    result
+                } else {
+                    crate::remote_start::withheld_replay_result()
+                },
+            );
+        }
+        crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::Compacted) => {
+            return Ok(
+                if replay_filesystem_disclosed(machine, name, &arguments, &start) {
+                    crate::remote_start::compacted_replay_result()
+                } else {
+                    crate::remote_start::withheld_replay_result()
+                },
+            );
+        }
         crate::jobs::RemoteStartDecision::Unknown => {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "remote Start outcome is unknown; inspect the original filesystem attempt before any new invocation",
@@ -884,14 +943,6 @@ mod tests {
     }
 
     #[test]
-    fn conversational_runtime_profile_owns_checkpoint_and_hard_shell_horizon() {
-        assert_eq!(runtime_profile().checkpoint_minutes, Some(30));
-        assert_eq!(runtime_profile().hard_shell_timeout_secs, Some(35 * 60));
-        assert_eq!(effective_shell_timeout_ceiling(600), 600);
-        assert_eq!(effective_shell_timeout_ceiling(3_600), 35 * 60);
-    }
-
-    #[test]
     fn projected_default_schemas_and_metadata_are_exact_shared_toolset() {
         let caps = SchemaCaps::default();
         let toolset = toolset(caps, crate::limits::DEFAULT_TRANSFER_BYTES);
@@ -918,7 +969,7 @@ mod tests {
             );
         }
         assert!(toolset.receipt_profile().unix_ts);
-        assert_eq!(toolset.receipt_profile().checkpoint_minutes, Some(30));
+        assert_eq!(toolset.receipt_profile().checkpoint_minutes, None);
         assert!(
             !toolset
                 .receipt_profile()

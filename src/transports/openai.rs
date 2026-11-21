@@ -3667,6 +3667,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -3817,6 +3818,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -4511,6 +4513,7 @@ mod tests {
             max_write_bytes: 1024,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -4895,6 +4898,7 @@ mod tests {
                     max_write_bytes: 1024,
 
                     task_result_budget: None,
+                    sync_hold: None,
                     job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                     job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -4999,6 +5003,7 @@ mod tests {
             max_write_bytes: 1024 * 1024,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -6097,6 +6102,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -7316,6 +7322,7 @@ name"
             max_write_bytes: 1024,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7803,6 +7810,7 @@ name"
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -7919,6 +7927,7 @@ name"
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -8627,6 +8636,7 @@ name"
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -8728,6 +8738,7 @@ name"
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,

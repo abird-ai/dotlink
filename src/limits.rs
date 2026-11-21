@@ -20,6 +20,49 @@ const _: () = assert!(
     OPENAI_TUNNEL_SYNC_HOLD.as_secs() + OPENAI_TUNNEL_DELIVERY_RESERVE.as_secs()
         < OPENAI_TUNNEL_REQUEST_DEADLINE.as_secs()
 );
+
+/// Bounded user/model turn horizon for a surface that hands work back mid-run.
+pub(crate) const TURN_HORIZON_MINUTES: u64 = 35;
+/// Reserve that remains after the last command deadline for coherent hand-back.
+pub(crate) const TURN_HANDBACK_RESERVE_MINUTES: u64 = 10;
+/// One command cannot consume the whole turn its result must be reported in.
+pub(crate) const CAPPED_SHELL_TIMEOUT_SECS: u64 =
+    (TURN_HORIZON_MINUTES - TURN_HANDBACK_RESERVE_MINUTES) * 60;
+const _: () = assert!(
+    TURN_HANDBACK_RESERVE_MINUTES > 0 && TURN_HANDBACK_RESERVE_MINUTES < TURN_HORIZON_MINUTES
+);
+
+/// Dotlink-only projection/execution policy derived from transport capability.
+/// AW receives only the resulting explicit Process deadline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeSurfacePolicy {
+    capped: bool,
+}
+
+impl RuntimeSurfacePolicy {
+    pub(crate) const fn from_sync_hold(sync_hold: Option<Duration>) -> Self {
+        Self {
+            capped: sync_hold.is_some(),
+        }
+    }
+
+    pub(crate) const fn capped(self) -> bool {
+        self.capped
+    }
+
+    pub(crate) const fn shell_timeout_ceiling(self, configured_secs: u64) -> u64 {
+        if self.capped {
+            if configured_secs < CAPPED_SHELL_TIMEOUT_SECS {
+                configured_secs
+            } else {
+                CAPPED_SHELL_TIMEOUT_SECS
+            }
+        } else {
+            configured_secs
+        }
+    }
+}
+
 /// OpenAI Secure MCP Tunnel's serialized request/response message ceiling.
 pub(crate) const OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Reserve between the complete embedded MCP message and the hosted tunnel
@@ -65,3 +108,18 @@ pub(crate) const MAX_JOB_SPOOL_BYTES_PER_STREAM: u64 = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_JOB_SPOOL_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MIN_JOB_SPOOL_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_JOB_SPOOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_surface_leaves_the_handback_reserve() {
+        let capped = RuntimeSurfacePolicy::from_sync_hold(Some(OPENAI_TUNNEL_SYNC_HOLD));
+        let local = RuntimeSurfacePolicy::from_sync_hold(None);
+        assert_eq!(CAPPED_SHELL_TIMEOUT_SECS, 25 * 60);
+        assert_eq!(capped.shell_timeout_ceiling(3_600), 25 * 60);
+        assert_eq!(capped.shell_timeout_ceiling(600), 600);
+        assert_eq!(local.shell_timeout_ceiling(3_600), 3_600);
+    }
+}

@@ -78,6 +78,7 @@ fn test_machine_with_launchers(
         max_write_bytes: 65536,
         shared_caps: crate::mcp::tools::shared_native::caps(65536, 65536).unwrap(),
         task_result_budget: None,
+        surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
         protected_paths: Vec::new(),
     };
     configure(&mut config);

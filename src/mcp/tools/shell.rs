@@ -129,7 +129,7 @@ pub(crate) struct ShellJobRun {
     pub(crate) log: crate::logging::LogConfig,
     pub(crate) stdin_text: Option<String>,
     pub(crate) interactive: bool,
-    pub(crate) deadline: Instant,
+    pub(crate) timeout_secs: u64,
     pub(crate) job: JobHandle,
     /// Product lifecycle label for this concrete process. Standalone shell uses
     /// the root Job id; Graph shell nodes append their canonical node coordinate.
@@ -2328,9 +2328,35 @@ impl LocalMachine {
             .claim_remote_start(&start)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?
         {
-            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))
-            | RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp { result, .. }) => {
-                return Ok(CallToolResponse::Complete(result));
+            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => {
+                let disclosed = start.replay_source_current() && self.has_tool_for_policy(name);
+                return Ok(CallToolResponse::Complete(if disclosed {
+                    result
+                } else {
+                    crate::remote_start::withheld_replay_result()
+                }));
+            }
+            RemoteStartDecision::Existing(RemoteStartReceipt::JobMcp { reference, result }) => {
+                let node = reference.node().map(|node| node.get() as usize);
+                let disclosed = start.replay_source_current()
+                    && self.has_tool_for_policy(name)
+                    && self
+                        .jobs
+                        .standalone_status(reference.job().as_str(), node)
+                        .is_ok();
+                return Ok(CallToolResponse::Complete(if disclosed {
+                    result
+                } else {
+                    crate::remote_start::withheld_replay_result()
+                }));
+            }
+            RemoteStartDecision::Existing(RemoteStartReceipt::Compacted) => {
+                let disclosed = start.replay_source_current() && self.has_tool_for_policy(name);
+                return Ok(CallToolResponse::Complete(if disclosed {
+                    crate::remote_start::compacted_replay_result()
+                } else {
+                    crate::remote_start::withheld_replay_result()
+                }));
             }
             RemoteStartDecision::Unknown => {
                 return Ok(CallToolResponse::Complete(tool_error(
@@ -2601,13 +2627,6 @@ impl LocalMachine {
                             StreamSummary::default(),
                         );
                     }
-                    let Some(deadline) =
-                        Instant::now().checked_add(Duration::from_secs(timeout_secs))
-                    else {
-                        let message =
-                            format!("timeout_secs {timeout_secs} is too large to schedule");
-                        return JobCompletion::failed(message);
-                    };
                     let shared_writers = match job.claim_prepared_shell(
                         shared_tool,
                         shared_arguments,
@@ -2635,7 +2654,7 @@ impl LocalMachine {
                         log: runtime.config.log.clone(),
                         stdin_text: args.stdin,
                         interactive,
-                        deadline,
+                        timeout_secs,
                         lifecycle_id: job.id.clone(),
                         job,
                         coordinate: 1,
@@ -2667,6 +2686,43 @@ impl LocalMachine {
                 force_truncated,
             ),
         )
+    }
+
+    fn spawn_error_completion(
+        error: aw_process::Error,
+        job: &JobHandle,
+        coordinate: usize,
+        result_context: JobResultContext,
+    ) -> JobCompletion {
+        match error {
+            aw_process::Error::CancelledBeforeSpawn => {
+                let (stdout, stderr) = Self::process_stream_summaries(job, coordinate, true);
+                JobCompletion::cancelled(stdout, stderr)
+                    .without_process()
+                    .with_cancel_origin(job.cancel.origin())
+                    .with_context(result_context)
+            }
+            aw_process::Error::TimedOutBeforeSpawn => {
+                let (stdout, stderr) = Self::process_stream_summaries(job, coordinate, true);
+                JobCompletion::timed_out(stdout, stderr)
+                    .without_process()
+                    .with_context(result_context)
+            }
+            aw_process::Error::Io(error) => {
+                JobCompletion::spawn_failed(error.to_string()).with_context(result_context)
+            }
+            error => {
+                let (stdout, stderr) = Self::process_stream_summaries(job, coordinate, true);
+                let terminal = Self::uncertain_process_terminal(
+                    stdout,
+                    stderr,
+                    SharedProcessStopReason::RuntimeError,
+                );
+                JobCompletion::unknown_with_output(error.to_string(), stdout, stderr)
+                    .with_process_terminal(terminal)
+                    .with_context(result_context)
+            }
+        }
     }
 
     fn uncertain_process_terminal(
@@ -2759,7 +2815,7 @@ impl LocalMachine {
             log: _,
             stdin_text,
             interactive,
-            deadline,
+            timeout_secs,
             job,
             lifecycle_id: _,
             coordinate,
@@ -2772,12 +2828,6 @@ impl LocalMachine {
             return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
                 .with_context(result_context);
         }
-        if Instant::now() >= deadline {
-            job.settle_node_unlaunched(coordinate);
-            return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
-                .with_context(result_context);
-        }
-
         // Reserve exactly the two product drain leases before the Start
         // checkpoint. Once reserved, seal registration: no later output writer
         // may appear after the external effect begins.
@@ -2791,7 +2841,20 @@ impl LocalMachine {
         };
         job.seal_spool_writers();
 
-        if let Err(error) = job.mark_node_launched(coordinate) {
+        // Running is the execution-budget boundary. Queueing, preparation and
+        // output admission above do not consume the command timeout.
+        let Some(deadline) = Instant::now().checked_add(Duration::from_secs(timeout_secs)) else {
+            let _ = shared_writers.stdout.finish();
+            let _ = shared_writers.stderr.finish();
+            drop(stdout_guard);
+            drop(stderr_guard);
+            job.settle_node_unlaunched(coordinate);
+            return JobCompletion::failed(format!(
+                "timeout_secs {timeout_secs} is too large to schedule"
+            ))
+            .with_context(result_context);
+        };
+        if let Err(error) = job.mark_node_launched(coordinate, deadline) {
             let _ = shared_writers.stdout.finish();
             let _ = shared_writers.stderr.finish();
             drop(stdout_guard);
@@ -2809,6 +2872,8 @@ impl LocalMachine {
         let stderr_sink =
             SharedProcessOutputSink::new(shared_writers.stderr, stderr_guard, job.clone());
         let stdin_open = stdin_text.is_some() || interactive;
+        let spawn_cancel = job.cancel.clone();
+        let spawn_cancel_signal = job.cancel.clone();
         let mut process = match aw_process::Process::spawn(
             command,
             aw_process::SpawnOptions {
@@ -2816,22 +2881,18 @@ impl LocalMachine {
                 stdout: Some(Box::new(stdout_sink)),
                 stderr: Some(Box::new(stderr_sink)),
                 event_sink: None,
+                control: Some(aw_process::SpawnControl::new(
+                    deadline,
+                    move || spawn_cancel.is_cancelled(),
+                    async move { spawn_cancel_signal.cancelled().await },
+                )),
             },
-        ) {
+        )
+        .await
+        {
             Ok(process) => process,
-            Err(aw_process::Error::Io(error)) => {
-                return JobCompletion::spawn_failed(error.to_string()).with_context(result_context);
-            }
             Err(error) => {
-                let (stdout, stderr) = Self::process_stream_summaries(&job, coordinate, true);
-                let terminal = Self::uncertain_process_terminal(
-                    stdout,
-                    stderr,
-                    SharedProcessStopReason::RuntimeError,
-                );
-                return JobCompletion::unknown_with_output(error.to_string(), stdout, stderr)
-                    .with_process_terminal(terminal)
-                    .with_context(result_context);
+                return Self::spawn_error_completion(error, &job, coordinate, result_context);
             }
         };
 
@@ -3222,6 +3283,7 @@ mod tests {
                 max_write_bytes: max_bytes,
                 shared_caps: crate::mcp::tools::shared_native::caps(max_bytes, max_bytes).unwrap(),
                 task_result_budget: None,
+                surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), None),
@@ -3311,6 +3373,185 @@ mod tests {
         );
         drop(job);
         manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_spawn_cancel_settles_without_process_terminal() {
+        use std::os::unix::process::CommandExt as _;
+
+        let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        assert!(manager.bind_policy([9; 32]));
+        let output_limit = crate::limits::DEFAULT_TRANSFER_BYTES;
+
+        let first = manager.create_for_test(3).unwrap();
+        let first_writers = first
+            .claim_prepared_shell(
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                serde_json::json!({
+                    "command":"spawn-lane-blocker",
+                    "dir":".",
+                    "stdin":null,
+                    "timeout_secs":3,
+                    "max_output_bytes":output_limit
+                }),
+                None,
+                output_limit,
+                crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM,
+            )
+            .unwrap();
+        let mut blocker = tokio::process::Command::new("sh");
+        blocker.args(["-c", "true"]);
+        // SAFETY: this test callback performs only libc nanosleep before exec.
+        unsafe {
+            blocker.as_std_mut().pre_exec(|| {
+                let requested = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 250_000_000,
+                };
+                if libc::nanosleep(&requested, std::ptr::null_mut()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let first_for_run = first.clone();
+        let first_task = tokio::spawn(async move {
+            LocalMachine::run_shell_job(ShellJobRun {
+                command: blocker,
+                log: LogConfig::default(),
+                stdin_text: None,
+                interactive: false,
+                timeout_secs: 3,
+                job: first_for_run,
+                lifecycle_id: "spawn-lane-blocker".into(),
+                coordinate: 1,
+                shared_writers: first_writers,
+                result_context: JobResultContext {
+                    dir: ".".into(),
+                    sandboxed: false,
+                    network: true,
+                },
+            })
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let second = manager.create_for_test(3).unwrap();
+        let second_writers = second
+            .claim_prepared_shell(
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                serde_json::json!({
+                    "command":"spawn-lane-must-not-run",
+                    "dir":".",
+                    "stdin":null,
+                    "timeout_secs":3,
+                    "max_output_bytes":output_limit
+                }),
+                None,
+                output_limit,
+                crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM,
+            )
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("ran");
+        let mut must_not_run = tokio::process::Command::new("sh");
+        must_not_run
+            .arg("-c")
+            .arg("printf ran > \"$1\"")
+            .arg("sh")
+            .arg(&marker);
+        let second_for_run = second.clone();
+        let second_task = tokio::spawn(async move {
+            LocalMachine::run_shell_job(ShellJobRun {
+                command: must_not_run,
+                log: LogConfig::default(),
+                stdin_text: None,
+                interactive: false,
+                timeout_secs: 3,
+                job: second_for_run,
+                lifecycle_id: "spawn-lane-must-not-run".into(),
+                coordinate: 1,
+                shared_writers: second_writers,
+                result_context: JobResultContext {
+                    dir: ".".into(),
+                    sandboxed: false,
+                    network: true,
+                },
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        second.cancel.cancel();
+
+        let second_completion = tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("queued spawn cancellation must settle")
+            .unwrap();
+        assert_eq!(second_completion.status, crate::jobs::JobStatus::Cancelled);
+        assert!(second_completion.process_not_started);
+        assert!(second_completion.process_terminal.is_none());
+        assert_eq!(
+            second_completion.cancel_origin,
+            Some(crate::jobs::CancelOrigin::Caller)
+        );
+        assert!(!marker.exists(), "cancelled queued command must never exec");
+        manager.finish(&second.id, second_completion);
+        let second_shared = second
+            .shared_manager()
+            .unwrap()
+            .runtime_snapshot(&second.id)
+            .unwrap();
+        assert_eq!(
+            second_shared.summary,
+            Some((aw_tools::filesystem::status::Primary::Fail, false, false))
+        );
+
+        let first_completion = tokio::time::timeout(Duration::from_secs(2), first_task)
+            .await
+            .expect("spawn-lane blocker must finish")
+            .unwrap();
+        assert_eq!(first_completion.status, crate::jobs::JobStatus::Completed);
+        manager.finish(&first.id, first_completion);
+    }
+
+    #[test]
+    fn pre_spawn_timeout_maps_without_process_terminal() {
+        let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        assert!(manager.bind_policy([9; 32]));
+        let output_limit = crate::limits::DEFAULT_TRANSFER_BYTES;
+        let job = manager.create_for_test(1).unwrap();
+        let writers = job
+            .claim_prepared_shell(
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                serde_json::json!({
+                    "command":"never-started",
+                    "dir":".",
+                    "stdin":null,
+                    "timeout_secs":1,
+                    "max_output_bytes":output_limit
+                }),
+                None,
+                output_limit,
+                crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM,
+            )
+            .unwrap();
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let completion = LocalMachine::spawn_error_completion(
+            aw_process::Error::TimedOutBeforeSpawn,
+            &job,
+            1,
+            JobResultContext {
+                dir: ".".into(),
+                sandboxed: false,
+                network: true,
+            },
+        );
+        assert_eq!(completion.status, crate::jobs::JobStatus::TimedOut);
+        assert!(completion.process_not_started);
+        assert!(completion.process_terminal.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3772,6 +4013,7 @@ mod tests {
             max_write_bytes: 16 * 1024,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -5529,6 +5771,7 @@ mod tests {
                 max_write_bytes: 4096,
                 shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
+                surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(
@@ -5579,7 +5822,9 @@ mod tests {
         let started = machine
             .jobs
             .spawn(30, 4096, Some(request_key.clone()), move |job| async move {
-                assert!(job.mark_running(Some(generation)));
+                assert!(
+                    job.mark_running(Some(generation), Instant::now() + Duration::from_secs(30))
+                );
                 std::fs::write(&job.stdout_path, b"secret").unwrap();
                 crate::jobs::JobCompletion::completed(
                     Some(0),
@@ -6102,6 +6347,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6171,6 +6417,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6220,6 +6467,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6276,6 +6524,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -6361,6 +6610,7 @@ mod tests {
                 max_write_bytes: 4096,
                 shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
+                surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(
@@ -6439,6 +6689,7 @@ mod tests {
                 max_write_bytes: 4096,
                 shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
+                surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(
@@ -6559,6 +6810,7 @@ mod tests {
                 max_write_bytes: 4096,
                 shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
+                surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), None),
@@ -6700,6 +6952,7 @@ mod tests {
                 max_write_bytes: 4096,
                 shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
+                surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), None),
@@ -6817,6 +7070,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6904,6 +7158,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6996,6 +7251,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7101,6 +7357,7 @@ mod tests {
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
                 task_result_budget: None,
+                sync_hold: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7189,6 +7446,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7254,6 +7512,7 @@ mod tests {
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
                 task_result_budget: None,
+                sync_hold: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7375,6 +7634,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7432,6 +7692,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -7470,6 +7731,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7534,6 +7796,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7621,6 +7884,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7717,6 +7981,7 @@ mod tests {
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
                 task_result_budget: None,
+                sync_hold: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7809,6 +8074,7 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7894,6 +8160,7 @@ mod tests {
                 max_write_bytes: 4096,
                 shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
+                surface_policy: crate::limits::RuntimeSurfacePolicy::default(),
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), Some(bwrap)),

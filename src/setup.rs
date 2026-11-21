@@ -23,7 +23,7 @@ use crate::{
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3000";
-const DEFAULT_MAX_SHELL_TIMEOUT_SECS: u64 = 3_600;
+pub(crate) const DEFAULT_MAX_SHELL_TIMEOUT_SECS: u64 = 3_600;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 const DEFAULT_MAX_FILE_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 

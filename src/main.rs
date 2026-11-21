@@ -1350,6 +1350,9 @@ fn runtime_authority_intent(
     transports: &ActiveTransports,
 ) -> Result<RuntimeAuthorityIntent> {
     let constraints = transports.constraints();
+    let surface_policy = crate::limits::RuntimeSurfacePolicy::from_sync_hold(constraints.sync_hold);
+    let effective_shell_timeout_secs =
+        surface_policy.shell_timeout_ceiling(setup.config.max_shell_timeout_secs);
     let execution = serde_json::json!({
         "base_dir": policy.base_dir,
         "read_roots": policy.read_roots,
@@ -1360,7 +1363,7 @@ fn runtime_authority_intent(
         "allow_shell": policy.allow_shell,
         "sandbox_shell": policy.sandbox_shell,
         "allow_network": policy.allow_network,
-        "max_shell_timeout_secs": setup.config.max_shell_timeout_secs,
+        "max_shell_timeout_secs": effective_shell_timeout_secs,
         "max_output_bytes": setup.config.max_output_bytes,
         "max_read_bytes": setup.config.max_read_bytes,
         "max_write_bytes": setup.config.max_write_bytes,
@@ -1594,6 +1597,22 @@ async fn prepare_runtime(
         }
     }
 
+    let constraints = transports.constraints();
+    let surface_policy = crate::limits::RuntimeSurfacePolicy::from_sync_hold(constraints.sync_hold);
+    if policy.allow_shell
+        && surface_policy.capped()
+        && setup.config.max_shell_timeout_secs > crate::limits::CAPPED_SHELL_TIMEOUT_SECS
+        && setup.config.max_shell_timeout_secs != setup::DEFAULT_MAX_SHELL_TIMEOUT_SECS
+    {
+        tracing::warn!(
+            "max_shell_timeout_secs={} is capped to {} s on the active hand-back surface ({} minute turn horizon minus {} minutes to report)",
+            setup.config.max_shell_timeout_secs,
+            crate::limits::CAPPED_SHELL_TIMEOUT_SECS,
+            crate::limits::TURN_HORIZON_MINUTES,
+            crate::limits::TURN_HANDBACK_RESERVE_MINUTES,
+        );
+    }
+
     let retention = std::time::Duration::from_secs(setup.config.job_retention_secs);
     let spool_limit = setup.config.job_spool_bytes;
     let machine_config = MachineConfig {
@@ -1618,7 +1637,8 @@ async fn prepare_runtime(
         max_output_bytes: setup.config.max_output_bytes,
         max_read_bytes: setup.config.max_read_bytes,
         max_write_bytes: setup.config.max_write_bytes,
-        task_result_budget: transports.constraints().task_result_budget,
+        task_result_budget: constraints.task_result_budget,
+        sync_hold: constraints.sync_hold,
         job_retention_secs: setup.config.job_retention_secs,
         job_spool_bytes: setup.config.job_spool_bytes,
         protected_paths: setup.protected_paths.clone(),
@@ -2503,6 +2523,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: vec![protected_alias.clone()],
@@ -2561,6 +2582,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -2628,6 +2650,7 @@ mod tests {
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
                 task_result_budget: None,
+                sync_hold: None,
                 job_retention_secs: 60,
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
                 protected_paths: Vec::new(),
@@ -2679,6 +2702,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),

@@ -139,6 +139,16 @@ where
     requested.unwrap_or(ceiling).clamp(T::from(1), ceiling)
 }
 
+pub(crate) fn human_duration(secs: u64) -> String {
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_capped;

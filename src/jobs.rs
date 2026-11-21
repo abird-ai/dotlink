@@ -7,7 +7,7 @@
 //! to wait for an already-started job and how to expose its stable id.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     fs::{self, File, OpenOptions},
     future::Future,
@@ -142,7 +142,7 @@ impl JobStatus {
         self != Self::Working
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Working => "working",
             Self::Completed => "completed",
@@ -154,12 +154,21 @@ impl JobStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JobPhase {
     Queued,
-    Running,
+    Running { deadline: TokioInstant },
     Terminal,
+}
+
+impl JobPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running { .. } => "running",
+            Self::Terminal => "terminal",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -196,9 +205,10 @@ pub(crate) struct JobCompletion {
     pub(crate) observed_status: Option<JobStatus>,
     /// Whether the host proved stdout/stderr readers quiesced after process settlement.
     pub(crate) output_complete: bool,
-    /// The canonical Start checkpoint committed, but `Command::spawn` itself
-    /// definitively failed, so no process/effect was created.
-    pub(crate) spawn_failed: bool,
+    /// The canonical Start checkpoint committed, but no Process existed.
+    /// Covers definite spawn failure and lane-side pre-spawn cancellation/timeout;
+    /// these outcomes must never synthesize a ProcessTerminal.
+    pub(crate) process_not_started: bool,
 }
 
 impl JobCompletion {
@@ -221,7 +231,7 @@ impl JobCompletion {
             internal_error: None,
             observed_status: None,
             output_complete: true,
-            spawn_failed: false,
+            process_not_started: false,
         }
     }
 
@@ -319,9 +329,12 @@ impl JobCompletion {
     }
 
     pub(crate) fn spawn_failed(message: impl Into<String>) -> Self {
-        let mut completion = Self::failed(message);
-        completion.spawn_failed = true;
-        completion
+        Self::failed(message).without_process()
+    }
+
+    pub(crate) fn without_process(mut self) -> Self {
+        self.process_not_started = true;
+        self
     }
 
     pub(crate) fn internal_failed(
@@ -748,6 +761,9 @@ pub(crate) enum RemoteStartReceipt {
         reference: JobRef,
         result: CallToolResult,
     },
+    /// Payload-free never-retry tombstone retained after ordinary receipt
+    /// retention expires. The claim key + semantic hash remain authoritative.
+    Compacted,
 }
 
 #[derive(Clone, Debug)]
@@ -770,6 +786,13 @@ struct JobState {
     jobs: HashMap<String, JobEntry>,
     request_jobs: HashMap<String, String>,
     remote_starts: HashMap<[u8; 32], RemoteStartEntry>,
+    /// Full replay receipts awaiting ordinary retention compaction. Tombstones
+    /// never enter this queue, so long-lived replay identity does not create an
+    /// O(n) admission scan.
+    remote_start_ready: VecDeque<([u8; 32], Instant)>,
+    /// Claimed + full-Ready entries only. Unknown/Compacted tombstones retain
+    /// no scarce receipt payload and therefore do not consume this budget.
+    remote_start_full: usize,
     next_exposure_sequence: u64,
 }
 
@@ -782,6 +805,34 @@ impl JobState {
         self.jobs
             .get_mut(id)
             .filter(|entry| !entry.expiration_pending)
+    }
+}
+
+fn release_remote_start_full(state: &mut JobState) {
+    debug_assert!(state.remote_start_full > 0);
+    state.remote_start_full = state.remote_start_full.saturating_sub(1);
+}
+
+fn compact_expired_remote_start_receipts(state: &mut JobState, retention: Duration) {
+    while let Some(&(key, settled_at)) = state.remote_start_ready.front() {
+        if settled_at.elapsed() < retention {
+            break;
+        }
+        state.remote_start_ready.pop_front();
+        let should_compact = state.remote_starts.get(&key).is_some_and(|entry| {
+            entry.settled_at == Some(settled_at)
+                && matches!(
+                    entry.disposition,
+                    RemoteStartDisposition::Ready(RemoteStartReceipt::Mcp(_))
+                        | RemoteStartDisposition::Ready(RemoteStartReceipt::JobMcp { .. })
+                )
+        });
+        if should_compact {
+            if let Some(entry) = state.remote_starts.get_mut(&key) {
+                entry.disposition = RemoteStartDisposition::Ready(RemoteStartReceipt::Compacted);
+            }
+            release_remote_start_full(state);
+        }
     }
 }
 
@@ -799,6 +850,9 @@ pub(crate) struct RemoteStartGuard {
 
 impl RemoteStartGuard {
     pub(crate) fn mark_ready(mut self, receipt: RemoteStartReceipt) -> Result<()> {
+        if matches!(receipt, RemoteStartReceipt::Compacted) {
+            bail!("remote Start compaction is owned by replay retention");
+        }
         let inner = self
             .inner
             .upgrade()
@@ -807,15 +861,19 @@ impl RemoteStartGuard {
             .state
             .lock()
             .map_err(|_| anyhow!("job manager lock poisoned"))?;
-        let entry = state
-            .remote_starts
-            .get_mut(&self.key)
-            .ok_or_else(|| anyhow!("remote Start claim disappeared"))?;
-        if !matches!(entry.disposition, RemoteStartDisposition::Claimed) {
-            bail!("remote Start claim is no longer pending");
+        let settled_at = Instant::now();
+        {
+            let entry = state
+                .remote_starts
+                .get_mut(&self.key)
+                .ok_or_else(|| anyhow!("remote Start claim disappeared"))?;
+            if !matches!(entry.disposition, RemoteStartDisposition::Claimed) {
+                bail!("remote Start claim is no longer pending");
+            }
+            entry.disposition = RemoteStartDisposition::Ready(receipt);
+            entry.settled_at = Some(settled_at);
         }
-        entry.disposition = RemoteStartDisposition::Ready(receipt);
-        entry.settled_at = Some(Instant::now());
+        state.remote_start_ready.push_back((self.key, settled_at));
         self.settled = true;
         Ok(())
     }
@@ -829,6 +887,7 @@ impl RemoteStartGuard {
                 .is_some_and(|entry| matches!(entry.disposition, RemoteStartDisposition::Claimed))
         {
             state.remote_starts.remove(&self.key);
+            release_remote_start_full(&mut state);
         }
         self.settled = true;
     }
@@ -836,11 +895,19 @@ impl RemoteStartGuard {
     pub(crate) fn mark_unknown(mut self) {
         if let Some(inner) = self.inner.upgrade()
             && let Ok(mut state) = inner.state.lock()
-            && let Some(entry) = state.remote_starts.get_mut(&self.key)
-            && matches!(entry.disposition, RemoteStartDisposition::Claimed)
         {
-            entry.disposition = RemoteStartDisposition::Unknown;
-            entry.settled_at = Some(Instant::now());
+            let changed = state
+                .remote_starts
+                .get_mut(&self.key)
+                .filter(|entry| matches!(entry.disposition, RemoteStartDisposition::Claimed))
+                .map(|entry| {
+                    entry.disposition = RemoteStartDisposition::Unknown;
+                    entry.settled_at = Some(Instant::now());
+                })
+                .is_some();
+            if changed {
+                release_remote_start_full(&mut state);
+            }
         }
         self.settled = true;
     }
@@ -853,11 +920,19 @@ impl Drop for RemoteStartGuard {
         }
         if let Some(inner) = self.inner.upgrade()
             && let Ok(mut state) = inner.state.lock()
-            && let Some(entry) = state.remote_starts.get_mut(&self.key)
-            && matches!(entry.disposition, RemoteStartDisposition::Claimed)
         {
-            entry.disposition = RemoteStartDisposition::Unknown;
-            entry.settled_at = Some(Instant::now());
+            let changed = state
+                .remote_starts
+                .get_mut(&self.key)
+                .filter(|entry| matches!(entry.disposition, RemoteStartDisposition::Claimed))
+                .map(|entry| {
+                    entry.disposition = RemoteStartDisposition::Unknown;
+                    entry.settled_at = Some(Instant::now());
+                })
+                .is_some();
+            if changed {
+                release_remote_start_full(&mut state);
+            }
         }
     }
 }
@@ -868,6 +943,7 @@ struct JobManagerInner {
     spool_limit_bytes: AtomicU64,
     spool_used_bytes: AtomicU64,
     closed: AtomicBool,
+    turn_advice: AtomicBool,
     state: Mutex<JobState>,
     operation_gate: Arc<RwLock<()>>,
     session_lock: Mutex<Option<File>>,
@@ -1279,7 +1355,7 @@ fn rollback_shared_claim(inner: &JobManagerInner, id: &str, transition_gate: &Ar
     match inner.shared_jobs.settle_unlaunched(
         id,
         1,
-        claimed,
+        SharedNodeState::Claimed { sequence: claimed },
         sequence,
         |_, _| Ok(()),
         |_, _| Ok::<_, SharedJournalError>(()),
@@ -1676,13 +1752,17 @@ impl JobHandle {
 
     #[cfg(test)]
     pub(crate) fn mark_launched(&self) -> Result<()> {
-        self.mark_node_launched(1)
+        self.mark_node_launched(1, TokioInstant::now() + Duration::from_secs(30))
     }
 
     /// Commit the canonical Start checkpoint before the OS is allowed to spawn
     /// the process. Every production shell Job must already own a shared claim;
     /// a missing shared entry is split-brain state, never a compatibility path.
-    pub(crate) fn mark_node_launched(&self, coordinate: usize) -> Result<()> {
+    pub(crate) fn mark_node_launched(
+        &self,
+        coordinate: usize,
+        deadline: TokioInstant,
+    ) -> Result<()> {
         let inner = self
             .inner
             .upgrade()
@@ -1722,7 +1802,7 @@ impl JobHandle {
         if entry.completion.is_some() {
             bail!("job became terminal before process launch");
         }
-        entry.phase = JobPhase::Running;
+        entry.phase = JobPhase::Running { deadline };
         entry.updated_at = chrono::Utc::now().to_rfc3339();
         entry.notify.notify_waiters();
         Ok(())
@@ -1757,7 +1837,7 @@ impl JobHandle {
                 .settle_unlaunched(
                     &self.id,
                     coordinate,
-                    claimed,
+                    SharedNodeState::Claimed { sequence: claimed },
                     sequence,
                     |_, _| Ok(()),
                     |_, _| Ok::<_, SharedJournalError>(()),
@@ -1822,7 +1902,11 @@ impl JobHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn mark_running(&self, shell_guard_generation: Option<[u8; 32]>) -> bool {
+    pub(crate) fn mark_running(
+        &self,
+        shell_guard_generation: Option<[u8; 32]>,
+        deadline: TokioInstant,
+    ) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
@@ -1836,7 +1920,7 @@ impl JobHandle {
         if entry.completion.is_some() {
             return false;
         }
-        entry.phase = JobPhase::Running;
+        entry.phase = JobPhase::Running { deadline };
         entry.shell_guard_generation = shell_guard_generation;
         entry.public_revision = entry.public_revision.saturating_add(1);
         entry.updated_at = chrono::Utc::now().to_rfc3339();
@@ -2247,6 +2331,7 @@ impl JobManager {
             spool_limit_bytes: AtomicU64::new(spool_limit_bytes),
             spool_used_bytes: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            turn_advice: AtomicBool::new(false),
             state: Mutex::new(JobState::default()),
             operation_gate: Arc::new(RwLock::new(())),
             session_lock: Mutex::new(None),
@@ -2571,7 +2656,9 @@ impl JobManager {
                 updated_at: now,
                 timeout_secs,
                 result_limit: crate::limits::DEFAULT_TRANSFER_BYTES,
-                phase: JobPhase::Running,
+                phase: JobPhase::Running {
+                    deadline: TokioInstant::now() + Duration::from_secs(timeout_secs),
+                },
                 cancel: cancel.clone(),
                 runner: None,
                 completion: None,
@@ -2659,6 +2746,10 @@ impl JobManager {
         sweep_expired(&self.inner);
     }
 
+    pub(crate) fn set_turn_advice(&self, enabled: bool) {
+        self.inner.turn_advice.store(enabled, Ordering::Relaxed);
+    }
+
     pub(crate) fn bind_intent(&self, fingerprint: [u8; 32]) -> bool {
         let mut current = self
             .inner
@@ -2740,12 +2831,7 @@ impl JobManager {
             .state
             .lock()
             .map_err(|_| anyhow!("job manager lock poisoned"))?;
-        state.remote_starts.retain(|_, entry| {
-            matches!(entry.disposition, RemoteStartDisposition::Claimed)
-                || entry
-                    .settled_at
-                    .is_some_and(|settled_at| settled_at.elapsed() < retention)
-        });
+        compact_expired_remote_start_receipts(&mut state, retention);
         if let Some(existing) = state.remote_starts.get(&key) {
             if existing.semantic_hash != semantic_hash {
                 bail!("remote Start replay identity was reused for different semantics");
@@ -2762,9 +2848,9 @@ impl JobManager {
         if let Some(reason) = start.new_claim_denial() {
             bail!(reason);
         }
-        if state.remote_starts.len() >= MAX_REQUEST_REPLAYS {
+        if state.remote_start_full >= MAX_REQUEST_REPLAYS {
             bail!(
-                "too many retained remote Start replay claims ({MAX_REQUEST_REPLAYS}); wait for proof expiry or restart the runtime"
+                "too many active/full remote Start replay claims ({MAX_REQUEST_REPLAYS}); wait for receipt compaction or restart the runtime"
             );
         }
         state.remote_starts.insert(
@@ -2775,6 +2861,7 @@ impl JobManager {
                 disposition: RemoteStartDisposition::Claimed,
             },
         );
+        state.remote_start_full += 1;
         Ok(RemoteStartDecision::New(RemoteStartGuard {
             inner: Arc::downgrade(&self.inner),
             key,
@@ -3032,7 +3119,7 @@ impl JobManager {
             {
                 let state = match (entry.phase, entry.status()) {
                     (JobPhase::Queued, JobStatus::Working) => "waiting",
-                    (JobPhase::Running, JobStatus::Working) => {
+                    (JobPhase::Running { .. }, JobStatus::Working) => {
                         if entry.cancel.is_cancelled() {
                             "cancelling"
                         } else {
@@ -3890,7 +3977,7 @@ impl JobManager {
                     serde_json::json!({
                         "job_id": entry.id,
                         "status": projected_status(&self.inner, entry),
-                        "phase": entry.phase,
+                        "phase": entry.phase.as_str(),
                         "created_at": entry.created_at,
                         "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                     })
@@ -6378,7 +6465,7 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
         "job_id": entry.id,
         "task_id": entry.id,
         "status": status,
-        "phase": entry.phase,
+        "phase": entry.phase.as_str(),
         "graph": graph,
         "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         "timeout_secs": entry.timeout_secs,
@@ -6412,7 +6499,33 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
     if let Some(completion) = completion {
         payload = with_termination(payload, completion);
     }
+    if let Some(next) = deadline_note(
+        entry,
+        inner.turn_advice.load(Ordering::Relaxed),
+        TokioInstant::now(),
+    ) {
+        payload["next"] = serde_json::Value::String(next);
+    }
     payload.to_string()
+}
+
+fn deadline_note(entry: &JobEntry, turn_advice: bool, now: TokioInstant) -> Option<String> {
+    let JobPhase::Running { deadline } = entry.phase else {
+        return None;
+    };
+    if !turn_advice || entry.cancel.is_cancelled() || entry.timeout_secs <= 1 {
+        return None;
+    }
+    let left = deadline.checked_duration_since(now)?;
+    let seconds = left.as_secs() + u64::from(left.subsec_nanos() != 0);
+    if seconds == 0 || seconds > (entry.timeout_secs / 5).min(300) {
+        return None;
+    }
+    Some(format!(
+        "execution deadline in {} at timeout_secs={}: checkpoint what it produced and drive the turn to completion",
+        crate::mcp::human_duration(seconds),
+        entry.timeout_secs,
+    ))
 }
 
 fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
@@ -6554,7 +6667,7 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
             "job_id": entry.id,
             "task_id": entry.id,
             "status": projected_status(inner, entry),
-            "phase": entry.phase,
+            "phase": entry.phase.as_str(),
             "timeout_secs": entry.timeout_secs,
             "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
             "spool_session_limit_bytes": inner.spool_limit_bytes.load(Ordering::Relaxed),
@@ -6634,7 +6747,7 @@ fn settle_shared_completion(
             return SharedSettlement::Uncertain;
         }
     };
-    let terminal = (!completion.spawn_failed).then(|| shared_process_terminal(completion));
+    let terminal = (!completion.process_not_started).then(|| shared_process_terminal(completion));
     let state = match inner.shared_jobs.node_state(id, 1) {
         Ok(state) => state,
         Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
@@ -6689,7 +6802,12 @@ fn settle_shared_completion(
             let Ok(sequence) = next_shared_sequence(&inner.shared_jobs, id) else {
                 return SharedSettlement::Uncertain;
             };
-            let settled = if completion.spawn_failed {
+            let settled = if completion.process_not_started {
+                let primary = if completion.status == JobStatus::Unknown {
+                    SharedPrimary::Unknown
+                } else {
+                    SharedPrimary::Fail
+                };
                 inner
                     .shared_jobs
                     .settle(
@@ -6697,7 +6815,7 @@ fn settle_shared_completion(
                         1,
                         SharedNodeState::Running { sequence: running },
                         SharedStatus {
-                            primary: SharedPrimary::Fail,
+                            primary,
                             more: false,
                             incomplete: false,
                         },
@@ -6705,7 +6823,7 @@ fn settle_shared_completion(
                         |_, _| Ok::<_, SharedJournalError>(()),
                     )
                     .map(|()| SharedStatus {
-                        primary: SharedPrimary::Fail,
+                        primary,
                         more: false,
                         incomplete: false,
                     })
@@ -7653,7 +7771,7 @@ fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
     task.with_poll_interval_ms(JOB_POLL_INTERVAL_MS)
         .with_status_message(match entry.phase {
             JobPhase::Queued => "shell job is queued",
-            JobPhase::Running => {
+            JobPhase::Running { .. } => {
                 "shell job is running; jobs_read provides durable paged stdout/stderr"
             }
             JobPhase::Terminal => {
@@ -7677,6 +7795,46 @@ mod tests {
 
     fn serialized(bytes: usize) -> SerializedResultBytes {
         SerializedResultBytes::new(bytes).expect("test serialized result budget")
+    }
+
+    #[test]
+    fn deadline_advice_uses_running_deadline_not_job_age() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        manager.set_turn_advice(true);
+        let job = manager.create_for_test(1_500).unwrap();
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            let entry = state.jobs.get_mut(&job.id).unwrap();
+            entry.created = Instant::now() - Duration::from_secs(21 * 60);
+        }
+
+        assert!(job.mark_running(None, TokioInstant::now() + Duration::from_secs(1_500)));
+        let far: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert!(far["elapsed_ms"].as_u64().unwrap() >= 21 * 60 * 1_000);
+        assert!(
+            far.get("next").is_none(),
+            "queue/job age must not consume execution budget: {far}"
+        );
+
+        assert!(job.mark_running(None, TokioInstant::now() + Duration::from_secs(4 * 60)));
+        let near: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert!(
+            near["next"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("execution deadline in 4 min at timeout_secs=1500"),
+            "{near}"
+        );
+
+        manager.set_turn_advice(false);
+        let local: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert!(
+            local.get("next").is_none(),
+            "uncapped surface must not advertise turn advice: {local}"
+        );
     }
 
     fn process_tail_with_ceiling(
@@ -7943,7 +8101,7 @@ mod tests {
                 .settle_unlaunched(
                     &job.id,
                     coordinate,
-                    claimed,
+                    SharedNodeState::Claimed { sequence: claimed },
                     settle,
                     |_, sequence| {
                         if sequence == claimed {
@@ -9087,7 +9245,9 @@ mod tests {
         let request_key = "revoked-sync".to_owned();
         let started = manager
             .spawn(30, 1024, Some(request_key.clone()), |job| async move {
-                assert!(job.mark_running(Some([7; 32])));
+                assert!(
+                    job.mark_running(Some([7; 32]), TokioInstant::now() + Duration::from_secs(30))
+                );
                 JobCompletion::completed(
                     Some(0),
                     true,
@@ -9129,7 +9289,9 @@ mod tests {
         let request_key = "revoked-running".to_owned();
         let started = manager
             .spawn(30, 1024, Some(request_key.clone()), |job| async move {
-                assert!(job.mark_running(Some([8; 32])));
+                assert!(
+                    job.mark_running(Some([8; 32]), TokioInstant::now() + Duration::from_secs(30))
+                );
                 job.cancel.cancelled().await;
                 JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
             })

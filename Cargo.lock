@@ -123,7 +123,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aw-mcp-protocol"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "aw-tools",
  "rmcp",
@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "aw-platform"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "aw-platform-unix",
  "aw-platform-win",
@@ -143,7 +143,7 @@ dependencies = [
 [[package]]
 name = "aw-platform-unix"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "aw-tools-fs-unix",
  "libc",
@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "aw-platform-win"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "aw-tools-fs-win",
  "sha2",
@@ -163,7 +163,7 @@ dependencies = [
 [[package]]
 name = "aw-process"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "aw-platform",
  "aw-tools",
@@ -174,7 +174,7 @@ dependencies = [
 [[package]]
 name = "aw-tools"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -193,7 +193,7 @@ dependencies = [
 [[package]]
 name = "aw-tools-fs-unix"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "aw-tools",
  "getrandom 0.3.4",
@@ -204,7 +204,7 @@ dependencies = [
 [[package]]
 name = "aw-tools-fs-win"
 version = "0.15.0"
-source = "git+https://github.com/abird-ai/aw?rev=7c1670821b15082821a0b9621cd1caccbe62f144#7c1670821b15082821a0b9621cd1caccbe62f144"
+source = "git+https://github.com/abird-ai/aw?rev=20a63a4d4547cc20b2a154787823125b82f5e385#20a63a4d4547cc20b2a154787823125b82f5e385"
 dependencies = [
  "aw-tools",
  "getrandom 0.3.4",

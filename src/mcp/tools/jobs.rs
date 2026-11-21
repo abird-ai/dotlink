@@ -64,6 +64,19 @@ fn bounded_job_status(
     )
 }
 
+fn replay_job_control_disclosed(
+    machine: &LocalMachine,
+    operation: aw_tools::OperationId,
+    start: &crate::remote_start::ValidatedRemoteStart,
+    reference: &JobRef,
+) -> bool {
+    if !start.replay_source_current() || !machine.has_tool_for_policy(operation.model_name()) {
+        return false;
+    }
+    job_ref_parts(reference)
+        .is_ok_and(|(id, node)| machine.jobs.standalone_status(id, node).is_ok())
+}
+
 fn result_fits(
     machine: &LocalMachine,
     operation: aw_tools::OperationId,
@@ -609,6 +622,9 @@ impl LocalMachine {
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
                     return result;
                 }
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Compacted)) => {
+                    return crate::remote_start::withheld_replay_result();
+                }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
                         "remote Start outcome is unknown; inspect the original attempt before any new invocation",
@@ -941,6 +957,14 @@ impl LocalMachine {
                             "Cached Job Control identity differs; inspect the Job before retrying",
                         );
                     }
+                    if !replay_job_control_disclosed(
+                        self,
+                        aw_tools::OperationId::JobsAck,
+                        start,
+                        &reference,
+                    ) {
+                        return crate::remote_start::withheld_replay_result();
+                    }
                     return bounded_control_replay(
                         self,
                         aw_tools::OperationId::JobsAck,
@@ -953,6 +977,9 @@ impl LocalMachine {
                     return tool_error(
                         "Cached Job Control outcome lacks typed identity; inspect the Job before retrying",
                     );
+                }
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Compacted)) => {
+                    return crate::remote_start::withheld_replay_result();
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -1093,12 +1120,23 @@ impl LocalMachine {
                             "Cached stdin Job identity differs; inspect Job, do not resend",
                         );
                     }
+                    if !replay_job_control_disclosed(
+                        self,
+                        aw_tools::OperationId::JobsSend,
+                        start,
+                        &reference,
+                    ) {
+                        return crate::remote_start::withheld_replay_result();
+                    }
                     return bounded_send_replay(self, &reference, result, result_budget);
                 }
                 Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(_))) => {
                     return tool_error(
                         "Cached stdin outcome lacks typed identity; inspect Job, do not resend",
                     );
+                }
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Compacted)) => {
+                    return crate::remote_start::withheld_replay_result();
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
@@ -1191,6 +1229,14 @@ impl LocalMachine {
                             "Cached cancellation Job identity differs; inspect the Job before retrying",
                         );
                     }
+                    if !replay_job_control_disclosed(
+                        self,
+                        aw_tools::OperationId::JobsCancel,
+                        start,
+                        &reference,
+                    ) {
+                        return crate::remote_start::withheld_replay_result();
+                    }
                     return bounded_control_replay(
                         self,
                         aw_tools::OperationId::JobsCancel,
@@ -1203,6 +1249,9 @@ impl LocalMachine {
                     return tool_error(
                         "Cached cancellation outcome lacks typed identity; inspect the Job before retrying",
                     );
+                }
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Compacted)) => {
+                    return crate::remote_start::withheld_replay_result();
                 }
                 Ok(RemoteStartDecision::Unknown) => {
                     return tool_error(
