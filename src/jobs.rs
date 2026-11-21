@@ -715,7 +715,7 @@ enum RemoteStartDisposition {
 #[derive(Clone, Debug)]
 struct RemoteStartEntry {
     semantic_hash: [u8; 32],
-    expires_at_unix_ms: u64,
+    settled_at: Option<Instant>,
     disposition: RemoteStartDisposition,
 }
 
@@ -770,6 +770,7 @@ impl RemoteStartGuard {
             bail!("remote Start claim is no longer pending");
         }
         entry.disposition = RemoteStartDisposition::Ready(receipt);
+        entry.settled_at = Some(Instant::now());
         self.settled = true;
         Ok(())
     }
@@ -794,6 +795,7 @@ impl RemoteStartGuard {
             && matches!(entry.disposition, RemoteStartDisposition::Claimed)
         {
             entry.disposition = RemoteStartDisposition::Unknown;
+            entry.settled_at = Some(Instant::now());
         }
         self.settled = true;
     }
@@ -810,6 +812,7 @@ impl Drop for RemoteStartGuard {
             && matches!(entry.disposition, RemoteStartDisposition::Claimed)
         {
             entry.disposition = RemoteStartDisposition::Unknown;
+            entry.settled_at = Some(Instant::now());
         }
     }
 }
@@ -2680,23 +2683,22 @@ impl JobManager {
         &self,
         start: &crate::remote_start::ValidatedRemoteStart,
     ) -> Result<RemoteStartDecision> {
-        let now = crate::remote_start::now_unix_ms()?;
-        if start.expires_at_unix_ms() <= now {
-            bail!("remote Start authorization expired before replay claim");
-        }
         let key = start.claim_key();
         let semantic_hash = start.semantic_hash();
         if key == [0; 32] || semantic_hash == [0; 32] {
             bail!("invalid remote Start replay identity");
         }
+        let retention = Duration::from_secs(self.inner.retention_secs.load(Ordering::Relaxed));
         let mut state = self
             .inner
             .state
             .lock()
             .map_err(|_| anyhow!("job manager lock poisoned"))?;
         state.remote_starts.retain(|_, entry| {
-            entry.expires_at_unix_ms > now
-                || matches!(entry.disposition, RemoteStartDisposition::Claimed)
+            matches!(entry.disposition, RemoteStartDisposition::Claimed)
+                || entry
+                    .settled_at
+                    .is_some_and(|settled_at| settled_at.elapsed() < retention)
         });
         if let Some(existing) = state.remote_starts.get(&key) {
             if existing.semantic_hash != semantic_hash {
@@ -2711,8 +2713,8 @@ impl JobManager {
                 }
             });
         }
-        if !start.new_claim_authorized() {
-            bail!("remote Start issuer is not currently trusted for new effects");
+        if let Some(reason) = start.new_claim_denial() {
+            bail!(reason);
         }
         if state.remote_starts.len() >= MAX_REQUEST_REPLAYS {
             bail!(
@@ -2723,7 +2725,7 @@ impl JobManager {
             key,
             RemoteStartEntry {
                 semantic_hash,
-                expires_at_unix_ms: start.expires_at_unix_ms(),
+                settled_at: None,
                 disposition: RemoteStartDisposition::Claimed,
             },
         );

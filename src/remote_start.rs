@@ -3,10 +3,10 @@
 //! A RemoteStartAuthorization is source-fencing evidence, not a dotlink grant.
 //! It is accepted only from the same OAuth-authenticated client named by the
 //! target-authenticated issuer. A genuinely new claim additionally requires that
-//! client's current explicit AW-bridge trust epoch; exact committed replay is
-//! resolved before that mutable trust check. Target generation, immutable
-//! host/profile identity and exact semantic operation/arguments remain bound to
-//! the authorization before the existing JobManager owner may claim it.
+//! client's current explicit AW-bridge trust epoch. Immutable host/profile/client/
+//! operation/argument identity is always bound first, then the existing JobManager
+//! replay owner is consulted. Lease age, runtime generation and current trust gate only
+//! a genuinely new effect claim; an exact retained receipt survives those mutable changes.
 
 use std::{
     sync::Arc,
@@ -166,16 +166,33 @@ impl StartClass {
 pub(crate) struct ValidatedRemoteStart {
     authorization: RemoteStartAuthorization,
     semantic_hash: [u8; 32],
-    new_claim_authorized: bool,
+    new_claim_denial: Option<NewClaimDenial>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewClaimDenial {
+    LeaseNotCurrent,
+    RuntimeGenerationChanged,
+    IssuerNotTrusted,
+}
+
+impl NewClaimDenial {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::LeaseNotCurrent => "remote Start lease is not current for a new effect",
+            Self::RuntimeGenerationChanged => {
+                "remote Start targets an old runtime generation; a new effect is forbidden"
+            }
+            Self::IssuerNotTrusted => {
+                "remote Start issuer is not currently trusted for new effects"
+            }
+        }
+    }
 }
 
 impl ValidatedRemoteStart {
     pub(crate) fn semantic_hash(&self) -> [u8; 32] {
         self.semantic_hash
-    }
-
-    pub(crate) fn expires_at_unix_ms(&self) -> u64 {
-        self.authorization.intent.target.expires_at_unix_ms
     }
 
     pub(crate) fn claim_key(&self) -> [u8; 32] {
@@ -193,8 +210,13 @@ impl ValidatedRemoteStart {
         format!("aw-start:{:x}", Sha256::digest(self.claim_key()))
     }
 
+    #[cfg(test)]
     pub(crate) fn new_claim_authorized(&self) -> bool {
-        self.new_claim_authorized
+        self.new_claim_denial.is_none()
+    }
+
+    pub(crate) fn new_claim_denial(&self) -> Option<&'static str> {
+        self.new_claim_denial.map(NewClaimDenial::message)
     }
 }
 
@@ -291,13 +313,13 @@ pub(crate) fn validate_authorization(
         None => AuthenticatedMcpClient::new(request.client_id)?,
     };
     authorization
-        .validate_for_target(
-            request.target.host(),
-            request.target.profile(),
-            &request.generation,
-            request.now_unix_ms,
-        )
-        .map_err(|_| anyhow!("remote Start is expired or targets another runtime"))?;
+        .validate()
+        .map_err(|_| anyhow!("invalid remote Start authorization"))?;
+    if authorization.intent.target.target_host != request.target.host()
+        || authorization.intent.target.target_profile != request.target.profile()
+    {
+        bail!("remote Start targets another bridge");
+    }
 
     if authorization.intent.operation != request.operation.semantic_name()
         || authorization.intent.session_action != request.class.action()
@@ -313,7 +335,18 @@ pub(crate) fn validate_authorization(
     if issuer.client_id != client.id() {
         bail!("remote Start issuer differs from authenticated MCP client");
     }
-    let new_claim_authorized = client.remote_start_trust_epoch() == Some(issuer.trust_epoch);
+    let target = &authorization.intent.target;
+    let new_claim_denial = if target.generation != request.generation {
+        Some(NewClaimDenial::RuntimeGenerationChanged)
+    } else if request.now_unix_ms < target.issued_at_unix_ms
+        || request.now_unix_ms >= target.expires_at_unix_ms
+    {
+        Some(NewClaimDenial::LeaseNotCurrent)
+    } else if client.remote_start_trust_epoch() != Some(issuer.trust_epoch) {
+        Some(NewClaimDenial::IssuerNotTrusted)
+    } else {
+        None
+    };
 
     if let Some(reference) = request.control_ref {
         let (requested_job, requested_node) = finite_suffix(reference)?;
@@ -332,7 +365,7 @@ pub(crate) fn validate_authorization(
     Ok(ValidatedRemoteStart {
         authorization,
         semantic_hash,
-        new_claim_authorized,
+        new_claim_denial,
     })
 }
 
@@ -440,12 +473,12 @@ mod tests {
         let first = ValidatedRemoteStart {
             semantic_hash: semantic_hash(&authorization, "client-a", OperationId::Bash, &arguments),
             authorization: authorization.clone(),
-            new_claim_authorized: true,
+            new_claim_denial: None,
         };
         let second = ValidatedRemoteStart {
             semantic_hash: semantic_hash(&authorization, "client-b", OperationId::Bash, &arguments),
             authorization,
-            new_claim_authorized: true,
+            new_claim_denial: None,
         };
         assert_eq!(first.claim_key(), second.claim_key());
         assert_eq!(first.replay_key(), second.replay_key());
@@ -486,39 +519,47 @@ mod tests {
         )
         .unwrap();
         assert_ne!(validated.claim_key(), [0; 32]);
+        let old_generation = validate_authorization(
+            authorization.clone(),
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
+                target: &target,
+                generation: [8; 32],
+                now_unix_ms: 150,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(!old_generation.new_claim_authorized());
         assert!(
-            validate_authorization(
-                authorization.clone(),
-                ValidationContext {
-                    client_id: "client-a",
-                    remote_start_trust_epoch: Some(7),
-                    target: &target,
-                    generation: [8; 32],
-                    now_unix_ms: 150,
-                    operation: OperationId::Bash,
-                    class: StartClass::Submit,
-                    arguments: &arguments,
-                    control_ref: None,
-                },
-            )
-            .is_err()
+            old_generation
+                .new_claim_denial()
+                .is_some_and(|reason| reason.contains("old runtime generation"))
         );
+        let expired = validate_authorization(
+            authorization.clone(),
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
+                target: &target,
+                generation,
+                now_unix_ms: 201,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(!expired.new_claim_authorized());
         assert!(
-            validate_authorization(
-                authorization.clone(),
-                ValidationContext {
-                    client_id: "client-a",
-                    remote_start_trust_epoch: Some(7),
-                    target: &target,
-                    generation,
-                    now_unix_ms: 201,
-                    operation: OperationId::Bash,
-                    class: StartClass::Submit,
-                    arguments: &arguments,
-                    control_ref: None,
-                },
-            )
-            .is_err()
+            expired
+                .new_claim_denial()
+                .is_some_and(|reason| reason.contains("lease is not current"))
         );
         assert!(
             validate_authorization(
@@ -720,6 +761,99 @@ mod tests {
     }
 
     #[test]
+    fn expired_lease_blocks_fresh_claim_but_retained_exact_replay_survives() {
+        let arguments = serde_json::json!({"command":"true"});
+        let generation = [9; 32];
+        let now = now_unix_ms().unwrap();
+        let mut authorization = auth(&arguments, generation);
+        authorization.intent.target.issued_at_unix_ms = now;
+        authorization.intent.target.expires_at_unix_ms = now + 1_000;
+        authorization = RemoteStartAuthorization::new(
+            authorization.intent.clone(),
+            authorization.provenance.clone(),
+        )
+        .unwrap();
+        let target = BridgeTarget::new("l5", "default").unwrap();
+        let fresh = validate_authorization(
+            authorization.clone(),
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        let manager = crate::jobs::JobManager::with_spool_limit(
+            std::time::Duration::from_secs(60),
+            crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+        )
+        .unwrap();
+        let guard = match manager.claim_remote_start(&fresh).unwrap() {
+            crate::jobs::RemoteStartDecision::New(guard) => guard,
+            _ => panic!("fresh lease must create the initial claim"),
+        };
+        let receipt = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "j:abc process settled rev=2 outcome=ok",
+        )]);
+        guard
+            .mark_ready(crate::jobs::RemoteStartReceipt::Mcp(receipt.clone()))
+            .unwrap();
+
+        let expired = validate_authorization(
+            authorization.clone(),
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: None,
+                target: &target,
+                generation,
+                now_unix_ms: now + 1_000,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(!expired.new_claim_authorized());
+        assert!(matches!(
+            manager.claim_remote_start(&expired).unwrap(),
+            crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::Mcp(
+                ref replay
+            )) if *replay == receipt
+        ));
+
+        let mut fresh_intent = authorization.intent.clone();
+        fresh_intent.call_id = "expired-fresh".into();
+        fresh_intent.effect_attempt_id = "expired-fresh".into();
+        let expired_fresh = validate_authorization(
+            RemoteStartAuthorization::new(fresh_intent, authorization.provenance.clone()).unwrap(),
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
+                target: &target,
+                generation,
+                now_unix_ms: now + 1_000,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        let error = match manager.claim_remote_start(&expired_fresh) {
+            Ok(_) => panic!("expired lease unexpectedly created a fresh Start claim"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("lease is not current"), "{error}");
+    }
+
+    #[test]
     fn old_generation_authorization_is_rejected_after_runtime_restart() {
         let arguments = serde_json::json!({"command":"true"});
         let first = crate::jobs::JobManager::with_spool_limit(
@@ -746,24 +880,27 @@ mod tests {
         )
         .unwrap();
         let target = BridgeTarget::new("l5", "default").unwrap();
-        assert!(
-            validate_authorization(
-                authorization,
-                ValidationContext {
-                    client_id: "client-a",
-                    remote_start_trust_epoch: Some(7),
-                    target: &target,
-                    generation: second_generation,
-                    now_unix_ms: now,
-                    operation: OperationId::Bash,
-                    class: StartClass::Submit,
-                    arguments: &arguments,
-                    control_ref: None,
-                },
-            )
-            .is_err(),
-            "a proof for the previous live runtime must fail before replay claim/effect"
-        );
+        let stale = validate_authorization(
+            authorization,
+            ValidationContext {
+                client_id: "client-a",
+                remote_start_trust_epoch: Some(7),
+                target: &target,
+                generation: second_generation,
+                now_unix_ms: now,
+                operation: OperationId::Bash,
+                class: StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+        assert!(!stale.new_claim_authorized());
+        let error = match second.claim_remote_start(&stale) {
+            Ok(_) => panic!("old runtime proof unexpectedly created a new Start claim"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("old runtime generation"), "{error}");
     }
 
     #[test]

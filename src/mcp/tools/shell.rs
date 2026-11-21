@@ -3195,11 +3195,10 @@ impl LocalMachine {
 
         let completion = match terminal {
             JobStatus::Completed => {
-                // Managed descendants were already stopped immediately after the
-                // waited command exited. Disarm only after the bounded pipe drain;
-                // a setsid-style escape may still keep an inherited FD open, in
-                // which case output_complete below is false without changing exit.
-                process_tree.disarm();
+                // A proven Stopped/NoTarget cleanup already disarms the shared guard.
+                // Do not force-disarm here: Unknown must remain armed so Drop gets the
+                // final fail-safe containment attempt. A setsid-style escape may still
+                // keep an inherited FD open; that only affects output completeness.
                 JobCompletion::completed_with_exit(
                     process_exit,
                     process_exit == SharedProcessExit::Code(0),
