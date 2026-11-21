@@ -12,23 +12,22 @@ Active DL-200 design:
 The previous AW+dotlink 2026-11-20 comprehensive handoff and the 2026-11-19 017
 handoff remain historical chronology referenced by the new canonical R6 handoff.
 
-**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 IN PROGRESS.** R6 was
-explicitly approved on 2026-11-21 after final live-owner review and is authoritative.
-AW seal/docs are checkpointed at `7c3800c`; AW Phase-0A Process plus Phase-0B owner
-hardening source is checkpointed at `c7cc948`. Dotlink Remote Start/replay hardening is
-checkpointed at `89ff3fb`; the real R6 shared-Process/`aw-process` cutover is still pending.
-The existing dotlink AW Git pin remains `b8a46a942a56a5ae5cb7e2a8fad47010fde4d65b`
-until a separately authorized AW publication/repin. Frozen 017 mounts/config-v13 remain
-deferred. Commit/push/tag/release/deploy remain separately gated.
+**DL-200 R6 is SEALED / IMPLEMENTATION PROMOTED / PHASE 0 CROSS-REPO PROCESS CUTOVER COMPLETE IN SOURCE.** R6 was explicitly approved on 2026-11-21 and is authoritative.
+AW shared runtime is published through `7c1670821b15082821a0b9621cd1caccbe62f144`; AW main
+is `59d67babaa846fa9b60e39a27170ac9d148e3b6f`, whose only later delta is the focused
+bounded-drain regression test. Dotlink source checkpoint `16475e4` consumes `aw-process`
+directly and pins all eight direct/transitive AW Git packages to `7c16708...`. The old
+parallel shell Process owner is deleted. Frozen 017 mounts/config-v13 remain deferred.
+No tag/release/deploy is implied by this checkpoint.
 
 Prepared: 2026-11-20
 Owner: @pvl
 Machine: **L5 implementation/source authority**
 Repo: `/home/pvl/spaces/abird/src/dotlink`
 
-> Runtime/source authority remains live AW/dotlink source and tests. Current local source
-> checkpoints are AW `c7cc948` and dotlink `89ff3fb`; dotlink still consumes published AW
-> `b8a46a94...` until the explicit repin step.
+> Runtime/source authority remains live AW/dotlink source and tests. Current published AW
+> main is `59d67ba...`; dotlink runtime dependency pin is `7c16708...`; current dotlink source
+> checkpoint is `16475e4` before this handoff-sync commit.
 > DL-200 design authority is the sealed, implementation-promoted AW spec linked above;
 `IMPLEMENTATION.md` owns the active Phase-0 checkpoint order. Historical
 unsealed/design-only labels below describe earlier checkpoints, not current state.
@@ -38,7 +37,59 @@ unsealed/design-only labels below describe earlier checkpoints, not current stat
 > [RELEASE-017-OPERATIONS-PORT-2026-11-15.md](RELEASE-017-OPERATIONS-PORT-2026-11-15.md).
 > It preserves this unified-runtime implementation and is not a release/tag.
 
-## LIVE pre-R6-implementation checkpoint — 2026-11-21
+## LIVE R6 shared-Process cross-repo checkpoint — 2026-11-21
+
+Source boundary before this handoff-sync commit:
+
+- AW runtime pin: `7c1670821b15082821a0b9621cd1caccbe62f144`;
+- AW main: `59d67babaa846fa9b60e39a27170ac9d148e3b6f` (test-only follow-up over the runtime pin);
+- dotlink source: `16475e4` — `Converge shell Process runtime on aw-process`;
+- all six direct AW manifest revisions and all eight direct/transitive AW lock sources resolve
+  to exactly `7c16708...`; no sibling/path override and no registry-version churn.
+
+Implemented:
+
+- `aw-process` is now dotlink's sole shell Process lifetime owner: containment finalization,
+  stdio, spawn, Child/Scope custody, stdin, pipe capture, wait/stop/reap and bounded drain;
+- deleted dotlink `src/shell_process.rs` and all production `ManagedProcessGuard`, local
+  Child/ChildStdin, stop-tree, terminate-child and duplicate stdout/stderr drain machinery;
+- `JobCompletion` stores one optional canonical `ProcessTerminal`; physical exit, StopRecord,
+  Occupancy and output completeness are projections, while a definite spawn failure has no
+  synthetic ProcessTerminal;
+- wire compatibility is exact: `Occupancy::Empty` omits `tree`, `Live` => `tree="leftovers"`,
+  `Unknown` => `tree="unknown"`; Live leftovers may clear product `success` without rewriting
+  exit/status into a generic tool error;
+- direct and Bubblewrap Bash both use non-login/non-profile execution (`--noprofile --norc -c`);
+- one dotlink runtime profile owns `checkpoint_minutes=30` and hard shell horizon=35 minutes;
+  the effective shell deadline is `min(configured shell policy, 35m)` and drives runtime +
+  schema projection. This policy remains absent from AW;
+- product stdin authority/revision admission remains in dotlink, but ChildStdin never leaves
+  `aw-process`; initial input is chunked through the shared 64 KiB primitive and all in-flight
+  shared writes are cancellation/deadline-preemptible;
+- shared output drain has one global bound. At the bound readers quiesce and flush already
+  captured partial sink batches before publishing incomplete output; abort is final fallback.
+
+Grouped evidence without fixture expansion:
+
+- final dotlink all-target/all-feature source graph type-checks green;
+- final strict all-target/all-feature Clippy `-D warnings` green;
+- rustfmt and `git diff --check` green;
+- static ownership audit: no production `ManagedProcessGuard`, `shell_process::`, local Child
+  owner, stop-tree/terminate-child or login-shell residue;
+- shell grouped executable run after the initial cut reached **133 passed / 1 failed**; the
+  single failure was the inherited-FD partial sink-batch loss described above;
+- that exact failure boundary is now covered at its actual shared owner: `aw-process` **3/3**,
+  including `reader_stop_flushes_partial_sink_batch_before_incomplete`, with strict Clippy green;
+- L5 repeatedly SIGKILLs the final dotlink test/binary during dotlink codegen/link after pin
+  changes, before any test executes. This is an explicit executable-qualification environment
+  gap, not a Rust diagnostic; do not split the suite into fixture fragments to work around it.
+
+Phase-0 Process architecture is now converged in source. Before declaring final Phase-0
+acceptance/release qualification, rerun the grouped shell/Process/Remote-Start executable gate
+on a host where dotlink test linking is not externally killed. **Do not start Phase 1 in this
+handoff.**
+
+## Historical pre-R6-implementation checkpoint — 2026-11-21
 
 - dotlink source checkpoint: `89ff3fb` — `Harden Remote Start replay admission`;
 - exact retained Remote Start replay now resolves before mutable lease/runtime-generation/
