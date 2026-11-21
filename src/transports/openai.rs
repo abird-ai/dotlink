@@ -7982,7 +7982,7 @@ name"
     }
 
     #[tokio::test]
-    async fn client_window_reaches_the_shell_deadline_end_to_end() {
+    async fn a_response_window_handoff_does_not_stop_shell_execution() {
         use crate::mcp::{AccessSpec, MachineConfig};
 
         if crate::mcp::resolve_executable("bash").is_none() {
@@ -8025,7 +8025,7 @@ name"
         let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
         let mut call = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "bash", "arguments": {"command": "sleep 30"}}
+            "params": {"name": "bash", "arguments": {"command": "sleep 0.05; printf survived"}}
         });
         let reserve = TunnelTuning::default().delivery_reserve;
         let transport_token = mcp.machine.transport_context_token().to_owned();
@@ -8051,7 +8051,28 @@ name"
         let receipt: Value = serde_json::from_str(receipt_text).unwrap();
         assert_eq!(receipt["async"], true, "{receipt}");
         assert_eq!(receipt["timeout_secs"], 600, "{receipt}");
-        assert!(receipt["job_id"].as_str().is_some(), "{receipt}");
+        let job_id = receipt["job_id"].as_str().expect("durable job id");
+        // Returning/dropping the response attempt must not cancel its execution.
+        let result = mcp
+            .dispatch(
+                &BTreeMap::new(),
+                &json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "job_get", "arguments": {"job_id": job_id, "wait_secs": 5}}
+                }),
+            )
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_str(
+            result.messages[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["status"], "completed", "{status}");
+        assert_eq!(status["exit_code"], 0, "{status}");
+        assert!(status.get("stopped_by").is_none(), "{status}");
+        assert!(status.get("signal").is_none(), "{status}");
     }
 
     #[test]

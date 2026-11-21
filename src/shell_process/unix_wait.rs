@@ -34,12 +34,27 @@ pub(super) async fn wait(pid: libc::pid_t) -> io::Result<()> {
             // SAFETY: pidfd_open returned a fresh owned fd.
             let fd = unsafe { OwnedFd::from_raw_fd(fd as _) };
             let ready = tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)?;
-            let _event = ready.readable().await?;
-            return Ok(());
+            return wait_pidfd(pid, &ready).await;
         }
         // Older kernels and policies without pidfd_open: same non-reaping contract.
     }
     wait_sigchld(pid).await
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_pidfd(
+    pid: libc::pid_t,
+    ready: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    loop {
+        let mut event = ready.readable().await?;
+        // AsyncFd readiness may be spurious. Only waitid authorizes a sweep;
+        // otherwise cleanup could SIGKILL the still-running leader itself.
+        if exited(pid)? {
+            return Ok(());
+        }
+        event.clear_ready();
+    }
 }
 
 async fn wait_sigchld(pid: libc::pid_t) -> io::Result<()> {
@@ -57,6 +72,48 @@ async fn wait_sigchld(pid: libc::pid_t) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_spurious_pidfd_wake_cannot_make_a_live_child_waitable() {
+        use std::{
+            os::{fd::OwnedFd, unix::net::UnixDatagram},
+            process::Stdio,
+        };
+        use tokio::io::{Interest, unix::AsyncFd};
+
+        let mut child = crate::shell_process::spawn({
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", "read line; exit 42"])
+                .stdin(Stdio::piped());
+            command
+        })
+        .unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        let (rx, tx) = UnixDatagram::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let fd: OwnedFd = rx.try_clone().unwrap().into();
+        let ready = AsyncFd::with_interest(fd, Interest::READABLE).unwrap();
+        tx.send(b"wake").unwrap();
+        drop(ready.readable().await.unwrap());
+        rx.recv(&mut [0; 4]).unwrap(); // cached readiness, no kernel readiness
+        let wait = wait_pidfd(pid, &ready);
+        tokio::pin!(wait);
+        assert!(
+            futures_util::poll!(&mut wait).is_pending(),
+            "a wake is not an exit"
+        );
+        assert!(!exited(pid).unwrap());
+        drop(child.stdin.take());
+        wait_sigchld(pid).await.unwrap();
+        tx.send(b"exit").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(42));
+    }
 
     /// Coalesced exits and an unrelated notification must not strand the last waiter.
     #[tokio::test]

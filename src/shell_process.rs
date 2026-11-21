@@ -5,6 +5,8 @@
 #[cfg(target_os = "linux")]
 mod linux_observation;
 #[cfg(target_os = "linux")]
+mod linux_spawn;
+#[cfg(target_os = "linux")]
 mod namespace_report;
 #[cfg(unix)]
 mod unix_wait;
@@ -190,7 +192,8 @@ pub(crate) fn end_message(
 }
 
 /// Establish the containment boundary before user code can run.
-pub(crate) fn spawn(command: &mut Command) -> io::Result<Child> {
+/// Requires a current Tokio runtime with I/O and (on Unix) signal drivers.
+pub(crate) fn spawn(mut command: Command) -> io::Result<Child> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -203,14 +206,19 @@ pub(crate) fn spawn(command: &mut Command) -> io::Result<Child> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, DETACHED_PROCESS};
-        // Noninteractive shell I/O is piped. Never inherit or allocate a console
-        // for the interpreter; job accounting needs no image-name exemptions.
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        // Keep a usable console without a visible window. DETACHED_PROCESS can
+        // make PowerShell exit 0 before executing anything (PowerShell#28383).
+        // Suspension still keeps user code behind Job Object assignment.
         command
             .as_std_mut()
-            .creation_flags(CREATE_SUSPENDED | DETACHED_PROCESS);
+            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
     }
-    command.kill_on_drop(true).spawn()
+    command.kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    return linux_spawn::spawn(command);
+    #[cfg(not(target_os = "linux"))]
+    command.spawn()
 }
 
 /// Resume a Windows child only after associating it with its job object.
@@ -827,46 +835,118 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn a_malformed_namespace_report_cannot_discard_a_claimed_stop() {
+        use std::os::unix::net::UnixDatagram;
+
+        let (recv, send) = UnixDatagram::pair().unwrap();
+        recv.set_nonblocking(true).unwrap();
+        let (mut child, trace) = guarded_sleep();
+        let mut guard = Guard::attach(&mut child, TreeObserver::Namespace(recv), trace.clone())
+            .await
+            .unwrap();
+        send.send(&[b'N', b'S', 9]).unwrap();
+        let end = guard.stop(StopCause::Cancel).await;
+        assert!(
+            matches!(end, ChildEnd::Stopped(Some(StopCause::Cancel))),
+            "{end:?}"
+        );
+        assert_eq!(trace.outcomes(), [StopOutcome::Delivered]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn stop_during_observer_tail_preserves_only_published_evidence() {
-        use std::os::unix::{net::UnixDatagram, process::ExitStatusExt};
+        use std::os::unix::net::UnixDatagram;
         // A live launcher, but the private observer has already waited on the
         // command. Exercise either side of the scan without a timing-dependent race.
-        for cause in [StopCause::Timeout, StopCause::Cancel] {
-            for tree in [None, Some(&b"L"[..]), Some(b"N")] {
-                let (recv, send) = UnixDatagram::pair().unwrap();
-                recv.set_nonblocking(true).unwrap();
-                let (mut child, trace) = guarded_sleep();
-                let mut guard = Guard::attach(&mut child, TreeObserver::Namespace(recv), trace)
-                    .await
-                    .unwrap();
-                let packet = if cause == StopCause::Timeout {
-                    b"E\x00"
-                } else {
-                    b"S\x09"
-                };
+        for tree in [None, Some(&b"L"[..]), Some(b"N")] {
+            let (recv, send) = UnixDatagram::pair().unwrap();
+            recv.set_nonblocking(true).unwrap();
+            let (mut child, trace) = guarded_sleep();
+            let mut guard = Guard::attach(&mut child, TreeObserver::Namespace(recv), trace)
+                .await
+                .unwrap();
+            // A published ending our kill cannot have produced outvotes the stop.
+            send.send(b"E\x00").unwrap();
+            if let Some(packet) = tree {
                 send.send(packet).unwrap();
-                if let Some(packet) = tree {
-                    send.send(packet).unwrap();
-                }
-                assert!(guard.try_wait().unwrap().is_none());
-                let ChildEnd::Exited(status) = guard.stop(cause).await else {
-                    panic!("stopping only the launcher cannot own the shell exit");
-                };
-                if cause == StopCause::Timeout {
-                    assert_eq!(status.code(), Some(0));
-                } else {
-                    assert_eq!(status.signal(), Some(libc::SIGKILL));
-                }
-                assert_eq!(
-                    guard.observation,
-                    match tree {
-                        Some(b"L") => TreeObservation::Leftovers,
-                        Some(b"N") => TreeObservation::None,
-                        _ => TreeObservation::Unknown,
-                    }
-                );
             }
+            assert!(guard.try_wait().unwrap().is_none());
+            let ChildEnd::Exited(status) = guard.stop(StopCause::Timeout).await else {
+                panic!("an exit status rules out the deadline's kill");
+            };
+            assert_eq!(status.code(), Some(0));
+            assert_eq!(
+                guard.observation,
+                match tree {
+                    Some(b"L") => TreeObservation::Leftovers,
+                    Some(b"N") => TreeObservation::None,
+                    _ => TreeObservation::Unknown,
+                }
+            );
         }
+    }
+
+    /// The report is read before our signal: killing the launcher afterwards
+    /// cannot have caused the inner shell's already-published SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_published_sigkill_remains_independent_of_a_later_stop() {
+        use std::os::unix::{net::UnixDatagram, process::ExitStatusExt};
+        for tree in [None, Some(&b"L"[..]), Some(b"N")] {
+            let (recv, send) = UnixDatagram::pair().unwrap();
+            recv.set_nonblocking(true).unwrap();
+            let (mut child, trace) = guarded_sleep();
+            let mut guard = Guard::attach(&mut child, TreeObserver::Namespace(recv), trace.clone())
+                .await
+                .unwrap();
+            send.send(b"S\x09").unwrap();
+            if let Some(packet) = tree {
+                send.send(packet).unwrap();
+            }
+            let end = guard.stop(StopCause::Cancel).await;
+            assert_eq!(trace.outcomes(), [StopOutcome::Delivered]);
+            let ChildEnd::Exited(status) = end else {
+                panic!("a later stop cannot own an earlier shell death: {end:?}");
+            };
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert_eq!(
+                guard.observation,
+                match tree {
+                    Some(b"L") => TreeObservation::Leftovers,
+                    Some(b"N") => TreeObservation::None,
+                    _ => TreeObservation::Unknown,
+                }
+            );
+        }
+    }
+
+    /// The other direction: an ending inconsistent with our SIGKILL remains the
+    /// command's own, so a real outside signal is still attributable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_published_foreign_signal_stays_the_commands_own_ending() {
+        use std::os::unix::net::UnixDatagram;
+        let (recv, send) = UnixDatagram::pair().unwrap();
+        recv.set_nonblocking(true).unwrap();
+        let (mut child, trace) = guarded_sleep();
+        let mut guard = Guard::attach(&mut child, TreeObserver::Namespace(recv), trace.clone())
+            .await
+            .unwrap();
+        send.send(b"S\x0b").unwrap();
+        send.send(b"L").unwrap();
+        let end = guard.stop(StopCause::Cancel).await;
+        assert_eq!(trace.outcomes(), [StopOutcome::Delivered]);
+        let ChildEnd::Exited(status) = end else {
+            panic!("a SIGSEGV report rules out our SIGKILL: {end:?}");
+        };
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGSEGV)
+        );
+        assert_eq!(guard.observation, TreeObservation::Leftovers);
+        drop(guard);
+        let _ = child.kill().await;
     }
 
     #[cfg(unix)]
@@ -955,11 +1035,149 @@ mod tests {
         assert!(stop.independent_status(false).is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    fn parent_death_command(sandbox: bool) -> Command {
+        let script = "echo ready; read line; exit 42";
+        let mut command = if sandbox {
+            let mut command = Command::new("bwrap");
+            command.args([
+                "--die-with-parent",
+                "--new-session",
+                "--unshare-pid",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+                "sh",
+                "-c",
+                script,
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            // Same kernel contract as Bubblewrap --die-with-parent.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command
+        };
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_retiring_tokio_worker_cannot_end_a_command() {
+        use std::{os::unix::process::ExitStatusExt, sync::mpsc, time::Duration};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        for sandbox in [false, true] {
+            if sandbox && std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
+                continue;
+            }
+            // Control: the old worker-spawn path dies. The production path must not.
+            for stable_parent in [false, true] {
+                let (stopped, stops) = mpsc::channel();
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_keep_alive(Duration::from_millis(10))
+                    .on_thread_stop(move || {
+                        let _ = stopped.send(std::thread::current().id());
+                    })
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (spawned, receive) = tokio::sync::oneshot::channel();
+                    let (retire, retired) = mpsc::channel();
+                    let runner = tokio::spawn(async move {
+                        let creator = std::thread::current().id();
+                        let mut command = parent_death_command(sandbox);
+                        let child = if stable_parent {
+                            spawn(command)
+                        } else {
+                            command.spawn()
+                        }
+                        .unwrap();
+                        spawned.send((child, creator)).unwrap();
+                        crate::blocking::run(|| {
+                            retired.recv_timeout(Duration::from_secs(5)).unwrap();
+                            // Force another worker to take the core before returning.
+                            let (ready, replacement) = mpsc::channel();
+                            tokio::spawn(async move {
+                                ready.send(()).unwrap();
+                            });
+                            replacement.recv_timeout(Duration::from_secs(5)).unwrap();
+                        });
+                    });
+                    let (mut child, creator) = receive.await.unwrap();
+                    let mut stdin = child.stdin.take().unwrap();
+                    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+                    let mut line = String::new();
+                    tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut line))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(line, "ready\n");
+                    retire.send(()).unwrap();
+                    runner.await.unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let thread = stops
+                            .recv_timeout(
+                                deadline.saturating_duration_since(std::time::Instant::now()),
+                            )
+                            .unwrap();
+                        if thread == creator {
+                            break;
+                        }
+                    }
+                    if stable_parent {
+                        let premature =
+                            tokio::time::timeout(Duration::from_millis(100), child.wait()).await;
+                        assert!(
+                            premature.is_err(),
+                            "worker retirement ended the command: {premature:?}"
+                        );
+                        stdin.write_all(b"finish\n").await.unwrap();
+                        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(status.code(), Some(42));
+                    } else {
+                        // Expected death gets the full bound, not the short survival probe.
+                        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                            .await
+                            .expect(
+                                "retired worker's child did not receive its parent-death signal",
+                            )
+                            .unwrap();
+                        assert_eq!(status.signal(), Some(libc::SIGKILL));
+                    }
+                });
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn guarded_sleep() -> (Child, StopTrace) {
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 5");
-        let child = spawn(&mut command).unwrap();
+        let child = spawn(command).unwrap();
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(2, false, crate::logging::ColorMode::Never),
             "job-1",
@@ -1003,7 +1221,7 @@ mod tests {
     async fn transient_refusal_retries_immediately_but_never_signals_again_on_drop() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 15 & exit 42"]);
-        let mut child = spawn(&mut command).unwrap();
+        let mut child = spawn(command).unwrap();
         let pid = child.id().unwrap() as libc::pid_t;
         let trace = StopTrace::new(crate::logging::LogConfig::default(), "racing-stop");
         let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
@@ -1052,7 +1270,7 @@ mod tests {
     async fn a_zombie_group_takes_the_signal_and_records_nothing() {
         let mut command = Command::new("sh");
         command.arg("-c").arg("exit 0");
-        let mut child = spawn(&mut command).unwrap();
+        let mut child = spawn(command).unwrap();
         let pid = child.id().unwrap() as libc::pid_t;
         let trace = StopTrace::new(crate::logging::LogConfig::default(), "zombie");
         let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
@@ -1093,7 +1311,7 @@ mod tests {
             ))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut child = spawn(&mut command).unwrap();
+        let mut child = spawn(command).unwrap();
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(0, false, crate::logging::ColorMode::Never),
             "job-contract",
@@ -1120,7 +1338,7 @@ mod tests {
     async fn a_later_stop_never_signals_the_reaped_group() {
         let mut command = Command::new("sh");
         command.arg("-c").arg("exit 0");
-        let mut child = spawn(&mut command).unwrap();
+        let mut child = spawn(command).unwrap();
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(1, false, crate::logging::ColorMode::Never),
             "gone",
@@ -1145,7 +1363,7 @@ mod tests {
     async fn stopping_a_zombie_only_group_preserves_its_exit() {
         let mut command = Command::new("sh");
         command.args(["-c", "exit 23"]);
-        let mut child = spawn(&mut command).unwrap();
+        let mut child = spawn(command).unwrap();
         let trace = StopTrace::new(crate::logging::LogConfig::default(), "gone");
         let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace)
             .await
@@ -1165,7 +1383,7 @@ mod tests {
         let mut child = {
             let mut command = Command::new("sh");
             command.arg("-c").arg("exit 0");
-            spawn(&mut command).unwrap()
+            spawn(command).unwrap()
         };
         let trace = StopTrace::new(
             crate::logging::LogConfig::new(2, false, crate::logging::ColorMode::Never),
@@ -1227,7 +1445,7 @@ mod tests {
         use std::process::Stdio;
         let mut command = Command::new("cmd.exe");
         command.arg("/C").arg("exit 0").stdout(Stdio::null());
-        let mut child = spawn(&mut command).unwrap();
+        let mut child = spawn(command).unwrap();
         let mut job = Guard::attach(
             &mut child,
             TreeObserver::Direct,
@@ -1256,7 +1474,7 @@ mod tests {
                 output.display()
             ))
             .kill_on_drop(true);
-        let mut child = spawn(&mut command).unwrap();
+        let mut child = spawn(command).unwrap();
         let mut tree = Guard::attach(
             &mut child,
             TreeObserver::Direct,

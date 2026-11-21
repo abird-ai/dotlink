@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows PowerShell uses a windowless console instead of `DETACHED_PROCESS`,
+  which can return exit 0 without executing the command. Suspended startup and
+  Job Object containment remain unchanged; the Windows lifetime test gates again.
+- Linux shell launchers now fork from a process-lifetime thread. Retiring a
+  Tokio worker no longer triggers Bubblewrap's thread-scoped parent-death
+  SIGKILL; actual dotlink process death still tears down the sandbox.
+- Verify child exit with non-reaping `waitid` before a cleanup sweep.
+  Spurious pidfd readiness can no longer authorize killing a live command.
+- Cancellation retains its first requester's attribution. Unclaimed-signal
+  diagnostics describe the missing recorded stop, not a proven outside sender;
+  independent inner-shell statuses published before a stop remain authoritative.
+
 ## [0.17.6] - 2026-11-21
 
 ### Breaking

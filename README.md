@@ -430,7 +430,8 @@ They cover startup, restart, verbosity changes, and shell job endings. A job wri
 most one line: `LOG job id=… end=… [by=…] [tree=…] [cleanup=kill-failed]`. `end=` reports an exit
 code, signal, timeout, cancel, error, or `abandoned` if the runner was dropped while
 still guarding the job. `by=caller` or `by=connector` identifies an attributed cancel;
-`by=external` means dotlink observed a signal it did not send, not that it knows who did.
+`by=external` means a signal has no recorded dotlink stop cause. A wait status
+cannot identify its sender; the label alone does not prove another process sent it.
 
 In direct Unix and Bubblewrap runs, a shell killed by `SIGKILL` reports
 `signal: "SIGKILL"` and logs `end=signal SIGKILL by=external` when dotlink did

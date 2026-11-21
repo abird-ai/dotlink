@@ -1,10 +1,10 @@
 //! A job's lifecycle line, end to end: one line when something happened, none when the
 //! command simply ended, and the same words at every verbosity.
 //!
-//! `end=` says what ended the job and `by=` names an actor only where the actor is a
-//! choice — `caller`/`connector` on a cancel, `external` on a signal from outside the
-//! connector; a deadline is dotlink by definition and names nobody. An ordinary exit with no tree observation or
-//! cleanup failure writes nothing.
+//! `end=` says what ended the job. `by=caller`/`by=connector` attributes a cancel;
+//! `by=external` means a signal without a recorded dotlink stop, not a known sender.
+//! A deadline is dotlink by definition and names nobody. An ordinary exit with no
+//! tree observation or cleanup failure writes nothing.
 //!
 //! Driven against the real binary with a piped stderr, because `LOG` lines are not
 //! captured by the in-process tests. Signals are a Unix concept here; on Windows
@@ -184,10 +184,9 @@ fn a_deadline_records_dotlink_at_every_verbosity() {
     }
 }
 
-/// The other actor: a signal dotlink did not deliver is somebody else's, and the result
-/// says so without claiming a stop.
+/// An independently delivered signal stays unclaimed at every verbosity.
 #[test]
-fn an_external_signal_names_the_actor_at_every_verbosity() {
+fn an_unclaimed_signal_is_reported_at_every_verbosity() {
     for flags in [vec![], vec!["-v"], vec!["--quiet", "-vv"]] {
         let workdir = tempfile::tempdir().unwrap();
         let pid_file = workdir.path().join("pid");

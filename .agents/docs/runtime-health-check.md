@@ -260,7 +260,11 @@ unconfirmed after its immediate retry. Silence does not establish host-wide cont
 Unix child in another group (including Bash job control or GNU `timeout`) is outside both observation and cleanup. A matching session ID does not put it back in scope.
 
 `by=` identifies an attributed cancel (`caller` or `connector`) or an observed signal
-not attributed to dotlink (`external`). In direct Unix and Bubblewrap runs an
+without a recorded dotlink stop (`external`). It cannot identify the sender.
+A `signal_generate` tracepoint names the task executing the kernel signal path,
+not necessarily a userspace `kill()` caller: `PR_SET_PDEATHSIG` runs in the dying
+parent thread's context. Bubblewrap launch must therefore use dotlink's stable
+spawn thread, never a retireable Tokio worker. In direct Unix and Bubblewrap runs an
 external SIGKILL of the shell gives `signal: "SIGKILL"` and `end=signal SIGKILL by=external`.
 A numeric `exit_code: 137` alone proves no signal. If the sandbox report is
 missing or inconsistent, dotlink keeps the launcher status and reports `tree: "unknown"`.

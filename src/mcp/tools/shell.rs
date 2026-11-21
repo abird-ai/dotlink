@@ -2422,7 +2422,7 @@ impl LocalMachine {
         use crate::shell_process::{End, StopCause};
         // A dotlink ending needs no actor: the deadline, the internal error and the
         // fail-safe are this process by definition. Only a cancel has a choice of who
-        // asked, and a signal is never ours.
+        // asked; an unclaimed signal has no recorded dotlink cause.
         let by = match completion.stopped_by {
             Some(StopCause::Cancel) => Some("caller"),
             Some(StopCause::Shutdown) => Some("connector"),
@@ -2459,10 +2459,7 @@ impl LocalMachine {
     }
 
     async fn run_shell_job_inner(
-        ShellCommand {
-            mut command,
-            observer,
-        }: ShellCommand,
+        ShellCommand { command, observer }: ShellCommand,
         stdin_text: Option<String>,
         deadline: Instant,
         job: JobHandle,
@@ -2473,7 +2470,7 @@ impl LocalMachine {
             return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
                 .with_context(result_context);
         }
-        let mut child = match crate::shell_process::spawn(&mut command) {
+        let mut child = match crate::shell_process::spawn(command) {
             Ok(child) => child,
             Err(error) => {
                 return JobCompletion::failed(error.to_string()).with_context(result_context);
@@ -4135,7 +4132,7 @@ mod tests {
         assert!(payload.get("exit_code").is_none(), "{text}");
         assert!(payload.get("stopped_by").is_none(), "{text}");
         let next = payload["next"].as_str().unwrap_or_default();
-        assert!(next.contains("outside dotlink"), "{text}");
+        assert!(next.contains("without a recorded dotlink stop"), "{text}");
     }
 
     /// A connector stop says so, and never claims a signal.

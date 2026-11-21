@@ -15,7 +15,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -261,11 +261,10 @@ pub(crate) struct JobCompletion {
     /// so a failure behind a deadline still reports the deadline. `status` cannot
     /// carry it: an internal failure is always `Failed` on the surface.
     pub(crate) terminal: Option<JobStatus>,
-    /// Set only when dotlink can prove it stopped the *waited command*: it
-    /// signalled the tree and the signal was delivered. Absent means no stop is
-    /// provable — the command ended on its own, was never spawned, was stopped
-    /// from outside the connector, or the runner died in a way this record cannot
-    /// see. Read it beside `status`, which says how the job ended.
+    /// Dotlink's attributed stop of the waited command, not merely an attempted
+    /// signal or post-exit sweep. Absence means no recorded dotlink stop cause;
+    /// it does not identify a signal's sender. Read beside `status` and the
+    /// process ending.
     pub(crate) stopped_by: Option<crate::shell_process::StopCause>,
     /// Journal-only: the last tree kill failed or could not be confirmed.
     /// Cleanup never overrides the command's own exit status.
@@ -559,23 +558,20 @@ pub(crate) enum CancelOrigin {
 #[derive(Clone, Debug)]
 pub(crate) struct JobCancel {
     token: CancellationToken,
-    connector: Arc<AtomicBool>,
+    origin: Arc<OnceLock<CancelOrigin>>,
 }
 
 impl JobCancel {
     fn new() -> Self {
         Self {
             token: CancellationToken::new(),
-            connector: Arc::new(AtomicBool::new(false)),
+            origin: Arc::new(OnceLock::new()),
         }
     }
 
     /// Who cancelled this job, as recorded by the side that did it.
     pub(crate) fn origin(&self) -> CancelOrigin {
-        match self.connector.load(Ordering::Acquire) {
-            true => CancelOrigin::Connector,
-            false => CancelOrigin::Caller,
-        }
+        self.origin.get().copied().unwrap_or(CancelOrigin::Caller)
     }
 
     /// Resolves once this job is cancelled. There is no matching `cancel`: the
@@ -584,11 +580,9 @@ impl JobCancel {
         self.token.cancelled()
     }
 
-    /// Record the origin before the token fires; the runner reads it as soon as
-    /// its `cancelled()` resolves.
+    /// First requester wins, published before any caller can fire the token.
     fn cancel_as(&self, origin: CancelOrigin) {
-        self.connector
-            .store(origin == CancelOrigin::Connector, Ordering::Release);
+        let _ = self.origin.set(origin);
         self.token.cancel();
     }
 
@@ -2603,22 +2597,15 @@ pub(crate) fn signal_token(signal: i32) -> String {
 fn external_stop_note(completion: &JobCompletion) -> Option<String> {
     let signal = external_signal(completion)?;
     Some(format!(
-        "killed by {} from outside dotlink; check what sent it before retrying",
+        "killed by {} without a recorded dotlink stop; check what sent it before retrying",
         signal_token(signal)
     ))
 }
 
-/// The one ending dotlink cannot attribute to itself: the command died on a
-/// signal no cause claims. `from outside` names the *absence* of our signal, not
-/// a culprit — a crash and a stranger's SIGKILL both land here.
-///
-/// The predicate is `stopped_by.is_none()`, which is exactly "no kill of ours
-/// ended this command": only a kill that ends the command claims a cause, and a
-/// sweep of leftovers claims nothing. So a command that somebody else killed keeps
-/// this ending even when dotlink also swept its tree behind it.
-///
-/// The result sentence and the `by=external` line both read this, so the journal
-/// and the reply cannot disagree about the same job.
+/// A signal with no recorded dotlink stop. Wait status cannot identify the
+/// sender: even a parent-death signal can originate in our own kernel context.
+/// The result note and `by=external` share this predicate, never a culprit claim.
+/// Post-exit cleanup does not overwrite the command's independent ending.
 pub(crate) fn external_signal(completion: &JobCompletion) -> Option<i32> {
     let signal = completion.signal?;
     completion.stopped_by.is_none().then_some(signal)
@@ -4280,7 +4267,11 @@ mod tests {
     fn external_stop_note_names_the_signal_it_reports() {
         let note = external_stop_note(&signalled_completion()).unwrap();
         assert!(note.contains(&signal_token(9)), "{note}");
-        assert!(note.contains("outside dotlink"), "{note}");
+        assert!(note.contains("without a recorded dotlink stop"), "{note}");
+        assert!(
+            !note.contains("outside dotlink"),
+            "a wait status cannot name its sender: {note}"
+        );
     }
 
     #[test]
@@ -4418,6 +4409,20 @@ mod tests {
         let teardown = JobCancel::new();
         teardown.cancel_as(CancelOrigin::Connector);
         assert_eq!(teardown.origin(), CancelOrigin::Connector);
+    }
+
+    #[test]
+    fn a_later_cancel_cannot_reassign_the_first_requesters_stop() {
+        for (first, later) in [
+            (CancelOrigin::Caller, CancelOrigin::Connector),
+            (CancelOrigin::Connector, CancelOrigin::Caller),
+        ] {
+            let cancel = JobCancel::new();
+            cancel.cancel_as(first);
+            cancel.cancel_as(later);
+            assert!(cancel.is_cancelled());
+            assert_eq!(cancel.origin(), first);
+        }
     }
 
     #[test]

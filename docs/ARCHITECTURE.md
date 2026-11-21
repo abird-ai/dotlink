@@ -574,6 +574,24 @@ Only bash is exposed on Unix and only powershell on Windows. Executable discover
 
 Shell stdin is fed concurrently after stdout/stderr drains start. A child may intentionally close its stdin without consuming all supplied bytes; `BrokenPipe` therefore ends input delivery but does not fail or terminate an otherwise valid command. Other stdin I/O failures remain execution failures, and the child's exit status remains authoritative after an early close.
 
+## Linux shell lifetime
+
+Linux shell launchers are spawned by one process-lifetime OS thread, not a Tokio
+worker. Bubblewrap's `--die-with-parent` uses `PR_SET_PDEATHSIG`, which follows
+the **forking thread**: a worker retired after `block_in_place` can otherwise
+kill a healthy sandbox while dotlink itself stays alive. The spawn thread
+enters each request's runtime only for spawning; synchronous handoff keeps
+cancellation from stranding a child. Job ownership and cleanup remain with
+`Guard`/`JobManager`, and process death still kills the sandbox.
+
+Pidfd readiness is only a wakeup. `waitid(WEXITED | WNOWAIT)` must confirm
+exit before the guard sweeps a group; spurious readiness never authorizes a kill.
+A valid inner status published before a stop remains independent evidence,
+including SIGKILL. Without a recorded stop cause, `by=external` means an
+unattributed signal, not proof of an outside sender. Linux parent-death signals
+can be generated in the dying parent thread's kernel context without a
+userspace `kill()` call.
+
 ## Linux Bubblewrap mapping
 
 On Linux, enabled shell runs inside Bubblewrap unless `--unrestricted` (or the legacy `--allow-all --no-sandbox` pair) was explicitly selected. Fine-grained broad grants may contain dotlink's own protected objects: `validate_shell_guards` returns a shallow-to-deep `GuardAnchor` plan for every mutable ancestor between a user bind and an existing canonical guarded leaf. Bubblewrap self-binds those pinned ancestors with their effective RO/RW mode; the leaf mask/read-only rebind becomes the final mountpoint. This prevents sandbox-child rename/unlink while preserving ordinary writes below writable anchors. Nested descendants collapse under a guarded directory. Missing names and symlink spellings remain fail-closed when overlapping a live broad bind.

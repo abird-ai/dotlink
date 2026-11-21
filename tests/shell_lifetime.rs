@@ -325,7 +325,7 @@ fn a_signal_is_not_an_explicit_exit_137() {
                         payload["next"]
                             .as_str()
                             .unwrap()
-                            .contains("outside dotlink")
+                            .contains("without a recorded dotlink stop")
                     );
                     "signal SIGKILL by=external"
                 } else {
@@ -404,45 +404,73 @@ fn stacked_proc_under_root_rw_preserves_the_tree_verdict() {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "unverified on Windows CI: the detached interpreter's script has no observable effect there"]
-fn detached_powershell_counts_real_job_members_not_a_console_host() {
-    // A quiet, bounded child: its lifetime does not depend on an inherited pipe.
-    let child = r#"$p = New-Object System.Diagnostics.ProcessStartInfo
+fn windowless_powershell_counts_real_job_members_not_a_console_host() {
+    for (action, wait) in [
+        (None, false),
+        (Some("Start-Sleep -Seconds 15"), false),
+        (Some("exit 0"), true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        // Child readiness distinguishes actual execution from PowerShell's silent
+        // exit-0 startup failure. Relative marker paths need no host-path quoting.
+        let prefix = action.map_or_else(String::new, |action| {
+            let finish = if wait {
+                r#"if (!$process.WaitForExit(10000)) { throw 'child did not finish' }
+if ($process.ExitCode -ne 0) { throw 'child failed' }"#
+            } else {
+                r#"$deadline = [DateTime]::UtcNow.AddSeconds(10)
+while (!(Test-Path -LiteralPath child-ready)) {
+    if ($process.HasExited -or [DateTime]::UtcNow -ge $deadline) {
+        throw 'child never became ready'
+    }
+    Start-Sleep -Milliseconds 10
+}
+if ($process.HasExited) { throw 'child ended before observation' }"#
+            };
+            format!(r#"$p = New-Object System.Diagnostics.ProcessStartInfo
 $p.FileName = (Get-Process -Id $PID).Path
-$p.Arguments = '-NoLogo -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 15"'
+$p.Arguments = '-NoLogo -NoProfile -NonInteractive -Command "Set-Content -LiteralPath child-ready -Value ready -ErrorAction Stop; {action}"'
+$p.WorkingDirectory = (Get-Location).ProviderPath
 $p.UseShellExecute = $false
 $p.CreateNoWindow = $true
-$null = [System.Diagnostics.Process]::Start($p);"#;
-    // The product detaches the interpreter itself; detaching dotlink as well only
-    // changes how the harness reaches it. `[Console]::Out` needs a console the
-    // detached child does not have, so prove liveness with a file: this test is
-    // about job accounting, not console capture.
-    for prefix in ["", child] {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("ran");
+$process = [System.Diagnostics.Process]::Start($p)
+{finish}"#)
+        });
         let call = one_call_with(
             dir.path(),
             &format!(
-                "{prefix} Set-Content -LiteralPath '{marker}' -Value ran; exit 0",
-                marker = marker.display()
+                r#"$ErrorActionPreference = 'Stop'
+{prefix}
+Set-Content -LiteralPath ran -Value ran
+[Console]::Out.Write('ok')
+exit 0"#
             ),
             Mode::Direct,
             |_| (),
         );
-        assert!(!call.is_error);
-        assert_eq!(call.payload["exit_code"], 0);
+        let payload = &call.payload;
+        assert!(!call.is_error, "{payload}");
+        assert_eq!(payload["exit_code"], 0, "{payload}");
         assert!(
-            marker.exists(),
-            "the command must have run: {}",
-            call.payload
+            dir.path().join("ran").exists(),
+            "command never ran: {payload}"
         );
-        assert_eq!(call.payload["success"], prefix.is_empty());
-        if prefix.is_empty() {
-            assert!(call.payload.get("tree").is_none());
-            assert!(call.lines.is_empty());
-        } else {
-            assert_eq!(call.payload["tree"], "leftovers");
+        assert_eq!(payload["stdout"], "ok", "{payload}");
+        if action.is_some() {
+            assert!(
+                dir.path().join("child-ready").exists(),
+                "child never ran: {payload}"
+            );
+        }
+        let leftovers = action.is_some() && !wait;
+        assert_eq!(payload["success"], !leftovers, "{payload}");
+        assert!(payload.get("stopped_by").is_none(), "{payload}");
+        if leftovers {
+            assert_eq!(payload["tree"], "leftovers", "{payload}");
             assert_eq!(call.lines, ["exit code=0 tree=leftovers"]);
+        } else {
+            assert!(payload.get("tree").is_none(), "{payload}");
+            assert!(call.lines.is_empty(), "{:?}", call.lines);
         }
     }
 }
@@ -492,4 +520,116 @@ fn direct_escaped_writer_costs_the_drain_window_not_the_deadline() {
     assert_eq!(payload["stdout_drain_incomplete"], true, "{payload}");
     assert!(payload.get("stdout_truncated").is_none(), "{payload}");
     assert!(call.lines.is_empty(), "{:?}", call.lines);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sandbox_still_dies_when_dotlink_is_killed() {
+    use std::{
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        process::Child,
+    };
+
+    struct Server(Child);
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    if std::env::var_os("DOTLINK_TEST_BWRAP").is_none() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("ready");
+    let config_path = root.path().join("config.jsonc");
+    std::fs::write(&config_path, config()).unwrap();
+    let mut server = Server(
+        Command::new(env!("CARGO_BIN_EXE_dotlink"))
+            .args(["--stdio", "--no-tunnel", "--allow-rw", "--allow-shell"])
+            .current_dir(root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("DOTLINK_CONFIG_FILE", &config_path)
+            .env_remove("DOTLINK_PROFILE")
+            .env_remove("BASH_ENV")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = server.0.stdin.take().unwrap();
+    let mut output = BufReader::new(server.0.stdout.take().unwrap());
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+            "protocolVersion":"2025-06-18", "capabilities":{},
+            "clientInfo":{"name":"parent-death-test", "version":"0"}
+        }})
+    )
+    .unwrap();
+    let mut line = String::new();
+    assert!(
+        output.read_line(&mut line).unwrap() > 0,
+        "server did not initialize"
+    );
+    let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], 1);
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"})
+    )
+    .unwrap();
+    writeln!(input, "{}", json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{
+        "name":"bash", "arguments":{"command":"echo ready > ready; exec sleep 60", "background":true}
+    }})).unwrap();
+    input.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "sandbox never reached its command"
+        );
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "dotlink exited early"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The dedicated parent thread, rather than the thread-group leader, owns
+    // the launcher. Pin every direct child before killing this disposable server.
+    let mut launchers = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{}/task", server.0.id())).unwrap() {
+        let children = std::fs::read_to_string(task.unwrap().path().join("children"));
+        for pid in children.unwrap_or_default().split_whitespace() {
+            let pid: libc::pid_t = pid.parse().unwrap();
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+            assert!(fd >= 0, "cannot pin test launcher");
+            // SAFETY: pidfd_open returned a fresh owned descriptor.
+            launchers.push(unsafe { OwnedFd::from_raw_fd(fd as _) });
+        }
+    }
+    assert_eq!(launchers.len(), 1, "one sandbox launcher expected");
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
+    for launcher in launchers {
+        let mut event = libc::pollfd {
+            fd: launcher.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: live pidfd and one writable poll record. Wait for death, not a reused PID.
+        assert_eq!(
+            unsafe { libc::poll(&mut event, 1, 5000) },
+            1,
+            "sandbox outlived dotlink"
+        );
+        assert_ne!(event.revents & libc::POLLIN, 0);
+    }
 }
