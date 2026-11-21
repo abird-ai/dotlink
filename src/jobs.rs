@@ -3162,7 +3162,7 @@ fn deadline_note(cap_secs: u64, elapsed_ms: u64, live: bool) -> Option<String> {
         return None;
     }
     Some(format!(
-        "ends in {} at timeout_secs={cap_secs}; report from what is retained",
+        "ends in {} at timeout_secs={cap_secs}: checkpoint what it produced and drive the turn to completion",
         crate::mcp::human_duration(remaining.max(1))
     ))
 }
@@ -4062,7 +4062,8 @@ mod tests {
         );
         let near = deadline_note(1_500, 1_260_000, true).expect("4 minutes left warns");
         assert_eq!(
-            near, "ends in 4 min at timeout_secs=1500; report from what is retained",
+            near,
+            "ends in 4 min at timeout_secs=1500: checkpoint what it produced and drive the turn to completion",
             "{near}"
         );
         // A finished or cancelling job has no deadline left to predict.

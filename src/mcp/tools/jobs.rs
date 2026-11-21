@@ -202,7 +202,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts, and the last {job_tail} lines of each stream so one call shows how far it got or why it failed. A job exposed as a native task uses this id as its `taskId`.",
+        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts, and the last {job_tail} lines of each stream so one call shows how far it got or why it failed. `next` warns as `timeout_secs` nears. A job exposed as a native task uses this id as its `taskId`.",
         annotations(
             title = "Get shell job status",
             read_only_hint = true,
