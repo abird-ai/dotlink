@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-11-21
+
 ### Fixed
 
 - Windows PowerShell uses a windowless console instead of `DETACHED_PROCESS`,
@@ -897,7 +899,8 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.6...HEAD
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.7...HEAD
+[0.17.7]: https://github.com/abird-ai/dotlink/compare/v0.17.6...v0.17.7
 [0.17.6]: https://github.com/abird-ai/dotlink/compare/v0.17.5...v0.17.6
 [0.17.5]: https://github.com/abird-ai/dotlink/compare/v0.17.4...v0.17.5
 [0.17.4]: https://github.com/abird-ai/dotlink/compare/v0.17.3...v0.17.4
