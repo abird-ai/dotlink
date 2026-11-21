@@ -19,12 +19,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   hands back before the horizon. The per-command cap is that same number, so the
   reserve always belongs to reporting. Uncapped runtimes keep the profile ceiling
   (default 3600 s) and carry no turn advice.
-- `job_get` states a live job's own deadline once it is close: inside a fifth of
-  `timeout_secs` (at most five minutes) `next` leads with `ends in 4 min at
-  timeout_secs=1500: checkpoint what it produced and drive the turn to completion`,
-  then the usual follow-up. Its description names the warning (`next` warns as
-  `timeout_secs` nears) without restating the horizon. A finished or cancelling job
-  has no deadline left to predict, and no other job tool repeats it.
+- On a capped runtime only, `job_get` states a live job's own deadline once it is
+  close: inside a fifth of `timeout_secs` (at most five minutes) `next` leads with
+  `ends in 4 min at timeout_secs=1500: checkpoint what it produced and drive the
+  turn to completion`, then the usual follow-up. The advisory is bound to the
+  transports answering the runtime, so a stdio/HTTP-only runtime never sees it; a
+  finished or cancelling job has no deadline left to predict, and no other job tool
+  repeats it.
 
 ## [0.17.7] - 2026-11-21
 

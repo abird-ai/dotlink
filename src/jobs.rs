@@ -700,6 +700,10 @@ struct JobManagerInner {
     sweeper: Mutex<Option<JoinHandle<()>>>,
     intent_fingerprint: Mutex<Option<[u8; 32]>>,
     policy_fingerprint: Mutex<Option<[u8; 32]>>,
+    /// Whether the answering surface hands a call back mid-work, which is the only
+    /// case where a command's own deadline is worth announcing: that caller is in a
+    /// turn it has to checkpoint into, while a stdio/HTTP caller just waits.
+    turn_advice: AtomicBool,
 }
 
 const SPOOL_WRITERS_SEALED: usize = 1usize << (usize::BITS - 1);
@@ -1265,6 +1269,19 @@ impl JobManager {
         Self::with_spool_limit(retention, DEFAULT_JOB_SPOOL_BYTES)
     }
 
+    /// Bind the turn advisory to the surface answering this runtime.
+    ///
+    /// Takes the capability itself rather than a re-derived flag, so a transport
+    /// decides this in exactly one place. Bound on every machine construction —
+    /// including one that reuses a durable session — because the surface can change
+    /// under an in-process restart (`--no-tunnel`, a dropped tunnel) while the
+    /// session and its jobs survive.
+    pub(crate) fn bind_surface(&self, sync_hold: Option<Duration>) {
+        self.inner
+            .turn_advice
+            .store(sync_hold.is_some(), Ordering::Relaxed);
+    }
+
     /// User-visible retention this manager applies, for advertised text.
     pub(crate) fn retention_secs(&self) -> u64 {
         self.inner.retention_secs.load(Ordering::Relaxed)
@@ -1290,6 +1307,7 @@ impl JobManager {
             sweeper: Mutex::new(None),
             intent_fingerprint: Mutex::new(None),
             policy_fingerprint: Mutex::new(None),
+            turn_advice: AtomicBool::new(false),
         });
         Self::start_sweeper(&inner);
         Ok(Self { inner })
@@ -1748,7 +1766,12 @@ impl JobManager {
             entry.cancel.cancel_as(CancelOrigin::Caller);
             entry.updated_at = chrono::Utc::now().to_rfc3339();
         }
-        Ok(render_status_locked(entry).to_string())
+        Ok(render_status_locked(
+            entry,
+            elapsed_ms(entry),
+            self.inner.turn_advice.load(Ordering::Relaxed),
+        )
+        .to_string())
     }
 
     /// Lifecycle stage only; tool payloads expose the single normalized
@@ -1777,7 +1800,11 @@ impl JobManager {
             let entry = state
                 .available(id)
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-            let payload = render_status_locked(entry);
+            let payload = render_status_locked(
+                entry,
+                elapsed_ms(entry),
+                self.inner.turn_advice.load(Ordering::Relaxed),
+            );
             // Read exactly the prefix the reply reports, so the tail can never
             // be newer than the byte counts next to it.
             let stdout_stored = stored_bytes_in(&payload, "stdout");
@@ -1824,7 +1851,7 @@ impl JobManager {
             "jobs": jobs.into_iter().take(limit).map(|entry| serde_json::json!({
                 "job_id": entry.id,
                 "status": entry.status(),
-                "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                "elapsed_ms": elapsed_ms(entry),
             })).collect::<Vec<_>>(),
             "spool_used": self.inner.spool_used_bytes.load(Ordering::Relaxed),
             "spool_limit": self.inner.spool_limit_bytes.load(Ordering::Relaxed),
@@ -3078,13 +3105,17 @@ fn stream_status(stored: u64, ack: u64, summary: Option<StreamSummary>, released
     })
 }
 
-fn render_status_locked(entry: &JobEntry) -> Value {
-    let completion = entry.completion.as_ref();
-    let elapsed_ms = entry
+/// One age for every payload that shows one.
+fn elapsed_ms(entry: &JobEntry) -> u64 {
+    entry
         .created
         .elapsed()
         .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn render_status_locked(entry: &JobEntry, elapsed_ms: u64, turn_advice: bool) -> Value {
+    let completion = entry.completion.as_ref();
     let live = completion.is_none() && !entry.cancel.is_cancelled();
     let stdout_stored = retained_bytes(entry, JobStream::Stdout);
     let stderr_stored = retained_bytes(entry, JobStream::Stderr);
@@ -3131,7 +3162,7 @@ fn render_status_locked(entry: &JobEntry) -> Value {
         }
     }
     let next = match (
-        deadline_note(entry.timeout_secs, elapsed_ms, live),
+        deadline_note(entry.timeout_secs, elapsed_ms, live, turn_advice),
         job_follow_up(JobFollowUp::of(entry), Some("job_get")),
     ) {
         (Some(deadline), Some(next)) => Some(format!("{deadline}; {next}")),
@@ -3144,7 +3175,8 @@ fn render_status_locked(entry: &JobEntry) -> Value {
     payload
 }
 
-/// A live command's own deadline, stated once it is close.
+/// A live command's own deadline, stated once it is close and only where a turn
+/// exists to checkpoint into.
 ///
 /// Nothing else in the payload predicts the *kind* of ending that is coming: the
 /// caller has to subtract `elapsed_ms` from `timeout_secs` to notice that the next
@@ -3153,8 +3185,8 @@ fn render_status_locked(entry: &JobEntry) -> Value {
 /// one budget it can see run out. A fifth of the budget, at most five minutes:
 /// long enough to finish the step in hand and report it, short enough that an
 /// ordinary command is not announced from its first poll.
-fn deadline_note(cap_secs: u64, elapsed_ms: u64, live: bool) -> Option<String> {
-    if !live || cap_secs <= 1 {
+fn deadline_note(cap_secs: u64, elapsed_ms: u64, live: bool, turn_advice: bool) -> Option<String> {
+    if !turn_advice || !live || cap_secs <= 1 {
         return None;
     }
     let remaining = cap_secs.saturating_sub(elapsed_ms / 1000);
@@ -4057,24 +4089,57 @@ mod tests {
     #[test]
     fn a_live_job_states_its_deadline_only_near_it() {
         assert!(
-            deadline_note(1_500, 1_100_000, true).is_none(),
+            deadline_note(1_500, 1_100_000, true, true).is_none(),
             "7 minutes of budget left is quiet"
         );
-        let near = deadline_note(1_500, 1_260_000, true).expect("4 minutes left warns");
+        let near = deadline_note(1_500, 1_260_000, true, true).expect("4 minutes left warns");
         assert_eq!(
             near,
             "ends in 4 min at timeout_secs=1500: checkpoint what it produced and drive the turn to completion",
             "{near}"
         );
         // A finished or cancelling job has no deadline left to predict.
-        assert!(deadline_note(1_500, 1_490_000, false).is_none());
+        assert!(deadline_note(1_500, 1_490_000, false, true).is_none());
         // A short cap warns near its end, not from its first poll.
-        assert!(deadline_note(30, 0, true).is_none());
-        assert!(deadline_note(30, 26_000, true).is_some());
+        assert!(deadline_note(30, 0, true, true).is_none());
+        assert!(deadline_note(30, 26_000, true, true).is_some());
         // A one-second cap has no room to act in.
-        assert!(deadline_note(1, 5_000, true).is_none());
+        assert!(deadline_note(1, 5_000, true, true).is_none());
+        // A runtime with no turn to checkpoint into never advertises one.
+        assert!(deadline_note(1_500, 1_260_000, true, false).is_none());
         assert_eq!(deadline_margin(1_500), 300);
         assert_eq!(deadline_margin(60), 12);
+    }
+
+    /// The gate where it actually renders: one aged job, two surfaces.
+    #[tokio::test]
+    async fn the_deadline_renders_only_on_a_surface_that_hands_back() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let started = manager
+            .spawn(1_500, 10, 4096, None, |_| async {
+                std::future::pending::<JobCompletion>().await
+            })
+            .unwrap();
+        let state = manager.inner.state.lock().unwrap();
+        let entry = state.jobs.get(&started.id).unwrap();
+        let aged = 1_260_000; // 21 minutes into a 25 minute cap
+        let advising = render_status_locked(entry, aged, true);
+        let plain = render_status_locked(entry, aged, false);
+        let advising_next = advising["next"].as_str().unwrap_or_default();
+        assert!(advising_next.starts_with("ends in 4 min"), "{advising}");
+        assert!(
+            advising_next.contains("drive the turn to completion"),
+            "{advising}"
+        );
+        assert!(
+            !plain["next"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ends in"),
+            "{plain}"
+        );
+        drop(state);
+        manager.cancel(&started.id).ok();
     }
 
     /// The wiring, from the surface a caller really reads: a fresh live job keeps the

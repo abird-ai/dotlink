@@ -2084,6 +2084,8 @@ impl LocalMachine {
             bail!("internal error: prepared machine belongs to a different job session");
         }
         jobs.set_limits(prepared.retention, prepared.spool_limit);
+        // The surface, not the session: a reused session outlives a transport change.
+        jobs.bind_surface(prepared.config.sync_hold);
         let operation_gate = jobs.operation_gate();
         Ok(Self {
             config: prepared.config,
