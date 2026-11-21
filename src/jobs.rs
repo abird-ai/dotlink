@@ -191,11 +191,10 @@ impl JobStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JobPhase {
     Queued,
-    Running,
+    Running { deadline: TokioInstant },
     Terminal,
 }
 
@@ -990,7 +989,11 @@ pub(crate) struct JobHandle {
 }
 
 impl JobHandle {
-    pub(crate) fn mark_running(&self, shell_guard_generation: Option<[u8; 32]>) -> bool {
+    pub(crate) fn mark_running(
+        &self,
+        shell_guard_generation: Option<[u8; 32]>,
+        deadline: TokioInstant,
+    ) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
@@ -1004,7 +1007,7 @@ impl JobHandle {
         if entry.completion.is_some() {
             return false;
         }
-        entry.phase = JobPhase::Running;
+        entry.phase = JobPhase::Running { deadline };
         entry.shell_guard_generation = shell_guard_generation;
         entry.updated_at = chrono::Utc::now().to_rfc3339();
         entry.notify.notify_waiters();
@@ -1590,7 +1593,7 @@ impl JobManager {
                 timeout_secs,
                 timeout_ceiling: timeout_secs,
                 result_limit: crate::limits::DEFAULT_TRANSFER_BYTES,
-                phase: JobPhase::Running,
+                phase: JobPhase::Queued,
                 cancel: cancel.clone(),
                 runner: None,
                 completion: None,
@@ -1768,8 +1771,8 @@ impl JobManager {
         }
         Ok(render_status_locked(
             entry,
-            elapsed_ms(entry),
             self.inner.turn_advice.load(Ordering::Relaxed),
+            TokioInstant::now(),
         )
         .to_string())
     }
@@ -1802,8 +1805,8 @@ impl JobManager {
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
             let payload = render_status_locked(
                 entry,
-                elapsed_ms(entry),
                 self.inner.turn_advice.load(Ordering::Relaxed),
+                TokioInstant::now(),
             );
             // Read exactly the prefix the reply reports, so the tail can never
             // be newer than the byte counts next to it.
@@ -1846,12 +1849,13 @@ impl JobManager {
             .filter(|entry| entry.disposition.exposed() && !entry.expiration_pending)
             .collect::<Vec<_>>();
         jobs.sort_by_key(|entry| std::cmp::Reverse(entry.created));
+        let now = Instant::now();
         serde_json::json!({
             "ts": crate::mcp::now_unix(),
             "jobs": jobs.into_iter().take(limit).map(|entry| serde_json::json!({
                 "job_id": entry.id,
                 "status": entry.status(),
-                "elapsed_ms": elapsed_ms(entry),
+                "elapsed_ms": elapsed_ms(entry, now),
             })).collect::<Vec<_>>(),
             "spool_used": self.inner.spool_used_bytes.load(Ordering::Relaxed),
             "spool_limit": self.inner.spool_limit_bytes.load(Ordering::Relaxed),
@@ -3106,24 +3110,21 @@ fn stream_status(stored: u64, ack: u64, summary: Option<StreamSummary>, released
 }
 
 /// One age for every payload that shows one.
-fn elapsed_ms(entry: &JobEntry) -> u64 {
-    entry
-        .created
-        .elapsed()
+fn elapsed_ms(entry: &JobEntry, now: Instant) -> u64 {
+    now.saturating_duration_since(entry.created)
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn render_status_locked(entry: &JobEntry, elapsed_ms: u64, turn_advice: bool) -> Value {
+fn render_status_locked(entry: &JobEntry, turn_advice: bool, now: TokioInstant) -> Value {
     let completion = entry.completion.as_ref();
-    let live = completion.is_none() && !entry.cancel.is_cancelled();
     let stdout_stored = retained_bytes(entry, JobStream::Stdout);
     let stderr_stored = retained_bytes(entry, JobStream::Stderr);
     let mut payload = serde_json::json!({
         "ts": crate::mcp::now_unix(),
         "job_id": entry.id,
         "status": entry.status(),
-        "elapsed_ms": elapsed_ms,
+        "elapsed_ms": elapsed_ms(entry, now.into_std()),
         "timeout_secs": entry.timeout_secs,
         "cancelling": entry.cancel.is_cancelled(),
         "exit_code": completion.and_then(|value| value.exit_code),
@@ -3162,7 +3163,7 @@ fn render_status_locked(entry: &JobEntry, elapsed_ms: u64, turn_advice: bool) ->
         }
     }
     let next = match (
-        deadline_note(entry.timeout_secs, elapsed_ms, live, turn_advice),
+        deadline_note(entry, turn_advice, now),
         job_follow_up(JobFollowUp::of(entry), Some("job_get")),
     ) {
         (Some(deadline), Some(next)) => Some(format!("{deadline}; {next}")),
@@ -3175,32 +3176,24 @@ fn render_status_locked(entry: &JobEntry, elapsed_ms: u64, turn_advice: bool) ->
     payload
 }
 
-/// A live command's own deadline, stated once it is close and only where a turn
-/// exists to checkpoint into.
-///
-/// Nothing else in the payload predicts the *kind* of ending that is coming: the
-/// caller has to subtract `elapsed_ms` from `timeout_secs` to notice that the next
-/// poll will be a kill with a partial result. This is not a turn clock — dotlink
-/// has no anchor for a turn — only the cap this execution was given, which is the
-/// one budget it can see run out. A fifth of the budget, at most five minutes:
-/// long enough to finish the step in hand and report it, short enough that an
-/// ordinary command is not announced from its first poll.
-fn deadline_note(cap_secs: u64, elapsed_ms: u64, live: bool, turn_advice: bool) -> Option<String> {
-    if !turn_advice || !live || cap_secs <= 1 {
+/// Countdown to the runner's actual deadline, not job age (which includes queueing).
+fn deadline_note(entry: &JobEntry, turn_advice: bool, now: TokioInstant) -> Option<String> {
+    let JobPhase::Running { deadline } = entry.phase else {
+        return None;
+    };
+    if !turn_advice || entry.cancel.is_cancelled() {
         return None;
     }
-    let remaining = cap_secs.saturating_sub(elapsed_ms / 1000);
-    if remaining > deadline_margin(cap_secs) {
+    let cap = entry.timeout_secs;
+    let left = deadline.checked_duration_since(now)?;
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() != 0);
+    if secs == 0 || secs > (cap / 5).min(300) {
         return None;
     }
     Some(format!(
-        "ends in {} at timeout_secs={cap_secs}: checkpoint what it produced and drive the turn to completion",
-        crate::mcp::human_duration(remaining.max(1))
+        "execution deadline in {} at timeout_secs={cap}: checkpoint what it produced and drive the turn to completion",
+        crate::mcp::human_duration(secs)
     ))
-}
-
-fn deadline_margin(cap_secs: u64) -> u64 {
-    (cap_secs / 5).min(300)
 }
 
 /// The last `lines` lines of one spool stream, best effort. Only a bounded
@@ -3902,7 +3895,7 @@ fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
     task.with_poll_interval_ms(JOB_POLL_INTERVAL_MS)
         .with_status_message(match entry.phase {
             JobPhase::Queued => "shell job is queued",
-            JobPhase::Running => {
+            JobPhase::Running { .. } => {
                 "shell job is running; job_output provides durable paged stdout/stderr"
             }
             JobPhase::Terminal if entry.status() == JobStatus::Cancelled => {
@@ -4083,81 +4076,58 @@ mod tests {
         }
     }
 
-    /// A live command near its own cap says so: nothing else in the payload predicts
-    /// that the next poll is a kill with a partial result, and `elapsed_ms` against
-    /// `timeout_secs` is arithmetic the caller should not have to do.
     #[test]
-    fn a_live_job_states_its_deadline_only_near_it() {
-        assert!(
-            deadline_note(1_500, 1_100_000, true, true).is_none(),
-            "7 minutes of budget left is quiet"
-        );
-        let near = deadline_note(1_500, 1_260_000, true, true).expect("4 minutes left warns");
-        assert_eq!(
-            near,
-            "ends in 4 min at timeout_secs=1500: checkpoint what it produced and drive the turn to completion",
-            "{near}"
-        );
-        // A finished or cancelling job has no deadline left to predict.
-        assert!(deadline_note(1_500, 1_490_000, false, true).is_none());
-        // A short cap warns near its end, not from its first poll.
-        assert!(deadline_note(30, 0, true, true).is_none());
-        assert!(deadline_note(30, 26_000, true, true).is_some());
-        // A one-second cap has no room to act in.
-        assert!(deadline_note(1, 5_000, true, true).is_none());
-        // A runtime with no turn to checkpoint into never advertises one.
-        assert!(deadline_note(1_500, 1_260_000, true, false).is_none());
-        assert_eq!(deadline_margin(1_500), 300);
-        assert_eq!(deadline_margin(60), 12);
+    fn deadline_advice_tracks_execution_not_time_in_the_queue() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(1500).unwrap();
+        let next = |now, advice| {
+            let state = manager.inner.state.lock().unwrap();
+            let payload = render_status_locked(&state.jobs[&job.id], advice, now);
+            payload["next"].as_str().unwrap_or_default().to_owned()
+        };
+        // Advance the observation time, never subtract from an unknown system uptime.
+        let start = TokioInstant::now() + Duration::from_secs(1600);
+        assert!(next(start, true).contains("job_cancel"));
+        assert!(!next(start, true).contains("execution deadline"));
+        let deadline = start + Duration::from_secs(1500);
+        assert!(job.mark_running(None, deadline));
+        assert!(!next(start, true).contains("execution deadline"));
+        let near = deadline - Duration::from_secs(240);
+        assert!(next(near, true).starts_with("execution deadline in 4 min at timeout_secs=1500"));
+        assert!(!next(near, false).contains("execution deadline"));
+        assert!(!next(deadline, true).contains("execution deadline"));
+        manager.cancel(&job.id).unwrap();
+        assert!(!next(near, true).contains("execution deadline"));
     }
 
-    /// The gate where it actually renders: one aged job, two surfaces.
-    #[tokio::test]
-    async fn the_deadline_renders_only_on_a_surface_that_hands_back() {
+    #[test]
+    fn deadline_advice_respects_short_caps_and_the_configured_surface() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
-        let started = manager
-            .spawn(1_500, 10, 4096, None, |_| async {
-                std::future::pending::<JobCompletion>().await
-            })
-            .unwrap();
-        let state = manager.inner.state.lock().unwrap();
-        let entry = state.jobs.get(&started.id).unwrap();
-        let aged = 1_260_000; // 21 minutes into a 25 minute cap
-        let advising = render_status_locked(entry, aged, true);
-        let plain = render_status_locked(entry, aged, false);
-        let advising_next = advising["next"].as_str().unwrap_or_default();
-        assert!(advising_next.starts_with("ends in 4 min"), "{advising}");
-        assert!(
-            advising_next.contains("drive the turn to completion"),
-            "{advising}"
-        );
-        assert!(
-            !plain["next"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("ends in"),
-            "{plain}"
-        );
-        drop(state);
-        manager.cancel(&started.id).ok();
-    }
-
-    /// The wiring, from the surface a caller really reads: a fresh live job keeps the
-    /// ordinary follow-up and gains no deadline clause.
-    #[tokio::test]
-    async fn a_fresh_job_keeps_the_ordinary_follow_up() {
-        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
-        let started = manager
-            .spawn(300, 10, 4096, None, |_| async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                JobCompletion::failed("never reached")
-            })
-            .unwrap();
-        let payload: Value = serde_json::from_str(&manager.status(&started.id).unwrap()).unwrap();
-        let next = payload["next"].as_str().unwrap_or_default();
-        assert!(next.contains("job_cancel"), "{payload}");
-        assert!(!next.contains("ends in"), "{payload}");
-        manager.wait_until(&started.id, None).await.ok();
+        let now = TokioInstant::now();
+        for (cap, remaining, warns) in [
+            (1, 1, false),
+            (30, 7, false),
+            (30, 6, true),
+            (3600, 301, false),
+        ] {
+            let job = manager.create_for_test(cap).unwrap();
+            assert!(job.mark_running(None, now + Duration::from_secs(remaining)));
+            let state = manager.inner.state.lock().unwrap();
+            assert_eq!(
+                deadline_note(&state.jobs[&job.id], true, now).is_some(),
+                warns
+            );
+        }
+        // Exercise job_get's configured surface, not just the renderer's flag.
+        let job = manager.create_for_test(1500).unwrap();
+        assert!(job.mark_running(None, now + Duration::from_secs(240)));
+        for (hold, advises) in [(Some(Duration::from_secs(90)), true), (None, false)] {
+            manager.bind_surface(hold);
+            let payload: Value = serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+            let next = payload["next"].as_str().unwrap();
+            assert_eq!(next.contains("drive the turn to completion"), advises);
+            assert!(next.contains("job_cancel"));
+        }
     }
 
     /// The surface a caller really reaches: `tool_result`, not the payload helper.
@@ -5810,7 +5780,9 @@ mod tests {
         let request_key = "revoked-sync".to_owned();
         let started = manager
             .spawn(30, 30, 1024, Some(request_key.clone()), |job| async move {
-                assert!(job.mark_running(Some([7; 32])));
+                assert!(
+                    job.mark_running(Some([7; 32]), TokioInstant::now() + Duration::from_secs(30))
+                );
                 JobCompletion::completed(
                     Some(0),
                     true,
@@ -5852,7 +5824,9 @@ mod tests {
         let request_key = "revoked-running".to_owned();
         let started = manager
             .spawn(30, 30, 1024, Some(request_key.clone()), |job| async move {
-                assert!(job.mark_running(Some([8; 32])));
+                assert!(
+                    job.mark_running(Some([8; 32]), TokioInstant::now() + Duration::from_secs(30))
+                );
                 job.cancel.cancelled().await;
                 JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
             })

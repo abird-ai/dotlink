@@ -450,7 +450,13 @@ must not outlive the call. Bash runs scripts as a non-login shell, so explicit
 `exit` does not run logout hooks. Direct execution inherits the host Bash
 environment (including `BASH_ENV` and exported functions); the sandbox starts
 with only its configured environment.
-If other processes are still live when the main command exits, the result includes
+
+Windows allows up to two seconds for its console host and other job members
+to exit naturally. Members still active after that grace count as leftovers.
+A deadline or cancellation interrupts grace and triggers immediate cleanup;
+a nonzero, unsettled count is unknown, not proof of leftovers.
+
+If other processes are still live at observation, the result includes
 `"tree":"leftovers"` and `"success":false`. The exit code is still the main command's,
 not a made-up failure code, and this is not an MCP tool error. For example:
 

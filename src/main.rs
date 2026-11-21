@@ -1598,11 +1598,10 @@ async fn prepare_runtime(
         && setup.config.max_shell_timeout_secs != setup::DEFAULT_MAX_SHELL_TIMEOUT_SECS
     {
         tracing::warn!(
-            "max_shell_timeout_secs={} exceeds the {} minute turn horizon; commands are capped at {} s ({} minute checkpoint plus {} minutes to report it)",
+            "max_shell_timeout_secs={} exceeds the capped command limit of {} s ({} minute turn horizon minus {} minutes to report)",
             setup.config.max_shell_timeout_secs,
-            crate::limits::TURN_CHECKPOINT_MINUTES,
             crate::limits::CAPPED_SHELL_TIMEOUT_SECS,
-            crate::limits::TURN_CHECKPOINT_MINUTES - crate::limits::TURN_CHECKPOINT_RESERVE_MINUTES,
+            crate::limits::TURN_CHECKPOINT_MINUTES,
             crate::limits::TURN_CHECKPOINT_RESERVE_MINUTES
         );
     }

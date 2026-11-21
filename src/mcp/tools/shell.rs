@@ -2322,12 +2322,6 @@ impl LocalMachine {
                         })
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped());
-                    if !job.mark_running(shell_guard_generation) {
-                        return JobCompletion::cancelled(
-                            StreamSummary::default(),
-                            StreamSummary::default(),
-                        );
-                    }
                     let Some(deadline) =
                         Instant::now().checked_add(Duration::from_secs(timeout_secs))
                     else {
@@ -2335,6 +2329,12 @@ impl LocalMachine {
                             format!("timeout_secs {timeout_secs} is too large to schedule");
                         return JobCompletion::failed(message);
                     };
+                    if !job.mark_running(shell_guard_generation, deadline) {
+                        return JobCompletion::cancelled(
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        );
+                    }
                     let result_context = JobResultContext {
                         dir: runtime.config.access.relative_display(&working_dir),
                         sandboxed: runtime.config.sandbox_shell,
@@ -2466,12 +2466,24 @@ impl LocalMachine {
         result_context: JobResultContext,
         stop_trace: StopTrace,
     ) -> JobCompletion {
-        if Instant::now() >= deadline {
-            return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
+        use crate::shell_process::LaunchResult;
+        let mut child = match crate::shell_process::spawn_job(command, job.cancel.clone(), deadline)
+        {
+            Ok(LaunchResult::Child(child)) => child,
+            Ok(LaunchResult::Cancelled) => {
+                return JobCompletion::cancelled(
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                )
                 .with_context(result_context);
-        }
-        let mut child = match crate::shell_process::spawn(command) {
-            Ok(child) => child,
+            }
+            Ok(LaunchResult::TimedOut) => {
+                return JobCompletion::timed_out(
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                )
+                .with_context(result_context);
+            }
             Err(error) => {
                 return JobCompletion::failed(error.to_string()).with_context(result_context);
             }
@@ -5266,25 +5278,29 @@ mod tests {
             .expect("sandboxed Linux shell has a live guard generation");
 
         let request_key = "retirement-guard-revocation".to_owned();
-        let started = machine
-            .jobs
-            .spawn(
-                30,
-                30,
-                4096,
-                Some(request_key.clone()),
-                move |job| async move {
-                    assert!(job.mark_running(Some(generation)));
-                    std::fs::write(&job.stdout_path, b"secret").unwrap();
-                    crate::jobs::JobCompletion::completed(
-                        Some(0),
-                        true,
-                        crate::jobs::StreamSummary::complete(6, 6),
-                        crate::jobs::StreamSummary::default(),
-                    )
-                },
-            )
-            .unwrap();
+        let started =
+            machine
+                .jobs
+                .spawn(
+                    30,
+                    30,
+                    4096,
+                    Some(request_key.clone()),
+                    move |job| async move {
+                        assert!(job.mark_running(
+                            Some(generation),
+                            Instant::now() + Duration::from_secs(30)
+                        ));
+                        std::fs::write(&job.stdout_path, b"secret").unwrap();
+                        crate::jobs::JobCompletion::completed(
+                            Some(0),
+                            true,
+                            crate::jobs::StreamSummary::complete(6, 6),
+                            crate::jobs::StreamSummary::default(),
+                        )
+                    },
+                )
+                .unwrap();
         let id = started.id.clone();
         assert!(matches!(
             machine.jobs.wait_until(&id, None).await.unwrap(),

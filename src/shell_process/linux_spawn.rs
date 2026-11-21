@@ -14,18 +14,16 @@ use std::{
     sync::{OnceLock, mpsc},
 };
 
-use tokio::{
-    process::{Child, Command},
-    runtime::Handle,
-};
+use super::{Launch, LaunchResult};
+use tokio::runtime::Handle;
 
 struct Request {
-    command: Command,
+    launch: Launch,
     runtime: Handle,
-    reply: mpsc::SyncSender<io::Result<Child>>,
+    reply: mpsc::SyncSender<io::Result<LaunchResult>>,
 }
 
-pub(super) fn spawn(command: Command) -> io::Result<Child> {
+pub(super) fn spawn(launch: Launch) -> io::Result<LaunchResult> {
     // No runtime/session owns this thread. Process death still triggers the
     // kernel fail-safe; ordinary job teardown remains the Guard's responsibility.
     static SPAWNER: OnceLock<mpsc::SyncSender<Request>> = OnceLock::new();
@@ -37,9 +35,9 @@ pub(super) fn spawn(command: Command) -> io::Result<Child> {
             std::thread::Builder::new()
                 .name("dotlink-spawn".into())
                 .spawn(move || {
-                    for mut request in receive {
+                    for request in receive {
                         let _runtime = request.runtime.enter();
-                        let _ = request.reply.send(request.command.spawn());
+                        let _ = request.reply.send(request.launch.start());
                     }
                 })?;
             // Don't cache a transient thread-creation failure. Concurrent losers
@@ -54,7 +52,7 @@ pub(super) fn spawn(command: Command) -> io::Result<Child> {
     crate::blocking::run(|| {
         spawner
             .send(Request {
-                command,
+                launch,
                 runtime,
                 reply,
             })

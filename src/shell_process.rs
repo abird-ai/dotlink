@@ -67,6 +67,7 @@ impl TreeObservation {
             Self::Unknown => Some("unknown"),
         }
     }
+    #[cfg(unix)]
     fn from_live(live: Option<bool>) -> Self {
         match live {
             Some(true) => Self::Leftovers,
@@ -191,9 +192,54 @@ pub(crate) fn end_message(
     line
 }
 
+pub(crate) enum LaunchResult {
+    Child(Child),
+    Cancelled,
+    TimedOut,
+}
+
+struct Launch {
+    command: Command,
+    window: Option<(crate::jobs::JobCancel, tokio::time::Instant)>,
+}
+
+impl Launch {
+    /// Recheck on the forking thread: a request can wait behind another spawn.
+    fn start(mut self) -> io::Result<LaunchResult> {
+        if let Some((cancel, deadline)) = self.window {
+            if cancel.is_cancelled() {
+                return Ok(LaunchResult::Cancelled);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(LaunchResult::TimedOut);
+            }
+        }
+        self.command.spawn().map(LaunchResult::Child)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn spawn(command: Command) -> io::Result<Child> {
+    match spawn_inner(command, None)? {
+        LaunchResult::Child(child) => Ok(child),
+        _ => unreachable!("unconditional test launch"),
+    }
+}
+
 /// Establish the containment boundary before user code can run.
 /// Requires a current Tokio runtime with I/O and (on Unix) signal drivers.
-pub(crate) fn spawn(mut command: Command) -> io::Result<Child> {
+pub(crate) fn spawn_job(
+    command: Command,
+    cancel: crate::jobs::JobCancel,
+    deadline: tokio::time::Instant,
+) -> io::Result<LaunchResult> {
+    spawn_inner(command, Some((cancel, deadline)))
+}
+
+fn spawn_inner(
+    mut command: Command,
+    window: Option<(crate::jobs::JobCancel, tokio::time::Instant)>,
+) -> io::Result<LaunchResult> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -216,9 +262,9 @@ pub(crate) fn spawn(mut command: Command) -> io::Result<Child> {
     }
     command.kill_on_drop(true);
     #[cfg(target_os = "linux")]
-    return linux_spawn::spawn(command);
+    return linux_spawn::spawn(Launch { command, window });
     #[cfg(not(target_os = "linux"))]
-    command.spawn()
+    Launch { command, window }.start()
 }
 
 /// Resume a Windows child only after associating it with its job object.
@@ -366,6 +412,7 @@ enum GuardState {
 
 pub(crate) struct Guard<'a> {
     child: &'a mut Child,
+    #[cfg(unix)]
     observer: TreeObserver,
     state: GuardState,
     pub(crate) observation: TreeObservation,
@@ -429,8 +476,11 @@ impl<'a> Guard<'a> {
                 ));
             }
         };
+        #[cfg(windows)]
+        let TreeObserver::Direct = observer;
         Ok(Self {
             child,
+            #[cfg(unix)]
             observer,
             trace,
             state: GuardState::Armed,
@@ -497,8 +547,10 @@ impl<'a> Guard<'a> {
         #[cfg(windows)]
         {
             let status = self.child.wait().await?;
-            let tree = self.sweep(); // the private job handle survives the leader
-            Ok(self.command_exit(status, tree))
+            // The job handle remains valid after reaping. The grace wait yields
+            // to cancellation/deadline; try_wait then sweeps without waiting.
+            let tree = self.settled_job_tree().await;
+            Ok(self.finish_windows_exit(status, tree))
         }
     }
 
@@ -512,8 +564,13 @@ impl<'a> Guard<'a> {
         #[cfg(windows)]
         {
             Ok(self.child.try_wait()?.map(|status| {
-                let tree = self.sweep();
-                self.command_exit(status, tree)
+                // An immediate zero is conclusive. A nonzero count may still be
+                // console teardown; don't delay a stop or invent leftovers.
+                let tree = match self.active_job_processes() {
+                    Ok(0) => TreeObservation::None,
+                    _ => TreeObservation::Unknown,
+                };
+                self.finish_windows_exit(status, tree)
             }))
         }
     }
@@ -530,6 +587,14 @@ impl<'a> Guard<'a> {
         Ok(self.command_exit(status, tree))
     }
 
+    #[cfg(windows)]
+    fn finish_windows_exit(&mut self, status: ExitStatus, tree: TreeObservation) -> ExitStatus {
+        self.signal();
+        self.observation = tree;
+        status
+    }
+
+    #[cfg(unix)]
     fn sweep(&mut self) -> TreeObservation {
         let tree = match self.observer {
             TreeObserver::Direct => self.observe_direct_tree(),
@@ -540,6 +605,7 @@ impl<'a> Guard<'a> {
         tree
     }
 
+    #[cfg(unix)]
     fn command_exit(&mut self, launcher: ExitStatus, direct: TreeObservation) -> ExitStatus {
         let (status, tree) = match &self.observer {
             TreeObserver::Direct => (launcher, direct),
@@ -552,13 +618,12 @@ impl<'a> Guard<'a> {
         status
     }
 
+    #[cfg(unix)]
     fn observe_direct_tree(&self) -> TreeObservation {
         #[cfg(target_os = "linux")]
         let check = crate::blocking::run(|| linux_observation::has_live_member(Some(self.group)));
         #[cfg(target_os = "macos")]
         let check = crate::blocking::run(|| mac_group_has_live_member(self.group));
-        #[cfg(windows)]
-        let check = crate::blocking::run(|| self.settled_job_processes().map(|n| n != 0));
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let check: io::Result<bool> = Err(io::ErrorKind::Unsupported.into());
         TreeObservation::from_live(check.ok())
@@ -624,29 +689,22 @@ impl<'a> Guard<'a> {
         }
     }
 
+    /// Job accounting can briefly include the exiting console host. A zero is
+    /// final; a persistent nonzero count is evidence only at the end of grace.
     #[cfg(windows)]
-    /// Live members, once the infrastructure that outlives the leader has left.
-    ///
-    /// A no-window console (which PowerShell needs to run at all) puts its console host
-    /// in the job, and the accounting clears the exited leader a moment after the wait
-    /// returns. Both would otherwise read as leftovers on a command that left nothing
-    /// behind — every Windows command would report `tree: "leftovers"`. Infrastructure
-    /// releases as soon as the last console handle closes, so poll while a member
-    /// remains instead of teaching this layer process names: a real leftover keeps the
-    /// count up for the whole window, and a clean exit answers on the first query.
-    #[cfg(windows)]
-    fn settled_job_processes(&self) -> io::Result<u32> {
-        use std::time::{Duration, Instant};
-        // Long enough for a console host and job accounting to settle under load.
-        const SETTLE: Duration = Duration::from_secs(2);
-        const POLL: Duration = Duration::from_millis(10);
-        let mut count = self.active_job_processes()?;
-        let deadline = Instant::now() + SETTLE;
-        while count != 0 && Instant::now() < deadline {
-            std::thread::sleep(POLL);
-            count = self.active_job_processes()?;
+    async fn settled_job_tree(&self) -> TreeObservation {
+        use tokio::time::{Duration, Instant, sleep_until};
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.active_job_processes() {
+                Ok(0) => return TreeObservation::None,
+                Err(_) => return TreeObservation::Unknown,
+                Ok(_) if Instant::now() >= deadline => return TreeObservation::Leftovers,
+                Ok(_) => {
+                    sleep_until(deadline.min(Instant::now() + Duration::from_millis(10))).await
+                }
+            }
         }
-        Ok(count)
     }
 
     #[cfg(windows)]
@@ -824,6 +882,28 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_launches_do_not_attempt_exec() {
+        use tokio::time::{Duration, Instant};
+        let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        // An attempted exec would fail with NotFound, not a pre-spawn outcome.
+        let request = |deadline| Launch {
+            command: Command::new("nonexistent-dotlink-regression-command"),
+            window: Some((job.cancel.clone(), deadline)),
+        };
+        let cancelled = request(Instant::now() + Duration::from_secs(30));
+        assert!(matches!(
+            request(Instant::now()).start().unwrap(),
+            LaunchResult::TimedOut
+        ));
+        manager.cancel(&job.id).unwrap();
+        assert!(matches!(
+            cancelled.start().unwrap(),
+            LaunchResult::Cancelled
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -1462,6 +1542,30 @@ mod tests {
             line(End::Abandoned, None, true),
             "id=3f0c9d1e end=abandoned cleanup=kill-failed"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn interrupting_windows_grace_sweeps_without_waiting_again() {
+        use std::process::Stdio;
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/d", "/c"])
+            .raw_arg("start /b ping.exe -n 30 127.0.0.1 >nul & exit /b 37")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn(command).unwrap();
+        let trace = StopTrace::new(crate::logging::LogConfig::default(), "settling");
+        let mut guard = Guard::attach(&mut child, TreeObserver::Direct, trace.clone())
+            .await
+            .unwrap();
+        // Make the normal wait enter grace on its very first poll. Dropping
+        // that future models the runner selecting cancellation or its deadline.
+        assert_eq!(guard.child.wait().await.unwrap().code(), Some(37));
+        assert!(futures_util::poll!(std::pin::pin!(guard.wait())).is_pending());
+        assert_eq!(guard.try_wait().unwrap().unwrap().code(), Some(37));
+        assert_eq!(guard.observation, TreeObservation::Unknown);
+        assert_eq!(trace.outcomes(), [StopOutcome::Delivered]);
     }
 
     #[cfg(windows)]

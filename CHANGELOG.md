@@ -6,15 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.9] - 2026-11-21
+
 ### Fixed
 
-- Windows no longer reports every direct command as `tree: "leftovers"` with
-  `success: false`. The no-window console introduced in 0.17.7 (which PowerShell
-  needs to run at all) puts its console host in the job, and job accounting clears
-  the exited leader a moment after the wait returns, so the sweep saw live members
-  on a command that left nothing behind. Observations now settle while a member
-  remains instead of deciding on the first query: a clean exit answers immediately,
-  a real leftover keeps the count up for the whole window.
+- Clean Windows shell commands no longer report leftovers just because the
+  console host is still exiting. An empty job completes immediately; otherwise
+  dotlink gives job members up to two seconds to leave. Cancellation or the execution deadline
+  interrupts this wait and sweeps immediately; an inconclusive count reports
+  `tree: "unknown"` without overwriting the interpreter's exit.
+- `job_get` uses the runner's execution deadline for its checkpoint advice.
+  Queue time still counts toward `elapsed_ms`, not `timeout_secs`.
+- Linux rechecks cancellation and expiry on the spawn thread before starting a
+  queued command. A skipped launch never claims a process was killed.
 
 ## [0.17.8] - 2026-11-21
 

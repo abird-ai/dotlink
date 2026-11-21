@@ -581,8 +581,9 @@ worker. Bubblewrap's `--die-with-parent` uses `PR_SET_PDEATHSIG`, which follows
 the **forking thread**: a worker retired after `block_in_place` can otherwise
 kill a healthy sandbox while dotlink itself stays alive. The spawn thread
 enters each request's runtime only for spawning; synchronous handoff keeps
-cancellation from stranding a child. Job ownership and cleanup remain with
-`Guard`/`JobManager`, and process death still kills the sandbox.
+cancellation from stranding a child. Before forking, that thread rechecks the
+job cancellation token and the execution deadline published with the running
+phase. `Guard` and `JobManager` still own cleanup; process death kills the sandbox.
 
 Pidfd readiness is only a wakeup. `waitid(WEXITED | WNOWAIT)` must confirm
 exit before the guard sweeps a group; spurious readiness never authorizes a kill.
